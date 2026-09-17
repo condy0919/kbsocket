@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+
+build --copt=-fPIC
+
+build --action_env=CC
+build --action_env=CXX
+build --action_env=LLVM_CONFIG
+build --action_env=PATH
+
+build:arm64 --copt=-march=armv8.1-a+lse

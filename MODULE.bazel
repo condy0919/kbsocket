@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+
+module(
+    name = "kbsocket",
+    version = "0.1.0",
+)
+
+git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
+
+bazel_dep(name = "rules_cc", version = "0.2.25")
+bazel_dep(name = "gflags", version = "2.3.1")
+
+git_repository(
+    name = "urma",
+    commit = "e8b7b6fbb8d17403eb484e6d34ab831e86c148e7",  # 2026-09-16
+    remote = "https://atomgit.com/openeuler/umdk.git",
+    strip_prefix = "src/urma",
+)
+
+# dev only
+bazel_dep(name = "googletest", version = "1.18.0.bcr.1")
+bazel_dep(name = "google_benchmark", version = "1.9.5")
+
+bazel_dep(name = "hedron_compile_commands", dev_dependency = True)
+git_override(
+    module_name = "hedron_compile_commands",
+    commit = "abb61a688167623088f8768cc9264798df6a9d10",  # 2025-08-12
+    remote = "https://github.com/hedronvision/bazel-compile-commands-extractor.git",
+)
