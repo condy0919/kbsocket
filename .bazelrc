@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MulanPSL-2.0
 
 build --copt=-fPIC
+build --cxxopt=-std=c++23
 
 build --action_env=CC
 build --action_env=CXX

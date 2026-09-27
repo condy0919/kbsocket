@@ -72,11 +72,12 @@ kbsocket 是下一代高性能用户态通信加速库，目标单容器支撑 4
 
 ## 6. 编码风格与提交规范
 
-- **注释规范**：
-  - 文档型注释使用 `///`, 普通注释使用 `//`, 禁用 C-style 的 `/* */`。
-  - 在文档型注释中，关注函数、类的功能与设计取舍，而不是描述每个参数的意思，并且避免生成 doxygen 形式的注释，`@param`, `@code`, `@endcode`, `@ref` 等这种 tag。
-- **语言使用分工**：
-  - 代码、标识符、提交信息全部使用 **English**, 不能出现中文。
-  - 注释、markdown 文档使用 **中文** 描述。
-- **Git 提交格式**：
-  - 遵循 Conventional Commits 格式：`<type>(<scope>): <summary>`（例如 `feat(rm_ctp): batch post recv wr`，`fix(shm): fix lease leak on peer abort`）。
+命名、头文件组织及可读性遵循 [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html)，本项目规则优先；格式和 include 排序以 `.clang-format` 为准，静态检查以 `.clang-tidy` 为准。异常处理遵循第 4 节，不额外引入 Google 的禁用异常政策。
+
+- **命名**：类型（含枚举）和普通函数用 `UpperCamelCase`；变量、命名空间及访问器/修改器用 `snake_case`；类成员加尾缀 `_`，结构体成员不加；常量及枚举值用 `kCamelCase`（如 `LoadCode::kOk`），普通 `const` 局部变量不强制加 `k`。
+- **头文件**：自包含，直接包含所需依赖，不依赖间接包含；禁止使用 `using namespace`。
+- **类型安全**：单参数构造函数默认 `explicit`（复制/移动构造除外）；使用 C++ cast，避免 C 风格转换；覆盖虚函数用 `override` 或 `final`，不重复写 `virtual`。
+- **标准与文件**：使用 `-std=c++23`；头文件以 `.hpp` 结尾，实现以 `.cpp` 结尾；使用 include guard，不使用 `#pragma once`。
+- **注释**：文档注释用 `///`，普通注释用 `//`，禁用 `/* */`；说明功能与设计取舍，不逐项解释参数，不使用 `@param`、`@code` 等 Doxygen 标签。
+- **语言**：代码、标识符和提交信息使用英文；注释和 Markdown 文档使用中文。
+- **提交**：遵循 Conventional Commits：`<type>(<scope>): <summary>`，如 `feat(rm_ctp): batch post recv wr`。

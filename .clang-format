@@ -58,20 +58,20 @@ ExperimentalAutoDetectBinPacking: false
 FixNamespaceComments: true
 ForEachMacros: []
 IncludeBlocks:   Regroup
+# clang-format 自动将对应主头文件归为优先级 0。
+# 分类按首次匹配生效；第三方规则须先于通用尖括号规则。
 IncludeCategories:
-  - Regex:           '^"(kbsocket/.*\.h)"'
-    Priority:        1
-  - Regex:           '^"kbsocket/'
-    Priority:        2
-  - Regex:           '^(<|")urma_'
+  - Regex:           '^[<"](urma_|uvs_|gtest/|gmock/|gflags/|benchmark/)'
     Priority:        3
-  - Regex:           '^(<|"(gtest|gmock|gflags|benchmark)/)'
+  - Regex:           '^[<"]kbsocket/'
     Priority:        4
-  - Regex:           '^<.*>'
-    Priority:        5
+  - Regex:           '^<.*\.h>'
+    Priority:        1
+  - Regex:           '^<[^./]+>'
+    Priority:        2
   - Regex:           '.*'
-    Priority:        6
-IncludeIsMainRegex: '(Test)?$'
+    Priority:        3
+IncludeIsMainRegex: '(_test|Test)?$'
 IndentCaseLabels: false
 IndentPPDirectives: None
 IndentWidth:     4
