@@ -2,7 +2,7 @@
 
 > 状态：设计提案，尚未完成实现及性能验收。本文记录当前会话的约束、架构演进、源码分析和用户提供的测试结果，不把设计目标写成已经验证的能力。
 >
-> 初稿整理日期：2026-09-14；tracing 细化更新：2026-09-15；tail-based sampling 增补：2026-09-16；shard/reactor 与资源所有权细化：2026-09-18。目标：替换 `ubs-comm/src/ubsocket`，在单容器 40k 连接规模下提供低开销的 UB 加速，并以 40k 次建链/秒为验收目标。
+> 初稿整理日期：2026-09-14；tracing 细化更新：2026-09-15；tail-based sampling 增补：2026-09-16；shard/reactor 与资源所有权细化：2026-09-18；CQE 观测边界、自动调度采集与 lease 审计增补：2026-09-27。目标：替换 `ubs-comm/src/ubsocket`，在单容器 40k 连接规模下提供低开销的 UB 加速，并以 40k 次建链/秒为验收目标。
 
 ## 1. 最终决策与适用边界
 
@@ -78,16 +78,17 @@ V1 仍保留：
 
 源码基线：
 
-| 仓库 | 基线与范围 |
-|---|---|
-| `umdk` | `c164b85668ad51b0c022ed707bc07fe3ca472e27` |
-| `ubs-comm` 历史问题分析 | 从 `5dfb3ae64071f56be443a65bf5f68bcc9cc13388` 之后，选取修复分析至 `7d62be17078589b7e630bb9252c349ce3f2c6c5b`；不是该区间每个提交的完整审计 |
-| `ubs-comm` 初稿整理时 HEAD | `d0669a66d68daec58ee659ff8479f5c9637c9ed5`；对 ArraySet、cooldown 和相关建链路径做了增量复核，不是对新 HEAD 的全面审计 |
-| `ubs-comm` 流控增补时 HEAD | `d5127e13bf229545f56fea5418e925f9b2b82ba9`；只增量复核初始授信、低水位申请、WR 截断和相关历史修复，未全面审计新增提交 |
-| `ubs-comm` tracing 核验 HEAD | `acbaa8eddd3ce3511cfa3c0388b8c19f6ee60631`；核验 PROF、SplitTrace、packet/stage trace 与离线 join，不将旧文档中的打点接线视为当前仍有效 |
-| `brpc` 压测语义补充 | `fa93433265827196490182271b2af6fda9ae1153`；检查 `example/ub_test` 等当前工具，不认定现场必然使用此版本 |
-| Linux 同机 TCP 核验 | 上游 `torvalds/linux` 的 `v6.16` tag 及 6.16 内核文档；是指定版本的源码结论，不代表已核验测试机的厂商补丁、CNI、路由或实际数据路径，详见第 18 节 |
-| 测试机二进制/驱动/固件 | 未提供准确版本；perftest 语义分析以本地 `umdk` 为条件依据 |
+| 仓库                         | 基线与范围                                                                                                                                                                                              |
+|------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `umdk`                       | `c164b85668ad51b0c022ed707bc07fe3ca472e27`                                                                                                                                                              |
+| `umdk` CQE 时间戳增量核验    | 2026-09-27 在上述基线检查后，于 `08b305081b490b9ac44b7fa889df77d95268fb80` 复核 CQE、公共 CR、poll 和 JFCE wait 接口；仍未暴露硬件完成时间戳。仅用于 19.18 的能力边界，不表示其他章节已全面升级至此版本 |
+| `ubs-comm` 历史问题分析      | 从 `5dfb3ae64071f56be443a65bf5f68bcc9cc13388` 之后，选取修复分析至 `7d62be17078589b7e630bb9252c349ce3f2c6c5b`；不是该区间每个提交的完整审计                                                             |
+| `ubs-comm` 初稿整理时 HEAD   | `d0669a66d68daec58ee659ff8479f5c9637c9ed5`；对 ArraySet、cooldown 和相关建链路径做了增量复核，不是对新 HEAD 的全面审计                                                                                  |
+| `ubs-comm` 流控增补时 HEAD   | `d5127e13bf229545f56fea5418e925f9b2b82ba9`；只增量复核初始授信、低水位申请、WR 截断和相关历史修复，未全面审计新增提交                                                                                   |
+| `ubs-comm` tracing 核验 HEAD | `acbaa8eddd3ce3511cfa3c0388b8c19f6ee60631`；核验 PROF、SplitTrace、packet/stage trace 与离线 join，不将旧文档中的打点接线视为当前仍有效                                                                 |
+| `brpc` 压测语义补充          | `fa93433265827196490182271b2af6fda9ae1153`；检查 `example/ub_test` 等当前工具，不认定现场必然使用此版本                                                                                                 |
+| Linux 同机 TCP 核验          | 上游 `torvalds/linux` 的 `v6.16` tag 及 6.16 内核文档；是指定版本的源码结论，不代表已核验测试机的厂商补丁、CNI、路由或实际数据路径，详见第 18 节                                                        |
+| 测试机二进制/驱动/固件       | 未提供准确版本；perftest 语义分析以本地 `umdk` 为条件依据                                                                                                                                               |
 
 ### 2.3 性能目标必须定义口径
 
@@ -1577,7 +1578,7 @@ SHM 按**实际同宿主机 runtime-pair 数**计费，不按 full-mesh 3000 pee
 
 ## 19. 跨层 tracing：从一条慢 RPC 到可核验的时间线
 
-本章不仅规定“增加 tracing”，还规定记录什么、在哪里记录、怎样关联、怎样采集和怎样解释。它是**待实现的设计与操作教程，不是已经交付的 tracing 系统**。现有 ubsocket/brpc 工具见 19.9；可以手工打开的合成示例见 19.10；接入 SDK 后的正式采集流程见 19.11；实施验收见 19.16；“主要保留慢请求”的尾采样机制见 19.17。先读 19.1–19.2，再做 19.10，最后回到实现细节，适合尚未使用过 tracing 的读者。
+本章不仅规定“增加 tracing”，还规定记录什么、在哪里记录、怎样关联、怎样采集和怎样解释。它是**待实现的设计与操作教程，不是已经交付的 tracing 系统**。现有 ubsocket/brpc 工具见 19.9；可以手工打开的合成示例见 19.10；接入 SDK 后的正式采集流程见 19.11；实施验收见 19.16；“主要保留慢请求”的尾采样机制见 19.17；CQE 硬件盲区与测量等级见 19.18；自动调度采集、lease 审计及专项验收见 19.19–19.21。先读 19.1–19.2，再做 19.10，最后回到实现细节，适合尚未使用过 tracing 的读者。
 
 ### 19.1 首先理解：timeline 究竟比函数打点多了什么
 
@@ -1658,6 +1659,8 @@ kbsocket：operation、wait reason、owner、WR/CQ、buffer 生命周期
 
 在事件模式记录 poll、arm、notify、睡眠与唤醒交接；busy-poll 模式按 poll batch 和周期计数记录 empty poll、processed CQE、repost 数，**不在每次空轮询循环记一条事件**。这样才能公平比较两种模式，不让 tracing 把 busy-poll 本身拖慢。
 
+19.19 的 `kb-observer` 是对此处宿主机 collector、部署配方与分析器的产品化封装，不是第三套热路径后端；19.20 补齐 buffer 生命周期语义，不要求所有事件同时写 SDK、recorder 和 BPF。
+
 ### 19.4 第一版到底埋哪些点：12 组必需事件
 
 下表是新 schema 的分组。当前代码“有相近点”不代表已经具备完整字段。位置用于指导 brpc adapter 与 ubsocket 迁移，不要求新库保留旧类结构。
@@ -1679,6 +1682,8 @@ kbsocket：operation、wait reason、owner、WR/CQ、buffer 生命周期
 
 表中 ubsocket 文件在 `ubs-comm/src/ubsocket/csrc` 下；完整文件入口见第 17 章。另有一组不必逐 RPC 重复的 resource counter：`SQ outstanding / SQ limit`、`posted RQE / pending repost`、credit 可用量、RNDV 在途字节、owner queue 长度、SHM slot/lease 占用及 trace drops。资源上限改变必须记录；高频变化可按时间窗口汇总 min/max/last，并标明窗口，不能把稀疏采样值当作任意时刻的精确余额。
 
+上述 12 组是 RPC/transport 基础事件；poll 服务阶段的细化契约见 19.19.1，独立于 RPC 结束的 BufferLease/allocator 审计事件见 19.20.1，两者复用同一 TraceFacade 和有界记录预算。
+
 `transport.wait.reason` 第一版固定枚举：`owner_queue, sq_capacity, remote_credit, rndv_grant, local_memory, jetty_resource, shm_space, application_consume, unknown`。等待必须有 begin/end 和解除原因，如 `resource_available / timeout / cancel / connection_error`。EAGAIN 只说明暂不能继续，若上层看不到真正原因，应填 unknown，不能一律写成 credit。
 
 异步生命周期规则必须写进 adapter 测试：
@@ -1698,7 +1703,8 @@ kbsocket：operation、wait reason、owner、WR/CQ、buffer 生命周期
 | RPC | `trace_id + logical_call_id + attempt_id` | 一个 RPC 可能重试、并发 backup；对端身份须通过协议或确定的 wire cid 关系关联 |
 | Socket/session | `session_id + session_generation + direction` | fd 复用、关闭后旧 CQE 迟到、TCP 降级后的新连接 |
 | 操作 / task | `operation_id / task_id + generation` | 操作跨线程、共享 batch、多次挂起与恢复 |
-| 硬件资源 | `device/lane/jetty_generation + wr_id` | jetty 被共享/重建后，旧完成不能关联新工作 |
+| 硬件资源 | `device/lane/jetty_generation + wr_id`，CQ 事件另带 `jfc_id + generation` | jetty/CQ 被共享或重建后，旧完成不能关联新工作 |
+| 内存资源 | `lease_id + generation`、`buffer_id + generation`、所属 region/pool | 同一 buffer 可有多个 lease；RPC 结束、lease 释放、最后引用归零与池可复用并不等价，见 19.20 |
 | 线程 | 进程实例、线程创建实例、容器与宿主机 TID 映射 | TID 会复用，容器内 TID 与 ftrace 中的 TID 不一定相同 |
 
 全局 ID 可以较长，但热事件只存本进程的短 `object_id`，完整身份放有界字典。跨进程 flow 要由 exporter 在校验双方身份后分配；不能把一个进程内部递增整数直接当全局 flow ID。
@@ -2079,11 +2085,12 @@ WHERE severity = 'data_loss' AND value != 0;
 | 序列化/拷贝执行开销 | 同一 RPC 的函数区间、task/线程调度交集；必要时栈样本 | 函数 wall time 全算 CPU time |
 | 用户态运行队列拥塞 | task ready/run、owner enqueue/dequeue、期间处理的任务/批次 | 只看 epoll 返回到 handler 的间隔 |
 | 内核 runnable 延迟 | 已确定执行归属的 worker、wakeup/switch 和 handoff 信息 | 任意 worker 的 sched 间隔归给目标 RPC |
-| CPU quota 节流 | 对应 cgroup 的配额、节流时间/计数与同窗口调度证据 | 看到 4 CPU 容器或长 runnable 就断言 throttle |
+| CPU quota 节流 | 对应 cgroup 的配额、节流时间/计数与同窗口调度证据；逐 RPC 定量还需可关联的节流区间 | 看到 4 CPU 容器或长 runnable 就断言 throttle，或将累计统计增量分配给单条 RPC |
 | credit / RNDV grant 等待 | 判定层的 wait begin/end、资源 ID、所需量/余额、grant 事件 | 把 EAGAIN、SQ 满和 RNR 混为同一种反压 |
 | SQ 容量等待 | 实际 accepted/retired、SQ limit、容量不足分支 | post 调用耗时长就认定设备队列满 |
 | RNR / ACK_TIMEOUT | 可取得的设备状态、错误完成、重试/错误计数及其作用域 | `post→cq.observed` 很长就声称发生 RNR |
 | CQ 处理/通知延迟 | poll batch、owner 调度、notify queued/flushed、task ready | 软件 CQE 时间冒充硬件收包/完成时刻 |
+| CQE 硬件完成后的观察延迟 | 明确语义的硬件时间戳、对应 CQE 身份及主机时钟映射/误差；无硬件时按 19.18 降级 | 把全部 off-CPU 时间视为 CQE 等待，或从 post→observed 减掉调度时间得到“网络耗时” |
 | SHM 慢 | publish/consume/release、slot/lease、缺页/NUMA/通知证据 | 不经过 NIC 就断言没有等待或拷贝开销 |
 
 `post→cq.observed` 同时可能包含设备排队、传输、对端资源等待、软件轮询不及时和聚合完成观察延迟。无法取得硬件细分时，统一命名 `transport_completion_observation`，不命名为 fabric latency。设备共享计数若不能按 WR/session 拆分，只作为相关资源证据，不伪造成单条 RPC 的精确重试次数。
@@ -2155,9 +2162,9 @@ WHERE severity = 'data_loss' AND value != 0;
 |---|---|---|
 | O0：理解格式 | 教学 JSON fixture、事件字典、身份/时钟说明 | 能解释 scope/flow/counter 与 sched 的差别；示例和实测明显区分 |
 | O1：迁移桥梁 | legacy log reader、byte-range join、离线 Perfetto exporter | 单 client/server 可从 RPC 点到现有阶段；无法关联的事件明确保留 unknown，不伪造 TID/网络时间 |
-| O2：真实跨层闭环 | `TraceFacade`、brpc adapter、SDK backend、宿主机配置与部署说明 | 同一真实 RPC 能关联 task→operation→completion→callback，并与真实 worker 的 sched 对齐；UB/TCP/SHM 上层事件语义一致 |
-| O3：生产有界采集 | recorder、本机尾部选择、候选上下文传播、history/trigger、loss/coverage 报告 | 慢/错与普通请求的保留规则可测；故障、迟到、停止与满环均安全；内存/导出有硬预算 |
-| O4：高级诊断 | 自动关键路径报告、跨机同步与事后保留协调、限时 CPU/PMU 联合采样 | 双端完整度、误差界与证据可查，能复现实验结论，不以残差冒充硬件时间 |
+| O2：真实跨层闭环 | `TraceFacade`、brpc adapter、SDK backend、`kb-observer` 最小宿主机配方与身份映射 | 同一真实 RPC 能关联 task→operation→completion→callback，并与真实 worker 的 sched 对齐；UB/TCP/SHM 上层事件语义一致 |
+| O3：生产有界采集 | recorder、本机尾部选择、候选上下文传播、history/trigger、lease 台账快照与 loss/coverage 报告 | 慢/错与普通请求的保留规则可测；故障、迟到、停止与满环均安全；内存/导出有硬预算，见 19.19–19.21 |
+| O4：高级诊断 | 自动关键路径报告、跨机同步与事后保留协调、限时 CPU/PMU 联合采样、可选硬件时间戳 adapter | 双端完整度、误差界与证据可查；硬件能力独立门禁，不阻塞软件侧交付，不以残差冒充硬件时间 |
 
 每次 capture 至少输出一个 bundle：
 
@@ -2323,3 +2330,155 @@ packet、sched、CPU profile 的采集开销与 RPC 导出选择独立。若此�
 验收使用 19.16 的尾采样专项，重点确认：快成功可不落盘；慢/错在预算内保留；卡住请求不等 END 也可输出；先到 END、迟到 CQE、共享 WR 和长于历史窗口都不误关联；100% 请求变慢时业务不被采集阻塞。性能对照要单列“候选开启但几乎不导出”，以测出尾采样无法消除的前置开销。
 
 全流量 p99、错误率和吞吐仍来自独立 metrics。慢请求集合、错误优先样本和触发窗口都有选择偏差，不能直接用于计算全流量分位数；正常对照也不能与过采样的慢请求无权重混算。最终目标是**有界地保存最有诊断价值的证据，并让没保存到的部分可见**，而不是在有限成本下承诺无条件保存每个慢请求的全部细节。
+
+### 19.18 CQE 硬件盲区：测量值、区间与推断必须分开
+
+#### 19.18.1 当前源码能提供什么
+
+按第 2.2 节的两次源码核验，当前 raw UDMA provider 和公共 URMA API **未暴露逐 CQE 的硬件完成时间戳**：
+
+| 源码入口 | 核验结论 |
+|---|---|
+| [udma_u_jfc.h](../../../umdk/src/urma/hw/udma/udma_u_jfc.h) 的 `udma_u_jfc_cqe` | 当前定义包含 owner、状态、索引、长度、标识及 inline 数据等，无 timestamp 字段 |
+| [urma_types.h](../../../umdk/src/urma/lib/urma/core/include/urma_types.h) 的 `urma_cr_t` | 公共完成结果无硬件时间戳；所检查的 device capability / JFC 配置也未提供对应时钟能力 |
+| [udma_u_jfc.c](../../../umdk/src/urma/hw/udma/udma_u_jfc.c) 的 `get_next_cqe`、`udma_u_poll_one`、`udma_u_poll_jfc` | 检查 owner bit、执行 device barrier 并解析；在此增加软件打点仍只能记录 CPU 观察时刻 |
+| [urma_cmd.h](../../../umdk/src/urma/lib/urma/core/include/urma_cmd.h) 的 `urma_cmd_jfce_wait_t` | 输出 event count 和 event data，没有通知产生时间，也不是逐 CQE 时间记录 |
+| [urma_perf.c](../../../umdk/src/urma/lib/urma/core/urma_perf.c) 的 `urma_get_perf_timestamp` | 读取 CPU 的 CNTVCT 或 `CLOCK_MONOTONIC`，不是 NIC 时钟 |
+
+这不是“所有 UB 硬件都不支持”的结论。实际 CQE stride 由 context 创建结果提供，不能从当前结构体排除其他固件/扩展格式。后续需向设备方确认能力；不能自行解释保留位，也不能用 BPF 推算一个从未被硬件或驱动记录的时间。
+
+#### 19.18.2 时间定义与证据等级
+
+| 时间 | 定义 | 与相邻时间的区别 |
+|---|---|---|
+| `T_arrive` | 相关包到达 NIC | 一次 WR 可能涉及多包；包到达不等于操作完成 |
+| `T_hw` | 设备在明确的硬件阶段生成 CQE | SEND、RX、READ、WRITE 的完成含义须分别确认 |
+| `T_visible` | 对应 CQE 按 provider 可见性和顺序规则可被 CPU 消费 | 不能假定等于 NIC 生成时刻，仍可能有写回/可见性间隔 |
+| `T_observed` | owner 实际在 poll 中观察到该 CQE | 应用只在批量 poll 返回处打点时，还包含 provider 内部处理，须标注为 batch return 观测/上界 |
+| `T_handled` | 对应协议处理完成 | poll 返回与 READ_DONE 处理、状态推进或资源释放之间仍可能排队 |
+
+`T_observed - T_hw` 命名为 `completion_observation_delay`，不是纯 OS 调度时延。它可能包含 CQE 写回、通知、等待 CPU 和 owner 服务其他工作；只有可验证的时间/因果关系才能进一步拆分。沿用 19.13 的 `measured / derived / approximate / unknown`，并增加 `measurement_point, clock_id/epoch, error_bound, lower/upper_bound, evidence_ids` 等解释字段；未取得值不能填 0。
+
+| 可用证据 | 允许输出 | 禁止推导 |
+|---|---|---|
+| 硬件完成时间戳、匹配身份、主机时钟映射 | `T_observed - T_hw`，附时间语义与校准误差 | 把它全部算成调度，或把 NIC 完成等同远端应用消费 |
+| 同一 CQ/generation 曾确证为空，之后观察到可消费 CQE | 满足下述条件时，对软件可消费时刻及观察延迟给保守区间 | 以该区间约束 NIC 生成时刻或包到达时刻 |
+| sched 与 owner 阶段事件 | owner 哪段没运行、等待 CPU、运行时在处理什么 | 断言目标 CQE 在整个 off-CPU 区间都已就绪 |
+| 仅 post 与 poll | `transport_completion_observation` 总区间 | 标成精确设备/网络耗时 |
+
+教学反例：owner 在 10–200 us 没有运行，205 us 观察到 CQE。CQE 可能在 20 us 生成，也可能在 200 us 生成；同一软件 trace 无法区分 185 us 与 5 us 的观察延迟。因此不能把 190 us off-CPU 全算成 CQE 等待，也不能从 post→observed 中机械减去 off-CPU 得到“网络耗时”。设备执行和主机未运行可以重叠，19.13 的互斥总账不能靠这种相减强行补齐。
+
+空 CQ 区间法仅适用于已验证的队列可见性/消费顺序、同一 generation、单 owner 且没有遗留 backlog 的观测：设 `E` 为最近一次确证为空的 poll **进入时间**，`O` 为后续包含目标完成的 poll 返回时间，可对相应软件可消费时间给出保守窗口 `[E, O]`，软件可消费至观测的延迟 `T_observed - T_visible` 至多为 `O-E`，下界仍可能为 0。若仅在 API 边界计时，不能用空 poll 的返回时间代替 `E`：CQE 可能在内部空检查之后、返回之前出现。batch 取满不能证明 CQ 已空，错误返回、记录缺失、CQ 重建或已有 backlog 时不套此公式；该方法不为硬件完成后的 `T_observed - T_hw` 提供同类上界。
+
+#### 19.18.3 可选硬件能力与行业参考
+
+Azure RDMA Estats 使用主机 WQE post、NIC CQE generation、主机 CQE polling 等测量点，并处理 NIC/主机时钟同步成本；这是区分“设备尚未完成”与“设备完成后软件观察不及时”的参考，而不是当前 UB 已有能力。[《Empowering Azure Storage with RDMA》§5](https://www.microsoft.com/en-us/research/wp-content/uploads/2023/03/RDMA_Experience_Paper_TR-1.pdf)
+
+rdma-core 扩展 CQ 提供可选 completion timestamp / wallclock timestamp 接口，也说明该能力需要显式申请及设备支持；不能直接将 libibverbs 接口套到 URMA。[ibv_create_cq_ex](https://man7.org/linux/man-pages/man3/ibv_create_cq_ex.3.html)
+
+为硬件 timestamp adapter 预留以下契约，满足后才启用：
+
+1. 运行时查询支持的 opcode、成功/错误完成及 timestamp 有效条件；明确记录点是包接收、操作完成还是 CQE 生成。
+2. 保存原始 tick、位宽/频率、有效标记、device clock ID/epoch、主机映射和误差；处理回绕、reset 与映射失效，不能把负差值直接截为 0。
+3. 四个 raw 设备按实际时钟域校准，不假定同 IOdie 或同宿主机就共用时钟。校准尽量放控制路径，不为每个 CQE 同步读取设备寄存器；映射过期时降级报告。
+4. 通过 provider 的受支持扩展导出，不越过 CQ 单 owner 协议，不增加另一个线程抢 poll。ClockSnapshot 只承载已建立的映射，不能凭空生成硬件对时能力。[Perfetto clock sync](https://perfetto.dev/docs/concepts/clock-sync)
+5. 独立验证启用后的 CQE 布局、吞吐、CPU、尾延迟及与 selective signaling 的兼容性。聚合完成只为实际报告的完成提供时间锚点；无独立 CQE 的 WR 仍遵守 19.5 的覆盖/回收上界，不能伪造逐 WR 完成时间。
+
+硬件能力缺失不阻塞软件可观测性和库功能交付；软件报告明确保留硬件盲区。
+
+### 19.19 Owner 服务间隔与自动宿主机 observer
+
+#### 19.19.1 两种 progress 模式的事件契约
+
+以 `{runtime_instance, shard, raw_context, jfc_id, generation}` 绑定 CQ 服务记录，以 batch/operation 关联完成；不能只用 fd、设备名或时间邻近关系匹配。
+
+| 事件组 | 必需语义与字段 | 用途 |
+|---|---|---|
+| `cq.poll` | enter/return、请求/返回 CQE 数、错误、是否取满、batch ID、可验证的 empty 锚点 | 区分 poll 本身慢、没有完成、批次受限；batch 时间不伪装成逐 CQE 时间 |
+| `reactor.phase` | TX/RX/control/repost/continuation 的起止、处理量、预算超限及让出原因 | 解释 owner 在运行却没服务目标 CQ 的时间 |
+| `cq.observed` / `completion.handled` | WR 或合法 retirement 集合、处理开始/结束、continuation ID | 拆开取得完成和执行后续协议；异步处理不在 poll 返回时提前记 handled |
+| `reactor.wait` | arm、recheck、wait enter/return、返回原因、通知源及重检结果 | 解释事件模式的睡眠/唤醒交接，覆盖防丢唤醒协议 |
+
+busy-poll 模式关注**同一 JFC 的服务间隔**，不仅是 reactor 整轮频率：owner 可能持续运行，却因 READ completions 或控制续体消耗过多时间而长期没有访问 RX CQ。记录 wall time 与调度交集，分别展示预算超限、runnable 等 CPU、正在执行其他阶段。`sched` 显示 Running 也不等于一直执行用户指令；IRQ/softirq、内核执行和 CPU/cache 停顿需对应额外证据，不能一律归成库内计算。
+
+空 poll 不逐次写记录。复用 per-owner 预分配状态保存必要时间锚点与累计量，按 batch/窗口汇总，长 service gap 或诊断窗口内增加细节；读时钟也受门禁/预算控制。稀疏锚点只能给较粗分辨率或较宽上界，manifest 记录采样方式，不能声称未采样间隙也被逐次测量。
+
+事件模式按实际因果关系关联设备通知、waking/wakeup、switch-in、wait return 与 poll，分开报告唤醒路径、等待 CPU 和恢复后的分派。保留 19.11 对 waking/wakeup 和 Perfetto 重建区间的限制。IRQ/CEQ 不是逐 CQE 时间戳：共享向量和通知合并时，只有设备/驱动提供足够 JFC 身份才能提高关联强度；否则作为相关 CPU/设备背景，不画确定的 IRQ→目标 CQE 因果边。采集 JFC `moderate_count/period` 等配置，但其硬件作用阶段仍需文档/实验确认，不能仅凭字段名认定只延迟 IRQ。
+
+#### 19.19.2 `kb-observer` 的交付边界
+
+`kb-observer` 是**拟议的宿主机受控采集与分析组件**，不是当前命令，也不要求用户逐次编写 bpftrace。它复用 19.3 的 collector、19.11 的 Perfetto 配方以及 19.17 的有界历史；优先使用 Perfetto 直接采集 `linux.ftrace` 调度事件。[Perfetto CPU scheduling](https://perfetto.dev/docs/data-sources/cpu-scheduling)
+
+用户输入为目标 runtime/容器、阈值/触发条件、窗口和资源预算，组件负责：
+
+1. 发现 runtime/shard 与宿主机 TID、进程/线程 incarnation、cgroup 的映射，并绑定 device/context/JFC 元数据；不能只按容器内 PID join。JFC→IRQ 映射不可取得时声明缺失。
+2. 校验可用的数据源、权限、时钟和必要事件，固化 sched 配方；IRQ/softirq、调用栈、PMU 和驱动专用探针按问题限时升级，不默认全部常驻。
+3. 后台采集 affinity、CPU 配额、相关父 cgroup 限制、`cpu.stat`、PSI 等窗口信息，不在 post/poll 热路径读 procfs/sysfs。采集量按宿主机实际范围估算，不能用“容器只有 4 CPU”替代预算。
+4. 将慢 RPC、长 lease、内存压力和 poll service gap 接入同一 trigger/预算机制，冻结尚存历史，关联共享资源上下文；应用和内核可能保留不同长度，分别报告有效覆盖区间。
+5. 输出 19.16 的 bundle、可展开 `.pftrace` 及摘要；标明 measurement point、证据 ID、时钟误差、上下文覆盖、丢失/截断和 unknown。源码/固件版本与采集配置随文件保存。
+
+系统侧权限留在宿主机受控 collector；业务容器不因 tracing 获得 root 或全机 consumer 权限。沿用 19.11 的授权边界；过滤时核验事件语义，例如只按 `common_pid` 筛选 wakeup 可能保留的是唤醒者而漏掉目标线程。USDT/eBPF 优先用于需要的动态扩展诊断，不要求每个 CQE 常驻触发用户态动态探针，也不承诺未经测量的固定纳秒成本。
+
+明确提供两种配置档：**有预算的常驻历史**用于回溯；**限时诊断**用于复现/深挖。若事前没有采 sched，慢后开启不能补齐过去；权限不足或元数据映射失败时保留应用 trace 并降级报告，不阻塞业务，也不谎称全链路完整。
+
+#### 19.19.3 自动归因的措辞与计账
+
+`cpu.stat` 的 `nr_throttled/throttled_usec`、PSI、线程运行/等待累计值是窗口证据。可以报告“同窗口发生节流且 owner 等待 CPU”，不能把窗口增量全部分配给某个 RPC；逐 RPC 精确节流时长需要额外的、可验证关联的区间事件。父 cgroup 也可能施加限制。[Linux 6.16 cgroup v2](https://docs.kernel.org/6.16/admin-guide/cgroup-v2.html)
+
+一个合格的无硬件时间戳摘要应写成：“目标 CQ 在该窗口未被服务；owner 有一段等待 CPU，另有一段处理 TX completion；目标 CQE 的硬件生成时间不可用，无法精确给出它在队列中等待多久。”不能自动改写成“网卡早已收到，全部慢在调度”。有硬件时间戳后才按 19.18 细分，仍避免与 RPC 父区间和并行 READ 重复计账。
+
+### 19.20 BufferLease 生命周期审计：RPC 结束不等于内存可复用
+
+#### 19.20.1 身份与事件
+
+以 `lease_id + generation` 关联 operation/RNDV group/逻辑字节范围，以独立 `buffer_id + generation` 关联真实存储及 region/pool。一个 buffer 可被多个 lease/RPC 引用，一次 release 也可覆盖多个 lease；使用显式范围/集合绑定，不只靠指针、fd 或“最近一次 RPC”。
+
+| 事件 | 记录点与解释 |
+|---|---|
+| `lease.acquire` | 实际取得引用/承诺资源，记录 owner、字节范围及用途 |
+| `lease.publish` | 远端访问描述符/授权发布，记录 session/transfer/group 与部分成功范围；不等同远端已收到 |
+| `lease.access_end` | 协议层取得已验证的访问终结证明，记录 completion/通知/撤销证据；不是以超时猜测完成 |
+| `lease.release_request` | 存在异步释放交接时，记录请求释放/入队及原因；申请取消或释放不等于已终止 DMA 或解除持有 |
+| `lease.release` | 该 lease 的持有关系确实解除，记录正常、取消、错误或未发布回滚等原因 |
+| `buffer.last_ref_drop` | 底层 buffer 最后一个真实引用消失，不把任意一次 DecRef 当作此事件 |
+| `buffer.return_queued` / `buffer.reusable` | 分别记录交给回收队列和进入对应分配域可用状态；跨 owner/缓存归还须保留目标 pool |
+| `region.deregister` / `pages.unpin` | 和逻辑 lease 分开，声明 API 请求、返回或已验证的内核实际回收观测点；无接口/内核证据时，不能用注销返回伪造物理页解除 pin 的精确时刻 |
+
+这些是状态转换语义，不强迫所有路径经过同一串事件：未发布回滚可直接 release；READ 源 lease、WRITE 源/目标 lease、SHM borrowed view 的终结证明不同。错误关闭后尚不能证明 DMA/远端访问停止的资源要记为 retired/quarantined 或对应真实状态，不能伪装成 reusable。注册池常驻时，普通 lease 释放通常也不意味着 MR 注销或 OS unpin。
+
+READ 路径还需关联接收端 READ 完成、DONE 创建/入队/实际 post，以及源端 DONE observed/handled，才能区分远端未结束、释放通知积压与本地处理积压。只有源端证据时，未观察到 DONE 不能证明远端尚未发出。跨端身份按 19.5/19.17.7 关联，无可靠对时只输出各端本地耗时，不直接相减；这里的诊断关联不新增业务数据 ACK/重放协议。
+
+#### 19.20.2 活跃台账与历史记录分离
+
+**活跃 lease 台账回答“现在谁持有、在等什么”，flight recorder 回答“此前怎么走到这里”。** 台账应复用真实 owner 的生命周期元数据，在既有 operation/lease 池中预分配，避免独立全局 pin map/mutex。最少保存身份、状态、持有范围、创建/最近转换时间（注明采集口径）、待满足条件与对应 operation/group；未知的应用外部引用不能编造持有者。
+
+台账容量随实际可准入 lease/operation 上限计费，不因 40k 连接各建无界历史。真实资源准入与安全记账即使 tracing 关闭仍成立；可选历史/导出预算不足只丢诊断细节并计数，不阻塞业务、不延长真实 lease，也不提前复用仍在 DMA 中的内存。
+
+快照通过有界控制请求交给原 owner 分批生成，collector 不直接遍历 owner 可变容器；跨 shard 快照记录各自时间/代际，不伪装成全局同一瞬间。启用 tracing 时若已有存活 lease，可生成当前状态 checkpoint，并标记 `history_before_capture_missing`；不能补造此前的 acquire/publish 事件。trace 自身冻结页的引用与业务 BufferLease 严格分开。
+
+同时统计逻辑 leased bytes、按 buffer/region 去重的 backing 容量、注册容量、待归还及可分配容量。多个 lease 引用同一存储时不能把 leased bytes 相加当作物理 pinned 内存。buffer 已进入某线程缓存，也不自动意味着另一个 shard 的池已经可分配。
+
+#### 19.20.3 尾采样与资源异常
+
+RPC 结束后仍按 lease/operation 身份保留有界诊断尾部；长 lease、池压力、release 通知积压可以独立触发资源快照，无需等某个 RPC 判慢。若 RPC 历史已过期，输出资源身份、当前依赖和剩余历史，明确 partial，不能因缺少 acquire/release 事件就直接判断泄漏。疑似泄漏需要与真实台账、引用和回收状态交叉验证。
+
+“所有事件可回溯”的承诺限定为：**在声明的采集范围、保留窗口和预算内，关键状态转换可回溯；缺失、截断与 unknown 可见。** 沿用 19.17 的候选/公共证据预算，不另建无限资源日志；总体 RPC 分位数仍由独立 metrics 统计，尾采样 trace 用于解释原因。
+
+### 19.21 CQE 与资源审计专项验收
+
+以下补充 19.16；优先使用无硬件的 mock provider/时钟/调度 fixture 验证分析语义，再在真实 UB 环境测量。测试值是注入值，不代表线上已观察到同样原因。
+
+| 场景 | 验收要求 |
+|---|---|
+| 相同 sched/poll trace，分别模拟 CQE 很早和很晚生成 | 无硬件时间戳时不能输出两个不同的“精确硬件等待”；有合法时间戳时能正确区分并附误差 |
+| 空检查后、poll 返回前出现 CQE；batch 取满、backlog、CQ generation 更换 | 空 CQ 区间不使用错误的返回下界；条件不满足时拒绝推导 |
+| owner 被抢占 vs owner 持续处理 READ CQE/continuation | 报告区分等待 CPU 与 owner 服务偏斜，observed/handled 分离；不把二者全部标为网络慢 |
+| IRQ 合并/共享、丢失 wakeup、缺少设备到 IRQ 映射 | 保留不确定因果，不将 IRQ 时间复制给所有 CQE；校验时钟、线程身份和记录缺口 |
+| 时间戳回绕、设备 reset、四设备不同钟、映射过期、聚合完成 | epoch/误差有效，失败时降级；不为 unsignaled WR 虚构精确完成时间 |
+| DONE 延迟、lease 已释放但仍有其他引用、跨 owner 延迟归还 | 能分别解释访问终结等待、引用持有和 allocator 可用性；不混用 unpin/release/reusable |
+| 多 RPC/lease 共用 buffer、RPC 超时后 lease 存活、捕获开始前已有 lease | 去重容量正确；资源诊断不依赖 RPC 仍活跃，checkpoint 不伪造完整历史 |
+| 无宿主机权限、采样溢出、exporter 停顿、内存压力和故障风暴 | 应用前进/内存安全不依赖采集成功；台账/快照/导出有界，partial 与实际保留窗口可见 |
+
+性能对照在 19.16 的负载矩阵外增加双向 8 MiB bulk 与 1 KiB/控制报文混合诊断场景，观察 READ CQE 压力下的 RX 服务间隔、DONE observed→handled、lease 年龄及池可用容量。分别测 tracing 关闭、应用轻量记录、增加 sched 历史、限时深度诊断、启用硬件时间戳的增量成本；不以诊断轮次替代干净基线，也不承诺固定百分比开销。
+
+落地顺序为：先完成软件侧 poll/phase、lease 台账与事件语义；再完成自动宿主机采集、身份/时钟关联和有界保留；最后在设备能力门禁后接入硬件时间戳。第一阶段解释“为什么没有及时推进”，硬件阶段才补齐“设备何时已经完成”的直接证据。
