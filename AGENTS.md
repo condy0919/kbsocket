@@ -53,7 +53,10 @@ kbsocket 是下一代高性能用户态通信加速库，目标单容器支撑 4
   - 单测与状态机逻辑应支持无真实 URMA 物理硬件环境运行（如 Mock Context、SHM 回环、NativeTCP 路径），确保在普通开发/CI 容器中可自测闭环。
 - **错误处理风格**：
   - 严禁在核心库代码中随意调用 `exit()`、`abort()` 或抛出未捕获异常；
-  - 统一通过显式错误码或 Result/Status 机制向上传递，所有失败分支必须由 RAII 保证资源妥善释放。
+  - 项目自有 C++ 可失败接口统一返回 `std::expected<T, Error>`；无返回值的操作使用 `std::expected<void, Error>`，失败通过 `std::unexpected(error)` 返回，不再新增自定义 Result/Status 成功失败容器。
+  - `Error` 仅描述失败，不包含 `kOk` 等成功状态，也不提供成功判断的 `operator bool()`；错误信息遵守数据路径零分配要求。
+  - 调用方先检查结果再访问值或错误，不依赖未检查的 `.value()` 抛异常；所有失败分支由 RAII 保证资源妥善释放。
+  - C ABI、系统调用和第三方接口保留原生签名，在项目语义边界转换为 `std::expected`；已有自定义结果接口在相关重构中迁移，避免无关的大范围改动。
 
 ## 5. 高性能与系统级编程契约
 
@@ -74,7 +77,7 @@ kbsocket 是下一代高性能用户态通信加速库，目标单容器支撑 4
 
 命名、头文件组织及可读性遵循 [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html)，本项目规则优先；格式和 include 排序以 `.clang-format` 为准，静态检查以 `.clang-tidy` 为准。异常处理遵循第 4 节，不额外引入 Google 的禁用异常政策。
 
-- **命名**：类型（含枚举）和普通函数用 `UpperCamelCase`；变量、命名空间及访问器/修改器用 `snake_case`；类成员加尾缀 `_`，结构体成员不加；常量及枚举值用 `kCamelCase`（如 `LoadCode::kOk`），普通 `const` 局部变量不强制加 `k`。
+- **命名**：类型（含枚举）和普通函数用 `UpperCamelCase`；变量、命名空间及访问器/修改器用 `snake_case`；类成员加尾缀 `_`，结构体成员不加；常量及枚举值用 `kCamelCase`（如 `LoadErrorCode::kInvalidArgument`），普通 `const` 局部变量不强制加 `k`。
 - **头文件**：自包含，直接包含所需依赖，不依赖间接包含；禁止使用 `using namespace`。
 - **类型安全**：单参数构造函数默认 `explicit`（复制/移动构造除外）；使用 C++ cast，避免 C 风格转换；覆盖虚函数用 `override` 或 `final`，不重复写 `virtual`。
 - **标准与文件**：使用 `-std=c++23`；头文件以 `.hpp` 结尾，实现以 `.cpp` 结尾；使用 include guard，不使用 `#pragma once`。

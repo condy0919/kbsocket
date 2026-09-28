@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+cc_library(
+    name = "no_destructor",
+    hdrs = ["no_destructor.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "no_destructor_test",
+    srcs = ["no_destructor_test.cpp"],
+    deps = [
+        ":no_destructor",
+        "@googletest//:gtest_main",
+    ],
+)
