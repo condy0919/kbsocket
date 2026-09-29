@@ -9,11 +9,9 @@
 #include <utility>
 
 namespace kbsocket {
-
-/// 在内部存储中构造 T，但不自动析构 T；用于进程生命周期对象。
-/// 不分配堆内存，也不提供单例或访问同步；通常声明为函数局部 static。
-/// 构造异常由调用方处理；资源清理若有需要，应通过 T 的显式接口完成。
-/// 包装器存储失效后不能继续访问对象，不适用于可卸载 DSO 中的永久引用。
+/// `NoDestructor` 在内部存储中构造 `T`，但不自动析构 `T`；用于进程生命周期对象。不分配堆内存，也不
+/// 提供单例或访问同步；通常声明为函数局部 static。构造异常由调用方处理；资源清理若有需要，应通过
+/// `T` 的显式接口完成。`NoDestructor` 存储失效后不能继续访问对象，不适用于可卸载 DSO 中的永久引用。
 template <typename T>
 class NoDestructor {
     static_assert(std::is_object_v<T> && !std::is_array_v<T>);
@@ -58,6 +56,6 @@ public:
 private:
     alignas(T) std::byte storage_[sizeof(T)];
 };
-
 } // namespace kbsocket
+
 #endif // KBSOCKET_BASE_NO_DESTRUCTOR_HPP_
