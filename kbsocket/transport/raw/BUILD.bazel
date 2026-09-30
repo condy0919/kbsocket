@@ -30,9 +30,34 @@ cc_test(
         "-Wl,--wrap=dlclose",
         "-Wl,--wrap=dlerror",
     ],
+    # --wrap 只在链接步骤替换符号引用，因此需将 urma_api 静态链接进去。如果没有
+    # `linkstatic = True` 则会使用 liburma_api.so, 它内部的 ::dlopen() 等调用不
+    # 会被 --wrap 拦截。这里不会静态链接 liburma.so, 只是要求静态链接 urma_api
+    # 与 urma_test_support.
     linkstatic = True,
     deps = [
         ":urma_api",
+        ":urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "device_catalog",
+    srcs = ["device_catalog.cpp"],
+    hdrs = ["device_catalog.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":urma_api",
+        "@urma//:urma_headers",
+    ],
+)
+
+cc_test(
+    name = "device_catalog_test",
+    srcs = ["device_catalog_test.cpp"],
+    deps = [
+        ":device_catalog",
         ":urma_test_support",
         "@googletest//:gtest_main",
     ],

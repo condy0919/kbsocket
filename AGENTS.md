@@ -79,6 +79,7 @@ kbsocket 是下一代高性能用户态通信加速库，目标单容器支撑 4
 
 - **命名**：类型（含枚举）和普通函数用 `UpperCamelCase`；变量、命名空间及访问器/修改器用 `snake_case`；类成员加尾缀 `_`，结构体成员不加；常量及枚举值用 `kCamelCase`（如 `LoadErrorCode::kInvalidArgument`），普通 `const` 局部变量不强制加 `k`。
 - **头文件**：自包含，直接包含所需依赖，不依赖间接包含；禁止使用 `using namespace`。
+- **命名空间**：禁止使用 C++ 嵌套命名空间简写（如 `namespace kbsocket::raw {}`）；必须逐层声明（如 `namespace kbsocket { namespace raw { ... } }`）.
 - **类型安全**：单参数构造函数默认 `explicit`（复制/移动构造除外）；使用 C++ cast，避免 C 风格转换；覆盖虚函数用 `override` 或 `final`，不重复写 `virtual`。
 - **标准与文件**：使用 `-std=c++23`；头文件以 `.hpp` 结尾，实现以 `.cpp` 结尾；使用 include guard，不使用 `#pragma once`。
 - **注释**：文档注释用 `///`，普通注释用 `//`，禁用 `/* */`；说明功能与设计取舍，不逐项解释参数，不使用 `@param`、`@code` 等 Doxygen 标签。
