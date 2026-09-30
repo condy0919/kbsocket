@@ -9,3 +9,13 @@ cc_binary(
         "@urma//:urma_headers",
     ],
 )
+
+cc_binary(
+    name = "device_info",
+    srcs = ["device_info.cpp"],
+    deps = [
+        "//kbsocket/transport/raw:device_catalog",
+        "//kbsocket/transport/raw:urma_api",
+        "@urma//:urma_headers",
+    ],
+)
