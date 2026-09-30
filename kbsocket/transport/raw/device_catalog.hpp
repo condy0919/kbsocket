@@ -64,7 +64,6 @@ public:
     std::expected<LocalEndpoint, CatalogError> Find(std::string_view device_name,
                                                     std::uint32_t eid_index) const noexcept;
 
-    /// 多个匹配项返回歧义，调用方应改用设备名和 index 定位。
     std::expected<LocalEndpoint, CatalogError> Find(const urma_eid_t& eid) const noexcept;
 
     const std::vector<DeviceRecord>& devices() const noexcept {

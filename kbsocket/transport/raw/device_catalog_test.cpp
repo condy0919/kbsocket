@@ -96,7 +96,7 @@ public:
             *out = count;
             return eids_;
         });
-        EXPECT_CALL(mock_, FreeEids(eids_)).RetiresOnSaturation();
+        EXPECT_CALL(mock_, FreeEids(eids_));
     }
 
 protected:
@@ -119,8 +119,9 @@ TEST_F(DeviceCatalogTest, CachesOwnedSnapshotAndPreservesSparseIndices) {
     ASSERT_EQ(catalog.devices().size(), 1u);
     EXPECT_EQ(catalog.devices()[0].eids[0].eid_index, 2u);
     EXPECT_EQ(catalog.devices()[0].attributes.dev_cap.max_eid_cnt, 256u);
-    // 模拟 provider 查询缓冲失效；目录必须持有自己的值拷贝。
+    // 模拟 provider 查询缓冲失效； Catalog 必须持有自己的值拷贝。
     eids_[0] = {};
+    // 初始化阶段的查询和释放必须已完成；清空预期后，StrictMock 会拒绝任何新的 provider 调用。
     ASSERT_TRUE(::testing::Mock::VerifyAndClearExpectations(&mock_));
     for (int i = 0; i < 100; ++i) {
         auto endpoint = catalog.Find("raw0", 7);
@@ -131,6 +132,7 @@ TEST_F(DeviceCatalogTest, CachesOwnedSnapshotAndPreservesSparseIndices) {
         ASSERT_TRUE(by_eid);
         EXPECT_EQ(by_eid->eid_index, 7u);
     }
+    // index 1 虽是有效数组下标，却不是已配置的 eid_index，不能误命中。
     ExpectError(catalog.Find("raw0", 1), CatalogErrorCode::kNotFound);
     ExpectError(catalog.Find("missing", 7), CatalogErrorCode::kNotFound);
     ExpectError(catalog.Find(urma_eid_t{}), CatalogErrorCode::kNotFound);
@@ -140,11 +142,14 @@ TEST_F(DeviceCatalogTest, CachesOwnedSnapshotAndPreservesSparseIndices) {
 TEST_F(DeviceCatalogTest, RejectsInvalidConfigurationBeforeProviderCalls) {
     test_support::ScopedUrmaOverride scope(MakeDiscoveryMockFunctions());
     DeviceCatalog catalog;
+    // 不设置 provider 预期：空配置、重复名称、超长名称及内嵌空字符都应在枚举前被拒绝。
     const std::vector<std::vector<std::string>> cases{
-        {}, {""}, {"raw0", "raw0"}, {std::string(URMA_MAX_NAME, 'x')}, {std::string("raw\0x", 5)}};
+        {}, {""}, {"raw0", "raw0"}, {std::string(URMA_MAX_NAME, 'x')}, {std::string("raw\0x", 5)},
+    };
     for (const auto& names : cases) {
         ExpectError(catalog.Initialize(names), CatalogErrorCode::kInvalidArgument);
     }
+    // 失败不能把 Catalog 标记为已初始化，两种查询入口都应拒绝访问。
     ExpectError(catalog.Find("raw0", 2), CatalogErrorCode::kNotInitialized);
     ExpectError(catalog.Find(eids_[0].eid), CatalogErrorCode::kNotInitialized);
 }
@@ -153,6 +158,7 @@ TEST_F(DeviceCatalogTest, RejectsBondingAndNonUbBeforeCapabilityQueries) {
     test_support::ScopedUrmaOverride scope(MakeDiscoveryMockFunctions());
     DeviceCatalog catalog;
     ExpectEnumeration();
+    // bonding 与非 UB 设备均可仅凭枚举信息拒绝，不应继续查询能力或 EID。
     ExpectError(catalog.Initialize({"bonding_dev0"}), CatalogErrorCode::kUnsupportedDevice);
     devices_[0].type = URMA_TRANSPORT_IB;
     ExpectEnumeration();
@@ -162,6 +168,7 @@ TEST_F(DeviceCatalogTest, RejectsBondingAndNonUbBeforeCapabilityQueries) {
 TEST_F(DeviceCatalogTest, ValidatesRmAndCtpBeforeEidQueries) {
     test_support::ScopedUrmaOverride scope(MakeDiscoveryMockFunctions());
     DeviceCatalog catalog;
+    // 分别缺少 RM 和 CTP；两项能力必须同时具备，且失败时不得查询 EID。
     for (bool rm : {false, true}) {
         attributes_.dev_cap.trans_mode = rm ? URMA_TM_RM : 0;
         attributes_.dev_cap.rm_tp_cap.bs.ctp = !rm;
@@ -177,45 +184,52 @@ TEST_F(DeviceCatalogTest, FailureDoesNotPublishPartialSnapshotAndAllowsRetry) {
     ExpectEnumeration();
     ExpectAttributes();
     ExpectEids();
+    // 第 1 次已读完 raw0，但后续设备不存在：必须释放已获取的列表，且不发布 raw0。
     ExpectError(catalog.Initialize({"raw0", "missing"}), CatalogErrorCode::kNotFound);
     EXPECT_TRUE(catalog.devices().empty());
     ExpectError(catalog.Find("raw0", 7), CatalogErrorCode::kNotInitialized);
+
+    // 第 2 次修正白名单，在同一个 Catalog 对象上重新查询并成功初始化。
     ExpectEnumeration();
     ExpectAttributes();
     ExpectEids();
     ASSERT_TRUE(catalog.Initialize({"raw0"}));
 }
 
-TEST_F(DeviceCatalogTest, DuplicateEidRequiresExplicitDeviceAndIndex) {
+TEST_F(DeviceCatalogTest, FindsUniqueEidAcrossDevices) {
     test_support::ScopedUrmaOverride scope(MakeDiscoveryMockFunctions());
     ExpectEnumeration();
-    for (int device : {0, 1}) {
-        ExpectAttributes(device);
-        ExpectEids(device);
-    }
+    ExpectAttributes(0);
+    ExpectEids(0);
+
+    // 同一 CLAN 内 EID 唯一；第二个设备必须返回另一组 EID。
+    urma_eid_info_t second_eids[1]{};
+    second_eids[0].eid.raw[0] = 3;
+    second_eids[0].eid_index = 9;
+    ExpectAttributes(1);
+    EXPECT_CALL(mock_, GetEids(&devices_[1], _)).WillOnce([&](auto*, auto* count) {
+        *count = 1;
+        return second_eids;
+    });
+    EXPECT_CALL(mock_, FreeEids(second_eids));
     DeviceCatalog catalog;
     ASSERT_TRUE(catalog.Initialize({"raw0", "raw1"}));
-    ExpectError(catalog.Find(eids_[0].eid), CatalogErrorCode::kAmbiguous);
-    auto endpoint = catalog.Find("raw1", 7);
+
+    // 查询第二个设备的 EID，验证会跳过无匹配的第一个设备，并返回真实 index。
+    auto endpoint = catalog.Find(second_eids[0].eid);
     ASSERT_TRUE(endpoint);
     EXPECT_EQ(endpoint->device, &devices_[1]);
-}
-
-TEST_F(DeviceCatalogTest, DuplicateEidWithinDeviceIsAlsoAmbiguous) {
-    test_support::ScopedUrmaOverride scope(MakeDiscoveryMockFunctions());
-    eids_[1].eid = eids_[0].eid;
-    ExpectEnumeration();
-    ExpectAttributes();
-    ExpectEids();
-    DeviceCatalog catalog;
-    ASSERT_TRUE(catalog.Initialize({"raw0"}));
-    ExpectError(catalog.Find(eids_[0].eid), CatalogErrorCode::kAmbiguous);
-    EXPECT_TRUE(catalog.Find("raw0", 2));
+    EXPECT_EQ(endpoint->eid_index, 9u);
+    auto first = catalog.Find(eids_[0].eid);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->device, &devices_[0]);
+    EXPECT_EQ(first->eid_index, 7u);
 }
 
 TEST_F(DeviceCatalogTest, PreservesProviderErrorsAndReleasesAcquiredLists) {
     test_support::ScopedUrmaOverride scope(MakeDiscoveryMockFunctions());
     DeviceCatalog catalog;
+    // 第 1 次枚举失败：保留 errno，未获得任何列表，因此不应调用释放接口。
     EXPECT_CALL(mock_, GetDevices(_)).WillOnce([](int*) -> urma_device_t** {
         errno = ENODEV;
         return nullptr;
@@ -223,11 +237,13 @@ TEST_F(DeviceCatalogTest, PreservesProviderErrorsAndReleasesAcquiredLists) {
     ExpectError(catalog.Initialize({"raw0"}), CatalogErrorCode::kQueryFailed, ENODEV);
 
     ExpectEnumeration();
+    // 第 2 次能力查询失败：保留 URMA 状态码，并释放此前获取的设备列表。
     EXPECT_CALL(mock_, QueryDevice(&devices_[0], _)).WillOnce(Return(URMA_FAIL));
     ExpectError(catalog.Initialize({"raw0"}), CatalogErrorCode::kQueryFailed, URMA_FAIL);
 
     ExpectEnumeration();
     ExpectAttributes();
+    // 第 3 次 EID 查询失败：保留 EIO，不猜测为无 EID；只释放已获取的设备列表。
     EXPECT_CALL(mock_, GetEids(&devices_[0], _)).WillOnce([](auto*, auto*) -> urma_eid_info_t* {
         errno = EIO;
         return nullptr;
@@ -238,6 +254,7 @@ TEST_F(DeviceCatalogTest, PreservesProviderErrorsAndReleasesAcquiredLists) {
 
 TEST_F(DeviceCatalogTest, ZeroEidCapacityFailsBeforeEidQuery) {
     test_support::ScopedUrmaOverride scope(MakeDiscoveryMockFunctions());
+    // cap 已经明确报告零容量，不应再调用 GetEids。
     attributes_.dev_cap.max_eid_cnt = 0;
     ExpectEnumeration();
     ExpectAttributes();
@@ -249,6 +266,7 @@ TEST_F(DeviceCatalogTest, ExplicitEmptyEidListIsReleased) {
     test_support::ScopedUrmaOverride scope(MakeDiscoveryMockFunctions());
     ExpectEnumeration();
     ExpectAttributes();
+    // 返回非空列表但数量为零：可明确报告无 EID，仍必须释放返回的列表。
     ExpectEids(0, 0);
     DeviceCatalog catalog;
     ExpectError(catalog.Initialize({"raw0"}), CatalogErrorCode::kNoEids);
@@ -257,17 +275,21 @@ TEST_F(DeviceCatalogTest, ExplicitEmptyEidListIsReleased) {
 TEST_F(DeviceCatalogTest, RejectsInvalidEnumerationAndDuplicateNames) {
     test_support::ScopedUrmaOverride scope(MakeDiscoveryMockFunctions());
     DeviceCatalog catalog;
+    // 负数是非法 provider 数据；零数量则是合法空列表，无法找到指定设备。
     ExpectEnumeration(-1);
     ExpectError(catalog.Initialize({"raw0"}), CatalogErrorCode::kInvalidProviderData);
     ExpectEnumeration(0);
     ExpectError(catalog.Initialize({"raw0"}), CatalogErrorCode::kNotFound);
+    // 即使 raw0 已匹配，列表中的空设备指针也不能被忽略。
     pointers_[1] = nullptr;
     ExpectEnumeration();
     ExpectError(catalog.Initialize({"raw0"}), CatalogErrorCode::kInvalidProviderData);
     pointers_[1] = &devices_[1];
+    // 固定长度名称没有终止符时必须拒绝，避免按 C 字符串读取越界。
     std::memset(devices_[1].name, 'x', URMA_MAX_NAME);
     ExpectEnumeration();
     ExpectError(catalog.Initialize({"raw0"}), CatalogErrorCode::kInvalidProviderData);
+    // 两个设备同名时不得随意选择其中一个。
     std::strcpy(devices_[1].name, "raw0");
     ExpectEnumeration();
     ExpectError(catalog.Initialize({"raw0"}), CatalogErrorCode::kAmbiguous);
@@ -277,6 +299,8 @@ TEST_F(DeviceCatalogTest, RejectsInvalidEidsAndAlwaysFreesQueryResults) {
     test_support::ScopedUrmaOverride scope(MakeDiscoveryMockFunctions());
     DeviceCatalog catalog;
     const auto original = eids_[1];
+    // 每轮只制造一种错误：重复 index、全零 EID、越界 index、超容量数量。
+    // 复用 Catalog 验证失败后可重试；每轮的释放预期保证错误分支不泄漏查询结果。
     for (int invalid_case = 0; invalid_case < 4; ++invalid_case) {
         eids_[1] = original;
         if (invalid_case == 0) {

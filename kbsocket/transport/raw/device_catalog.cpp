@@ -253,28 +253,17 @@ std::expected<LocalEndpoint, CatalogError> DeviceCatalog::Find(const urma_eid_t&
         });
     }
 
-    LocalEndpoint found;
+    // 同一 CLAN 内 EID 唯一，首次匹配即可确定本地端点。
     for (const auto& device : devices_) {
         for (const auto& eid : device.eids) {
-            if (!SameEid(eid.eid, value)) {
-                continue;
+            if (SameEid(eid.eid, value)) {
+                return MakeEndpoint(device, eid);
             }
-
-            if (found.device) {
-                return std::unexpected(CatalogError{
-                    .code = CatalogErrorCode::kAmbiguous,
-                });
-            }
-            found = MakeEndpoint(device, eid);
         }
     }
-
-    if (!found.device) {
-        return std::unexpected(CatalogError{
-            .code = CatalogErrorCode::kNotFound,
-        });
-    }
-    return found;
+    return std::unexpected(CatalogError{
+        .code = CatalogErrorCode::kNotFound,
+    });
 }
 } // namespace raw
 } // namespace kbsocket
