@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+cc_library(
+    name = "urma_api",
+    srcs = ["urma_api.cpp"],
+    hdrs = ["urma_api.hpp"],
+    linkopts = ["-ldl"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@urma//:urma_headers",
+    ],
+)
+
+cc_library(
+    name = "urma_test_support",
+    testonly = True,
+    hdrs = ["testing/scoped_urma_override.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [":urma_api"],
+)
+
+cc_test(
+    name = "urma_api_test",
+    srcs = ["urma_api_test.cpp"],
+    linkopts = [
+        "-Wl,--wrap=dlopen",
+        "-Wl,--wrap=dlsym",
+        "-Wl,--wrap=dlclose",
+        "-Wl,--wrap=dlerror",
+    ],
+    linkstatic = True,
+    deps = [
+        ":urma_api",
+        ":urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
