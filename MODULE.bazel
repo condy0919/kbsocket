@@ -9,6 +9,7 @@ git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "g
 
 bazel_dep(name = "rules_cc", version = "0.2.25")
 bazel_dep(name = "gflags", version = "2.3.1")
+bazel_dep(name = "spdlog", version = "1.17.0")
 
 git_repository(
     name = "urma",
