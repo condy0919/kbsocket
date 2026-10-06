@@ -16,3 +16,24 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "log",
+    srcs = ["log.cpp"],
+    hdrs = ["log.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":no_destructor",
+        "@spdlog",
+    ],
+)
+
+cc_test(
+    name = "log_test",
+    srcs = ["log_test.cpp"],
+    deps = [
+        ":log",
+        "@googletest//:gtest_main",
+        "@spdlog",
+    ],
+)

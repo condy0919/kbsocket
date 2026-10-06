@@ -9,3 +9,7 @@ build --action_env=LLVM_CONFIG
 build --action_env=PATH
 
 build:arm64 --copt=-march=armv8.1-a+lse
+
+# 日志后端统一使用外部 fmt 和编译库，避免各调用方重复实例化 spdlog 实现。
+build --@spdlog//:use_fmt=True
+build --@spdlog//:header_only=False
