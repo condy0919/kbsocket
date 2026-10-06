@@ -29,3 +29,15 @@ return kbsocket::ShutdownLog();
 该接口用于初始化、配置和低频异常诊断，不保证零分配或无锁。收发/poll 热路径继续使用 USDT 与计数器，不以同步文本日志替代热路径可观测机制。
 
 验证：`bazel test //kbsocket/base:log_test`。测试覆盖禁用日志不求值、格式和源码位置、失败重试、宿主 logger 隔离、多线程文件追加、后端写入失败。
+
+## 命令行日志级别
+
+宿主程序先调用 `gflags::ParseCommandLineFlags(&argc, &argv, true)`，再调用 `kbsocket::InitLog()`。日志库声明并注册 `--kbsocket_log_level`，但不自行解析命令行。宿主源码直接使用 gflags 时，Bazel target 应增加 `@gflags//:gflags` 依赖。
+
+```sh
+./your_program --kbsocket_log_level=debug
+```
+
+支持小写 `trace/debug/info/warn/error/critical/off`，默认 `info`。空值、大小写不匹配或其他字符串会让 InitLog 返回 `kInvalidArgument`，不会启动 logger，可修正后重试。此检查在 InitLog 中进行，不注册会导致命令行解析退出的 validator。
+
+`LogOptions::level` 是可选值：显式设置时优先于 flag；不设置时读取 flag。因此只配置 `file_path` 仍会使用命令行级别。初始化完成后修改 flag 不会自动更新日志级别，运行时请调用 SetLogLevel；flag 的解析或修改应在初始化前由控制线程完成，不得与读取并发。测试通过 FlagSaver 恢复全局参数，避免用例相互影响。

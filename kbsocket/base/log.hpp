@@ -7,8 +7,14 @@
 
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <utility>
+
+#include <gflags/gflags.h>
+
+// 由宿主程序解析命令行，库内部不调用 ParseCommandLineFlags。
+DECLARE_string(kbsocket_log_level);
 
 namespace kbsocket {
 enum class LogLevel : std::uint8_t {
@@ -34,7 +40,8 @@ struct LogError {
 };
 
 struct LogOptions {
-    LogLevel level = LogLevel::kInfo;
+    // 显式级别优先；未设置时在 InitLog 中读取 --kbsocket_log_level（默认 info）。
+    std::optional<LogLevel> level;
     // 为空时输出到 stderr；非空时以追加模式写入该文件。
     std::string file_path;
 };

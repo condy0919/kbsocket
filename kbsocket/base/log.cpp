@@ -9,8 +9,11 @@
 #include <cstdio>
 #include <exception>
 #include <memory>
+#include <string_view>
 
 #include "kbsocket/base/no_destructor.hpp"
+
+DEFINE_string(kbsocket_log_level, "info", "kbsocket log level: trace, debug, info, warn, error, critical, off");
 
 namespace kbsocket {
 namespace {
@@ -22,6 +25,22 @@ constinit std::atomic<std::uint64_t> failures{0};
 
 bool ValidLevel(LogLevel level) noexcept {
     return level >= LogLevel::kTrace && level <= LogLevel::kOff;
+}
+
+std::expected<LogLevel, LogError> ParseLogLevel(std::string_view name) noexcept {
+    constexpr std::string_view names[] = {"trace", "debug", "info", "warn", "error", "critical", "off"};
+    constexpr LogLevel levels[] = {LogLevel::kTrace, LogLevel::kDebug,    LogLevel::kInfo, LogLevel::kWarn,
+                                   LogLevel::kError, LogLevel::kCritical, LogLevel::kOff};
+    for (unsigned i = 0; i < 7; ++i) {
+        if (name == names[i]) {
+            return levels[i];
+        }
+    }
+
+    return std::unexpected(LogError{
+        .code = LogErrorCode::kInvalidArgument,
+        .message = "invalid --kbsocket_log_level: expected trace, debug, info, warn, error, critical or off",
+    });
 }
 
 LogError BackendError(const char* message) noexcept {
@@ -39,7 +58,13 @@ std::expected<void, LogError> InitLog(const LogOptions& options) noexcept {
         });
     }
 
-    if (!ValidLevel(options.level) || options.file_path.find('\0') != std::string::npos) {
+    // 用户显式配置 log level 时不受 gflags 选项影响。
+    const std::expected<LogLevel, LogError> level =
+        options.level ? *options.level : ParseLogLevel(FLAGS_kbsocket_log_level);
+    if (!level) {
+        return std::unexpected(level.error());
+    }
+    if (!ValidLevel(*level) || options.file_path.find('\0') != std::string::npos) {
         return std::unexpected(LogError{
             .code = LogErrorCode::kInvalidArgument,
             .message = "invalid log options",
@@ -54,7 +79,7 @@ std::expected<void, LogError> InitLog(const LogOptions& options) noexcept {
             sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(options.file_path, false);
         }
         auto pending = std::make_unique<spdlog::logger>("kbsocket", std::move(sink));
-        pending->set_level(internal::BackendLevel(options.level));
+        pending->set_level(internal::BackendLevel(*level));
         pending->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%n] [%l] [%s:%#] %v");
         // 替换 spdlog 默认的打印到 stderr 的行为，改为抛出异常交由上层统一处理。
         pending->set_error_handler([](const std::string& message) { throw spdlog::spdlog_ex(message); });
