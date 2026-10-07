@@ -1,11 +1,16 @@
-#include <cstring>
+#include <cstdio>
 #include <exception>
 #include <print>
 #include <string>
 #include <vector>
 
+#include "tools/capabilities/device_info_output.hpp"
+#include <gflags/gflags.h>
+
 #include "kbsocket/transport/raw/device_catalog.hpp"
 #include "kbsocket/transport/raw/urma_api.hpp"
+
+DEFINE_string(library, "liburma.so", "Path to the URMA shared library");
 
 namespace {
 struct UrmaSession {
@@ -16,21 +21,14 @@ struct UrmaSession {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::println(stderr, "Usage: {} [--library PATH] RAW_DEVICE [RAW_DEVICE ...]", argv[0]);
+    gflags::SetUsageMessage("[--library PATH] RAW_DEVICE [RAW_DEVICE ...]");
+    gflags::ParseCommandLineFlags(&argc, &argv, true);
+    if (argc < 2 || FLAGS_library.empty()) {
+        std::println(stderr, "Expected a nonempty library path and at least one RAW_DEVICE; use --help");
         return 2;
     }
-    int first_device = 1;
-    const char* library = "liburma.so";
-    if (std::strcmp(argv[1], "--library") == 0) {
-        if (argc < 4) {
-            std::println(stderr, "Expected --library PATH RAW_DEVICE [RAW_DEVICE ...]");
-            return 2;
-        }
-        library = argv[2];
-        first_device = 3;
-    }
-    auto loaded = kbsocket::raw::UrmaApi::Load(library);
+
+    auto loaded = kbsocket::raw::UrmaApi::Load(FLAGS_library.c_str());
     if (!loaded) {
         std::println(stderr, "URMA load failed: {}", loaded.error().message);
         return 1;
@@ -43,27 +41,26 @@ int main(int argc, char** argv) {
             }
         }
     } library_scope;
+
     urma_init_attr_t attr{};
     if (kbsocket::raw::UrmaApi::Init(&attr) != URMA_SUCCESS) {
         std::println(stderr, "urma_init failed");
         return 1;
     }
+
     UrmaSession session;
     try {
         kbsocket::raw::DeviceCatalog catalog;
-        std::vector<std::string> names(argv + first_device, argv + argc);
+        std::vector<std::string> names(argv + 1, argv + argc);
         auto status = catalog.Initialize(names);
         if (!status) {
             std::println(stderr, "Discovery failed: code={} provider_error={}", static_cast<int>(status.error().code),
                          status.error().provider_error);
             return 1;
         }
+
         for (const auto& device : catalog.devices()) {
-            const auto& cap = device.attributes.dev_cap;
-            std::println("device={} rm_ctp=reported jfs_depth={} jfr_depth={} "
-                         "jfc_depth={} inline={} sge={}",
-                         device.name, cap.max_jfs_depth, cap.max_jfr_depth, cap.max_jfc_depth, cap.max_jfs_inline_len,
-                         cap.max_jfs_sge);
+            PrintDeviceInfo(device);
             for (const auto& item : device.eids) {
                 std::print("  eid_index={} eid=", item.eid_index);
                 for (auto byte : item.eid.raw) {
@@ -76,5 +73,6 @@ int main(int argc, char** argv) {
         std::println(stderr, "Discovery failed: {}", error.what());
         return 1;
     }
+
     return 0;
 }
