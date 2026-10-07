@@ -243,8 +243,8 @@ TEST_F(RawRuntimeTest, RollbackFailureRetainsHandlesAndBothErrors) {
     // 触发内部校验失败（kEndpointChanged），从而引发回滚流程。
     contexts_[1].eid.raw[0] = 99;
     EXPECT_CALL(mock_, Create(&devices_[1], 5)).WillOnce(Return(&contexts_[1]));
-    // 阶段二故障注入：回滚删除 context[1] 时底层驱动返回 EAGAIN，模拟级联故障。
-    EXPECT_CALL(mock_, Delete(&contexts_[1])).WillOnce(Return(URMA_EAGAIN));
+    // Open 自动清理与 runtime 回滚各尝试一次，均失败时必须保留会话供显式重试。
+    EXPECT_CALL(mock_, Delete(&contexts_[1])).Times(2).WillRepeatedly(Return(URMA_EAGAIN));
 
     RawRuntime runtime;
     auto failed = runtime.Initialize(configs_);
@@ -252,6 +252,7 @@ TEST_F(RawRuntimeTest, RollbackFailureRetainsHandlesAndBothErrors) {
     // 验证错误根因保留机制：同时保留启动阶段的业务错误与回滚阶段的清理错误，杜绝后者覆盖前者。
     ASSERT_TRUE(failed.error().context_error);
     EXPECT_EQ(failed.error().context_error->code, ContextErrorCode::kEndpointChanged);
+    EXPECT_EQ(failed.error().context_error->cleanup_error, URMA_EAGAIN);
     ASSERT_TRUE(failed.error().cleanup_error);
     EXPECT_EQ(failed.error().cleanup_error->device_index, 1u);
     EXPECT_EQ(failed.error().cleanup_error->provider_error, URMA_EAGAIN);
@@ -395,21 +396,51 @@ TEST_F(RawRuntimeTest, ContextKeepsHandleOnCloseFailure) {
     EXPECT_TRUE(context.Close());
 }
 
-TEST_F(RawRuntimeTest, ContextValidationFailureRetainsOwnership) {
+TEST_F(RawRuntimeTest, ContextIndexMismatchCleansUpBeforeReturningAndAllowsRetry) {
     test_support::ScopedUrmaOverride scope(Functions());
-    // 故障注入：底层已成功分配 context，但实际生效的 EID 索引与请求不一致（端点漂移）。
     contexts_[0].eid_index = 200;
     EXPECT_CALL(mock_, Create(&devices_[0], 2)).WillOnce(Return(&contexts_[0]));
-    // 契约验证：析构时必须自动释放底层句柄，防止硬件资源泄漏。
     EXPECT_CALL(mock_, Delete(&contexts_[0])).WillOnce(Return(URMA_SUCCESS));
-
     UrmaContext context;
     auto result = context.Open(Endpoint(0));
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error().code, ContextErrorCode::kEndpointChanged);
-    // 校验失败但仍持有资源以备清理：has_handle() 为 true，但业务必须依 expected 判失败。
-    EXPECT_TRUE(context.has_handle());
+    EXPECT_FALSE(result.error().cleanup_error);
+    EXPECT_FALSE(context.has_handle());
+    EXPECT_EQ(context.get(), nullptr);
+    // 必须在 Open 返回前完成删除；恢复正确索引后可直接重试，无需调用 Close。
+    ASSERT_TRUE(::testing::Mock::VerifyAndClearExpectations(&mock_));
+    contexts_[0].eid_index = 2;
+    EXPECT_CALL(mock_, Create(&devices_[0], 2)).WillOnce(Return(&contexts_[0]));
+    EXPECT_CALL(mock_, Delete(&contexts_[0])).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_TRUE(context.Open(Endpoint(0)));
     EXPECT_EQ(context.get(), &contexts_[0]);
+    ASSERT_TRUE(context.Close());
+    EXPECT_EQ(context.get(), nullptr);
+}
+
+TEST_F(RawRuntimeTest, ContextEidMismatchHidesResourceWhenAutomaticCleanupFails) {
+    test_support::ScopedUrmaOverride scope(Functions());
+    contexts_[0].eid.raw[0] = 99;
+    EXPECT_CALL(mock_, Create(&devices_[0], 2)).WillOnce(Return(&contexts_[0]));
+    EXPECT_CALL(mock_, Delete(&contexts_[0])).WillOnce(Return(URMA_EAGAIN));
+    UrmaContext context;
+    auto result = context.Open(Endpoint(0));
+    ASSERT_FALSE(result);
+    // 原始校验错误与自动清理错误同时保留；资源仍归对象所有，但不得发布。
+    EXPECT_EQ(result.error().code, ContextErrorCode::kEndpointChanged);
+    EXPECT_EQ(result.error().provider_error, 0);
+    EXPECT_EQ(result.error().cleanup_error, URMA_EAGAIN);
+    EXPECT_TRUE(context.has_handle());
+    EXPECT_EQ(context.get(), nullptr);
+    auto blocked = context.Open(Endpoint(0));
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code, ContextErrorCode::kAlreadyOpen);
+    // 重试清理成功后析构不能再次删除该 context。
+    EXPECT_CALL(mock_, Delete(&contexts_[0])).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_TRUE(context.Close());
+    EXPECT_FALSE(context.has_handle());
+    EXPECT_EQ(context.get(), nullptr);
 }
 } // namespace
 } // namespace raw

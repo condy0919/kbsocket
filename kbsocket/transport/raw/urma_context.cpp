@@ -42,11 +42,17 @@ std::expected<void, ContextError> UrmaContext::Open(const LocalEndpoint& endpoin
 
     if (ctx_->eid_index != endpoint.eid_index ||
         std::memcmp(ctx_->eid.raw, endpoint.eid.raw, sizeof(endpoint.eid.raw)) != 0) {
-        return std::unexpected(ContextError{
+        ContextError error{
             .code = ContextErrorCode::kEndpointChanged,
-        });
+        };
+        // 校验失败不发布 context；删除失败仍保留所有权，允许外层回滚或显式 Close 重试。
+        if (auto cleanup = Close(); !cleanup) {
+            error.cleanup_error = cleanup.error().provider_error;
+        }
+        return std::unexpected(error);
     }
 
+    verified_ = true;
     return {};
 }
 
@@ -63,6 +69,7 @@ std::expected<void, ContextError> UrmaContext::Close() noexcept {
         });
     }
     ctx_ = nullptr;
+    verified_ = false;
     return {};
 }
 } // namespace raw
