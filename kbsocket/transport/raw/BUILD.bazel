@@ -99,3 +99,29 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "jetty_pool",
+    srcs = ["jetty_pool.cpp"],
+    hdrs = [
+        "jetty_pool.hpp",
+        "jetty_pool_error.hpp",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":urma_api",
+        "//kbsocket/base:log",
+        "@gflags",
+    ],
+)
+
+cc_test(
+    name = "jetty_pool_test",
+    srcs = ["jetty_pool_test.cpp"],
+    deps = [
+        ":jetty_pool",
+        ":urma_test_support",
+        "@gflags",
+        "@googletest//:gtest_main",
+    ],
+)
