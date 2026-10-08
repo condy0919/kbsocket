@@ -125,3 +125,25 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "attempt_ledger",
+    srcs = ["attempt_ledger.cpp"],
+    hdrs = ["attempt_ledger.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":jetty_pool",
+        ":urma_api",
+    ],
+)
+
+cc_test(
+    name = "attempt_ledger_test",
+    srcs = ["attempt_ledger_test.cpp"],
+    deps = [
+        ":attempt_ledger",
+        ":jetty_pool",
+        ":urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)

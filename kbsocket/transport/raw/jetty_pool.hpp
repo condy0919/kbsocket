@@ -73,7 +73,7 @@ struct JettyTicket {
 /// - 预留（Reserve / ReserveOn）：向通道申请额度，进入 Reserved 状态；
 /// - 提交（Commit）：硬件驱动成功接受 WR 后确认为 Posted 状态；
 /// - 撤销（Cancel）：硬件拒绝或放弃投递时撤销 Reserved 额度；
-/// - 终结（Complete）：确认收到 CQE 或连接断开后退休 Posted 额度，槽位返回自由链表。
+/// - 终结（Complete）：确认对应 WR 已终结且不再访问 DMA 内存后退休 Posted 额度，槽位返回自由链表。
 ///
 /// 生命周期与硬件依赖：
 /// - 仅借用外部传入的 `urma_context_t*`，且 `cap` 必须源自同一物理设备；底层 context 及注册内存必须覆盖池的存活期。
@@ -124,8 +124,9 @@ public:
     /// 撤销票据：仅用于确定未被底层驱动接受的 WR（处于 Reserved 状态），将其配额归还；严禁撤销已提交工作。
     std::expected<void, JettyPoolFailure> Cancel(JettyTicket ticket) noexcept;
 
-    /// 终结票据：在上层确认该已提交 WR（处于 Posted 状态）彻底终结（收到 CQE 或连接断开）后退休票据并归还配额。
-    /// 严禁依据 CQE 数量推算非逐条 signaled 的完成数；FLUSH_ERR_DONE 属于边界事件，不对应用户票据。
+    /// 终结票据：在上层确认该已提交 WR（处于 Posted 状态）彻底终结且不再访问 DMA
+    /// 内存（连接断开本身不构成此保证）后退休票据并归还配额。 严禁依据 CQE 数量推算非逐条 signaled
+    /// 的完成数；FLUSH_ERR_DONE 属于边界事件，不对应用户票据。
     std::expected<void, JettyPoolFailure> Complete(JettyTicket ticket) noexcept;
 
     /// 标记隔离故障 SQ，禁止后续新的预留；已有在途票据仍可正常 Cancel 或 Complete。

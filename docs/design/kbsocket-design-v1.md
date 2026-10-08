@@ -340,7 +340,7 @@ RM_CTP 的发送有序不能直接推出接收有序。接收端还可能遇到�
 
 本地 raw provider 非 RC 路径逐 WR 使用 `wr->tjetty`，表明 RM 物理发送队列具备逐 WR 选择远端目标的接口基础。现有“一个 jetty 借给某 socket，直到它的 CQE 收干净才换人”的做法不是必须保留的抽象。[逐 WR 目标选择](umdk/src/urma/hw/udma/udma_u_jfs.c)
 
-V1 以 `AttemptLedger` 记录每个被 provider 接受的 WR：lane epoch、提交序号/WQEBB 范围、OpId、ConnId、目标、opcode、buffer/grant 租约、signal 状态。批量 post 部分成功时，仅已接受的前缀进入在途集合；未接受后缀仍是待提交操作。
+V1 以 `AttemptLedger` 记录每个被 provider 接受的 WR：lane epoch、逻辑 WR 提交序号、OpId、ConnId、目标、opcode、buffer/grant 租约、signal 状态。批量 post 部分成功时，仅已接受的前缀进入在途集合；未接受后缀仍是待提交操作。
 
 逻辑连接关闭只撤销该连接的新提交与未提交工作，不销毁共享 jetty/JFR。已 post 的记录直到满足完成/终结条件才退休，不需要让 lane 一直“归关闭的 socket 借用”。
 

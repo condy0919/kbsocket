@@ -146,7 +146,7 @@ bazel run //tools/capabilities:device_info -- --library=/opt/urma/lib/liburma.so
 
 ## 单设备 JettyPool
 
-`JettyPool` 独占发送 JFC、接收 JFC、一个 JFR 和共享该 JFR 的多个 jetty。这里的共享指 URMA jetty 引用独立创建的 JFR，每池只有一个 JFR；不创建独立 JFS。`Open(ctx, cap, config)` 借用已打开的 context，`cap` 必须来自同一设备的目录快照。先检查 RM_CTP、队列深度、SGE 和 inline 限制，再创建资源，全部成功才允许通过 `Acquire()` / `jfr()` 借用。
+`JettyPool` 独占发送 JFC、接收 JFC、一个 JFR 和共享该 JFR 的多个 jetty。这里的共享指 URMA jetty 引用独立创建的 JFR，每池只有一个 JFR；不创建独立 JFS。`Open(ctx, cap, config)` 借用已打开的 context，`cap` 必须来自同一设备的目录快照。先检查 `RM_CTP`、队列深度、SGE 和 inline 限制，再创建资源，全部成功才允许通过 `Reserve()` / `jfr()` 借用。
 
 使用 `//kbsocket/transport/raw:jetty_pool` Bazel 目标。配置默认发送/接收深度各 128，两个 JFC 深度各 256，SGE 各 1；不满足设备限制时显式失败，不自动裁剪。inline 为 0 遵循 URMA 的设备默认值语义。采用无 JFCE 的纯轮询模式，队列配置 lock_free，所有投递和轮询必须遵守同一 owner 约束。没有事件唤醒、远端导入或建链；RM_CTP 能力门禁不等于已完成 CTP 连接，远端导入时仍须指定正确的 TP 类型。JFR 暂用默认无 token 策略，后续建链认证需另行配置。
 
@@ -164,7 +164,7 @@ RM_CTP 每个 WR 自行指定 `tjetty`，连接不独占 jetty。`Reserve()` 轮
 
 票据遵循 `Reserve → Commit → Complete` 或 `Reserve → Cancel`。批量 post 部分成功时，仅 Commit 已接受前缀，Cancel 未接受后缀。预留已经扣除额度，确认不重复扣减；已提交票据不能 Cancel，未提交票据不能 Complete。票据序号防止迟到或重复完成误释放复用后的额度，lane epoch 则仅随物理队列重建更新。票据不跨越池对象销毁重建有效。所有票据槽在 Open 预分配，热路径不分配内存。
 
-池当前不包装 post，不解析 CQE，也不拥有连接或 DMA buffer。调用方须在发送账本中关联票据、ConnId/OpId、目标和 buffer/grant 租约；批量 post、登记和 poll 不得重入。聚合完成须由上层识别实际终结的 WR 并逐条退休，不能按 CQE 条数释放额度，FLUSH_ERR_DONE 不对应用户票据。当前实现提供逐 WR 身份与状态校验，尚不包含设计中的完整 AttemptLedger 和 WQEBB 完成范围映射。
+池当前不包装 post，不解析 CQE，也不拥有连接或 DMA buffer。调用方须在发送账本中关联票据、ConnId/OpId、目标和 buffer/grant 租约；批量 post、登记和 poll 不得重入。聚合完成须由上层识别实际终结的 WR 并逐条退休，不能按 CQE 条数释放额度，`FLUSH_ERR_DONE` 不对应用户票据。逐 WR 身份与状态校验由池和下述 AttemptLedger 协作完成；账本仅记录逻辑 WR，不暴露 provider 的硬件队列布局。
 
 `MarkFaulted(lane)` 阻止整个 SQ 的新预留及 Get，但允许确认先前已接受的 WR、取消未提交票据及退休终结 WR，不重放请求。只要仍有预留或在途票据，Close 返回 kInUse 并保持轮询可用；全部退休后按依赖逆序销毁。关闭连接不销毁共享队列，也不取消其已提交票据；共享 SQ 上其他连接可继续发送。接收 WR、导入对象及 DMA 内存的关闭顺序仍由上层管理。
 
@@ -181,3 +181,20 @@ TX JFC 的额外容量用于每个 jetty 的 FLUSH_ERR_DONE 边界 CQE；用户 
 `--kbsocket_link_priority=4` 控制创建 jetty 时的 `jfs_cfg.priority`，合法范围为 0–15，在 Open 时读取，已创建的 jetty 不随 flag 变化。非法值在创建任何硬件资源前返回参数错误。实际调度效果依赖 provider 和网络 QoS 配置。
 
 远端 SGE（`jfs_cfg.max_rsge`）与接收 SGE（`jfr_cfg.max_sge`）固定为 1；Open 检查设备至少支持一个，不再暴露 `remote_sge`/`recv_sge` 配置。`rnr_retry=6`、`err_timeout=2` 保持当前配置；min_rnr_timer 使用 `URMA_TYPICAL_MIN_RNR_TIMER`（12），与当前 UMQ 的 19 不同，属于明确的重试等待策略选择，仍需在真实设备上验证。
+
+
+### AttemptLedger 发送账本
+
+Bazel 目标为 `//kbsocket/transport/raw:attempt_ledger`。账本绑定一个 JettyPool，由相同 owner 推进。`Open(pool, capacity)` 预分配固定数量记录；容量不足在 post 前失败，不动态扩容。通常按池内发送额度总量设置容量。
+
+使用顺序：
+
+1. `Prepare(metadata, optional_lane)` 预留账本和 SQ 额度，返回可写入 WR `user_ctx` 的 `AttemptId`。通过 `Lookup(id)` 读取 ticket，使用 `pool.Get(ticket.lane)` 取得队列。Prepare 失败不接管目标和资源引用。
+2. 提交层将 metadata 对应目标、opcode 写入 WR，确保启用完成通知，执行 post；已接受部分调用 `Commit(id, submission_sequence)`，未接受后缀调用 `Cancel(id)`。预留顺序不等于实际提交顺序，提交位置由提交层明确传入。
+3. 完成层确认某条 WR 已终结且 DMA 不再访问其资源后调用 `Complete(id)`，取得原始记录，再分发结果并处理 buffer/grant 租约。SQ 额度归还不代表协议 grant 自动撤销；远端授权生命周期仍由上层协议决定。
+
+记录保存连接、操作及其代次、远端目标、opcode、buffer/grant 租约标识，以及 lane epoch、票据、逻辑提交位置。尚无统一资源租约实现，因此账本保存的是引用标识，不会自动释放内存或 unimport 目标。上层资源表必须保持引用直到返回退休记录，且根据协议判断是否可以真正回收。
+
+AttemptId 在同一账本对象存活期间单调增加且不回绕，Close/Open 不重置，按容量取模直接定位槽位；预留跳过仍占用的槽，最坏扫描 capacity 次，查询和退休为 O(1)。不同账本的 id 不保证唯一，CQ 路由必须先确定所属账本；票据仅经账本流转，不能再直接调用池的 Commit/Cancel/Complete。
+
+首版只接受全 signal 记录，不解析 CQE 状态、不自动 post、不实现 selective signaling 或累计成功推导。连接关闭、队列故障、`FLUSH_ERR_DONE` 本身都不能触发账本整体清空。Close 在有预留或在途记录时拒绝关闭；进程退出仍有工作线程时，账本、队列及资源表必须一起常驻。对象销毁后不得再使用旧 id。
