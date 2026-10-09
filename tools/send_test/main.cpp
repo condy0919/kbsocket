@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MulanPSL-2.0
+#include <cerrno>
 #include <cstdio>
 #include <exception>
 #include <print>
@@ -11,6 +12,7 @@
 #include "kbsocket/transport/raw/raw_runtime.hpp"
 #include "kbsocket/transport/raw/urma_api.hpp"
 
+DEFINE_bool(urma_debug, false, "Enable URMA debug logging to stderr");
 DEFINE_bool(server, false, "Receive SEND data; omit on the transmitting endpoint");
 DEFINE_string(address, "127.0.0.1", "Numeric IPv4: bind address for server, peer address for client");
 DEFINE_uint32(port, 18515, "TCP control port (payload uses URMA)");
@@ -23,6 +25,16 @@ DEFINE_uint32(batch, 32, "WRs per round, 1 to 256; must match peer");
 DEFINE_uint32(timeout_ms, 10000, "Timeout per control operation or completion batch, 1 to 3600000 ms");
 
 namespace {
+// URMA 的 C 日志回调不能传播 C++ 异常，也不修改 errno，避免覆盖原始失败信息。
+void UrmaLog(int level, char* message) noexcept {
+    const int saved_errno = errno;
+    try {
+        std::println(stderr, "URMA[{}]: {}", level, message ? message : "");
+    } catch (...) {
+        // stderr 故障不能使 provider 的日志回调终止测试进程。
+    }
+    errno = saved_errno;
+}
 struct Hardware {
     kbsocket::raw::RawRuntime runtime;
     kbsocket::tools::SendTestSession session;
@@ -42,12 +54,20 @@ int Run() {
         std::println(stderr, "Load failed: {}", loaded.error().message);
         return 1;
     }
+    const auto log_status = UrmaApi::RegisterLogFunc(UrmaLog);
+    if (log_status != URMA_SUCCESS) {
+        std::println(stderr, "URMA log callback registration failed: {}", static_cast<int>(log_status));
+    }
+    if (FLAGS_urma_debug)
+        UrmaApi::LogSetLevel(URMA_VLOG_LEVEL_DEBUG);
     auto initialized = hardware->runtime.Initialize({{FLAGS_device, FLAGS_eid_index}});
     if (!initialized) {
         std::println(stderr, "Runtime failed: code={} provider={}", static_cast<int>(initialized.error().code),
                      initialized.error().provider_error);
         return 1;
     }
+    if (FLAGS_urma_debug)
+        UrmaApi::LogSetLevel(URMA_VLOG_LEVEL_DEBUG);
     auto* ctx = hardware->runtime.context(0);
     urma_device_attr_t attributes{};
     auto queried = UrmaApi::QueryDevice(ctx->dev, &attributes);

@@ -66,3 +66,7 @@ bazel test //tools/send_test:send_test_test
 ```
 
 使用 gMock 替代 URMA 调用，使用真实 socketpair 检查控制协议。覆盖线格式、版本/参数拒绝、超时/EOF、数据损坏、发送端多批次、接收完成乱序和清理失败重试。这些测试不依赖本机 liburma.so，但不等价于真实设备验证。
+
+## 注册失败诊断
+
+工具把 URMA 日志转发到 stderr；增加 `--urma_debug` 可打开 URMA debug 级别。UDMA/UMMU 可能使用独立日志通道，仍需查看服务器对应日志。`register local memory` 表示 RegisterSeg 返回空指针，尚未进入 TCP 等待或数据发送。若 provider 未设置 errno，工具会明确标注 `without errno` 并使用工具侧 EIO，而不是打印误导性的 0；EIO 不代表已经定位到具体驱动故障。应结合 alloc token、segment grant、pin segment 等日志判断失败阶段。

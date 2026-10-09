@@ -216,6 +216,37 @@ TEST_F(SendTestHardware, ServerPrepostsAndValidatesOutOfOrderReceiveCompletions)
     ASSERT_TRUE(session_.Close());
 }
 
+TEST_F(SendTestHardware, RegisterFailureWithoutErrnoIsReportedAndCanCleanUp) {
+    ExpectClose(false);
+    ASSERT_TRUE(session_.Close());
+    ::testing::Mock::VerifyAndClearExpectations(this);
+    EXPECT_CALL(*this, CreateJfc(&ctx_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
+    EXPECT_CALL(*this, CreateJfr(&ctx_, _)).WillOnce(Return(&jfr_));
+    EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce(Return(&jetty_));
+    // 重现 provider 返回 nullptr 但 errno 仍为 0；诊断不能将其显示为无错误。
+    EXPECT_CALL(*this, Register(&ctx_, _)).WillOnce([](auto*, auto*) -> urma_target_seg_t* {
+        errno = 0;
+        return nullptr;
+    });
+    urma_device_cap_t cap{};
+    cap.max_msg_size = 4096;
+    cap.trans_mode = URMA_TM_RM;
+    cap.rm_tp_cap.bs.ctp = 1;
+    cap.max_jetty = 1;
+    cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 256;
+    cap.max_jfs_sge = cap.max_jfs_rsge = cap.max_jfr_sge = 1;
+    auto opened = session_.Open(&ctx_, cap, options_);
+    ASSERT_FALSE(opened);
+    EXPECT_EQ(opened.error().code, EIO);
+    EXPECT_THAT(opened.error().operation, ::testing::HasSubstr("without errno"));
+    EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, Unregister(_)).Times(0);
+    ASSERT_TRUE(session_.Close());
+}
+
 TEST_F(SendTestHardware, PeerMismatchFailsBeforePostingAndDeleteFailureCanRetry) {
     int fds[2];
     ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);

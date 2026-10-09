@@ -49,8 +49,13 @@ std::expected<void, SendTestError> SendTestSession::Open(urma_context_t* ctx, co
     segment.flag.bs.access = URMA_ACCESS_LOCAL_ONLY;
     errno = 0;
     segment_ = UrmaApi::RegisterSeg(ctx, &segment);
-    if (!segment_)
-        return Error("register local memory");
+    if (!segment_) {
+        const int saved_errno = errno;
+        if (!saved_errno) {
+            return Error("register local memory: provider returned nullptr without errno; inspect URMA/UDMA logs", EIO);
+        }
+        return Error("register local memory", saved_errno);
+    }
     for (std::size_t i = 0; i < options.batch; ++i) {
         sges_[i].addr = reinterpret_cast<std::uintptr_t>(buffer_.data() + i * options.bytes);
         sges_[i].len = options.bytes;
