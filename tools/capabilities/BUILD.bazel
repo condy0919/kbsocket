@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -14,8 +14,28 @@ cc_binary(
     name = "device_info",
     srcs = ["device_info.cpp"],
     deps = [
+        ":device_info_output",
+        "//kbsocket/base:scope_exit",
         "//kbsocket/transport/raw:device_catalog",
         "//kbsocket/transport/raw:urma_api",
-        "@urma//:urma_headers",
+        "@gflags",
+    ],
+)
+
+cc_library(
+    name = "device_info_output",
+    srcs = ["device_info_output.cpp"],
+    hdrs = ["device_info_output.hpp"],
+    deps = [
+        "//kbsocket/transport/raw:device_catalog",
+    ],
+)
+
+cc_test(
+    name = "device_info_output_test",
+    srcs = ["device_info_output_test.cpp"],
+    deps = [
+        ":device_info_output",
+        "@googletest//:gtest_main",
     ],
 )

@@ -62,3 +62,137 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "urma_context",
+    srcs = ["urma_context.cpp"],
+    hdrs = ["urma_context.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":device_catalog",
+        ":urma_api",
+        "//kbsocket/base:log",
+    ],
+)
+
+cc_library(
+    name = "raw_runtime",
+    srcs = ["raw_runtime.cpp"],
+    hdrs = ["raw_runtime.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":device_catalog",
+        ":urma_api",
+        ":urma_context",
+        "//kbsocket/base:log",
+        "//kbsocket/base:no_destructor",
+    ],
+)
+
+cc_test(
+    name = "raw_runtime_test",
+    srcs = ["raw_runtime_test.cpp"],
+    deps = [
+        ":raw_runtime",
+        ":urma_context",
+        ":urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "jetty_pool",
+    srcs = ["jetty_pool.cpp"],
+    hdrs = [
+        "jetty_pool.hpp",
+        "jetty_pool_error.hpp",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":urma_api",
+        "//kbsocket/base:log",
+        "@gflags",
+    ],
+)
+
+cc_test(
+    name = "jetty_pool_test",
+    srcs = ["jetty_pool_test.cpp"],
+    deps = [
+        ":jetty_pool",
+        ":urma_test_support",
+        "@gflags",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "attempt_ledger",
+    srcs = ["attempt_ledger.cpp"],
+    hdrs = ["attempt_ledger.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":jetty_pool",
+        ":urma_api",
+    ],
+)
+
+cc_test(
+    name = "attempt_ledger_test",
+    srcs = ["attempt_ledger_test.cpp"],
+    deps = [
+        ":attempt_ledger",
+        ":jetty_pool",
+        ":urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "tx_sender",
+    srcs = ["tx_sender.cpp"],
+    hdrs = ["tx_sender.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":attempt_ledger",
+        ":jetty_pool",
+        ":urma_api",
+    ],
+)
+
+cc_test(
+    name = "tx_sender_test",
+    srcs = ["tx_sender_test.cpp"],
+    deps = [
+        ":attempt_ledger",
+        ":jetty_pool",
+        ":tx_sender",
+        ":urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "tx_completion_processor",
+    srcs = ["tx_completion_processor.cpp"],
+    hdrs = ["tx_completion_processor.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":attempt_ledger",
+        ":jetty_pool",
+        ":urma_api",
+    ],
+)
+
+cc_test(
+    name = "tx_completion_processor_test",
+    srcs = ["tx_completion_processor_test.cpp"],
+    deps = [
+        ":attempt_ledger",
+        ":jetty_pool",
+        ":tx_completion_processor",
+        ":tx_sender",
+        ":urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
