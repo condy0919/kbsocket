@@ -23,6 +23,8 @@ public:
     MOCK_METHOD(urma_status_t, DeleteJfc, (urma_jfc_t*));
     MOCK_METHOD(urma_status_t, DeleteJfr, (urma_jfr_t*));
     MOCK_METHOD(urma_status_t, DeleteJetty, (urma_jetty_t*));
+    MOCK_METHOD(urma_status_t, Modify, (urma_jetty_t*, urma_jetty_attr_t*));
+    MOCK_METHOD(int, Flush, (urma_jetty_t*, int, urma_cr_t*));
 
     MOCK_METHOD(urma_status_t, Post, (urma_jetty_t*, urma_jfs_wr_t*, urma_jfs_wr_t**));
 
@@ -45,6 +47,8 @@ public:
         ASSERT_TRUE(ledger_.Open(pool_, 3));
         ASSERT_TRUE(sender_.Open(ledger_));
         EXPECT_CALL(*this, Post(_, _, _)).Times(0);
+        EXPECT_CALL(*this, Modify(_, _)).Times(0);
+        EXPECT_CALL(*this, Flush(_, _, _)).Times(0);
         sge_.addr = reinterpret_cast<std::uintptr_t>(payload_.data());
         sge_.len = payload_.size();
         sge_.tseg = &segment_;
@@ -70,6 +74,8 @@ public:
         f.delete_jfc = [](auto* q) { return active_->DeleteJfc(q); };
         f.delete_jfr = [](auto* q) { return active_->DeleteJfr(q); };
         f.delete_jetty = [](auto* q) { return active_->DeleteJetty(q); };
+        f.modify_jetty = [](auto* q, auto* attr) { return active_->Modify(q, attr); };
+        f.flush_jetty = [](auto* q, int n, auto* cr) { return active_->Flush(q, n, cr); };
         f.post_jetty_send_wr = [](auto* q, auto* wr, auto** bad) { return active_->Post(q, wr, bad); };
         return f;
     }
@@ -112,6 +118,7 @@ protected:
             *bad = success ? wr : (foreign ? &alien : nullptr);
             return success ? URMA_SUCCESS : URMA_EINVAL;
         });
+        EXPECT_CALL(*this, Modify(&jetty_, _)).WillOnce(Return(URMA_SUCCESS));
         auto result = sender_.Send(requests, ids);
         ASSERT_FALSE(result);
         EXPECT_EQ(result.error().code, TxSendErrorCode::kProviderContract);
@@ -128,6 +135,11 @@ protected:
         // 此处凭 mock 的“完全未提交”事实恢复；生产中须先获得同等确定的终结/未提交证据。
         ASSERT_TRUE(ledger_.Cancel(ids[0]));
         ASSERT_TRUE(ledger_.Cancel(ids[1]));
+        // 即使账本已空，也必须先消费硬件边界，再确认软件队列为空。
+        ASSERT_TRUE(pool_.ObserveFlushDone(record->ticket.lane));
+        EXPECT_CALL(*this, Flush(&jetty_, 1, _)).WillOnce(Return(0));
+        std::array<urma_cr_t, 1> cr{};
+        ASSERT_TRUE(pool_.FlushSend(record->ticket.lane, cr));
     }
 };
 
@@ -198,14 +210,21 @@ TEST_F(TxSenderTest, AccountingFailureNeverCancelsAcceptedRequests) {
         EXPECT_TRUE(ledger_.Commit(wr->user_ctx, 1));
         return URMA_SUCCESS;
     });
+    EXPECT_CALL(*this, Modify(&jetty_, _)).WillOnce(Return(URMA_SUCCESS));
     auto result = sender_.Send(requests, ids);
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error().code, TxSendErrorCode::kAccountingFailure);
     EXPECT_EQ(result.error().accepted, 2u);
     EXPECT_EQ(ledger_.posted(), 2u);
     EXPECT_FALSE(sender_.Send(requests, ids));
+    auto record = ledger_.Lookup(ids[0]);
+    ASSERT_TRUE(record);
     ASSERT_TRUE(ledger_.Complete(ids[0]));
     ASSERT_TRUE(ledger_.Complete(ids[1]));
+    ASSERT_TRUE(pool_.ObserveFlushDone(record->ticket.lane));
+    EXPECT_CALL(*this, Flush(&jetty_, 1, _)).WillOnce(Return(0));
+    std::array<urma_cr_t, 1> cr{};
+    ASSERT_TRUE(pool_.FlushSend(record->ticket.lane, cr));
 }
 
 TEST_F(TxSenderTest, MaximumBatchUsesEntireFixedArrayAndRejectsOneMore) {

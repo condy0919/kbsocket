@@ -52,6 +52,15 @@ struct JettyLane {
     std::uint64_t epoch = 0;
 };
 
+/// 故障通道只单向排空，不恢复为可发送状态。
+enum class JettyLaneState : std::uint8_t {
+    kReady,
+    kFaulted,    // 已隔离，尚未确认 modify ERROR 成功。
+    kError,      // 已切 ERROR，等待硬件 FLUSH_ERR_DONE。
+    kFlushReady, // 已消费硬件边界，允许分批软件 flush。
+    kDrained,    // 软件队列和本 SQ 票据均已排空，仍不可发送。
+};
+
 /// 单个发送 WR 的预留额度票据。
 /// - 配额凭证：代表已在目标物理 SQ 上成功预扣的一个 WR 投递额度。
 /// - 序号防错（sequence）：全局单调递增序号，严格防止重复完成或迟到完成误释放已被回收复用的额度条目（防 ABA 错乱）。
@@ -94,7 +103,7 @@ public:
                                              const JettyPoolConfig& config = {}) noexcept;
 
     /// 逆序销毁池内全部硬件队列资源。
-    /// 若仍有预留或在途票据，返回 `kInUse` 并保持轮询通道可用；任一资源删除失败保留剩余句柄供重试。
+    /// 若仍有票据或尚未完成 ERROR 排空，返回 `kInUse` 并保持轮询可用；删除失败保留句柄供重试。
     std::expected<void, JettyPoolFailure> Close() noexcept;
 
     /// 轮询发送完成队列（Send JFC），由调用方传入预分配的完成条目缓冲区（零动态分配）。
@@ -115,6 +124,7 @@ public:
     std::expected<JettyTicket, JettyPoolFailure> ReserveOn(JettyLane lane) noexcept;
 
     /// 获取通道对应的物理 `urma_jetty_t*` 句柄以执行投递；句柄不具独占权，投递前必须已预留足额票据。
+    /// 不得跨故障状态转换缓存句柄再投递；ERROR jetty 的 provider post 仍可能返回 SUCCESS。
     std::expected<urma_jetty_t*, JettyPoolFailure> Get(JettyLane lane) noexcept;
 
     /// 确认票据：在底层驱动接受 WR 后调用，票据由 Reserved 状态转换为 Posted 状态。
@@ -129,8 +139,23 @@ public:
     /// 的完成数；FLUSH_ERR_DONE 属于边界事件，不对应用户票据。
     std::expected<void, JettyPoolFailure> Complete(JettyTicket ticket) noexcept;
 
-    /// 标记隔离故障 SQ，禁止后续新的预留；已有在途票据仍可正常 Cancel 或 Complete。
+    /// 仅执行本地隔离，不修改硬件状态；排空须继续调用 BeginDrain。
+    /// 禁止新的预留与 Get；已存在票据仍可 Commit、Cancel 或 Complete。
     std::expected<void, JettyPoolFailure> MarkFaulted(JettyLane lane) noexcept;
+
+    /// 先隔离 SQ，再修改硬件为 ERROR；失败仍禁止发送，可重试。
+    /// 成功后幂等，不重复 modify；必须继续 poll 等待 FLUSH_ERR_DONE。
+    std::expected<void, JettyPoolFailure> BeginDrain(JettyLane lane) noexcept;
+
+    /// 仅在已切 ERROR 后，由完成层确认消费了该 SQ 的 FLUSH_ERR_DONE 时调用。
+    /// 边界不对应 WR；不读取 user_ctx，也不归还票据。
+    std::expected<void, JettyPoolFailure> ObserveFlushDone(JettyLane lane) noexcept;
+
+    /// 仅在边界之后调用软件 flush；返回的 WR_UNHANDLED 仍须逐条核验并退休。
+    /// 返回 0 且该 SQ 无残留票据才进入 kDrained；残留票据返回 kInUse，禁止推测释放。
+    std::expected<int, JettyPoolFailure> FlushSend(JettyLane lane, std::span<urma_cr_t> completions) noexcept;
+
+    std::expected<JettyLaneState, JettyPoolFailure> lane_state(JettyLane lane) const noexcept;
 
     /// 用 TX CQE 的本地 jetty id 查找当前通道，包括已隔离但仍需排空的 SQ。
     /// 不授予发送权限；未知 id 返回 kInvalidLane。
@@ -167,7 +192,7 @@ private:
         std::vector<Entry> entries;
         std::uint32_t free_head = 0;
         std::uint32_t used = 0;
-        bool faulted = false;
+        JettyLaneState state = JettyLaneState::kReady;
     };
 
     std::expected<Slot*, JettyPoolFailure> Find(JettyLane lane) noexcept;

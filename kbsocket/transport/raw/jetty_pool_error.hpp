@@ -29,12 +29,15 @@ enum class JettyPoolErrorCode : std::uint8_t {
     kInvalidLane,
     kInvalidTicket,
     kFaulted,
+    kModifyFailed,
+    kInvalidState,
+    kFlushFailed,
 };
 
 struct JettyPoolFailure {
     JettyPoolErrorCode code;
     JettyPoolResource resource = JettyPoolResource::kPool;
-    // 创建失败为 errno，删除失败为 urma_status_t；轮询失败保留 PollJfc 原始返回值。
+    // 创建失败为 errno，删除/修改失败为 urma_status_t；轮询/flush 失败保留 provider 原始返回值。
     int provider_error = 0;
     // 仅在失败涉及具体 jetty 槽位时有意义。
     std::uint32_t jetty_index = 0;

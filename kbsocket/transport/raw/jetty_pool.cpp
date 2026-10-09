@@ -233,10 +233,11 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
 }
 
 std::expected<void, JettyPoolFailure> JettyPool::Close() noexcept {
-    // 安全校验：预留（Reserved）和在途（Posted）的 WR 票据均持有额度，必须完全退休后才允许关闭。
+    // 票据必须全部退休；已经切 ERROR 的队列还须消费边界并完成软件排空，避免丢下 fake CQE。
     // 拒绝关闭时刻意保持 ready_ 为 true，确保调用方仍可继续调用 PollSend/PollRecv 与 Complete 推进排空。
     for (std::uint32_t i = 0; i < slots_.size(); ++i) {
-        if (slots_[i].used) {
+        if (slots_[i].used || slots_[i].state == JettyLaneState::kError ||
+            slots_[i].state == JettyLaneState::kFlushReady) {
             return std::unexpected(Failure(JettyPoolErrorCode::kInUse, i));
         }
     }
@@ -364,7 +365,7 @@ std::size_t JettyPool::available() const noexcept {
     // 统计当前未故障且尚有剩余可预留额度（used < tx_depth_）的物理 SQ 数量。
     std::size_t count = 0;
     for (const auto& slot : slots_) {
-        count += !slot.faulted && slot.used < tx_depth_;
+        count += slot.state == JettyLaneState::kReady && slot.used < tx_depth_;
     }
     return count;
 }
@@ -378,7 +379,7 @@ std::expected<JettyTicket, JettyPoolFailure> JettyPool::Reserve() noexcept {
     for (std::size_t i = 0; i < slots_.size(); ++i) {
         const auto index = next_lane_;
         next_lane_ = (next_lane_ + 1) % slots_.size();
-        if (!slots_[index].faulted && slots_[index].used < tx_depth_) {
+        if (slots_[index].state == JettyLaneState::kReady && slots_[index].used < tx_depth_) {
             return ReserveOn(JettyLane{
                 .pool = this,
                 .index = index,
@@ -396,7 +397,7 @@ std::expected<JettyTicket, JettyPoolFailure> JettyPool::ReserveOn(JettyLane lane
     }
 
     auto& slot = **result;
-    if (slot.faulted) {
+    if (slot.state != JettyLaneState::kReady) {
         return std::unexpected(Failure(JettyPoolErrorCode::kFaulted, lane.index));
     }
     // 额度满或序号计数器达到上限时拒绝预留。
@@ -424,7 +425,7 @@ std::expected<urma_jetty_t*, JettyPoolFailure> JettyPool::Get(JettyLane lane) no
         return std::unexpected(slot.error());
     }
     // 故障 SQ 严禁获取硬件句柄投递新请求。
-    if ((*slot)->faulted) {
+    if ((*slot)->state != JettyLaneState::kReady) {
         return std::unexpected(Failure(JettyPoolErrorCode::kFaulted, lane.index));
     }
 
@@ -480,8 +481,83 @@ std::expected<void, JettyPoolFailure> JettyPool::MarkFaulted(JettyLane lane) noe
         return std::unexpected(slot.error());
     }
     // 标记故障隔离：阻断后续新的 Reserve / Get，但保留通道以供已有在途票据继续 Cancel 或 Complete。
-    (*slot)->faulted = true;
+    if ((*slot)->state == JettyLaneState::kReady) {
+        (*slot)->state = JettyLaneState::kFaulted;
+    }
     return {};
+}
+
+std::expected<JettyLaneState, JettyPoolFailure> JettyPool::lane_state(JettyLane lane) const noexcept {
+    if (!ready_ || lane.pool != this || lane.epoch != epoch_ || lane.index >= slots_.size()) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kInvalidLane, lane.index));
+    }
+    return slots_[lane.index].state;
+}
+
+std::expected<void, JettyPoolFailure> JettyPool::BeginDrain(JettyLane lane) noexcept {
+    auto isolated = MarkFaulted(lane);
+    if (!isolated) {
+        return isolated;
+    }
+    auto& slot = slots_[lane.index];
+    if (slot.state != JettyLaneState::kFaulted) {
+        return {};
+    }
+    urma_jetty_attr_t attr{};
+    attr.mask = JETTY_STATE;
+    attr.state = URMA_JETTY_STATE_ERROR;
+    const auto status = UrmaApi::ModifyJetty(slot.jetty, &attr);
+    if (status != URMA_SUCCESS) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kModifyFailed, lane.index, status));
+    }
+    slot.state = JettyLaneState::kError;
+    return {};
+}
+
+std::expected<void, JettyPoolFailure> JettyPool::ObserveFlushDone(JettyLane lane) noexcept {
+    auto found = Find(lane);
+    if (!found) {
+        return std::unexpected(found.error());
+    }
+    auto& slot = **found;
+    if (slot.state != JettyLaneState::kError) {
+        // 意外边界不能替代本地状态转换，但也不能继续向该 SQ 发送。
+        if (slot.state == JettyLaneState::kReady) {
+            slot.state = JettyLaneState::kFaulted;
+        }
+        return std::unexpected(Failure(JettyPoolErrorCode::kInvalidState, lane.index));
+    }
+    slot.state = JettyLaneState::kFlushReady;
+    return {};
+}
+
+std::expected<int, JettyPoolFailure> JettyPool::FlushSend(JettyLane lane, std::span<urma_cr_t> completions) noexcept {
+    auto found = Find(lane);
+    if (!found) {
+        return std::unexpected(found.error());
+    }
+    auto& slot = **found;
+    if (completions.empty() || completions.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kInvalidArgument, lane.index));
+    }
+    if (slot.state == JettyLaneState::kDrained) {
+        return 0;
+    }
+    if (slot.state != JettyLaneState::kFlushReady) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kInvalidState, lane.index));
+    }
+    const int count = UrmaApi::FlushJetty(slot.jetty, static_cast<int>(completions.size()), completions.data());
+    if (count < 0 || static_cast<std::size_t>(count) > completions.size()) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kFlushFailed, lane.index, count));
+    }
+    if (count == 0) {
+        // 软件队列为空不等于账本为空；缺失或不可信的完成必须保留资源并报告。
+        if (slot.used) {
+            return std::unexpected(Failure(JettyPoolErrorCode::kInUse, lane.index));
+        }
+        slot.state = JettyLaneState::kDrained;
+    }
+    return count;
 }
 } // namespace raw
 } // namespace kbsocket
