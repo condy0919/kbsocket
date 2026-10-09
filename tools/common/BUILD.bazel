@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "control_channel",
+    srcs = ["control_channel.cpp"],
+    hdrs = ["control_channel.hpp"],
+    visibility = ["//tools:__subpackages__"],
+    deps = ["//kbsocket/base:scope_exit"],
+)

@@ -10,6 +10,8 @@
 #include <span>
 #include <vector>
 
+#include "tools/common/control_channel.hpp"
+
 #include "kbsocket/transport/raw/attempt_ledger.hpp"
 #include "kbsocket/transport/raw/jetty_pool.hpp"
 #include "kbsocket/transport/raw/tx_completion_processor.hpp"
@@ -17,10 +19,7 @@
 
 namespace kbsocket {
 namespace tools {
-struct SendTestError {
-    const char* operation;
-    int code = 0;
-};
+using SendTestError = ToolError;
 struct SendTestOptions {
     std::uint32_t bytes = 4096;
     std::uint32_t messages = 1024;
@@ -28,24 +27,6 @@ struct SendTestOptions {
     std::uint32_t timeout_ms = 10000;
 };
 std::expected<void, SendTestError> ValidateOptions(const SendTestOptions& options) noexcept;
-
-/// 有界 TCP 控制通道，仅传端点和同步消息；不承载测试 payload。所有等待都有截止时间。
-class ControlChannel {
-public:
-    explicit ControlChannel(int fd = -1) noexcept : fd_(fd) {}
-    ControlChannel(const ControlChannel&) = delete;
-    ControlChannel& operator=(const ControlChannel&) = delete;
-    ~ControlChannel();
-    std::expected<void, SendTestError> Open(bool server, const char* ipv4, std::uint16_t port,
-                                            std::uint32_t timeout_ms) noexcept;
-    std::expected<void, SendTestError> Write(std::span<const std::byte> data, std::uint32_t timeout_ms) noexcept;
-    std::expected<void, SendTestError> Read(std::span<std::byte> data, std::uint32_t timeout_ms) noexcept;
-    std::expected<void, SendTestError> SendMarker(std::uint32_t value, std::uint32_t timeout_ms) noexcept;
-    std::expected<void, SendTestError> ExpectMarker(std::uint32_t value, std::uint32_t timeout_ms) noexcept;
-
-private:
-    int fd_;
-};
 
 struct SendTestHello {
     urma_jetty_id_t endpoint{};

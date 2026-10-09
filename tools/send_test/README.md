@@ -4,6 +4,8 @@
 
 整体调用关系见 [当前 Raw 传输流程](../../docs/raw-transport-flow.md)，发送记账和完成语义见 [TX 数据路径](../../docs/tx-pipeline.md)。
 
+主动切 ERROR 与单 SQ 排空验证使用独立的 [tx_drain_test](../tx_drain_test/README.md)。
+
 ## 编译与运行
 
 ```sh

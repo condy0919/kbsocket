@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: MulanPSL-2.0
+#include "tools/common/control_channel.hpp"
+
 #include <arpa/inet.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
+#include <chrono>
 #include <climits>
-
-#include "tools/send_test/send_test.hpp"
 
 #include "kbsocket/base/scope_exit.hpp"
 
@@ -17,9 +19,9 @@ namespace tools {
 namespace {
 using Clock = std::chrono::steady_clock;
 auto Error(const char* operation, int code = errno) noexcept {
-    return std::unexpected(SendTestError{operation, code});
+    return std::unexpected(ToolError{operation, code});
 }
-std::expected<void, SendTestError> Wait(int fd, short events, Clock::time_point deadline) noexcept {
+std::expected<void, ToolError> Wait(int fd, short events, Clock::time_point deadline) noexcept {
     while (Clock::now() < deadline) {
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
         pollfd item{fd, events, 0};
@@ -53,8 +55,8 @@ ControlChannel::~ControlChannel() {
     if (fd_ >= 0)
         ::close(fd_);
 }
-std::expected<void, SendTestError> ControlChannel::Open(bool server, const char* ipv4, std::uint16_t port,
-                                                        std::uint32_t timeout_ms) noexcept {
+std::expected<void, ToolError> ControlChannel::Open(bool server, const char* ipv4, std::uint16_t port,
+                                                    std::uint32_t timeout_ms) noexcept {
     if (fd_ >= 0)
         return Error("control already open", EBUSY);
     sockaddr_in address{};
@@ -105,8 +107,8 @@ std::expected<void, SendTestError> ControlChannel::Open(bool server, const char*
     cleanup.Release();
     return {};
 }
-std::expected<void, SendTestError> ControlChannel::Write(std::span<const std::byte> data,
-                                                         std::uint32_t timeout_ms) noexcept {
+std::expected<void, ToolError> ControlChannel::Write(std::span<const std::byte> data,
+                                                     std::uint32_t timeout_ms) noexcept {
     if (fd_ < 0) {
         return Error("control not open", EBADF);
     }
@@ -125,7 +127,7 @@ std::expected<void, SendTestError> ControlChannel::Write(std::span<const std::by
     }
     return {};
 }
-std::expected<void, SendTestError> ControlChannel::Read(std::span<std::byte> data, std::uint32_t timeout_ms) noexcept {
+std::expected<void, ToolError> ControlChannel::Read(std::span<std::byte> data, std::uint32_t timeout_ms) noexcept {
     if (fd_ < 0) {
         return Error("control not open", EBADF);
     }
@@ -144,13 +146,12 @@ std::expected<void, SendTestError> ControlChannel::Read(std::span<std::byte> dat
     }
     return {};
 }
-std::expected<void, SendTestError> ControlChannel::SendMarker(std::uint32_t value, std::uint32_t timeout_ms) noexcept {
+std::expected<void, ToolError> ControlChannel::SendMarker(std::uint32_t value, std::uint32_t timeout_ms) noexcept {
     std::array<std::byte, 4> data{};
     Put32(data, value);
     return Write(data, timeout_ms);
 }
-std::expected<void, SendTestError> ControlChannel::ExpectMarker(std::uint32_t value,
-                                                                std::uint32_t timeout_ms) noexcept {
+std::expected<void, ToolError> ControlChannel::ExpectMarker(std::uint32_t value, std::uint32_t timeout_ms) noexcept {
     std::array<std::byte, 4> data{};
     auto result = Read(data, timeout_ms);
     if (!result)
@@ -160,57 +161,5 @@ std::expected<void, SendTestError> ControlChannel::ExpectMarker(std::uint32_t va
     return {};
 }
 
-std::expected<void, SendTestError> ValidateOptions(const SendTestOptions& o) noexcept {
-    if (o.bytes < 8 || o.bytes > 1024 * 1024 || !o.messages || !o.batch || o.batch > raw::TxSender::kMaxBatch ||
-        !o.timeout_ms || o.timeout_ms > 3600000)
-        return Error("invalid test options", EINVAL);
-    return {};
-}
-HelloBytes EncodeHello(const SendTestHello& hello) noexcept {
-    HelloBytes wire{};
-    Put32(wire, 0x4b425354); // KBST
-    Put32(std::span(wire).subspan(4), 1);
-    for (std::size_t i = 0; i < 16; ++i)
-        wire[8 + i] = static_cast<std::byte>(hello.endpoint.eid.raw[i]);
-    Put32(std::span(wire).subspan(24), hello.endpoint.id);
-    Put32(std::span(wire).subspan(28), hello.options.bytes);
-    Put32(std::span(wire).subspan(32), hello.options.messages);
-    Put32(std::span(wire).subspan(36), hello.options.batch);
-    return wire;
-}
-std::expected<SendTestHello, SendTestError> DecodeHello(const HelloBytes& wire) noexcept {
-    if (Get32(wire) != 0x4b425354 || Get32(std::span(wire).subspan(4)) != 1)
-        return Error("hello version", EPROTO);
-    SendTestHello hello;
-    for (std::size_t i = 0; i < 16; ++i)
-        hello.endpoint.eid.raw[i] = std::to_integer<std::uint8_t>(wire[8 + i]);
-    hello.endpoint.id = Get32(std::span(wire).subspan(24));
-    hello.options.bytes = Get32(std::span(wire).subspan(28));
-    hello.options.messages = Get32(std::span(wire).subspan(32));
-    hello.options.batch = Get32(std::span(wire).subspan(36));
-    auto valid = ValidateOptions(hello.options);
-    if (!valid)
-        return std::unexpected(valid.error());
-    return hello;
-}
-void FillPayload(std::span<std::byte> data, std::uint64_t sequence) noexcept {
-    // 调用者已保证长度至少为 8；编码消息序号后填充与序号、偏移有关的确定性内容。
-    for (std::size_t i = 0; i < data.size(); ++i) {
-        data[i] = i < 8 ? static_cast<std::byte>((sequence >> ((7 - i) * 8)) & 255)
-                        : static_cast<std::byte>((sequence * 31 + i * 17) & 255);
-    }
-}
-std::expected<std::uint64_t, SendTestError> CheckPayload(std::span<const std::byte> data) noexcept {
-    if (data.size() < 8)
-        return Error("short payload", EPROTO);
-    std::uint64_t sequence = 0;
-    for (std::size_t i = 0; i < 8; ++i)
-        sequence = (sequence << 8) | std::to_integer<unsigned>(data[i]);
-    for (std::size_t i = 8; i < data.size(); ++i) {
-        if (data[i] != static_cast<std::byte>((sequence * 31 + i * 17) & 255))
-            return Error("payload mismatch", EILSEQ);
-    }
-    return sequence;
-}
 } // namespace tools
 } // namespace kbsocket

@@ -2,12 +2,9 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 
 cc_library(
-    name = "send_test_support",
-    srcs = [
-        "send_test.cpp",
-        "send_test_protocol.cpp",
-    ],
-    hdrs = ["send_test.hpp"],
+    name = "tx_drain_test_support",
+    srcs = ["tx_drain_test.cpp"],
+    hdrs = ["tx_drain_test.hpp"],
     deps = [
         "//kbsocket/transport/raw:attempt_ledger",
         "//kbsocket/transport/raw:jetty_pool",
@@ -19,23 +16,26 @@ cc_library(
 )
 
 cc_binary(
-    name = "send_test",
+    name = "tx_drain_test",
     srcs = ["main.cpp"],
     deps = [
-        ":send_test_support",
+        ":tx_drain_test_support",
         "//kbsocket/base:no_destructor",
         "//kbsocket/transport/raw:raw_runtime",
         "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
         "@gflags",
     ],
 )
 
 cc_test(
-    name = "send_test_test",
-    srcs = ["send_test_test.cpp"],
+    name = "tx_drain_test_test",
+    srcs = ["tx_drain_test_test.cpp"],
     deps = [
-        ":send_test_support",
+        ":tx_drain_test_support",
+        "//kbsocket/base:no_destructor",
         "//kbsocket/transport/raw:urma_test_support",
+        "//tools/common:control_channel",
         "@googletest//:gtest_main",
     ],
 )
