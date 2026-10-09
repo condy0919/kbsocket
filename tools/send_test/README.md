@@ -2,6 +2,8 @@
 
 这是单设备、单 jetty、单 owner 的正确性测试。TCP 仅交换端点、同步接收就绪和校验完成；payload 通过真实 URMA RM_CTP SEND 传输，不走 TCP。发送端使用 JettyPool、AttemptLedger、TxSender 和 TxCompletionProcessor；接收端向共享 JFR 投递已注册 buffer，并轮询 RX JFC。
 
+整体调用关系见 [当前 Raw 传输流程](../../docs/raw-transport-flow.md)，发送记账和完成语义见 [TX 数据路径](../../docs/tx-pipeline.md)。
+
 ## 编译与运行
 
 ```sh
@@ -49,6 +51,8 @@ bazel build //tools/send_test:send_test
 --bytes=4096 --messages=1024 --batch=256
 ```
 
+上述三组配置已由用户在真实双端环境验证通过：接收端输出 `payload validated`，发送端输出 `TX and remote RX confirmed`。此记录未包含设备型号、驱动/URMA 版本及提交号，验证范围见 [当前流程中的说明](../../docs/raw-transport-flow.md#已验证范围)。
+
 最后一组需要设备支持至少 256 个工作队列槽和 257 个 TX CQ 槽。参数或设备能力不满足时显式失败，不自动裁剪。退出码 2 表示命令行参数错误，1 表示初始化、通信、校验或清理失败。
 
 ## 资源与失败语义
@@ -71,4 +75,4 @@ bazel test //tools/send_test:send_test_test
 
 工具把 URMA 日志转发到 stderr；增加 `--urma_debug` 可打开 URMA debug 级别。UDMA/UMMU 可能使用独立日志通道，仍需查看服务器对应日志。`register local memory` 表示 RegisterSeg 返回空指针，尚未进入 TCP 等待或数据发送。若 provider 未设置 errno，工具会明确标注 `without errno` 并使用工具侧 EIO，而不是打印误导性的 0；EIO 不代表已经定位到具体驱动故障。应结合 alloc token、segment grant、pin segment 等日志判断失败阶段。
 
-若出现 `segment grant failed, access=1, ret=-22`，错误发生于 UMMU grant 参数处理。工具已将 LOCAL_ONLY（e_bit=1）改为与 UMQ 一致的 READ | WRITE | ATOMIC（access=14），并将注册地址、长度按页对齐。该修正覆盖与参考实现的两处差异；实际 UMMU 拒绝原因仍须以服务器日志和重跑结果确认。
+若出现 `segment grant failed, access=1, ret=-22`，错误发生于 UMMU grant 参数处理。工具已将 LOCAL_ONLY（e_bit=1）改为与 UMQ 一致的 READ | WRITE | ATOMIC（access=14），并将注册地址、长度按页对齐。两项调整后，上述三组测试已通过。由于权限与对齐同时修改，现有结果不能单独判定原始拒绝由哪一项引起。
