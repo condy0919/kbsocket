@@ -101,8 +101,13 @@ protected:
         EXPECT_CALL(*this, CreateJfr(&ctx_, _)).WillOnce(Return(&jfr_));
         EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce(Return(&jetty_));
         EXPECT_CALL(*this, Register(&ctx_, _)).WillOnce([&](auto*, auto* cfg) {
-            EXPECT_EQ(cfg->len, 64u * 3);
-            EXPECT_EQ(cfg->flag.bs.access, static_cast<unsigned>(URMA_ACCESS_LOCAL_ONLY));
+            // 小于一页的 payload 仍按完整页注册，地址和长度均不能沿用普通堆分配的对齐。
+            const auto page = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+            EXPECT_EQ(cfg->va % page, 0u);
+            EXPECT_EQ(cfg->len % page, 0u);
+            EXPECT_GE(cfg->len, 64u * 3);
+            EXPECT_EQ(cfg->flag.bs.access,
+                      static_cast<unsigned>(URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC));
             return &seg_;
         });
         urma_device_cap_t cap{};

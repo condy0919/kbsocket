@@ -53,7 +53,7 @@ bazel build //tools/send_test:send_test
 
 ## 资源与失败语义
 
-本工具使用非 inline、全 signal、无 token 验证的普通 SEND，注册段只授予本地访问，不交换远端内存地址。正常退出顺序为：数据路径排空、关闭发送器/账本、解除远端导入、销毁 jetty/JFR/JFC、注销内存、关闭 runtime、卸载库。
+本工具使用非 inline、全 signal、无 token 验证的普通 SEND，注册权限与 UMQ 一致，为 READ | WRITE | ATOMIC，不交换远端内存地址。注册地址和长度按系统页大小对齐，实际 SEND 长度仍由 bytes 指定。正常退出顺序为：数据路径排空、关闭发送器/账本、解除远端导入、销毁 jetty/JFR/JFC、注销内存、关闭 runtime、卸载库。
 
 超时、post 部分成功、错误或边界 CQE 都导致测试失败；不重放、不自动恢复。若无法证明全部 DMA 已结束，Close 会拒绝清理；入口以 NoDestructor 保持会话和 buffer 到进程退出，交由进程/驱动回收，不能在这条路径上先 free buffer 或 Uninit/Unload。初始化中途失败也可能保留已创建对象至进程退出。报错中的 code 来自对应阶段的 errno、URMA 状态或内部错误枚举。
 
@@ -70,3 +70,5 @@ bazel test //tools/send_test:send_test_test
 ## 注册失败诊断
 
 工具把 URMA 日志转发到 stderr；增加 `--urma_debug` 可打开 URMA debug 级别。UDMA/UMMU 可能使用独立日志通道，仍需查看服务器对应日志。`register local memory` 表示 RegisterSeg 返回空指针，尚未进入 TCP 等待或数据发送。若 provider 未设置 errno，工具会明确标注 `without errno` 并使用工具侧 EIO，而不是打印误导性的 0；EIO 不代表已经定位到具体驱动故障。应结合 alloc token、segment grant、pin segment 等日志判断失败阶段。
+
+若出现 `segment grant failed, access=1, ret=-22`，错误发生于 UMMU grant 参数处理。工具已将 LOCAL_ONLY（e_bit=1）改为与 UMQ 一致的 READ | WRITE | ATOMIC（access=14），并将注册地址、长度按页对齐。该修正覆盖与参考实现的两处差异；实际 UMMU 拒绝原因仍须以服务器日志和重跑结果确认。

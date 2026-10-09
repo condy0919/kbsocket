@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 #include "tools/send_test/send_test.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cerrno>
 #include <thread>
@@ -42,11 +44,22 @@ std::expected<void, SendTestError> SendTestSession::Open(urma_context_t* ctx, co
     if (!jetty || !cancelled)
         return Error("get endpoint", EIO);
     jetty_ = *jetty;
-    buffer_.resize(static_cast<std::size_t>(options.bytes) * options.batch);
+    const long page_size = ::sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+        return Error("query system page size", EINVAL);
+    const auto page = static_cast<std::size_t>(page_size);
+    const auto payload_size = static_cast<std::size_t>(options.bytes) * options.batch;
+    const auto registration_size = (payload_size + page - 1) / page * page;
+    // 保持注册范围完全位于拥有的内存中，不把相邻堆对象所在页暴露给注册操作。
+    buffer_.resize(registration_size + page - 1);
+    const auto address = reinterpret_cast<std::uintptr_t>(buffer_.data());
+    const auto offset = (page - address % page) % page;
+    registered_buffer_ = std::span(buffer_).subspan(offset, registration_size);
     urma_seg_cfg_t segment{};
-    segment.va = reinterpret_cast<std::uintptr_t>(buffer_.data());
-    segment.len = buffer_.size();
-    segment.flag.bs.access = URMA_ACCESS_LOCAL_ONLY;
+    segment.va = reinterpret_cast<std::uintptr_t>(registered_buffer_.data());
+    segment.len = registered_buffer_.size();
+    // 与 UMQ 的注册权限一致，避免默认走 LOCAL_ONLY 对应的 e_bit 授权分支。
+    segment.flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
     errno = 0;
     segment_ = UrmaApi::RegisterSeg(ctx, &segment);
     if (!segment_) {
@@ -57,7 +70,7 @@ std::expected<void, SendTestError> SendTestSession::Open(urma_context_t* ctx, co
         return Error("register local memory", saved_errno);
     }
     for (std::size_t i = 0; i < options.batch; ++i) {
-        sges_[i].addr = reinterpret_cast<std::uintptr_t>(buffer_.data() + i * options.bytes);
+        sges_[i].addr = reinterpret_cast<std::uintptr_t>(registered_buffer_.data() + i * options.bytes);
         sges_[i].len = options.bytes;
         sges_[i].tseg = segment_;
     }
@@ -153,7 +166,7 @@ std::expected<void, SendTestError> SendTestSession::ReceiveBatch(std::uint32_t b
                 return Error("duplicate RX slot", EPROTO);
             seen_slots_[slot] = true;
             --pending_rx_;
-            auto payload = std::span(buffer_).subspan(slot * options_.bytes, options_.bytes);
+            auto payload = registered_buffer_.subspan(slot * options_.bytes, options_.bytes);
             auto sequence = CheckPayload(payload);
             if (!sequence)
                 return std::unexpected(sequence.error());
@@ -172,7 +185,7 @@ std::expected<void, SendTestError> SendTestSession::SendBatch(std::uint32_t base
     if (!ready)
         return ready;
     for (std::uint32_t i = 0; i < count; ++i) {
-        FillPayload(std::span(buffer_).subspan(static_cast<std::size_t>(i) * options_.bytes, options_.bytes),
+        FillPayload(registered_buffer_.subspan(static_cast<std::size_t>(i) * options_.bytes, options_.bytes),
                     static_cast<std::uint64_t>(base) + i);
         requests_[i] = {.metadata = {.connection_id = 1,
                                      .operation_id = static_cast<std::uint64_t>(base) + i + 1,
@@ -231,6 +244,7 @@ std::expected<void, SendTestError> SendTestSession::Close() noexcept {
             return Error("unregister memory", status);
         segment_ = nullptr;
     }
+    registered_buffer_ = {};
     std::vector<std::byte>().swap(buffer_);
     ctx_ = nullptr;
     return {};

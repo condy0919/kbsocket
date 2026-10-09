@@ -81,6 +81,8 @@ private:
     raw::TxSender sender_;
     raw::TxCompletionProcessor processor_{ledger_};
     std::vector<std::byte> buffer_;
+    // buffer_ 内的页对齐注册范围，包含向上取整的尾部；不单独拥有内存。
+    std::span<std::byte> registered_buffer_;
     std::array<urma_sge_t, kBatch> sges_{};
     std::array<urma_jfr_wr_t, kBatch> recv_wrs_{};
     std::array<raw::TxSendRequest, kBatch> requests_{};
