@@ -4,7 +4,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cerrno>
 
 #include <gmock/gmock.h>
@@ -189,14 +188,16 @@ protected:
     }
     void ExpectClose(bool imported = true, bool registered = true) {
         ::testing::InSequence order;
-        if (imported)
+        if (imported) {
             EXPECT_CALL(*this, Unimport(&remote_)).WillOnce(Return(URMA_SUCCESS));
+        }
         EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
-        if (registered)
+        if (registered) {
             EXPECT_CALL(*this, Unregister(&segment_)).WillOnce(Return(URMA_SUCCESS));
+        }
     }
     void ExpectRetained() {
         // 故障注入后不伪造额外终结证据；与工具入口相同，保留对象直到测试进程退出。
@@ -226,10 +227,12 @@ protected:
 class TxDrainDistribution : public TxDrainHardware, public ::testing::WithParamInterface<int> {};
 TEST_P(TxDrainDistribution, EveryAttemptRetiresOnceAcrossHardwareAndSoftwareBatches) {
     const int scenario = GetParam();
-    if (scenario == 3)
+    if (scenario == 3) {
         options_.batch = 256;
-    if (scenario == 4)
+    }
+    if (scenario >= 4) {
         options_.batch = 1;
+    }
     Open();
     int fds[2];
     ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
@@ -246,7 +249,11 @@ TEST_P(TxDrainDistribution, EveryAttemptRetiresOnceAcrossHardwareAndSoftwareBatc
             .WillRepeatedly([&](auto*, int n, auto* out) {
                 int count = 0;
                 while (count < n && polled < hardware) {
-                    const auto status = scenario == 4                  ? URMA_CR_RNR_RETRY_CNT_EXC_ERR
+                    // 四种常见错误分别计数；另用 LOC_LEN_ERR 验证兜底计数仍然有效。
+                    constexpr std::array errors{URMA_CR_RNR_RETRY_CNT_EXC_ERR, URMA_CR_LOC_ACCESS_ERR,
+                                                URMA_CR_REM_ACCESS_ABORT_ERR, URMA_CR_ACK_TIMEOUT_ERR,
+                                                URMA_CR_LOC_LEN_ERR};
+                    const auto status = scenario >= 4                  ? errors[scenario - 4]
                                         : scenario == 0 && polled == 0 ? URMA_CR_SUCCESS
                                                                        : URMA_CR_WR_FLUSH_ERR;
                     out[count++] = Completion(ids_[polled++], status);
@@ -261,8 +268,9 @@ TEST_P(TxDrainDistribution, EveryAttemptRetiresOnceAcrossHardwareAndSoftwareBatc
             .Times((options_.batch - hardware + 63) / 64 + 1)
             .WillRepeatedly([&](auto*, int n, auto* out) {
                 int count = 0;
-                while (count < n && flushed < options_.batch)
+                while (count < n && flushed < options_.batch) {
                     out[count++] = Completion(ids_[flushed++], URMA_CR_WR_UNHANDLED);
+                }
                 return count;
             });
     }
@@ -271,9 +279,18 @@ TEST_P(TxDrainDistribution, EveryAttemptRetiresOnceAcrossHardwareAndSoftwareBatc
     EXPECT_EQ(stats.accepted, options_.batch);
     EXPECT_EQ(stats.retired, options_.batch);
     EXPECT_EQ(stats.success, scenario == 0 ? 1u : 0u);
-    EXPECT_EQ(stats.flush_error, hardware - stats.success - stats.other_error);
+    EXPECT_EQ(stats.loc_access_error, scenario == 5 ? 1u : 0u);
+    EXPECT_EQ(stats.remote_access_abort_error, scenario == 6 ? 1u : 0u);
+    EXPECT_EQ(stats.ack_timeout_error, scenario == 7 ? 1u : 0u);
+    EXPECT_EQ(stats.rnr_retry_count_exceeded_error, scenario == 4 ? 1u : 0u);
+    EXPECT_EQ(stats.flush_error, scenario >= 4 ? 0u : hardware - stats.success);
+    EXPECT_EQ(stats.success + stats.flush_error + stats.unhandled + stats.loc_access_error +
+                  stats.remote_access_abort_error + stats.ack_timeout_error + stats.rnr_retry_count_exceeded_error +
+                  stats.other_error,
+              stats.retired);
     EXPECT_EQ(stats.unhandled, options_.batch - hardware);
-    EXPECT_EQ(stats.other_error, scenario == 4 ? 1u : 0u);
+    EXPECT_EQ(stats.other_error, scenario == 8 ? 1u : 0u);
+    EXPECT_EQ(stats.last_other_error, scenario == 8 ? static_cast<int>(URMA_CR_LOC_LEN_ERR) : 0);
     EXPECT_TRUE(stats.accepted_known);
     EXPECT_EQ(stats.flush_done, 1u);
     EXPECT_EQ(stats.rejected_sends, 3u);
@@ -297,7 +314,7 @@ TEST_P(TxDrainDistribution, EveryAttemptRetiresOnceAcrossHardwareAndSoftwareBatc
     ASSERT_TRUE(peer.Read(sent, 100));
     ASSERT_TRUE(peer.ExpectMarker(0x445202, 100));
 }
-INSTANTIATE_TEST_SUITE_P(CompletionDistributions, TxDrainDistribution, ::testing::Values(0, 1, 2, 3, 4));
+INSTANTIATE_TEST_SUITE_P(CompletionDistributions, TxDrainDistribution, ::testing::Values(0, 1, 2, 3, 4, 5, 6, 7, 8));
 
 TEST_F(TxDrainHardware, ServerProvidesEndpointWithoutRegisteringOrPostingReceives) {
     Open(true);
@@ -342,8 +359,9 @@ TEST_F(TxDrainHardware, MissingBoundaryTimesOutEvenWhenAllWrHaveCompleted) {
     ExpectPostAndModify();
     EXPECT_CALL(*this, Poll(&tx_, 64, _))
         .WillOnce([&](auto*, int, auto* out) {
-            for (unsigned i = 0; i < options_.batch; ++i)
+            for (unsigned i = 0; i < options_.batch; ++i) {
                 out[i] = Completion(ids_[i], URMA_CR_SUCCESS);
+            }
             return options_.batch;
         })
         .WillRepeatedly(Return(0));

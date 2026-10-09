@@ -41,6 +41,11 @@ struct TxDrainStats {
     std::uint32_t success = 0;
     std::uint32_t flush_error = 0;
     std::uint32_t unhandled = 0;
+    std::uint32_t loc_access_error = 0;
+    std::uint32_t remote_access_abort_error = 0;
+    std::uint32_t ack_timeout_error = 0;
+    std::uint32_t rnr_retry_count_exceeded_error = 0;
+    // 仅统计未单列的终结错误，避免重复计数。
     std::uint32_t other_error = 0;
     int last_other_error = 0;
     std::uint32_t flush_done = 0;

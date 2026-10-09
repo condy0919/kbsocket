@@ -91,11 +91,14 @@ int Run() {
         std::println(stderr, "FAIL: {}: {}", result.error().operation, result.error().code);
     if (!FLAGS_server) {
         const auto& stats = hardware->session.stats();
-        std::println("TX drain: accepted={} retired={} success={} flush_err={} unhandled={} other_error={} "
-                     "last_other_status={} flush_done={} rejected_sends={}",
-                     stats.accepted_known ? std::to_string(stats.accepted) : "unknown", stats.retired, stats.success,
-                     stats.flush_error, stats.unhandled, stats.other_error, stats.last_other_error, stats.flush_done,
-                     stats.rejected_sends);
+        std::println(
+            "TX drain: accepted={} retired={} success={} flush_err={} unhandled={} "
+            "loc_access_err={} remote_access_abort_err={} ack_timeout_err={} rnr_retry_cnt_exc_err={} other_error={} "
+            "last_other_status={} flush_done={} rejected_sends={}",
+            stats.accepted_known ? std::to_string(stats.accepted) : "unknown", stats.retired, stats.success,
+            stats.flush_error, stats.unhandled, stats.loc_access_error, stats.remote_access_abort_error,
+            stats.ack_timeout_error, stats.rnr_retry_count_exceeded_error, stats.other_error, stats.last_other_error,
+            stats.flush_done, stats.rejected_sends);
     }
     auto closed = hardware->session.Close();
     if (!closed) {

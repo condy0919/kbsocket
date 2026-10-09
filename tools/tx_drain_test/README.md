@@ -17,7 +17,7 @@
 5. 每个提交的 AttemptId 恰好退休一次。收到边界后、彻底排空后再次检查发送门禁，共三次；排空不会恢复 jetty 可用性。
 6. 对端确认发送端完成排空，然后双方分别关闭 session、runtime 和动态库。双方交换关闭确认后才各自输出 PASS。
 
-TCP 仅用于端点交换和同步，使用与 SEND 工具不同的协议标识与默认端口；不能将两个不同工具配对。测试不要求 FLUSH_ERR、WR_UNHANDLED 都出现，数量取决于切 ERROR 时硬件已经推进到哪里。无接收 WR 时还可能出现 RNR 等普通错误，它们作为合法终结完成计数在 other_error 中。
+TCP 仅用于端点交换和同步，使用与 SEND 工具不同的协议标识与默认端口；不能将两个不同工具配对。测试不要求 FLUSH_ERR、WR_UNHANDLED 都出现，数量取决于切 ERROR 时硬件已经推进到哪里。无接收 WR 时还可能出现 RNR 等普通错误，它们作为合法终结完成分别计数，未单列的错误计入 other_error。
 
 ## 编译与运行
 
@@ -56,11 +56,20 @@ bazel build //tools/tx_drain_test:tx_drain_test
 发送端打印实际统计，例如混合完成可能显示：
 
 ```text
-TX drain: accepted=32 retired=32 success=0 flush_err=20 unhandled=12 other_error=0 last_other_status=0 flush_done=1 rejected_sends=3
+TX drain: accepted=32 retired=32 success=0 flush_err=20 unhandled=12 loc_access_err=0 remote_access_abort_err=0 ack_timeout_err=0 rnr_retry_cnt_exc_err=0 other_error=0 last_other_status=0 flush_done=1 rejected_sends=3
 PASS: all attempts retired once; ERROR SQ rejected new sends; both endpoints closed resources
 ```
 
 这个数字分布仅作格式示例，不能作为硬件验收要求。判定条件为 accepted=retired=batch、各类终结数量之和等于 retired、flush_done=1、rejected_sends=3，以及双方关闭成功。
+
+四种常见错误独立统计，不再重复计入 other_error：
+
+| 输出字段                | URMA 状态                     |
+|-------------------------|-------------------------------|
+| loc_access_err          | URMA_CR_LOC_ACCESS_ERR        |
+| remote_access_abort_err | URMA_CR_REM_ACCESS_ABORT_ERR  |
+| ack_timeout_err         | URMA_CR_ACK_TIMEOUT_ERR       |
+| rnr_retry_cnt_exc_err   | URMA_CR_RNR_RETRY_CNT_EXC_ERR |
 
 对端输出：
 
@@ -68,7 +77,7 @@ PASS: all attempts retired once; ERROR SQ rejected new sends; both endpoints clo
 PASS: peer TX drain confirmed; both endpoints closed resources
 ```
 
-两端都 PASS 且退出码为 0 才算通过。退出码 2 表示参数错误，1 表示初始化、协议、投递、排空、校验或清理失败。普通 WR 错误状态可以是主动故障测试的预期结果；modify/flush 调用失败、缺失边界、重复或未知 AttemptId、残留记录、对端失联等均不能算通过。接受范围不可信时 accepted 显示 unknown；last_other_status 保存最后一个普通错误的 URMA 状态码，other_error 为 0 时该字段无意义。other_error 不证明网络健康，需结合基础 SEND 结果与 provider 日志判断。
+两端都 PASS 且退出码为 0 才算通过。退出码 2 表示参数错误，1 表示初始化、协议、投递、排空、校验或清理失败。普通 WR 错误状态可以是主动故障测试的预期结果；modify/flush 调用失败、缺失边界、重复或未知 AttemptId、残留记录、对端失联等均不能算通过。接受范围不可信时 accepted 显示 unknown；last_other_status 保存最后一个未单列错误的 URMA 状态码，other_error 为 0 时该字段无意义。other_error 不证明网络健康，需结合基础 SEND 结果与 provider 日志判断。
 
 部分提交、提交范围不可信、异常 CQE 或排空超时会保留会话及注册内存到进程退出，不自动重试或重放。由于无法证明完整排空，这些路径不会先 free buffer、Uninit 或 Unload。正常路径依次解除导入、删除 jetty/JFR/JFC、注销内存、关闭 runtime 和动态库；任何清理失败都不输出 PASS。
 
@@ -80,4 +89,4 @@ bazel test //tools/tx_drain_test:tx_drain_test_test //tools/send_test:send_test_
 
 单测以真实 JettyPool、Ledger、Sender 和 CompletionProcessor 配合 gMock URMA、socketpair 验证控制协议与排空流程。控制通道共用 [tools/common](../common/control_channel.hpp)，基础 SEND 的协议和收发逻辑独立保留。
 
-当前只测试单设备、单 SQ、单 owner 的主动 ERROR。尚未覆盖同池多个 SQ、预置接收队列下的数据交付、异步设备事件、故障重建或吞吐性能。此工具已可用于服务器验证；本地没有真实 URMA 硬件，尚未取得该工具的硬件运行结果。
+当前只测试单设备、单 SQ、单 owner 的主动 ERROR。尚未覆盖同池多个 SQ、预置接收队列下的数据交付、异步设备事件、故障重建或吞吐性能。此工具已可用于服务器验证；本地未执行真实 URMA 硬件测试，硬件结果以服务器上的双端运行输出为准。
