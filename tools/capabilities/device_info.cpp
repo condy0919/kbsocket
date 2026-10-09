@@ -7,18 +7,11 @@
 #include "tools/capabilities/device_info_output.hpp"
 #include <gflags/gflags.h>
 
+#include "kbsocket/base/scope_exit.hpp"
 #include "kbsocket/transport/raw/device_catalog.hpp"
 #include "kbsocket/transport/raw/urma_api.hpp"
 
 DEFINE_string(library, "liburma.so", "Path to the URMA shared library");
-
-namespace {
-struct UrmaSession {
-    ~UrmaSession() {
-        kbsocket::raw::UrmaApi::Uninit();
-    }
-};
-} // namespace
 
 int main(int argc, char** argv) {
     gflags::SetUsageMessage("[--library PATH] RAW_DEVICE [RAW_DEVICE ...]");
@@ -33,14 +26,12 @@ int main(int argc, char** argv) {
         std::println(stderr, "URMA load failed: {}", loaded.error().message);
         return 1;
     }
-    struct LibraryScope {
-        ~LibraryScope() {
-            const auto result = kbsocket::raw::UrmaApi::Unload();
-            if (!result) {
-                std::println(stderr, "URMA unload failed: {}", result.error().message);
-            }
+    kbsocket::ScopeExit library_scope([]() noexcept {
+        const auto result = kbsocket::raw::UrmaApi::Unload();
+        if (!result) {
+            std::println(stderr, "URMA unload failed: {}", result.error().message);
         }
-    } library_scope;
+    });
 
     urma_init_attr_t attr{};
     if (kbsocket::raw::UrmaApi::Init(&attr) != URMA_SUCCESS) {
@@ -48,7 +39,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    UrmaSession session;
+    kbsocket::ScopeExit session([]() noexcept { kbsocket::raw::UrmaApi::Uninit(); });
     try {
         kbsocket::raw::DeviceCatalog catalog;
         std::vector<std::string> names(argv + 1, argv + argc);

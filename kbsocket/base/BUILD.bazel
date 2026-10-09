@@ -24,7 +24,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":no_destructor",
-        "@gflags//:gflags",
+        "@gflags",
         "@spdlog",
     ],
 )
@@ -34,8 +34,23 @@ cc_test(
     srcs = ["log_test.cpp"],
     deps = [
         ":log",
-        "@gflags//:gflags",
+        "@gflags",
         "@googletest//:gtest_main",
         "@spdlog",
+    ],
+)
+
+cc_library(
+    name = "scope_exit",
+    hdrs = ["scope_exit.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "scope_exit_test",
+    srcs = ["scope_exit_test.cpp"],
+    deps = [
+        ":scope_exit",
+        "@googletest//:gtest_main",
     ],
 )

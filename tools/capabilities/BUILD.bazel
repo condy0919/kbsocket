@@ -15,6 +15,7 @@ cc_binary(
     srcs = ["device_info.cpp"],
     deps = [
         ":device_info_output",
+        "//kbsocket/base:scope_exit",
         "//kbsocket/transport/raw:device_catalog",
         "//kbsocket/transport/raw:urma_api",
         "@gflags",
