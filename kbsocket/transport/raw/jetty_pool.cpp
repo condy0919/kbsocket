@@ -344,6 +344,18 @@ std::expected<JettyPool::Entry*, JettyPoolFailure> JettyPool::Find(JettyTicket t
     return &entry;
 }
 
+std::expected<JettyLane, JettyPoolFailure> JettyPool::FindLane(std::uint32_t local_id) const noexcept {
+    if (!ready_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kNotReady));
+    }
+    for (std::uint32_t i = 0; i < slots_.size(); ++i) {
+        if (slots_[i].jetty && slots_[i].jetty->jetty_id.id == local_id) {
+            return JettyLane{this, i, epoch_};
+        }
+    }
+    return std::unexpected(Failure(JettyPoolErrorCode::kInvalidLane));
+}
+
 std::size_t JettyPool::available() const noexcept {
     if (!ready_) {
         return 0;

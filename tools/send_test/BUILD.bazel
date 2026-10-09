@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+cc_library(
+    name = "send_test_support",
+    srcs = [
+        "control_channel.cpp",
+        "send_test.cpp",
+    ],
+    hdrs = ["send_test.hpp"],
+    deps = [
+        "//kbsocket/base:scope_exit",
+        "//kbsocket/transport/raw:attempt_ledger",
+        "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:tx_completion_processor",
+        "//kbsocket/transport/raw:tx_sender",
+        "//kbsocket/transport/raw:urma_api",
+    ],
+)
+
+cc_binary(
+    name = "send_test",
+    srcs = ["main.cpp"],
+    deps = [
+        ":send_test_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:raw_runtime",
+        "//kbsocket/transport/raw:urma_api",
+        "@gflags",
+    ],
+)
+
+cc_test(
+    name = "send_test_test",
+    srcs = ["send_test_test.cpp"],
+    deps = [
+        ":send_test_support",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)

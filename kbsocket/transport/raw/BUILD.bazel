@@ -147,3 +147,52 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "tx_sender",
+    srcs = ["tx_sender.cpp"],
+    hdrs = ["tx_sender.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":attempt_ledger",
+        ":jetty_pool",
+        ":urma_api",
+    ],
+)
+
+cc_test(
+    name = "tx_sender_test",
+    srcs = ["tx_sender_test.cpp"],
+    deps = [
+        ":attempt_ledger",
+        ":jetty_pool",
+        ":tx_sender",
+        ":urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "tx_completion_processor",
+    srcs = ["tx_completion_processor.cpp"],
+    hdrs = ["tx_completion_processor.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":attempt_ledger",
+        ":jetty_pool",
+        ":urma_api",
+    ],
+)
+
+cc_test(
+    name = "tx_completion_processor_test",
+    srcs = ["tx_completion_processor_test.cpp"],
+    deps = [
+        ":attempt_ledger",
+        ":jetty_pool",
+        ":tx_completion_processor",
+        ":tx_sender",
+        ":urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)

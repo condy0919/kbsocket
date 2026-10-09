@@ -132,6 +132,10 @@ public:
     /// 标记隔离故障 SQ，禁止后续新的预留；已有在途票据仍可正常 Cancel 或 Complete。
     std::expected<void, JettyPoolFailure> MarkFaulted(JettyLane lane) noexcept;
 
+    /// 用 TX CQE 的本地 jetty id 查找当前通道，包括已隔离但仍需排空的 SQ。
+    /// 不授予发送权限；未知 id 返回 kInvalidLane。
+    std::expected<JettyLane, JettyPoolFailure> FindLane(std::uint32_t local_id) const noexcept;
+
     /// 查询池是否已就绪。
     bool ready() const noexcept {
         return ready_;

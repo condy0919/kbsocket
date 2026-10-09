@@ -88,6 +88,11 @@ public:
     /// 仅退休已提交且已由完成层确认终结的 WR，返回记录供上层分发结果和处理资源。
     std::expected<AttemptRecord, AttemptLedgerError> Complete(AttemptId id) noexcept;
 
+    /// 供提交层验证绑定关系；仅借用，不转移池的生命周期责任。
+    JettyPool* pool() const noexcept {
+        return pool_;
+    }
+
     std::size_t size() const noexcept {
         return used_;
     }
