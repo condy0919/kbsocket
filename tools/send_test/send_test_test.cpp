@@ -41,6 +41,8 @@ TEST(SendTestProtocol, WireFormatAndPayloadRejectCorruption) {
     EXPECT_FALSE(CheckPayload(payload));
     EXPECT_FALSE(CheckPayload(std::span(payload).first(7)));
     EXPECT_FALSE(ValidateOptions({.bytes = 7}));
+    EXPECT_FALSE(ValidateOptions({.bytes = 4097}));
+    EXPECT_TRUE(ValidateOptions({.bytes = 4096}));
     EXPECT_FALSE(ValidateOptions({.messages = 0}));
     EXPECT_FALSE(ValidateOptions({.timeout_ms = 0}));
 }
@@ -96,6 +98,8 @@ public:
 protected:
     void SetUp() override {
         active_ = this;
+    }
+    void Open(bool server = false) {
         jetty_.jetty_id.id = 7;
         EXPECT_CALL(*this, CreateJfc(&ctx_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
         EXPECT_CALL(*this, CreateJfr(&ctx_, _)).WillOnce(Return(&jfr_));
@@ -117,18 +121,24 @@ protected:
         cap.max_jetty = 1;
         cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 256;
         cap.max_jfs_sge = cap.max_jfs_rsge = cap.max_jfr_sge = 1;
-        ASSERT_TRUE(session_.Open(&ctx_, cap, options_));
+        ASSERT_TRUE(session_.Open(&ctx_, cap, options_, server));
     }
-    void ExpectClose(bool imported) {
-        // 完成后先解除远端引用、销毁队列，再注销注册段；禁止在队列删除前释放 DMA 内存。
+    void ExpectClose(bool imported, bool server = false) {
+        // RX 池已收到全部终结 CQE 且 lease 已归还，先注销并解绑，才允许关闭父队列。
         ::testing::InSequence order;
-        if (imported)
+        if (imported) {
             EXPECT_CALL(*this, Unimport(&remote_)).WillOnce(Return(URMA_SUCCESS));
+        }
+        if (server) {
+            EXPECT_CALL(*this, Unregister(&seg_)).WillOnce(Return(URMA_SUCCESS));
+        }
         EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
-        EXPECT_CALL(*this, Unregister(&seg_)).WillOnce(Return(URMA_SUCCESS));
+        if (!server) {
+            EXPECT_CALL(*this, Unregister(&seg_)).WillOnce(Return(URMA_SUCCESS));
+        }
     }
     static inline SendTestHardware* active_;
     raw::test_support::ScopedUrmaOverride scope_{Functions()};
@@ -143,6 +153,7 @@ protected:
 };
 
 TEST_F(SendTestHardware, ClientRunsMultipleBatchesAndChecksRemoteAcknowledgment) {
+    Open();
     int fds[2];
     ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
     ControlChannel client(fds[0]), peer(fds[1]);
@@ -150,8 +161,9 @@ TEST_F(SendTestHardware, ClientRunsMultipleBatchesAndChecksRemoteAcknowledgment)
     hello.endpoint.id = 99;
     ASSERT_TRUE(peer.Write(EncodeHello(hello), 100));
     // 预置对端两批的 READY/ACK；没有 TCP payload，数据仍经 mock URMA 路径校验。
-    for (auto marker : {3u, 3u, 5u, 5u})
+    for (auto marker : {3u, 3u, 5u, 5u}) {
         ASSERT_TRUE(peer.SendMarker(marker, 100));
+    }
     EXPECT_CALL(*this, Import(&ctx_, _, _)).WillOnce([&](auto*, auto* r, auto*) {
         EXPECT_EQ(r->jetty_id.id, 99u);
         EXPECT_EQ(r->tp_type, URMA_CTP);
@@ -187,6 +199,7 @@ TEST_F(SendTestHardware, ClientRunsMultipleBatchesAndChecksRemoteAcknowledgment)
 }
 
 TEST_F(SendTestHardware, ServerPrepostsAndValidatesOutOfOrderReceiveCompletions) {
+    Open(true);
     int fds[2];
     ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
     ControlChannel server(fds[0]), peer(fds[1]);
@@ -200,28 +213,69 @@ TEST_F(SendTestHardware, ServerPrepostsAndValidatesOutOfOrderReceiveCompletions)
         pending = 0;
         for (; wr; wr = wr->next) {
             const auto& sge = wr->src.sge[0];
-            FillPayload({reinterpret_cast<std::byte*>(sge.addr), sge.len}, sequence++);
+            EXPECT_EQ(sge.len, raw::RxBufferPool::kBufferSize);
+            FillPayload({reinterpret_cast<std::byte*>(sge.addr), options_.bytes}, sequence++);
             auto& cr = completions[pending++];
             cr = {};
             cr.flag.bs.s_r = 1;
-            cr.completion_len = sge.len;
+            cr.completion_len = options_.bytes;
+            cr.flag.bs.jetty = 1;
+            cr.local_id = jetty_.jetty_id.id;
             cr.user_ctx = wr->user_ctx;
         }
         return URMA_SUCCESS;
     });
     EXPECT_CALL(*this, Poll(&rx_, _, _)).Times(2).WillRepeatedly([&](auto*, int, auto* cr) {
         // 完成顺序与投递顺序相反，接收校验按 user_ctx 找 buffer，并独立验证消息序号。
-        for (int i = 0; i < pending; ++i)
+        for (int i = 0; i < pending; ++i) {
             cr[i] = completions[pending - 1 - i];
+        }
         return pending;
     });
     ASSERT_TRUE(session_.Run(server, true));
     EXPECT_EQ(sequence, 5u);
-    ExpectClose(false);
+    ExpectClose(false, true);
     ASSERT_TRUE(session_.Close());
 }
 
+TEST_F(SendTestHardware, ServerReturnsEveryLeaseWhenOnePayloadIsCorrupt) {
+    Open(true);
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
+    ControlChannel server(fds[0]), peer(fds[1]);
+    ASSERT_TRUE(peer.Write(EncodeHello({.options = options_}), 100));
+    std::array<urma_cr_t, 3> completions{};
+    EXPECT_CALL(*this, PostRecv(&jfr_, _, _)).WillOnce([&](auto*, auto* wr, auto**) {
+        std::size_t index = 0;
+        for (; wr; wr = wr->next, ++index) {
+            auto* data = reinterpret_cast<std::byte*>(wr->src.sge[0].addr);
+            FillPayload({data, options_.bytes}, index);
+            if (!index) {
+                data[8] ^= std::byte{1};
+            }
+            auto& cr = completions[index];
+            cr.flag.bs.s_r = 1;
+            cr.flag.bs.jetty = 1;
+            cr.local_id = jetty_.jetty_id.id;
+            cr.user_ctx = wr->user_ctx;
+            cr.completion_len = options_.bytes;
+        }
+        return URMA_SUCCESS;
+    });
+    EXPECT_CALL(*this, Poll(&rx_, _, _)).WillOnce([&](auto*, int, auto* cr) {
+        std::copy(completions.begin(), completions.end(), cr);
+        return 3;
+    });
+    // 第一个 payload 失败后，同批其他完成已从 CQ 取走，必须一并归还才能关闭 RX 池。
+    auto result = session_.Run(server, true);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, EILSEQ);
+    ExpectClose(false, true);
+    EXPECT_TRUE(session_.Close());
+}
+
 TEST_F(SendTestHardware, RegisterFailureWithoutErrnoIsReportedAndCanCleanUp) {
+    Open();
     ExpectClose(false);
     ASSERT_TRUE(session_.Close());
     ::testing::Mock::VerifyAndClearExpectations(this);
@@ -253,6 +307,7 @@ TEST_F(SendTestHardware, RegisterFailureWithoutErrnoIsReportedAndCanCleanUp) {
 }
 
 TEST_F(SendTestHardware, PeerMismatchFailsBeforePostingAndDeleteFailureCanRetry) {
+    Open();
     int fds[2];
     ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
     ControlChannel local(fds[0]), peer(fds[1]);

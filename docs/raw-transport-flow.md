@@ -2,7 +2,7 @@
 
 [文档入口](README.md)
 
-目前已实现显式裸设备选择、context 生命周期、共享队列池，以及普通 SEND 的提交和 TX 完成回收。双端工具把这些组件与测试用 TCP 控制协议、内存注册和接收循环串成了硬件验证闭环。正式连接协议与 socket/epoll 接入仍未实现；单 SQ 故障排空已提供显式推进接口，尚未做硬件故障验证；工具中的控制协议和 RX 循环目前属于测试工具。
+目前已实现显式裸设备选择、context 生命周期、共享队列池，普通 SEND 的提交和 TX 完成回收，以及 RX buffer 池。双端工具把这些组件与测试用 TCP 控制协议、内存注册和接收循环串成了硬件验证闭环。正式连接协议与 socket/epoll 接入仍未实现；RX 内存管理已进入 raw 层，工具中的控制协议和 payload 校验仍属于测试逻辑。单 SQ TX 排空已通过用户的硬件测试，RX 故障排空尚未实现。
 
 ## 组件与所有权
 
@@ -16,6 +16,7 @@
 | AttemptLedger         | 固定容量的 attempt 记录                                         | pool、目标指针、buffer/grant 租约标识 |
 | TxSender              | 最多 256 条 WR 的固定描述符数组                                 | ledger                                |
 | TxCompletionProcessor | 最多 64 条 CQE 的固定轮询数组                                   | ledger 及其 pool                      |
+| RxBufferPool          | 4 KiB buffer slab、注册段、接收 WR 和 lease 状态                | JettyPool 及其 context               |
 | SendTestSession       | 池、账本、发送器、注册内存和远端导入等测试资源                  | runtime 提供的 context                |
 
 RawRuntime 不包含 JettyPool，账本也不会因保存租约标识而自动管理实际内存。宿主必须使被借用的资源活到最后一次访问和 DMA 终结之后。队列、账本、post 和 poll 由同一 owner 串行推进，不允许并发或重入。
@@ -45,19 +46,19 @@ flowchart TD
 
 1. 两端准备一个 jetty、一个共享 JFR 和独立 TX/RX JFC，注册按系统页对齐的内存。工具显式将 TX/RX 深度设为 batch，TX CQ 设为 batch+1。
 2. TCP 交换 EID、jetty ID 和测试参数；发送端导入对端 RM_CTP jetty。TCP 地址用于控制通信，EID 用于 UB 数据传输。
-3. 接收端向 JFR 投递本轮接收 buffer，然后经 TCP 发出 READY。
+3. 接收端通过 `RxBufferPool::Refill(count)` 向 JFR 投递本轮接收 buffer，然后经 TCP 发出 READY。
 4. 发送端填充 payload，`TxSender::Send` 通过账本预留整批额度，将 AttemptId 写入 WR 的 user_ctx，再 post 到同一 SQ。每条 WR 可独立指定目标；连接并不独占 jetty。
 5. 发送端用 `TxCompletionProcessor::Poll` 处理 TX CQE。合法终结完成通过账本归还池额度，并返回原操作和资源引用。
-6. 接收端直接 poll RX JFC，用 user_ctx 定位 buffer，检查状态、长度、消息序号及 payload，全部正确后经 TCP 返回 ACK。
+6. 接收端通过 `RxBufferPool::Poll` 获得完成事件与 lease，检查长度、消息序号及 payload，归还全部 lease 后经 TCP 返回 ACK。
 7. 发送端等待本轮所有 TX attempt 退休且收到远端校验 ACK，才复用 buffer 进入下一轮。最后完成控制握手并显式清理。
 
 提交成功、TX 完成、远端 payload 校验是三个不同阶段。TX CQE 不代替远端应用确认。工具的逐批 READY/ACK 避免接收额度不足，因此不能用它推断吞吐、延迟或背压表现。
 
-发送组件之间的调用和失败处理见 [TX 数据路径](tx-pipeline.md)；队列容量、票据和故障隔离见 [JettyPool](jetty-pool.md)。
+发送组件之间的调用和失败处理见 [TX 数据路径](tx-pipeline.md)；接收内存及 lease 见 [RX buffer 池](rx-buffer-pool.md)；队列容量、票据和故障隔离见 [JettyPool](jetty-pool.md)。
 
 ## 退出路径
 
-正常顺序是停止新操作、排空在途收发、关闭发送器和账本、解除远端导入、关闭队列池、注销内存，再关闭 runtime（context → Uninit），最后 Unload。具体子资源顺序由其依赖决定，不能只看到发送器 Close 就释放 buffer。
+正常顺序是停止新操作、排空在途收发、关闭发送器和账本、解除远端导入、关闭 RX buffer 池并注销接收内存、关闭队列池、注销发送内存，再关闭 runtime（context → Uninit），最后 Unload。具体子资源顺序由其依赖决定，不能只看到发送器 Close 就释放 buffer。
 
 出现无法确定接受范围、未终结 DMA 或清理失败时，必须保留依赖资源，不能强行清空账本。测试工具将这类情况判为失败；当前支持 modify ERROR、等待硬件边界、软件 flush 的单 SQ 排空，详见 [TX 故障排空](tx-pipeline.md#error-continue-与单-sq-故障排空)。不自动重放或在线恢复，接受范围不可信的 Prepared 记录仍保留。
 
@@ -73,6 +74,8 @@ flowchart TD
 | 4096       | 1000     | 32    | 多轮额度/内存复用及最后不足一批 |
 | 4096       | 1024     | 256   | 当前 256 条批次上限             |
 
-接收端报告 payload validated，发送端报告 TX and remote RX confirmed。这支持当前配置下初始化、普通 SEND、完成回收、数据校验和正常清理路径可用。记录来自用户硬件运行反馈，本地未重复进行硬件测试；尚未记录设备型号、驱动/URMA 版本及对应提交号。
+接收端报告 payload validated，发送端报告 TX and remote RX confirmed。这支持当前配置下初始化、普通 SEND、完成回收、数据校验和正常清理路径可用。记录来自用户硬件运行反馈，本地未重复进行硬件测试；尚未记录设备型号、驱动/URMA 版本及对应提交号。上述记录早于接入 RxBufferPool，新接收实现尚待同配置硬件回归。
 
-未据此验证的能力包括多设备/多远端并行、持续无批间屏障收发、EAGAIN 到 EPOLLOUT 唤醒、RNR/超时、错误 CQE/软件 flush、异步事件及故障排空。单元测试中的故障注入用于验证代码契约，不能替代这些硬件专项测试。
+独立 TX 排空工具另已获得用户反馈：accepted=retired=256，ACK_TIMEOUT_ERR=253、RNR_RETRY_CNT_EXC_ERR=3、flush_done=1，ERROR SQ 拒绝新发送且两端资源关闭。该次运行没有非零 FLUSH_ERR 或 WR_UNHANDLED。
+
+未据此验证的能力包括多设备/多远端并行、持续无批间屏障收发、EAGAIN 到 EPOLLOUT 唤醒、非零软件 flush、异步事件及 RX 故障排空。单元测试中的故障注入用于验证代码契约，不能替代这些硬件专项测试。

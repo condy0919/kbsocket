@@ -22,9 +22,10 @@ std::uint32_t Get32(std::span<const std::byte> wire) noexcept {
 }
 } // namespace
 std::expected<void, SendTestError> ValidateOptions(const SendTestOptions& o) noexcept {
-    if (o.bytes < 8 || o.bytes > 1024 * 1024 || !o.messages || !o.batch || o.batch > raw::TxSender::kMaxBatch ||
-        !o.timeout_ms || o.timeout_ms > 3600000)
+    if (o.bytes < 8 || o.bytes > raw::RxBufferPool::kBufferSize || !o.messages || !o.batch ||
+        o.batch > raw::TxSender::kMaxBatch || !o.timeout_ms || o.timeout_ms > 3600000) {
         return Error("invalid test options", EINVAL);
+    }
     return {};
 }
 HelloBytes EncodeHello(const SendTestHello& hello) noexcept {

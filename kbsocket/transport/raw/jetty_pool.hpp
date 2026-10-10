@@ -42,6 +42,7 @@ struct JettyPoolConfig {
 };
 
 class JettyPool;
+class RxBufferPool;
 
 /// 物理发送队列（SQ）的稳定通道身份。
 /// - 共享通道模型：同一物理 Jetty 通道在生命周期内可同时服务多个逻辑连接与远端目标。
@@ -103,7 +104,7 @@ public:
                                              const JettyPoolConfig& config = {}) noexcept;
 
     /// 逆序销毁池内全部硬件队列资源。
-    /// 若仍有票据或尚未完成 ERROR 排空，返回 `kInUse` 并保持轮询可用；删除失败保留句柄供重试。
+    /// 若仍绑定 RX buffer 池、有票据或尚未完成 ERROR 排空，返回 `kInUse` 并保持轮询可用；删除失败保留句柄供重试。
     std::expected<void, JettyPoolFailure> Close() noexcept;
 
     /// 轮询发送完成队列（Send JFC），由调用方传入预分配的完成条目缓冲区（零动态分配）。
@@ -175,6 +176,8 @@ public:
     std::size_t available() const noexcept;
 
 private:
+    friend class RxBufferPool;
+
     enum class TicketState : std::uint8_t {
         kFree,
         kReserved,
@@ -205,6 +208,10 @@ private:
     std::expected<int, JettyPoolFailure> Poll(urma_jfc_t* jfc, JettyPoolResource resource,
                                               std::span<urma_cr_t> completions) noexcept;
 
+    // RX owner 独占 JFR/RX CQ；解除绑定前禁止关闭底层队列。
+    RxBufferPool* rx_owner_ = nullptr;
+    urma_context_t* ctx_ = nullptr;
+    std::uint32_t rx_depth_ = 0;
     urma_jfc_t* send_jfc_ = nullptr;
     urma_jfc_t* recv_jfc_ = nullptr;
     urma_jfr_t* jfr_ = nullptr;

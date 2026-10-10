@@ -26,7 +26,7 @@ RM_CTP 每个 WR 自行指定 `tjetty`，连接不独占 jetty。`Reserve()` 轮
 
 池当前不包装 post，不解析 CQE，也不拥有连接或 DMA buffer。调用方须在发送账本中关联票据、ConnId/OpId、目标和 buffer/grant 租约；批量 post、登记和 poll 不得重入。聚合完成须由上层识别实际终结的 WR 并逐条退休，不能按 CQE 条数释放额度，`FLUSH_ERR_DONE` 不对应用户票据。逐 WR 身份与状态校验由池和[AttemptLedger](tx-pipeline.md) 协作完成；账本仅记录逻辑 WR，不暴露 provider 的硬件队列布局。
 
-`MarkFaulted(lane)` 阻止整个 SQ 的新预留及 Get，但允许确认先前已接受的 WR、取消未提交票据及退休终结 WR，不重放请求。只要仍有预留或在途票据，Close 返回 kInUse 并保持轮询可用；若已开始硬件排空，还必须消费 FLUSH_ERR_DONE 并确认软件队列为空，之后才按依赖逆序销毁。关闭连接不销毁共享队列，也不取消其已提交票据；共享 SQ 上其他连接可继续发送。接收 WR、导入对象及 DMA 内存的关闭顺序仍由上层管理。
+`MarkFaulted(lane)` 阻止整个 SQ 的新预留及 Get，但允许确认先前已接受的 WR、取消未提交票据及退休终结 WR，不重放请求。只要仍有预留或在途票据，Close 返回 kInUse 并保持轮询可用；若已开始硬件排空，还必须消费 FLUSH_ERR_DONE 并确认软件队列为空，之后才按依赖逆序销毁。关闭连接不销毁共享队列，也不取消其已提交票据；共享 SQ 上其他连接可继续发送。绑定 [RxBufferPool](rx-buffer-pool.md) 后，须先终结全部 RX WR、归还 lease 并关闭 RX 池；仍有绑定时 JettyPool::Close 返回 kInUse。导入对象和发送 DMA 内存的关闭顺序仍由上层管理。
 
 ## 通过 gflags 设置队列深度
 

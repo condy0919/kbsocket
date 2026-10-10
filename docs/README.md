@@ -9,6 +9,7 @@
 | [DeviceCatalog](device-catalog-reference.md) | 裸设备筛选、EID 快照、查找与指针生命周期 |
 | [JettyPool](jetty-pool.md) | 两个 JFC、共享 JFR、多 jetty、配置与逐 WR 额度 |
 | [TX 数据路径](tx-pipeline.md) | AttemptLedger、TxSender、TxCompletionProcessor 的配合与单 SQ 故障排空 |
+| [RX buffer 池](rx-buffer-pool.md) | 4 KiB 注册内存、共享 JFR 投递、完成 lease 与归还 |
 | [日志](logging.md) | 日志封装及 gflags 配置 |
 | [device_info 工具](../tools/capabilities/README.md) | 设备能力查看 |
 | [双端 SEND 测试](../tools/send_test/README.md) | 编译、运行参数、结果判定与故障诊断 |

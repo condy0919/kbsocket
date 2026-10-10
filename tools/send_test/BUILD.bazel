@@ -11,6 +11,7 @@ cc_library(
     deps = [
         "//kbsocket/transport/raw:attempt_ledger",
         "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:rx_buffer_pool",
         "//kbsocket/transport/raw:tx_completion_processor",
         "//kbsocket/transport/raw:tx_sender",
         "//kbsocket/transport/raw:urma_api",

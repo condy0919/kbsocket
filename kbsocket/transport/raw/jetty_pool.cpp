@@ -228,11 +228,16 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
     ++epoch_;
     next_lane_ = 0;
     tx_depth_ = tx_depth;
+    rx_depth_ = rx_depth;
+    ctx_ = ctx;
     ready_ = true;
     return {};
 }
 
 std::expected<void, JettyPoolFailure> JettyPool::Close() noexcept {
+    if (rx_owner_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kInUse));
+    }
     // 票据必须全部退休；已经切 ERROR 的队列还须消费边界并完成软件排空，避免丢下 fake CQE。
     // 拒绝关闭时刻意保持 ready_ 为 true，确保调用方仍可继续调用 PollSend/PollRecv 与 Complete 推进排空。
     for (std::uint32_t i = 0; i < slots_.size(); ++i) {

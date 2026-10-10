@@ -14,6 +14,7 @@
 
 #include "kbsocket/transport/raw/attempt_ledger.hpp"
 #include "kbsocket/transport/raw/jetty_pool.hpp"
+#include "kbsocket/transport/raw/rx_buffer_pool.hpp"
 #include "kbsocket/transport/raw/tx_completion_processor.hpp"
 #include "kbsocket/transport/raw/tx_sender.hpp"
 
@@ -44,7 +45,7 @@ std::expected<std::uint64_t, SendTestError> CheckPayload(std::span<const std::by
 class SendTestSession {
 public:
     std::expected<void, SendTestError> Open(urma_context_t* ctx, const urma_device_cap_t& cap,
-                                            const SendTestOptions& options);
+                                            const SendTestOptions& options, bool server = false);
     std::expected<void, SendTestError> Run(ControlChannel& channel, bool server);
     std::expected<void, SendTestError> Close() noexcept;
 
@@ -58,6 +59,7 @@ private:
     urma_target_seg_t* segment_ = nullptr;
     urma_target_jetty_t* remote_ = nullptr;
     raw::JettyPool pool_;
+    raw::RxBufferPool rx_buffers_;
     raw::AttemptLedger ledger_;
     raw::TxSender sender_;
     raw::TxCompletionProcessor processor_{ledger_};
@@ -65,12 +67,10 @@ private:
     // buffer_ 内的页对齐注册范围，包含向上取整的尾部；不单独拥有内存。
     std::span<std::byte> registered_buffer_;
     std::array<urma_sge_t, kBatch> sges_{};
-    std::array<urma_jfr_wr_t, kBatch> recv_wrs_{};
     std::array<raw::TxSendRequest, kBatch> requests_{};
     std::array<raw::AttemptId, kBatch> ids_{};
-    std::array<bool, kBatch> seen_slots_{};
     std::array<bool, kBatch> seen_messages_{};
-    std::uint32_t pending_rx_ = 0;
+    bool server_ = false;
     bool unsafe_ = false;
 };
 } // namespace tools
