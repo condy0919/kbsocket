@@ -8,8 +8,11 @@
 #include <print>
 #include <string>
 
+#include "tools/import_jetty_test/control_plane.hpp"
 #include "tools/import_jetty_test/import_test.hpp"
 #include <gflags/gflags.h>
+
+#include "kbsocket/base/scope_exit.hpp"
 
 DEFINE_bool(server, false, "Export 100 jettys; omit on importing client");
 DEFINE_string(address, "127.0.0.1", "Numeric IPv4: server bind address or client peer address");
@@ -19,10 +22,12 @@ DEFINE_uint32(eid_index, 0, "Local EID index");
 DEFINE_string(library, "liburma.so", "URMA shared library path");
 DEFINE_int32(priority, -1, "CTP priority, -1 selects first advertised CTP priority");
 DEFINE_uint32(timeout_ms, 120000, "Timeout per TCP operation; does not interrupt a URMA call");
+DEFINE_bool(control_plane, false, "Measure RM_CTP control-plane resource lifecycle on both peers");
 DEFINE_bool(all_samples, false, "Print all 100 samples as CSV after measurement");
 
 namespace {
 using kbsocket::raw::UrmaApi;
+using kbsocket::tools::ControlApi;
 using kbsocket::tools::ToolError;
 auto Error(const char* operation, int code = errno) noexcept {
     return std::unexpected(ToolError{operation, code});
@@ -32,6 +37,17 @@ auto Error(const char* operation, int code = errno) noexcept {
 class Environment {
 public:
     ~Environment() {
+        // 报告必须晚于所有释放操作，包括失败路径上的清理。
+        kbsocket::ScopeExit report([&]() noexcept {
+            if (FLAGS_control_plane) {
+                try {
+                    std::println("CONTROL_PLANE role={} unit=ns", FLAGS_server ? "server" : "client");
+                    timings.Print(stdout, FLAGS_all_samples);
+                } catch (...) {
+                    std::fprintf(stderr, "Failed to print control-plane report\n");
+                }
+            }
+        });
         if (auto result = Close(); !result) {
             std::fprintf(stderr, "Cleanup failed: %s (%d); dependencies retained until process exit\n",
                          result.error().operation, result.error().code);
@@ -44,15 +60,20 @@ public:
             return Error("load URMA", EINVAL);
         }
         loaded_ = true;
+        if (FLAGS_control_plane) {
+            if (auto result = extra.Load(FLAGS_library.c_str()); !result) {
+                return result;
+            }
+        }
         urma_init_attr_t init{};
-        auto rc = UrmaApi::Init(&init);
+        auto rc = Call(ControlApi::Init, [&] { return UrmaApi::Init(&init); });
         if (rc != URMA_SUCCESS) {
             return Error("init URMA", rc);
         }
         initialized_ = true;
         UrmaApi::LogSetLevel(URMA_VLOG_LEVEL_ERR);
         int count = 0;
-        devices_ = UrmaApi::GetDeviceList(&count);
+        devices_ = Call(ControlApi::GetDeviceList, [&] { return UrmaApi::GetDeviceList(&count); });
         if (!devices_) {
             return Error("get device list");
         }
@@ -67,7 +88,7 @@ public:
             return Error("UB device not found", ENODEV);
         }
         urma_device_attr_t attr{};
-        rc = UrmaApi::QueryDevice(device, &attr);
+        rc = Call(ControlApi::QueryDevice, [&] { return UrmaApi::QueryDevice(device, &attr); });
         if (rc != URMA_SUCCESS) {
             return Error("query device", rc);
         }
@@ -76,29 +97,32 @@ public:
             return std::unexpected(selected.error());
         }
         priority = *selected;
-        ctx_ = UrmaApi::CreateContext(device, FLAGS_eid_index);
+        ctx_ = Call(ControlApi::CreateContext, [&] { return UrmaApi::CreateContext(device, FLAGS_eid_index); });
         if (!ctx_) {
             return Error("create context");
         }
         return session.Open(ctx_, attr.dev_cap, priority);
     }
     std::expected<void, ToolError> Close() noexcept {
+        if (auto result = control.Close(); !result) {
+            return result;
+        }
         if (auto result = session.Close(); !result) {
             return result;
         }
         if (ctx_) {
-            const auto rc = UrmaApi::DeleteContext(ctx_);
+            const auto rc = Call(ControlApi::DeleteContext, [&] { return UrmaApi::DeleteContext(ctx_); });
             if (rc != URMA_SUCCESS) {
                 return Error("delete context", rc);
             }
             ctx_ = nullptr;
         }
         if (devices_) {
-            UrmaApi::FreeDeviceList(devices_);
+            Call(ControlApi::FreeDeviceList, [&] { return UrmaApi::FreeDeviceList(devices_); });
             devices_ = nullptr;
         }
         if (initialized_) {
-            const auto rc = UrmaApi::Uninit();
+            const auto rc = Call(ControlApi::Uninit, [&] { return UrmaApi::Uninit(); });
             if (rc != URMA_SUCCESS) {
                 return Error("uninit URMA", rc);
             }
@@ -112,10 +136,23 @@ public:
         }
         return {};
     }
-    kbsocket::tools::ImportSession session;
+    kbsocket::tools::ApiTimings timings;
+    kbsocket::tools::ControlPlaneApis extra;
+    kbsocket::tools::ImportSession session{FLAGS_control_plane ? &timings : nullptr};
+    kbsocket::tools::ControlPlaneSession control{timings, extra};
+    std::expected<void, ToolError> RunControlPlane(kbsocket::tools::ControlChannel& channel) {
+        if (auto result = control.RunLocal(ctx_, priority, session.jettys()); !result) {
+            return result;
+        }
+        return control.RunSegments(channel, FLAGS_server, FLAGS_timeout_ms);
+    }
     unsigned priority = 0;
 
 private:
+    template <typename F>
+    auto Call(ControlApi api, F&& function) -> std::invoke_result_t<F> {
+        return kbsocket::tools::MeasureApi(FLAGS_control_plane ? &timings : nullptr, api, std::forward<F>(function));
+    }
     bool loaded_ = false;
     bool initialized_ = false;
     urma_device_t** devices_ = nullptr;
@@ -143,6 +180,9 @@ int Run() {
     auto connected =
         channel.Open(FLAGS_server, FLAGS_address.c_str(), static_cast<std::uint16_t>(FLAGS_port), FLAGS_timeout_ms);
     auto result = connected ? env.session.Run(channel, FLAGS_server, FLAGS_timeout_ms) : connected;
+    if (result && FLAGS_control_plane) {
+        result = env.RunControlPlane(channel);
+    }
     if (!result) {
         std::println(stderr, "FAIL: {}: {}; completed_imports={}", result.error().operation, result.error().code,
                      env.session.completed());
@@ -169,13 +209,17 @@ int Run() {
         std::println(stderr, "FAIL cleanup: {}: {}", closed.error().operation, closed.error().code);
         return 1;
     }
+    if (FLAGS_control_plane && env.timings.HasFailures()) {
+        std::println(stderr, "Control-plane suite completed with API failures; see per-API report");
+        return 1;
+    }
     std::println("PASS: 100 imports completed; no application data WRs posted");
     return 0;
 }
 } // namespace
 
 int main(int argc, char** argv) {
-    gflags::SetUsageMessage("--device DEVICE [--server] --address IPv4 [--all_samples]");
+    gflags::SetUsageMessage("--device DEVICE [--server] --address IPv4 [--all_samples] [--control_plane]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     if (argc != 1) {
         std::fprintf(stderr, "Unexpected positional arguments\n");

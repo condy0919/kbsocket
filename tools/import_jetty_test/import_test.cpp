@@ -20,14 +20,18 @@ auto Error(const char* operation, int code = errno) noexcept {
     return std::unexpected(ToolError{operation, code});
 }
 using Blob = std::unique_ptr<void, decltype(&std::free)>;
-constexpr std::uint32_t kHello = 0x494d5001;
+constexpr std::uint32_t kHello = 0x494d5002;
 constexpr std::uint32_t kDone = 0x444f4e45;
 constexpr std::uint32_t kAck = 0x41434b31;
 
 // rjetty 扩展由 provider 定义，按 URMA perftest 的做法完整传输；仅支持相同 ABI 的可信双端。
-std::expected<void, ToolError> ExchangeHeader(ControlChannel& channel, std::uint32_t timeout) {
-    const std::array<std::uint32_t, 5> fields{kHello, kImportCount, sizeof(urma_rjetty_t), sizeof(void*),
-                                              std::endian::native == std::endian::little ? 1u : 2u};
+std::expected<void, ToolError> ExchangeHeader(ControlChannel& channel, std::uint32_t timeout, bool control_plane) {
+    const std::array<std::uint32_t, 6> fields{kHello,
+                                              kImportCount,
+                                              sizeof(urma_rjetty_t),
+                                              sizeof(void*),
+                                              std::endian::native == std::endian::little ? 1u : 2u,
+                                              control_plane ? 1u : 0u};
     for (auto value : fields) {
         if (auto result = channel.SendMarker(value, timeout); !result) {
             return result;
@@ -92,11 +96,11 @@ std::expected<void, ToolError> ImportSession::Open(urma_context_t* ctx, const ur
     ctx_ = ctx;
     urma_jfc_cfg_t cq{};
     cq.depth = 64;
-    send_cq_ = UrmaApi::CreateJfc(ctx, &cq);
+    send_cq_ = MeasureApi(timings_, ControlApi::CreateJfc, [&] { return UrmaApi::CreateJfc(ctx, &cq); });
     if (!send_cq_) {
         return Error("create send JFC");
     }
-    recv_cq_ = UrmaApi::CreateJfc(ctx, &cq);
+    recv_cq_ = MeasureApi(timings_, ControlApi::CreateJfc, [&] { return UrmaApi::CreateJfc(ctx, &cq); });
     if (!recv_cq_) {
         return Error("create receive JFC");
     }
@@ -107,7 +111,7 @@ std::expected<void, ToolError> ImportSession::Open(urma_context_t* ctx, const ur
     recv.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
     recv.jfc = recv_cq_;
     recv.flag.bs.token_policy = URMA_TOKEN_NONE;
-    jfr_ = UrmaApi::CreateJfr(ctx, &recv);
+    jfr_ = MeasureApi(timings_, ControlApi::CreateJfr, [&] { return UrmaApi::CreateJfr(ctx, &recv); });
     if (!jfr_) {
         return Error("create JFR");
     }
@@ -124,7 +128,7 @@ std::expected<void, ToolError> ImportSession::Open(urma_context_t* ctx, const ur
         cfg.jfs_cfg.jfc = send_cq_;
         cfg.shared.jfr = jfr_;
         cfg.shared.jfc = recv_cq_;
-        jetty = UrmaApi::CreateJetty(ctx, &cfg);
+        jetty = MeasureApi(timings_, ControlApi::CreateJetty, [&] { return UrmaApi::CreateJetty(ctx, &cfg); });
         if (!jetty) {
             return Error("create jetty");
         }
@@ -137,18 +141,21 @@ std::expected<void, ToolError> ImportSession::Run(ControlChannel& channel, bool 
         return Error("session incomplete or already measured", EINVAL);
     }
     ran_ = true;
-    if (auto result = ExchangeHeader(channel, timeout); !result) {
+    if (auto result = ExchangeHeader(channel, timeout, timings_ != nullptr); !result) {
         return result;
     }
     if (server) {
         for (auto* jetty : jettys_) {
             urma_rjetty_t* descriptor = nullptr;
             std::uint32_t length = 0;
-            const auto rc = UrmaApi::GetRjetty(jetty, &descriptor, &length);
+            const auto rc = MeasureApi(timings_, ControlApi::GetRjetty,
+                                       [&] { return UrmaApi::GetRjetty(jetty, &descriptor, &length); });
             if (rc != URMA_SUCCESS || !descriptor) {
                 return Error("get rjetty", rc);
             }
-            ScopeExit release([&]() noexcept { UrmaApi::PutRjetty(descriptor); });
+            ScopeExit release([&]() noexcept {
+                MeasureApi(timings_, ControlApi::PutRjetty, [&] { return UrmaApi::PutRjetty(descriptor); });
+            });
             // GetRjetty 不一定填 tp_type，显式设置 CTP，保留全部 bonding 扩展。
             descriptor->tp_type = URMA_CTP;
             auto bytes = std::span(reinterpret_cast<const std::byte*>(descriptor), length);
@@ -212,6 +219,9 @@ std::expected<void, ToolError> ImportSession::Run(ControlChannel& channel, bool 
         const int error = errno;
         targets_[i] = target;
         samples_[i] = std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
+        if (timings_) {
+            timings_->Record(ControlApi::ImportJetty, samples_[i], target != nullptr, target ? 0 : error);
+        }
         if (!target) {
             return Error("import jetty (see completed count)", error);
         }
@@ -229,7 +239,8 @@ std::expected<void, ToolError> ImportSession::Run(ControlChannel& channel, bool 
 std::expected<void, ToolError> ImportSession::UnimportAll() noexcept {
     for (auto it = targets_.rbegin(); it != targets_.rend(); ++it) {
         if (*it) {
-            const auto rc = UrmaApi::UnimportJetty(*it);
+            const auto rc =
+                MeasureApi(timings_, ControlApi::UnimportJetty, [&] { return UrmaApi::UnimportJetty(*it); });
             if (rc != URMA_SUCCESS) {
                 return Error("unimport jetty", rc);
             }
@@ -245,7 +256,7 @@ std::expected<void, ToolError> ImportSession::Close() noexcept {
     }
     for (auto it = jettys_.rbegin(); it != jettys_.rend(); ++it) {
         if (*it) {
-            const auto rc = UrmaApi::DeleteJetty(*it);
+            const auto rc = MeasureApi(timings_, ControlApi::DeleteJetty, [&] { return UrmaApi::DeleteJetty(*it); });
             if (rc != URMA_SUCCESS) {
                 return Error("delete jetty", rc);
             }
@@ -253,7 +264,7 @@ std::expected<void, ToolError> ImportSession::Close() noexcept {
         }
     }
     if (jfr_) {
-        const auto rc = UrmaApi::DeleteJfr(jfr_);
+        const auto rc = MeasureApi(timings_, ControlApi::DeleteJfr, [&] { return UrmaApi::DeleteJfr(jfr_); });
         if (rc != URMA_SUCCESS) {
             return Error("delete JFR", rc);
         }
@@ -261,7 +272,7 @@ std::expected<void, ToolError> ImportSession::Close() noexcept {
     }
     for (auto** cq : {&recv_cq_, &send_cq_}) {
         if (*cq) {
-            const auto rc = UrmaApi::DeleteJfc(*cq);
+            const auto rc = MeasureApi(timings_, ControlApi::DeleteJfc, [&] { return UrmaApi::DeleteJfc(*cq); });
             if (rc != URMA_SUCCESS) {
                 return Error("delete JFC", rc);
             }

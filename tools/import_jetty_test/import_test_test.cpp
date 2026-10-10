@@ -136,14 +136,16 @@ protected:
     void SetUp() override {
         state = {};
     }
-    void RunPair(bool extension, int fail_import = 0, bool fail_cleanup = false) {
+    void RunPair(bool extension, int fail_import = 0, bool fail_cleanup = false, bool profile = false) {
         state.extension = extension;
         state.fail_import = fail_import;
         state.fail_unimport = fail_cleanup;
         raw::test_support::ScopedUrmaOverride override(Functions());
         urma_context_t context{};
-        ImportSession server;
-        ImportSession client;
+        ApiTimings server_timings;
+        ApiTimings client_timings;
+        ImportSession server(profile ? &server_timings : nullptr);
+        ImportSession client(profile ? &client_timings : nullptr);
         ASSERT_TRUE(server.Open(&context, Capabilities(), 3));
         ASSERT_TRUE(client.Open(&context, Capabilities(), 3));
         int sockets[2];
@@ -175,6 +177,15 @@ protected:
         EXPECT_EQ(state.deleted, 200);
         EXPECT_EQ(state.exports, 100);
         EXPECT_EQ(state.released, 100);
+        if (profile) {
+            // 扩展计时仍保持原导入场景；释放、导出也必须进入各自 API 的统计。
+            EXPECT_EQ(client_timings.measurements(ControlApi::ImportJetty).count, 100u);
+            EXPECT_EQ(client_timings.measurements(ControlApi::UnimportJetty).count, 100u);
+            EXPECT_EQ(client_timings.measurements(ControlApi::DeleteJetty).count, 100u);
+            EXPECT_EQ(server_timings.measurements(ControlApi::GetRjetty).count, 100u);
+            EXPECT_EQ(server_timings.measurements(ControlApi::PutRjetty).count, 100u);
+            EXPECT_FALSE(client_timings.HasFailures());
+        }
     }
 };
 
@@ -189,6 +200,36 @@ TEST_F(ImportTest, FailedImportCleansSuccessfulPrefix) {
 }
 TEST_F(ImportTest, FailedUnimportRetainsDependenciesForRetry) {
     RunPair(false, 0, true);
+}
+
+TEST_F(ImportTest, ProfileIncludesOriginalImportAndCleanup) {
+    RunPair(true, 0, false, true);
+}
+
+TEST_F(ImportTest, DifferentControlPlaneModesFailBeforeImport) {
+    raw::test_support::ScopedUrmaOverride override(Functions());
+    urma_context_t context{};
+    ApiTimings timings;
+    ImportSession server;
+    ImportSession client(&timings);
+    ASSERT_TRUE(server.Open(&context, Capabilities(), 3));
+    ASSERT_TRUE(client.Open(&context, Capabilities(), 3));
+    int sockets[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+    std::expected<void, ToolError> server_result;
+    std::thread peer([&] {
+        ControlChannel channel(sockets[0]);
+        server_result = server.Run(channel, true, 5000);
+    });
+    {
+        ControlChannel channel(sockets[1]);
+        EXPECT_FALSE(client.Run(channel, false, 5000));
+    }
+    peer.join();
+    EXPECT_FALSE(server_result);
+    EXPECT_EQ(state.imports, 0);
+    EXPECT_TRUE(client.Close());
+    EXPECT_TRUE(server.Close());
 }
 
 TEST_F(ImportTest, PartialQueueCreationCanBeClosed) {
