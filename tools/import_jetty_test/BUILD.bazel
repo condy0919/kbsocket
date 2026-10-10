@@ -3,8 +3,8 @@ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 
 cc_library(
     name = "import_test_support",
-    srcs = ["import_test.cpp", "api_timings.cpp", "control_plane.cpp"],
-    hdrs = ["import_test.hpp", "api_timings.hpp", "control_plane.hpp"],
+    srcs = ["import_test.cpp", "api_timings.cpp", "control_plane.cpp", "import_stress.cpp"],
+    hdrs = ["import_test.hpp", "api_timings.hpp", "control_plane.hpp", "import_stress.hpp"],
     deps = [
         "//kbsocket/base:scope_exit",
         "//kbsocket/transport/raw:urma_api",
@@ -20,7 +20,7 @@ cc_binary(
 
 cc_test(
     name = "import_test_test",
-    srcs = ["import_test_test.cpp", "control_plane_test.cpp"],
+    srcs = ["import_test_test.cpp", "control_plane_test.cpp", "import_stress_test.cpp"],
     deps = [
         ":import_test_support",
         "//kbsocket/transport/raw:urma_test_support",

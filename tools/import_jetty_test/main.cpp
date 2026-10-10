@@ -23,7 +23,10 @@ DEFINE_string(library, "liburma.so", "URMA shared library path");
 DEFINE_int32(priority, -1, "CTP priority, -1 selects first advertised CTP priority");
 DEFINE_uint32(timeout_ms, 120000, "Timeout per TCP operation; does not interrupt a URMA call");
 DEFINE_bool(control_plane, false, "Measure RM_CTP control-plane resource lifecycle on both peers");
-DEFINE_bool(all_samples, false, "Print all 100 samples as CSV after measurement");
+DEFINE_bool(all_samples, false, "Print per-call samples as CSV after measurement");
+DEFINE_bool(stress, false, "Concurrent import only; retain targets until all workers finish (both peers)");
+DEFINE_uint32(import_count, 10000, "Client stress import count, reusing 100 remote jetty descriptors");
+DEFINE_uint32(import_threads, 8, "Client stress worker count, sharing one context");
 
 namespace {
 using kbsocket::raw::UrmaApi;
@@ -162,7 +165,10 @@ private:
 int Run() {
     if (FLAGS_device.empty() || FLAGS_library.empty() || FLAGS_port == 0 || FLAGS_port > 65535 ||
         FLAGS_timeout_ms == 0 || FLAGS_timeout_ms > 3600000 || FLAGS_priority < -1 ||
-        FLAGS_priority > URMA_MAX_PRIORITY) {
+        FLAGS_priority > URMA_MAX_PRIORITY || (FLAGS_stress && FLAGS_control_plane) || FLAGS_import_count == 0 ||
+        FLAGS_import_count > 10000000 || FLAGS_import_threads == 0 || FLAGS_import_threads > 256 ||
+        FLAGS_import_threads > FLAGS_import_count ||
+        (!FLAGS_stress && (FLAGS_import_count != 10000 || FLAGS_import_threads != 8))) {
         std::println(stderr, "Invalid arguments; --device is required. See --help.");
         return 2;
     }
@@ -179,7 +185,11 @@ int Run() {
     std::fflush(stdout);
     auto connected =
         channel.Open(FLAGS_server, FLAGS_address.c_str(), static_cast<std::uint16_t>(FLAGS_port), FLAGS_timeout_ms);
-    auto result = connected ? env.session.Run(channel, FLAGS_server, FLAGS_timeout_ms) : connected;
+    const kbsocket::tools::StressOptions stress{FLAGS_stress, FLAGS_import_count, FLAGS_import_threads};
+    auto result = connected ? env.session.Run(channel, FLAGS_server, FLAGS_timeout_ms, stress) : connected;
+    if (FLAGS_stress && !FLAGS_server && connected) {
+        env.session.stress().Print(FLAGS_all_samples);
+    }
     if (result && FLAGS_control_plane) {
         result = env.RunControlPlane(channel);
     }
@@ -188,7 +198,7 @@ int Run() {
                      env.session.completed());
         return 1;
     }
-    if (!FLAGS_server) {
+    if (!FLAGS_server && !FLAGS_stress) {
         const auto& samples = env.session.samples();
         auto sorted = samples;
         std::sort(sorted.begin(), sorted.end());
@@ -213,13 +223,18 @@ int Run() {
         std::println(stderr, "Control-plane suite completed with API failures; see per-API report");
         return 1;
     }
-    std::println("PASS: 100 imports completed; no application data WRs posted");
+    if (FLAGS_stress) {
+        std::println("PASS: import stress session completed; no application data WRs posted");
+    } else {
+        std::println("PASS: 100 imports completed; no application data WRs posted");
+    }
     return 0;
 }
 } // namespace
 
 int main(int argc, char** argv) {
-    gflags::SetUsageMessage("--device DEVICE [--server] --address IPv4 [--all_samples] [--control_plane]");
+    gflags::SetUsageMessage("--device DEVICE [--server] --address IPv4 [--all_samples] [--control_plane | --stress "
+                            "--import_threads N --import_count N]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     if (argc != 1) {
         std::fprintf(stderr, "Unexpected positional arguments\n");

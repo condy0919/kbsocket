@@ -20,18 +20,20 @@ auto Error(const char* operation, int code = errno) noexcept {
     return std::unexpected(ToolError{operation, code});
 }
 using Blob = std::unique_ptr<void, decltype(&std::free)>;
-constexpr std::uint32_t kHello = 0x494d5002;
+constexpr std::uint32_t kHello = 0x494d5003;
 constexpr std::uint32_t kDone = 0x444f4e45;
 constexpr std::uint32_t kAck = 0x41434b31;
 
 // rjetty 扩展由 provider 定义，按 URMA perftest 的做法完整传输；仅支持相同 ABI 的可信双端。
-std::expected<void, ToolError> ExchangeHeader(ControlChannel& channel, std::uint32_t timeout, bool control_plane) {
-    const std::array<std::uint32_t, 6> fields{kHello,
+std::expected<void, ToolError> ExchangeHeader(ControlChannel& channel, std::uint32_t timeout, bool control_plane,
+                                              bool stress) {
+    const std::array<std::uint32_t, 7> fields{kHello,
                                               kImportCount,
                                               sizeof(urma_rjetty_t),
                                               sizeof(void*),
                                               std::endian::native == std::endian::little ? 1u : 2u,
-                                              control_plane ? 1u : 0u};
+                                              control_plane ? 1u : 0u,
+                                              stress ? 1u : 0u};
     for (auto value : fields) {
         if (auto result = channel.SendMarker(value, timeout); !result) {
             return result;
@@ -136,12 +138,13 @@ std::expected<void, ToolError> ImportSession::Open(urma_context_t* ctx, const ur
     return {};
 }
 
-std::expected<void, ToolError> ImportSession::Run(ControlChannel& channel, bool server, std::uint32_t timeout) {
-    if (!jettys_.back() || ran_) {
+std::expected<void, ToolError> ImportSession::Run(ControlChannel& channel, bool server, std::uint32_t timeout,
+                                                  StressOptions stress) {
+    if (!jettys_.back() || ran_ || (stress.enabled && timings_)) {
         return Error("session incomplete or already measured", EINVAL);
     }
     ran_ = true;
-    if (auto result = ExchangeHeader(channel, timeout, timings_ != nullptr); !result) {
+    if (auto result = ExchangeHeader(channel, timeout, timings_ != nullptr, stress.enabled); !result) {
         return result;
     }
     if (server) {
@@ -178,6 +181,8 @@ std::expected<void, ToolError> ImportSession::Run(ControlChannel& channel, bool 
 
     std::vector<Blob> descriptors;
     descriptors.reserve(kImportCount);
+    std::vector<std::span<const std::byte>> descriptor_views;
+    descriptor_views.reserve(kImportCount);
     for (std::size_t i = 0; i < kImportCount; ++i) {
         std::array<std::byte, 4> wire{};
         if (auto result = channel.Read(wire, timeout); !result) {
@@ -201,7 +206,24 @@ std::expected<void, ToolError> ImportSession::Run(ControlChannel& channel, bool 
         if (auto result = ValidateDescriptor(bytes); !result) {
             return result;
         }
+        descriptor_views.push_back(bytes);
         descriptors.push_back(std::move(blob));
+    }
+
+    if (stress.enabled) {
+        const auto measured = stress_.Run(ctx_, descriptor_views, stress);
+        completed_ = stress_.completed();
+        if (auto result = stress_.Close(); !result) {
+            return result;
+        }
+        // 即使 import 失败，也先完成清理屏障，避免服务端提前删除被引用的 jetty。
+        if (auto result = channel.SendMarker(kDone, timeout); !result) {
+            return result;
+        }
+        if (auto result = channel.ExpectMarker(kAck, timeout); !result) {
+            return result;
+        }
+        return measured;
     }
 
     // 所有网络交换、分配、预触页在计时前完成；不预热 import，不在循环中输出。
@@ -251,6 +273,9 @@ std::expected<void, ToolError> ImportSession::UnimportAll() noexcept {
 }
 
 std::expected<void, ToolError> ImportSession::Close() noexcept {
+    if (auto result = stress_.Close(); !result) {
+        return result;
+    }
     if (auto result = UnimportAll(); !result) {
         return result;
     }

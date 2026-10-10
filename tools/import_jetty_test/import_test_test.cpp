@@ -136,7 +136,8 @@ protected:
     void SetUp() override {
         state = {};
     }
-    void RunPair(bool extension, int fail_import = 0, bool fail_cleanup = false, bool profile = false) {
+    void RunPair(bool extension, int fail_import = 0, bool fail_cleanup = false, bool profile = false,
+                 bool stress = false) {
         state.extension = extension;
         state.fail_import = fail_import;
         state.fail_unimport = fail_cleanup;
@@ -153,11 +154,11 @@ protected:
         std::expected<void, ToolError> server_result;
         std::thread peer([&] {
             ControlChannel channel(sockets[0]);
-            server_result = server.Run(channel, true, 5000);
+            server_result = server.Run(channel, true, 5000, {stress, 100, 1});
         });
         {
             ControlChannel channel(sockets[1]);
-            auto result = client.Run(channel, false, 5000);
+            auto result = client.Run(channel, false, 5000, {stress, 100, 1});
             EXPECT_EQ(result.has_value(), fail_import == 0 && !fail_cleanup);
             EXPECT_EQ(client.completed(), fail_import ? static_cast<unsigned>(fail_import - 1) : 100u);
             if (fail_cleanup) {
@@ -200,6 +201,37 @@ TEST_F(ImportTest, FailedImportCleansSuccessfulPrefix) {
 }
 TEST_F(ImportTest, FailedUnimportRetainsDependenciesForRetry) {
     RunPair(false, 0, true);
+}
+
+TEST_F(ImportTest, StressExchangePreservesBondingDescriptorsAndCleanupBarrier) {
+    RunPair(true, 0, false, false, true);
+}
+TEST_F(ImportTest, StressFailureStillCompletesPeerCleanupBarrier) {
+    // stress 在失败后等待所有 worker 并释放成功对象，服务端正常收到 done。
+    state.extension = true;
+    state.fail_import = 37;
+    raw::test_support::ScopedUrmaOverride override(Functions());
+    urma_context_t context{};
+    ImportSession server;
+    ImportSession client;
+    ASSERT_TRUE(server.Open(&context, Capabilities(), 3));
+    ASSERT_TRUE(client.Open(&context, Capabilities(), 3));
+    int sockets[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+    std::expected<void, ToolError> server_result;
+    std::thread peer([&] {
+        ControlChannel channel(sockets[0]);
+        server_result = server.Run(channel, true, 5000, {true, 100, 1});
+    });
+    {
+        ControlChannel channel(sockets[1]);
+        EXPECT_FALSE(client.Run(channel, false, 5000, {true, 100, 1}));
+        EXPECT_EQ(state.unimports, 36);
+        EXPECT_TRUE(client.Close());
+    }
+    peer.join();
+    EXPECT_TRUE(server_result);
+    EXPECT_TRUE(server.Close());
 }
 
 TEST_F(ImportTest, ProfileIncludesOriginalImportAndCleanup) {

@@ -10,6 +10,7 @@
 
 #include "tools/common/control_channel.hpp"
 #include "tools/import_jetty_test/api_timings.hpp"
+#include "tools/import_jetty_test/import_stress.hpp"
 
 #include "kbsocket/transport/raw/urma_api.hpp"
 
@@ -30,8 +31,12 @@ public:
     ImportSession(const ImportSession&) = delete;
     ImportSession& operator=(const ImportSession&) = delete;
     std::expected<void, ToolError> Open(urma_context_t* ctx, const urma_device_cap_t& cap, unsigned priority);
-    std::expected<void, ToolError> Run(ControlChannel& channel, bool server, std::uint32_t timeout_ms);
+    std::expected<void, ToolError> Run(ControlChannel& channel, bool server, std::uint32_t timeout_ms,
+                                       StressOptions stress = {});
     std::expected<void, ToolError> Close() noexcept;
+    const ImportStress& stress() const noexcept {
+        return stress_;
+    }
     std::span<urma_jetty_t* const> jettys() const noexcept {
         return jettys_;
     }
@@ -44,6 +49,7 @@ public:
 
 private:
     std::expected<void, ToolError> UnimportAll() noexcept;
+    ImportStress stress_;
     ApiTimings* timings_;
     urma_context_t* ctx_ = nullptr;
     urma_jfc_t* send_cq_ = nullptr;
