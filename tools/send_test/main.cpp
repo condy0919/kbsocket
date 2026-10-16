@@ -19,7 +19,7 @@ DEFINE_uint32(port, 18515, "TCP control port (payload uses URMA)");
 DEFINE_string(device, "", "Raw UB device name");
 DEFINE_uint32(eid_index, 0, "Local EID index");
 DEFINE_string(library, "liburma.so", "URMA shared library path");
-DEFINE_uint32(bytes, 4096, "Bytes per SEND, 8 to 1048576 and within device capability");
+DEFINE_uint32(bytes, 4096, "Bytes per SEND, 8 to 4096 and within device capability");
 DEFINE_uint32(messages, 1024, "Total SEND messages; must match peer");
 DEFINE_uint32(batch, 32, "WRs per round, 1 to 256; must match peer");
 DEFINE_uint32(timeout_ms, 10000, "Timeout per control operation or completion batch, 1 to 3600000 ms");
@@ -75,7 +75,7 @@ int Run() {
         std::println(stderr, "QueryDevice failed: {}", static_cast<int>(queried));
         return 1;
     }
-    auto opened = hardware->session.Open(ctx, attributes.dev_cap, options);
+    auto opened = hardware->session.Open(ctx, attributes.dev_cap, options, FLAGS_server);
     if (!opened) {
         std::println(stderr, "{}: {}", opened.error().operation, opened.error().code);
         return 1;

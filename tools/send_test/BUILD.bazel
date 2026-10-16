@@ -4,17 +4,18 @@ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 cc_library(
     name = "send_test_support",
     srcs = [
-        "control_channel.cpp",
         "send_test.cpp",
+        "send_test_protocol.cpp",
     ],
     hdrs = ["send_test.hpp"],
     deps = [
-        "//kbsocket/base:scope_exit",
         "//kbsocket/transport/raw:attempt_ledger",
         "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:rx_buffer_pool",
         "//kbsocket/transport/raw:tx_completion_processor",
         "//kbsocket/transport/raw:tx_sender",
         "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
     ],
 )
 

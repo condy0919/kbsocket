@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+cc_library(
+    name = "tx_drain_test_support",
+    srcs = ["tx_drain_test.cpp"],
+    hdrs = ["tx_drain_test.hpp"],
+    deps = [
+        "//kbsocket/transport/raw:attempt_ledger",
+        "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:tx_completion_processor",
+        "//kbsocket/transport/raw:tx_sender",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+    ],
+)
+
+cc_binary(
+    name = "tx_drain_test",
+    srcs = ["main.cpp"],
+    deps = [
+        ":tx_drain_test_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:raw_runtime",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+        "@gflags",
+    ],
+)
+
+cc_test(
+    name = "tx_drain_test_test",
+    srcs = ["tx_drain_test_test.cpp"],
+    deps = [
+        ":tx_drain_test_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:urma_test_support",
+        "//tools/common:control_channel",
+        "@googletest//:gtest_main",
+    ],
+)

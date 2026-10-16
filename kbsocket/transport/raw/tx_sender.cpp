@@ -136,7 +136,7 @@ std::expected<std::size_t, TxSendError> TxSender::Send(std::span<const TxSendReq
     }
     if ((status != URMA_SUCCESS && accepted == requests.size()) || (status == URMA_SUCCESS && bad_wr)) {
         blocked_ = true;
-        auto fault = pool_->MarkFaulted(*lane);
+        auto fault = pool_->BeginDrain(*lane);
         return std::unexpected(TxSendError{
             .code = TxSendErrorCode::kProviderContract,
             .accepted = std::nullopt,
@@ -157,7 +157,7 @@ std::expected<std::size_t, TxSendError> TxSender::Send(std::span<const TxSendReq
     }
     if (accounting_error) {
         blocked_ = true;
-        auto fault = pool_->MarkFaulted(*lane);
+        auto fault = pool_->BeginDrain(*lane);
         return std::unexpected(TxSendError{
             .code = TxSendErrorCode::kAccountingFailure,
             .accepted = accepted,

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MulanPSL-2.0
+
 #ifndef KBSOCKET_TRANSPORT_RAW_TX_COMPLETION_PROCESSOR_HPP_
 #define KBSOCKET_TRANSPORT_RAW_TX_COMPLETION_PROCESSOR_HPP_
 
@@ -11,7 +12,7 @@
 
 #include "kbsocket/transport/raw/attempt_ledger.hpp"
 #include "kbsocket/transport/raw/jetty_pool.hpp"
-#include "kbsocket/transport/raw/urma_api.hpp"
+#include "kbsocket/transport/raw/urma_api.hpp" // IWYU pragma: keep
 
 namespace kbsocket {
 namespace raw {
@@ -24,6 +25,7 @@ enum class TxCompletionErrorCode : std::uint8_t {
     kWrongLane,
     kLedgerFailure,
     kPoolFailure,
+    kFlushFailed,
 };
 
 struct TxCompletionError {
@@ -47,6 +49,7 @@ struct TxCompletionEvent {
     /// 仅 kCompleted 有退休记录；成功或失败由 completion.status 判断。
     /// 租约标识交回上层后，仍需按协议决定 buffer/grant 的回收时机。
     std::optional<AttemptRecord> record;
+    /// 即使已有退休记录，也须检查此字段：切 ERROR 失败不应丢失当前 WR 的终结证据。
     std::optional<TxCompletionError> error;
 };
 
@@ -59,11 +62,13 @@ struct TxCompletionBatch {
 
 /// 单 owner 的全 signal TX CQ 推进器，自身不分配内存、不调用上层回调、不执行重放。
 /// 账本须覆盖对象使用期，并拥有所属池全部 TX attempt；同一 TX CQ 只能由此 owner 消费。
-/// 与 Send、账本操作及 Open/Close 不得并发或重入。不处理 RX、异步事件和软件 flush。
+/// 与 Send、账本操作及 Open/Close 不得并发或重入。不处理 RX 和异步事件；软件 flush 须由 owner 在边界后显式推进。
 class TxCompletionProcessor {
 public:
     static constexpr std::size_t kMaxPollBatch = 64;
+
     explicit TxCompletionProcessor(AttemptLedger& ledger) noexcept : ledger_(ledger) {}
+
     TxCompletionProcessor(const TxCompletionProcessor&) = delete;
     TxCompletionProcessor& operator=(const TxCompletionProcessor&) = delete;
 
@@ -72,11 +77,20 @@ public:
     /// 边界事件不读取 user_ctx、不清空账本；所有 WR 仍须逐条获得可信终结证据。
     std::expected<TxCompletionBatch, TxCompletionError> Poll(std::span<TxCompletionEvent> events) noexcept;
 
+    /// 收到指定 SQ 的 kFlushDone 后，分批取出软件队列的 WR_UNHANDLED 并退休。
+    /// 与 Poll 使用相同事件结构，每次最多 64 条；只接受本 SQ、正确方向及有效 id。
+    /// 持续调用直到 count 为 0 且无错误，届时通道为 kDrained，仍禁止发送。
+    std::expected<TxCompletionBatch, TxCompletionError> Flush(JettyLane lane,
+                                                              std::span<TxCompletionEvent> events) noexcept;
+
 private:
-    TxCompletionEvent Process(JettyPool& pool, const urma_cr_t& cr) noexcept;
+    TxCompletionEvent Process(JettyPool& pool, const urma_cr_t& cr,
+                              std::optional<JettyLane> flushing_lane = {}) noexcept;
+
     AttemptLedger& ledger_;
     std::array<urma_cr_t, kMaxPollBatch> completions_{};
 };
 } // namespace raw
 } // namespace kbsocket
+
 #endif // KBSOCKET_TRANSPORT_RAW_TX_COMPLETION_PROCESSOR_HPP_

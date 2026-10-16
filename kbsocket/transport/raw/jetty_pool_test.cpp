@@ -106,6 +106,7 @@ public:
                                 EXPECT_EQ(cfg->jfs_cfg.priority, priority);
                                 EXPECT_EQ(cfg->jfs_cfg.max_rsge, 1u);
                                 EXPECT_EQ(cfg->jfs_cfg.rnr_retry, 6u);
+                                EXPECT_EQ(cfg->jfs_cfg.flag.bs.error_suspend, 0u);
                                 EXPECT_EQ(cfg->jfs_cfg.err_timeout, 2u);
                                 if (fail == 3) {
                                     errno = ENOMEM;

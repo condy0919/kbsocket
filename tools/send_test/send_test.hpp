@@ -10,17 +10,17 @@
 #include <span>
 #include <vector>
 
+#include "tools/common/control_channel.hpp"
+
 #include "kbsocket/transport/raw/attempt_ledger.hpp"
 #include "kbsocket/transport/raw/jetty_pool.hpp"
+#include "kbsocket/transport/raw/rx_buffer_pool.hpp"
 #include "kbsocket/transport/raw/tx_completion_processor.hpp"
 #include "kbsocket/transport/raw/tx_sender.hpp"
 
 namespace kbsocket {
 namespace tools {
-struct SendTestError {
-    const char* operation;
-    int code = 0;
-};
+using SendTestError = ToolError;
 struct SendTestOptions {
     std::uint32_t bytes = 4096;
     std::uint32_t messages = 1024;
@@ -28,24 +28,6 @@ struct SendTestOptions {
     std::uint32_t timeout_ms = 10000;
 };
 std::expected<void, SendTestError> ValidateOptions(const SendTestOptions& options) noexcept;
-
-/// 有界 TCP 控制通道，仅传端点和同步消息；不承载测试 payload。所有等待都有截止时间。
-class ControlChannel {
-public:
-    explicit ControlChannel(int fd = -1) noexcept : fd_(fd) {}
-    ControlChannel(const ControlChannel&) = delete;
-    ControlChannel& operator=(const ControlChannel&) = delete;
-    ~ControlChannel();
-    std::expected<void, SendTestError> Open(bool server, const char* ipv4, std::uint16_t port,
-                                            std::uint32_t timeout_ms) noexcept;
-    std::expected<void, SendTestError> Write(std::span<const std::byte> data, std::uint32_t timeout_ms) noexcept;
-    std::expected<void, SendTestError> Read(std::span<std::byte> data, std::uint32_t timeout_ms) noexcept;
-    std::expected<void, SendTestError> SendMarker(std::uint32_t value, std::uint32_t timeout_ms) noexcept;
-    std::expected<void, SendTestError> ExpectMarker(std::uint32_t value, std::uint32_t timeout_ms) noexcept;
-
-private:
-    int fd_;
-};
 
 struct SendTestHello {
     urma_jetty_id_t endpoint{};
@@ -63,7 +45,7 @@ std::expected<std::uint64_t, SendTestError> CheckPayload(std::span<const std::by
 class SendTestSession {
 public:
     std::expected<void, SendTestError> Open(urma_context_t* ctx, const urma_device_cap_t& cap,
-                                            const SendTestOptions& options);
+                                            const SendTestOptions& options, bool server = false);
     std::expected<void, SendTestError> Run(ControlChannel& channel, bool server);
     std::expected<void, SendTestError> Close() noexcept;
 
@@ -77,6 +59,7 @@ private:
     urma_target_seg_t* segment_ = nullptr;
     urma_target_jetty_t* remote_ = nullptr;
     raw::JettyPool pool_;
+    raw::RxBufferPool rx_buffers_;
     raw::AttemptLedger ledger_;
     raw::TxSender sender_;
     raw::TxCompletionProcessor processor_{ledger_};
@@ -84,12 +67,10 @@ private:
     // buffer_ 内的页对齐注册范围，包含向上取整的尾部；不单独拥有内存。
     std::span<std::byte> registered_buffer_;
     std::array<urma_sge_t, kBatch> sges_{};
-    std::array<urma_jfr_wr_t, kBatch> recv_wrs_{};
     std::array<raw::TxSendRequest, kBatch> requests_{};
     std::array<raw::AttemptId, kBatch> ids_{};
-    std::array<bool, kBatch> seen_slots_{};
     std::array<bool, kBatch> seen_messages_{};
-    std::uint32_t pending_rx_ = 0;
+    bool server_ = false;
     bool unsafe_ = false;
 };
 } // namespace tools

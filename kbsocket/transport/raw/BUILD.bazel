@@ -196,3 +196,26 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "rx_buffer_pool",
+    srcs = ["rx_buffer_pool.cpp"],
+    hdrs = ["rx_buffer_pool.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":jetty_pool",
+        ":urma_api",
+        "//kbsocket/base:log",
+    ],
+)
+
+cc_test(
+    name = "rx_buffer_pool_test",
+    srcs = ["rx_buffer_pool_test.cpp"],
+    deps = [
+        ":jetty_pool",
+        ":rx_buffer_pool",
+        ":urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
