@@ -35,6 +35,28 @@ bool SameLane(raw::JettyLane a, raw::JettyLane b) noexcept {
 bool SameEndpoint(const urma_jetty_id_t& a, const urma_jetty_id_t& b) noexcept {
     return a.id == b.id && std::memcmp(a.eid.raw, b.eid.raw, sizeof(a.eid.raw)) == 0;
 }
+bool IsContinueCompletion(urma_cr_status_t status) noexcept {
+    // 仅逐 WR 的终结 CQE 可归还额度；伪 CQE 和软件 flush 记录不能用于本实验。
+    switch (status) {
+    case URMA_CR_SUCCESS:
+    case URMA_CR_UNSUPPORTED_OPCODE_ERR:
+    case URMA_CR_LOC_LEN_ERR:
+    case URMA_CR_LOC_OPERATION_ERR:
+    case URMA_CR_LOC_ACCESS_ERR:
+    case URMA_CR_REM_RESP_LEN_ERR:
+    case URMA_CR_REM_UNSUPPORTED_REQ_ERR:
+    case URMA_CR_REM_OPERATION_ERR:
+    case URMA_CR_REM_ACCESS_ABORT_ERR:
+    case URMA_CR_ACK_TIMEOUT_ERR:
+    case URMA_CR_RNR_RETRY_CNT_EXC_ERR:
+    case URMA_CR_WR_FLUSH_ERR:
+    case URMA_CR_LOC_DATA_POISON:
+    case URMA_CR_REM_DATA_POISON:
+        return true;
+    default:
+        return false;
+    }
+}
 std::expected<void, ToolError> WriteCount(ControlChannel& channel, std::uint32_t value, std::uint32_t timeout) {
     std::array<std::byte, 4> bytes{};
     for (std::size_t i = 0; i < bytes.size(); ++i) {
@@ -77,9 +99,10 @@ std::expected<void, ToolError> BackpressureSession::Open(urma_context_t* ctx, co
     peer_quiescent_ = true;
     unsafe_ = false;
     round_ = cleanup_count_ = 0;
+    continue_jetty_ = nullptr;
     ctx_ = ctx;
     const bool delay = options.mode == BackpressureMode::kRxDelay;
-    const auto rx_depth = options.tx_depth + (delay ? 0u : 1u);
+    const auto rx_depth = options.tx_depth + (options.mode == BackpressureMode::kTxQuota ? 1u : 0u);
     raw::JettyPoolConfig config;
     config.jetty_count = delay ? 2 : 1;
     config.tx_depth = options.tx_depth;
@@ -177,7 +200,18 @@ std::expected<void, ToolError> BackpressureSession::Run(ControlChannel& channel)
     if (!start) {
         return start;
     }
-    auto result = options_.mode == BackpressureMode::kTxQuota ? RunQuota(channel) : RunDelay(channel);
+    std::expected<void, ToolError> result;
+    switch (options_.mode) {
+    case BackpressureMode::kTxQuota:
+        result = RunQuota(channel);
+        break;
+    case BackpressureMode::kRxDelay:
+        result = RunDelay(channel);
+        break;
+    case BackpressureMode::kRnrContinue:
+        result = RunRnrContinue(channel);
+        break;
+    }
     if (!result) {
         return result;
     }
@@ -230,7 +264,7 @@ std::expected<void, ToolError> BackpressureSession::Send(std::uint32_t first, st
     }
     auto sent = sender_.Send(std::span(requests_).subspan(first, count), std::span(ids_).subspan(first, count),
                              lanes_[cleanup ? 1 : 0]);
-    auto& stats = cleanup ? stats_.cleanup : stats_.traffic;
+    auto& stats = Traffic(cleanup);
     const auto accepted = sent ? std::optional<std::size_t>(*sent) : sent.error().accepted;
     if (accepted) {
         stats.accepted += *accepted;
@@ -455,13 +489,219 @@ std::expected<void, ToolError> BackpressureSession::RunDelay(ControlChannel& cha
     return {};
 }
 
+BackpressureTraffic& BackpressureSession::Traffic(bool cleanup) noexcept {
+    if (options_.mode == BackpressureMode::kRnrContinue && round_ == 1) {
+        return stats_.continuation;
+    }
+    return cleanup ? stats_.cleanup : stats_.traffic;
+}
+
+std::expected<void, ToolError> BackpressureSession::CheckContinueState() {
+    auto jetty = pool_.Get(lanes_[0]);
+    if (!jetty) {
+        return Error("query continuation SQ", PoolError(jetty.error()));
+    }
+    if (!continue_jetty_) {
+        continue_jetty_ = *jetty;
+        stats_.jetty_id = local_.endpoints[0].id;
+    }
+    if (*jetty != continue_jetty_ || !SameEndpoint((*jetty)->jetty_id, local_.endpoints[0])) {
+        return Error("continuation SQ identity changed", EPROTO);
+    }
+    // 当前 uburma query 路径可能将 jfs_flag 固定返回 0，不能把它作为硬件模式的独立证据。
+    // 同时核对创建配置；最终仍以同 SQ 新 WR 的 SUCCESS 和远端校验作为行为证据。
+    if ((*jetty)->jetty_cfg.jfs_cfg.flag.bs.error_suspend) {
+        return Error("continuation requires error_suspend=0 at creation", EPROTO);
+    }
+    urma_jetty_cfg_t cfg{};
+    urma_jetty_attr_t attr{};
+    const auto status = UrmaApi::QueryJetty(*jetty, &cfg, &attr);
+    if (status != URMA_SUCCESS) {
+        return Error("query hardware jetty state", status);
+    }
+    stats_.queried_rnr_retry = cfg.jfs_cfg.rnr_retry;
+    stats_.queried_err_timeout = cfg.jfs_cfg.err_timeout;
+    if (attr.state != URMA_JETTY_STATE_READY) {
+        return Error("hardware jetty is not READY", static_cast<int>(attr.state));
+    }
+    if (cfg.jfs_cfg.flag.bs.error_suspend) {
+        return Error("continuation requires error_suspend=0", EPROTO);
+    }
+    ++stats_.state_checks;
+    return {};
+}
+
+std::expected<std::size_t, ToolError> BackpressureSession::PollContinueTx() {
+    // 本实验只观察硬件行为。生产完成层遇到错误会 BeginDrain，使用它会改变被测条件。
+    // 仍逐条核验 CQE 身份并通过账本退休，不允许依据计数释放 DMA 内存。
+    continue_completions_.fill({});
+    auto polled = pool_.PollSend(continue_completions_);
+    if (!polled) {
+        return Error("poll continuation TX JFC", PoolError(polled.error()));
+    }
+    std::optional<ToolError> failure;
+    for (const auto& cr : std::span(continue_completions_).first(*polled)) {
+        auto consume = [&]() -> std::expected<void, ToolError> {
+            // 先排除没有合法 user_ctx 的边界事件；本模式从未请求切 ERROR 或 suspend。
+            if (!IsContinueCompletion(cr.status) || cr.flag.bs.s_r || !cr.flag.bs.jetty ||
+                cr.local_id != local_.endpoints[0].id) {
+                return Error("unexpected continuation CQE status/direction/jetty", static_cast<int>(cr.status));
+            }
+            auto record = ledger_.Lookup(cr.user_ctx);
+            if (!record || !SameLane(record->ticket.lane, lanes_[0])) {
+                return Error("unknown or foreign continuation attempt", EPROTO);
+            }
+            auto retired = ledger_.Complete(cr.user_ctx);
+            if (!retired) {
+                return Error("retire continuation attempt", static_cast<int>(retired.error().code));
+            }
+            raw::TxCompletionEvent event{
+                .kind = raw::TxCompletionKind::kCompleted, .completion = cr, .lane = lanes_[0], .record = *retired};
+            auto observed = ObserveTx(event, false, true);
+            if (!observed) {
+                return observed;
+            }
+            const auto expected = round_ == 0 ? URMA_CR_RNR_RETRY_CNT_EXC_ERR : URMA_CR_SUCCESS;
+            if (cr.status != expected) {
+                return Error(round_ == 0 ? "initial WR did not complete with RNR"
+                                         : "new WR on same SQ did not complete successfully",
+                             static_cast<int>(cr.status));
+            }
+            return {};
+        };
+        auto result = consume();
+        if (!result && !failure) {
+            failure = result.error();
+        }
+    }
+    if (failure) {
+        unsafe_ = true;
+        return std::unexpected(*failure);
+    }
+    return static_cast<std::size_t>(*polled);
+}
+
+std::expected<void, ToolError> BackpressureSession::FinishContinueTx() {
+    const auto deadline = Clock::now() + std::chrono::milliseconds(options_.timeout_ms);
+    while (Clock::now() < deadline) {
+        auto polled = PollContinueTx();
+        if (!polled) {
+            return std::unexpected(polled.error());
+        }
+        if (!ledger_.size()) {
+            // 阶段切换前再检查重复 CQE，不能让旧完成释放下一批的额度。
+            auto extra = PollContinueTx();
+            if (!extra) {
+                return std::unexpected(extra.error());
+            }
+            return {};
+        }
+        if (!*polled) {
+            std::this_thread::yield();
+        }
+    }
+    return Error("continuation TX completion timeout; retaining resources", ETIMEDOUT);
+}
+
+std::expected<void, ToolError> BackpressureSession::RunRnrContinue(ControlChannel& channel) {
+    tx_seen_.fill(false);
+    tx_success_.fill(false);
+    for (auto& seen : rx_seen_) {
+        seen.fill(false);
+    }
+    if (local_.server) {
+        // 必须先收到全批 RNR 的终结报告再投 RX，排除时延和调度造成的首批偶然成功。
+        auto report = ReadReport(channel, false, options_.tx_depth);
+        if (!report) {
+            return report;
+        }
+        round_ = 1;
+        auto refilled = Refill(options_.tx_depth);
+        if (!refilled) {
+            return refilled;
+        }
+        auto ready = channel.SendMarker(kRxReady, options_.timeout_ms);
+        if (!ready) {
+            return ready;
+        }
+        report = ReadReport(channel, false, options_.tx_depth);
+        if (!report) {
+            return report;
+        }
+        auto received = Receive(options_.tx_depth);
+        if (!received) {
+            return received;
+        }
+        for (std::uint32_t i = 0; i < options_.tx_depth; ++i) {
+            if (!rx_seen_[0][i] || !(peer_success_[0][i / 64] & (std::uint64_t{1} << (i % 64)))) {
+                return Error("continuation TX/RX identity mismatch", EPROTO);
+            }
+        }
+    } else {
+        auto state = CheckContinueState();
+        if (!state) {
+            return state;
+        }
+        Prepare(0, options_.tx_depth, false);
+        auto sent = Send(0, options_.tx_depth, false);
+        if (!sent) {
+            return sent;
+        }
+        auto finished = FinishContinueTx();
+        if (!finished) {
+            return finished;
+        }
+        state = CheckContinueState();
+        if (!state) {
+            return state;
+        }
+        auto report = ReportTx(channel, false);
+        if (!report) {
+            return report;
+        }
+        auto ready = channel.ExpectMarker(kRxReady, options_.timeout_ms);
+        if (!ready) {
+            return ready;
+        }
+        // 旧 WR 已逐条终结，才复用内存。round=1 是全新的数据身份，绝不重放 round=0。
+        round_ = 1;
+        tx_seen_.fill(false);
+        tx_success_.fill(false);
+        ids_.fill(0);
+        Prepare(0, options_.tx_depth, false);
+        sent = Send(0, options_.tx_depth, false);
+        if (!sent) {
+            return sent;
+        }
+        finished = FinishContinueTx();
+        if (!finished) {
+            return finished;
+        }
+        state = CheckContinueState();
+        if (!state) {
+            return state;
+        }
+        report = ReportTx(channel, false);
+        if (!report) {
+            return report;
+        }
+    }
+    if (stats_.traffic.accepted != options_.tx_depth || stats_.traffic.retired != options_.tx_depth ||
+        stats_.traffic.success || stats_.traffic.flush_done || stats_.continuation.accepted != options_.tx_depth ||
+        stats_.continuation.retired != options_.tx_depth || stats_.continuation.success != options_.tx_depth ||
+        stats_.continuation.flush_done || (local_.server && stats_.continuation.received != options_.tx_depth)) {
+        return Error("RNR continuation totals mismatch", EPROTO);
+    }
+    return {};
+}
+
 std::expected<void, ToolError> BackpressureSession::ReportTx(ControlChannel& channel, bool cleanup) {
-    const auto& stats = cleanup ? stats_.cleanup : stats_.traffic;
+    const auto& stats = Traffic(cleanup);
     BackpressureReport report{.accepted = static_cast<std::uint32_t>(stats.accepted),
                               .retired = static_cast<std::uint32_t>(stats.retired),
                               .success = static_cast<std::uint32_t>(stats.success),
                               .flush_done = static_cast<std::uint32_t>(stats.flush_done),
-                              .has_success_map = options_.mode == BackpressureMode::kRxDelay};
+                              .has_success_map = options_.mode != BackpressureMode::kTxQuota};
     if (report.has_success_map) {
         for (std::uint32_t index = 0; index < options_.tx_depth; ++index) {
             if (tx_success_[index]) {
@@ -469,19 +709,21 @@ std::expected<void, ToolError> BackpressureSession::ReportTx(ControlChannel& cha
             }
         }
     }
-    return WriteBackpressureReport(channel, report, options_.timeout_ms);
+    return WriteBackpressureReport(channel, report, options_.timeout_ms,
+                                   options_.mode == BackpressureMode::kRnrContinue && round_ == 0);
 }
 
 std::expected<void, ToolError> BackpressureSession::ReadReport(ControlChannel& channel, bool cleanup,
                                                                std::uint32_t expected) {
-    auto report = ReadBackpressureReport(channel, options_.timeout_ms);
+    auto report = ReadBackpressureReport(channel, options_.timeout_ms,
+                                         options_.mode == BackpressureMode::kRnrContinue && round_ == 0);
     if (!report) {
         return std::unexpected(report.error());
     }
-    if (report->accepted != expected || report->has_success_map != (options_.mode == BackpressureMode::kRxDelay)) {
+    if (report->accepted != expected || report->has_success_map != (options_.mode != BackpressureMode::kTxQuota)) {
         return Error("peer accepted count or success map mismatch", EPROTO);
     }
-    auto& stats = cleanup ? stats_.cleanup : stats_.traffic;
+    auto& stats = Traffic(cleanup);
     stats.accepted = report->accepted;
     stats.retired = report->retired;
     stats.success = report->success;
@@ -496,7 +738,7 @@ std::expected<void, ToolError> BackpressureSession::ObserveTx(const raw::TxCompl
         return Error("invalid TX completion or drain operation", CompletionError(*event.error));
     }
     const auto lane = lanes_[cleanup ? 1 : 0];
-    auto& stats = cleanup ? stats_.cleanup : stats_.traffic;
+    auto& stats = Traffic(cleanup);
     if (!event.lane || !SameLane(*event.lane, lane)) {
         return Error("TX completion belongs to another SQ", EPROTO);
     }
@@ -658,7 +900,7 @@ std::expected<void, ToolError> BackpressureSession::ValidateRx(const raw::RxBuff
         return Error("duplicate RX message", EPROTO);
     }
     seen = true;
-    ++(frame->cleanup ? stats_.cleanup : stats_.traffic).received;
+    ++Traffic(frame->cleanup).received;
     return {};
 }
 
@@ -698,7 +940,7 @@ std::expected<void, ToolError> BackpressureSession::Receive(std::uint64_t count)
             return std::unexpected(polled.error());
         }
         // 达到下限后仍取到一次空 CQ，观察已可见的错误 WR 对应 RX；这不代表网络屏障。
-        if (stats_.traffic.received + stats_.cleanup.received >= count && !*polled) {
+        if (stats_.traffic.received + stats_.cleanup.received + stats_.continuation.received >= count && !*polled) {
             return {};
         }
         if (!*polled) {

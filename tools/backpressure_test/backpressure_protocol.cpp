@@ -66,7 +66,14 @@ std::byte NextPayloadByte(std::uint64_t& state) noexcept {
     return static_cast<std::byte>((state * 2685821657736338717ull) >> 56);
 }
 
-bool ValidReport(const BackpressureReport& report) noexcept {
+bool ValidReport(const BackpressureReport& report, bool rnr_without_drain) noexcept {
+    if (rnr_without_drain) {
+        // 同一 SQ 续发实验不修改队列状态；只有整批 RNR 已终结、没有成功消息或排空边界才可补投 RX。
+        return report.accepted > 0 && report.accepted <= raw::TxSender::kMaxBatch &&
+               report.accepted == report.retired && report.success == 0 && report.flush_done == 0 &&
+               report.has_success_map &&
+               std::all_of(report.success_map.begin(), report.success_map.end(), [](auto word) { return word == 0; });
+    }
     if (report.accepted != report.retired || report.success > report.retired ||
         report.flush_done != static_cast<std::uint32_t>(report.success < report.retired)) {
         return false;
@@ -91,7 +98,8 @@ bool ValidReport(const BackpressureReport& report) noexcept {
 } // namespace
 
 std::expected<void, ToolError> ValidateBackpressureOptions(const BackpressureOptions& options) noexcept {
-    if (options.mode != BackpressureMode::kTxQuota && options.mode != BackpressureMode::kRxDelay) {
+    if (options.mode != BackpressureMode::kTxQuota && options.mode != BackpressureMode::kRxDelay &&
+        options.mode != BackpressureMode::kRnrContinue) {
         return Error("invalid backpressure mode", EINVAL);
     }
     if (options.expect != BackpressureExpectation::kEither && options.expect != BackpressureExpectation::kSuccess &&
@@ -103,7 +111,7 @@ std::expected<void, ToolError> ValidateBackpressureOptions(const BackpressureOpt
         options.timeout_ms == 0 || options.timeout_ms > kMaxTimeoutMs) {
         return Error("invalid backpressure limits", EINVAL);
     }
-    if (options.mode == BackpressureMode::kTxQuota && options.expect != BackpressureExpectation::kEither) {
+    if (options.mode != BackpressureMode::kRxDelay && options.expect != BackpressureExpectation::kEither) {
         return Error("--expect applies only to rx_delay", EINVAL);
     }
     if (options.mode == BackpressureMode::kRxDelay &&
@@ -272,8 +280,8 @@ std::expected<BackpressureFrame, ToolError> CheckBackpressurePayload(std::span<c
 }
 
 std::expected<void, ToolError> WriteBackpressureReport(ControlChannel& channel, const BackpressureReport& report,
-                                                       std::uint32_t timeout_ms) noexcept {
-    if (!ValidReport(report)) {
+                                                       std::uint32_t timeout_ms, bool rnr_without_drain) noexcept {
+    if (!ValidReport(report, rnr_without_drain)) {
         return Error("invalid backpressure terminal report", EINVAL);
     }
     std::array<std::byte, 52> wire{};
@@ -288,8 +296,8 @@ std::expected<void, ToolError> WriteBackpressureReport(ControlChannel& channel, 
     return channel.Write(wire, timeout_ms);
 }
 
-std::expected<BackpressureReport, ToolError> ReadBackpressureReport(ControlChannel& channel,
-                                                                    std::uint32_t timeout_ms) noexcept {
+std::expected<BackpressureReport, ToolError> ReadBackpressureReport(ControlChannel& channel, std::uint32_t timeout_ms,
+                                                                    bool rnr_without_drain) noexcept {
     std::array<std::byte, 52> wire{};
     auto received = channel.Read(wire, timeout_ms);
     if (!received) {
@@ -307,7 +315,7 @@ std::expected<BackpressureReport, ToolError> ReadBackpressureReport(ControlChann
     for (std::size_t i = 0; i < report.success_map.size(); ++i) {
         report.success_map[i] = Get64(std::span(wire).subspan(20 + 8 * i));
     }
-    if (!ValidReport(report)) {
+    if (!ValidReport(report, rnr_without_drain)) {
         return Error("invalid peer backpressure terminal report", EPROTO);
     }
     return report;

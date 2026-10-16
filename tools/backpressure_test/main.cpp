@@ -22,7 +22,7 @@ DEFINE_uint32(port, 18519, "TCP control port (payload uses URMA)");
 DEFINE_string(device, "", "Raw UB device name");
 DEFINE_uint32(eid_index, 0, "Local EID index");
 DEFINE_string(library, "liburma.so", "URMA shared library path");
-DEFINE_string(mode, "tx_quota", "Test tx_quota or rx_delay; must match peer");
+DEFINE_string(mode, "tx_quota", "Test tx_quota, rx_delay or rnr_continue; must match peer");
 DEFINE_string(expect, "either", "Expected rx_delay outcome: either, success or error; must match peer");
 DEFINE_uint32(bytes, 4096, "Bytes per SEND_WITH_IMM, 32 to 4096 including the test header; must match peer");
 DEFINE_uint32(tx_depth, 32, "SQ depth and initial batch size, 1 to 256; must match peer");
@@ -88,9 +88,15 @@ void PrintStats(const kbsocket::tools::BackpressureStats& stats) {
     PrintTraffic("Original traffic", stats.traffic, stats.accepted_known);
     if (FLAGS_mode == "rx_delay") {
         PrintTraffic("Cleanup traffic", stats.cleanup, stats.accepted_known);
+    } else if (FLAGS_mode == "rnr_continue") {
+        PrintTraffic("Continuation traffic", stats.continuation, stats.accepted_known);
     }
     if (FLAGS_server) {
         std::println("Detailed TX error counters are reported by the client.");
+    } else if (FLAGS_mode == "rnr_continue") {
+        // provider 返回的 err_timeout 可能是硬件档位，原样显示，不套用统一的时间换算公式。
+        std::println("Same SQ: jetty_id={} state_checks={} queried_rnr_retry={} queried_err_timeout={}", stats.jetty_id,
+                     stats.state_checks, stats.queried_rnr_retry, stats.queried_err_timeout);
     } else {
         std::println("Backpressure: quota_rejections={} recovery_sends={} provider_eagain={}", stats.quota_rejections,
                      stats.recovery_sends, stats.provider_eagain);
@@ -101,13 +107,15 @@ int Run() {
     using kbsocket::raw::UrmaApi;
     using kbsocket::tools::BackpressureExpectation;
     using kbsocket::tools::BackpressureMode;
-    if ((FLAGS_mode != "tx_quota" && FLAGS_mode != "rx_delay") ||
+    if ((FLAGS_mode != "tx_quota" && FLAGS_mode != "rx_delay" && FLAGS_mode != "rnr_continue") ||
         (FLAGS_expect != "either" && FLAGS_expect != "success" && FLAGS_expect != "error")) {
         std::println(stderr, "Invalid --mode or --expect; use --help for supported values.");
         return 2;
     }
     const kbsocket::tools::BackpressureOptions options{
-        .mode = FLAGS_mode == "tx_quota" ? BackpressureMode::kTxQuota : BackpressureMode::kRxDelay,
+        .mode = FLAGS_mode == "tx_quota"   ? BackpressureMode::kTxQuota
+                : FLAGS_mode == "rx_delay" ? BackpressureMode::kRxDelay
+                                           : BackpressureMode::kRnrContinue,
         .expect = FLAGS_expect == "either"    ? BackpressureExpectation::kEither
                   : FLAGS_expect == "success" ? BackpressureExpectation::kSuccess
                                               : BackpressureExpectation::kError,
@@ -196,6 +204,9 @@ int Run() {
     if (options.mode == BackpressureMode::kTxQuota) {
         std::println("PASS: outcome=quota_recovery; rejected work was accepted after TX retirement; "
                      "payload validated; both endpoints closed resources");
+    } else if (options.mode == BackpressureMode::kRnrContinue) {
+        std::println("PASS: outcome=rnr_continue_success; same SQ sent new payload after RNR without "
+                     "modification or recreation; payload validated; both endpoints closed resources");
     } else if (terminal_failure) {
         std::println("PASS: outcome=rx_delay_terminal_failure; original attempts retired without replay; "
                      "RX slots consumed by original or distinct cleanup traffic; both endpoints closed resources");
@@ -209,7 +220,7 @@ int Run() {
 
 int main(int argc, char** argv) {
     gflags::SetUsageMessage("--device RAW_DEVICE [--server] --address IPv4 [--port 18519] "
-                            "[--mode tx_quota|rx_delay] [--tx_depth 32] [--rx_delay_us 1000]");
+                            "[--mode tx_quota|rx_delay|rnr_continue] [--tx_depth 32] [--rx_delay_us 1000]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     if (argc != 1) {
         std::println(stderr, "Unexpected positional arguments");

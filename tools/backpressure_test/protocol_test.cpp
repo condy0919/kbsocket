@@ -56,7 +56,7 @@ TEST(BackpressureProtocol, OptionsBoundDepthRoundsAndDelayWithoutOverflow) {
     EXPECT_FALSE(ValidateBackpressureOptions({.rounds = 1000001}));
     EXPECT_FALSE(ValidateBackpressureOptions({.timeout_ms = 0}));
     EXPECT_FALSE(ValidateBackpressureOptions({.timeout_ms = 3600001}));
-    EXPECT_FALSE(ValidateBackpressureOptions({.mode = static_cast<BackpressureMode>(2)}));
+    EXPECT_FALSE(ValidateBackpressureOptions({.mode = static_cast<BackpressureMode>(3)}));
     EXPECT_FALSE(ValidateBackpressureOptions({.expect = static_cast<BackpressureExpectation>(3)}));
     EXPECT_FALSE(ValidateBackpressureOptions({.expect = BackpressureExpectation::kSuccess}));
     BackpressureOptions delayed{.mode = BackpressureMode::kRxDelay, .rx_delay_us = 999, .timeout_ms = 1};
@@ -68,6 +68,37 @@ TEST(BackpressureProtocol, OptionsBoundDepthRoundsAndDelayWithoutOverflow) {
     EXPECT_TRUE(ValidateBackpressureOptions(delayed));
     delayed.rx_delay_us = std::numeric_limits<std::uint32_t>::max();
     EXPECT_FALSE(ValidateBackpressureOptions(delayed));
+}
+
+TEST(BackpressureProtocol, RnrContinuationSelectsStrictScenarioWithoutDelayOrRoundMatching) {
+    auto local = Hello();
+    auto remote = Hello(true);
+    local.options.mode = remote.options.mode = BackpressureMode::kRnrContinue;
+    local.endpoints[1] = remote.endpoints[1] = {};
+    // 此模式只有一条 SQ：先确认 RNR，再补投 RX；延迟与轮数不参与阶段同步。
+    remote.options.rounds = 1;
+    remote.options.rx_delay_us = std::numeric_limits<std::uint32_t>::max();
+    EXPECT_TRUE(ValidateBackpressureOptions(remote.options));
+    auto exchanged = ExchangeWithPeer(local, remote);
+    ASSERT_TRUE(exchanged);
+    EXPECT_EQ(exchanged->options.mode, BackpressureMode::kRnrContinue);
+    const auto encoded = EncodeBackpressureHello(local);
+    EXPECT_EQ(encoded[15], std::byte{2});
+    auto decoded = DecodeBackpressureHello(encoded);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->options.mode, BackpressureMode::kRnrContinue);
+
+    // 必须观察“先 RNR、后成功”，不能把只有错误也视作通过，因此不接受 rx_delay 的宽松期望。
+    for (const auto expect : {BackpressureExpectation::kSuccess, BackpressureExpectation::kError}) {
+        auto invalid = local.options;
+        invalid.expect = expect;
+        EXPECT_FALSE(ValidateBackpressureOptions(invalid));
+    }
+    remote.options.mode = BackpressureMode::kTxQuota;
+    EXPECT_FALSE(ExchangeWithPeer(local, remote));
+    remote.options.mode = BackpressureMode::kRnrContinue;
+    ++remote.options.tx_depth;
+    EXPECT_FALSE(ExchangeWithPeer(local, remote));
 }
 
 TEST(BackpressureProtocol, HelloUsesNetworkOrderAndOmitsLocalTimeout) {
@@ -312,6 +343,83 @@ TEST(BackpressureProtocol, SuccessMapPreservesExactIdentitiesAndRejectsAmbiguous
         ASSERT_FALSE(received) << "variant=" << variant;
         EXPECT_EQ(received.error().code, EPROTO);
     }
+}
+
+TEST(BackpressureProtocol, RnrReportRequiresExplicitContextAndAllAttemptsTerminalWithoutDrain) {
+    int fds[2]{};
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
+    ControlChannel local(fds[0]), peer(fds[1]);
+    const BackpressureReport report{.accepted = 3, .retired = 3, .has_success_map = true};
+    // 原有错误排空协议仍要求 FLUSH_ERR_DONE；只有双方明确进入 RNR 续发阶段才可省略边界。
+    EXPECT_FALSE(WriteBackpressureReport(peer, report, 100));
+    ASSERT_TRUE(WriteBackpressureReport(peer, report, 100, true));
+    auto received = ReadBackpressureReport(local, 100, true);
+    ASSERT_TRUE(received);
+    EXPECT_EQ(received->accepted, 3u);
+    EXPECT_EQ(received->retired, 3u);
+    EXPECT_EQ(received->success, 0u);
+    EXPECT_EQ(received->flush_done, 0u);
+    EXPECT_TRUE(received->has_success_map);
+    ASSERT_TRUE(WriteBackpressureReport(peer, report, 100, true));
+    received = ReadBackpressureReport(local, 100);
+    ASSERT_FALSE(received);
+    EXPECT_EQ(received.error().code, EPROTO);
+
+    // 空批次、未终结、部分成功、主动排空或丢失身份信息都不能授权服务端进入补投 RX 阶段。
+    std::array<BackpressureReport, 7> invalid_reports{};
+    invalid_reports.fill(report);
+    invalid_reports[0].accepted = invalid_reports[0].retired = 0;
+    invalid_reports[1].retired = 2;
+    invalid_reports[2].success = 1;
+    invalid_reports[3].flush_done = 1;
+    invalid_reports[4].has_success_map = false;
+    invalid_reports[5].success_map[3] = std::uint64_t{1} << 63;
+    invalid_reports[6].accepted = invalid_reports[6].retired = 257;
+    for (const auto& invalid : invalid_reports) {
+        EXPECT_FALSE(WriteBackpressureReport(peer, invalid, 100, true));
+    }
+    // 从线上的合法报告逐项破坏，同步覆盖接收侧，不能只依赖发送侧的参数检查。
+    std::array<std::byte, 52> valid{};
+    valid[3] = valid[7] = std::byte{3};
+    valid[19] = std::byte{1};
+    for (const auto variant : {0u, 1u, 2u, 3u, 4u, 5u, 6u}) {
+        auto wire = valid;
+        switch (variant) {
+        case 0:
+            wire[3] = wire[7] = std::byte{0};
+            break;
+        case 1:
+            wire[7] = std::byte{2};
+            break;
+        case 2:
+            wire[11] = std::byte{1};
+            break;
+        case 3:
+            wire[15] = std::byte{1};
+            break;
+        case 4:
+            wire[19] = std::byte{0};
+            break;
+        case 5:
+            wire[44] = std::byte{0x80};
+            break;
+        case 6:
+            wire[2] = wire[3] = wire[6] = wire[7] = std::byte{1};
+            break;
+        }
+        ASSERT_TRUE(peer.Write(wire, 100));
+        received = ReadBackpressureReport(local, 100, true);
+        ASSERT_FALSE(received) << "variant=" << variant;
+        EXPECT_EQ(received.error().code, EPROTO);
+    }
+    // 最大批次同样可用；续发成功报告则回到原有全成功校验，不沿用允许错误的上下文。
+    ASSERT_TRUE(WriteBackpressureReport(peer, {.accepted = 256, .retired = 256, .has_success_map = true}, 100, true));
+    EXPECT_TRUE(ReadBackpressureReport(local, 100, true));
+    BackpressureReport continuation{
+        .accepted = 3, .retired = 3, .success = 3, .has_success_map = true, .success_map = {7}};
+    EXPECT_FALSE(WriteBackpressureReport(peer, continuation, 100, true));
+    ASSERT_TRUE(WriteBackpressureReport(peer, continuation, 100));
+    EXPECT_TRUE(ReadBackpressureReport(local, 100));
 }
 
 TEST(BackpressureProtocol, BarrierRequiresDedicatedPeerCloseConfirmation) {

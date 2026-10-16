@@ -82,7 +82,7 @@ public:
         // UrmaApi::Init() 总是会成功。
         auto init = +[](urma_init_attr_t*) -> urma_status_t { return URMA_SUCCESS; };
         EXPECT_CALL(mock_, Symbol(handle_, _))
-            .Times(49)
+            .Times(50)
             .WillRepeatedly(Return(reinterpret_cast<void*>(&SymbolAddress)));
         // gmock 优先匹配后声明的 EXPECT_CALL，精确匹配应放在通配匹配之后。
         EXPECT_CALL(mock_, Symbol(handle_, StrEq("urma_init"))).WillOnce(Return(reinterpret_cast<void*>(init)));
@@ -98,6 +98,7 @@ class MockUrma {
 public:
     MOCK_METHOD(urma_jfr_t*, CreateJfr, (urma_context_t*, urma_jfr_cfg_t*));
     MOCK_METHOD(urma_status_t, DeleteJfr, (urma_jfr_t*));
+    MOCK_METHOD(urma_status_t, QueryJetty, (urma_jetty_t*, urma_jetty_cfg_t*, urma_jetty_attr_t*));
 };
 
 class UrmaApiOverrideTest : public Test {
@@ -182,7 +183,7 @@ TEST_F(UrmaApiLoadingTest, MissingSymbolReadsDiagnosticAndStopsLoading) {
 TEST_F(UrmaApiLoadingTest, MissingLastSymbolRollsBackAndAllowsRetry) {
     EXPECT_CALL(mock_, Open(_, _)).Times(2).WillRepeatedly(Return(handle_));
     EXPECT_CALL(mock_, Error()).WillOnce(Return(nullptr));
-    EXPECT_CALL(mock_, Symbol(handle_, _)).Times(96).WillRepeatedly(Return(reinterpret_cast<void*>(&SymbolAddress)));
+    EXPECT_CALL(mock_, Symbol(handle_, _)).Times(98).WillRepeatedly(Return(reinterpret_cast<void*>(&SymbolAddress)));
     auto perf = +[](char*, uint32_t*) -> urma_status_t { return URMA_SUCCESS; };
     EXPECT_CALL(mock_, Symbol(handle_, StrEq("urma_get_perf_info")))
         .WillOnce(Return(nullptr))
@@ -193,7 +194,7 @@ TEST_F(UrmaApiLoadingTest, MissingLastSymbolRollsBackAndAllowsRetry) {
         .WillRepeatedly(Return(reinterpret_cast<void*>(init)));
     EXPECT_CALL(mock_, Close(handle_)).Times(2).WillRepeatedly(Return(0));
 
-    // 第 1 次在处理第 50 个符号 urma_get_perf_info 时 dlsym 会返回 nullptr, 所以失败。
+    // 第 1 次在处理最后一个符号 urma_get_perf_info 时 dlsym 会返回 nullptr，所以失败。
     const auto status = UrmaApi::Load();
     ASSERT_FALSE(status);
     EXPECT_EQ(status.error().code, LoadErrorCode::kSymbolMissing);
@@ -201,7 +202,7 @@ TEST_F(UrmaApiLoadingTest, MissingLastSymbolRollsBackAndAllowsRetry) {
     EXPECT_EQ(UrmaApi::Init(nullptr), URMA_FAIL);
     EXPECT_EQ(errno, ENOSYS);
 
-    // 第 2 次第 50 个符号 urma_get_perf_info 时也返回了一个有效地址，符号全部解析成功。
+    // 第 2 次最后一个符号 urma_get_perf_info 也返回了有效地址，符号全部解析成功。
     ASSERT_TRUE(UrmaApi::Load());
     EXPECT_EQ(UrmaApi::Init(nullptr), URMA_SUCCESS);
     EXPECT_EQ(UrmaApi::GetPerfInfo(nullptr, nullptr), URMA_SUCCESS);
@@ -257,6 +258,31 @@ TEST_F(UrmaApiLoadingTest, ExplicitUnloadStillClosesLibraryAfterCallsStop) {
     EXPECT_EQ(errno, ENOSYS);
 }
 
+TEST_F(UrmaApiLoadingTest, QueryJettyUsesResolvedSymbol) {
+    EXPECT_CALL(mock_, Open(_, _)).WillOnce(Return(handle_));
+    EXPECT_CALL(mock_, Symbol(handle_, _)).Times(50).WillRepeatedly(Return(reinterpret_cast<void*>(&SymbolAddress)));
+    auto query = +[](urma_jetty_t*, urma_jetty_cfg_t* cfg, urma_jetty_attr_t* attr) -> urma_status_t {
+        cfg->jfs_cfg.rnr_retry = 6;
+        cfg->jfs_cfg.flag.bs.error_suspend = 0;
+        attr->state = URMA_JETTY_STATE_READY;
+        return URMA_SUCCESS;
+    };
+    EXPECT_CALL(mock_, Symbol(handle_, StrEq("urma_query_jetty"))).WillOnce(Return(reinterpret_cast<void*>(query)));
+    EXPECT_CALL(mock_, Close(handle_)).WillOnce(Return(0));
+
+    // 创建时保存的配置不能代替查询结果；验证调用实际解析到的入口并保留其输出。
+    ASSERT_TRUE(UrmaApi::Load());
+    urma_jetty_t jetty{};
+    jetty.jetty_cfg.jfs_cfg.flag.bs.error_suspend = 1;
+    urma_jetty_cfg_t cfg{};
+    urma_jetty_attr_t attr{};
+    attr.state = URMA_JETTY_STATE_ERROR;
+    EXPECT_EQ(UrmaApi::QueryJetty(&jetty, &cfg, &attr), URMA_SUCCESS);
+    EXPECT_EQ(cfg.jfs_cfg.rnr_retry, 6);
+    EXPECT_EQ(cfg.jfs_cfg.flag.bs.error_suspend, 0U);
+    EXPECT_EQ(attr.state, URMA_JETTY_STATE_READY);
+}
+
 // Overriding
 
 TEST_F(UrmaApiOverrideTest, BusinessCallsReachMockOnOwnerThread) {
@@ -273,6 +299,21 @@ TEST_F(UrmaApiOverrideTest, BusinessCallsReachMockOnOwnerThread) {
         EXPECT_EQ(UrmaApi::DeleteJfr(created), URMA_SUCCESS);
     });
     owner.join();
+}
+
+TEST_F(UrmaApiOverrideTest, QueryJettyForwardsArgumentsAndProviderFailure) {
+    urma_jetty_t jetty{};
+    urma_jetty_cfg_t cfg{};
+    urma_jetty_attr_t attr{};
+    UrmaFunctions functions;
+    functions.query_jetty = [](urma_jetty_t* queried, urma_jetty_cfg_t* queried_cfg, urma_jetty_attr_t* queried_attr) {
+        return active_mock_->QueryJetty(queried, queried_cfg, queried_attr);
+    };
+    test_support::ScopedUrmaOverride scope(functions);
+
+    // 查询失败不能被当作默认的 READY 状态，原样交给调用方处理。
+    EXPECT_CALL(mock_, QueryJetty(&jetty, &cfg, &attr)).WillOnce(Return(URMA_FAIL));
+    EXPECT_EQ(UrmaApi::QueryJetty(&jetty, &cfg, &attr), URMA_FAIL);
 }
 
 TEST_F(UrmaApiOverrideTest, NestedOverrideRestoresOuterTableAndRejectsUnload) {
@@ -324,6 +365,9 @@ TEST(UrmaApiUnavailableTest, MissingFunctionsReturnErrorsInsteadOfCallingNull) {
     EXPECT_EQ(UrmaApi::CreateJfr(nullptr, nullptr), nullptr);
     EXPECT_EQ(errno, ENOSYS);
     EXPECT_EQ(UrmaApi::DeleteJfr(nullptr), URMA_FAIL);
+    errno = 0;
+    EXPECT_EQ(UrmaApi::QueryJetty(nullptr, nullptr, nullptr), URMA_FAIL);
+    EXPECT_EQ(errno, ENOSYS);
     EXPECT_EQ(UrmaApi::PollJfc(nullptr, 0, nullptr), -1);
     errno = 0;
     UrmaApi::FreeEidList(nullptr);

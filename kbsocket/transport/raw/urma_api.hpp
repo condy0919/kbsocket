@@ -50,6 +50,7 @@ struct UrmaFunctions {
     decltype(&::urma_create_jetty) create_jetty = nullptr;
     decltype(&::urma_delete_jetty) delete_jetty = nullptr;
     decltype(&::urma_modify_jetty) modify_jetty = nullptr;
+    decltype(&::urma_query_jetty) query_jetty = nullptr;
     decltype(&::urma_bind_jetty) bind_jetty = nullptr;
     decltype(&::urma_unbind_jetty) unbind_jetty = nullptr;
     decltype(&::urma_import_jetty) import_jetty = nullptr;
@@ -211,6 +212,10 @@ public:
 
     static urma_status_t ModifyJetty(urma_jetty_t* jetty, urma_jetty_attr_t* attr) {
         return Invoke<true>(functions_.modify_jetty, jetty, attr);
+    }
+
+    static urma_status_t QueryJetty(urma_jetty_t* jetty, urma_jetty_cfg_t* cfg, urma_jetty_attr_t* attr) {
+        return Invoke<true>(functions_.query_jetty, jetty, cfg, attr);
     }
 
     static urma_status_t BindJetty(urma_jetty_t* jetty, urma_target_jetty_t* tjetty) {

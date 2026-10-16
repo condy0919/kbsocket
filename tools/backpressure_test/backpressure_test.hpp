@@ -20,14 +20,14 @@
 
 namespace kbsocket {
 namespace tools {
-enum class BackpressureMode : std::uint32_t { kTxQuota = 0, kRxDelay = 1 };
+enum class BackpressureMode : std::uint32_t { kTxQuota = 0, kRxDelay = 1, kRnrContinue = 2 };
 enum class BackpressureExpectation : std::uint32_t { kEither = 0, kSuccess = 1, kError = 2 };
 struct BackpressureOptions {
     BackpressureMode mode = BackpressureMode::kTxQuota;
     BackpressureExpectation expect = BackpressureExpectation::kEither;
     std::uint32_t bytes = 4096;
     std::uint32_t tx_depth = 32;
-    // 仅 tx_quota 使用 rounds；rx_delay 只测试一个批次，不复用故障 SQ。
+    // 仅 tx_quota 使用 rounds；其余模式各测试一组固定阶段。
     std::uint32_t rounds = 8;
     std::uint32_t rx_delay_us = 1000;
     std::uint32_t timeout_ms = 10000;
@@ -80,17 +80,24 @@ struct BackpressureReport {
     std::uint32_t retired = 0;
     std::uint32_t success = 0;
     std::uint32_t flush_done = 0;
-    // rx_delay 对原始及清理消息分别交换成功身份，防止错误 WR 的 RX 抵消另一条成功 WR 的缺失。
+    // rx_delay 与 rnr_continue 逐批交换成功身份，防止错误 WR 的 RX 抵消另一条成功 WR 的缺失。
     bool has_success_map = false;
     std::array<std::uint64_t, 4> success_map{};
 };
 std::expected<void, ToolError> WriteBackpressureReport(ControlChannel& channel, const BackpressureReport& report,
-                                                       std::uint32_t timeout_ms) noexcept;
-std::expected<BackpressureReport, ToolError> ReadBackpressureReport(ControlChannel& channel,
-                                                                    std::uint32_t timeout_ms) noexcept;
+                                                       std::uint32_t timeout_ms,
+                                                       bool rnr_without_drain = false) noexcept;
+std::expected<BackpressureReport, ToolError> ReadBackpressureReport(ControlChannel& channel, std::uint32_t timeout_ms,
+                                                                    bool rnr_without_drain = false) noexcept;
 struct BackpressureStats {
     BackpressureTraffic traffic;
     BackpressureTraffic cleanup;
+    BackpressureTraffic continuation;
+    std::uint32_t jetty_id = 0;
+    std::uint32_t queried_rnr_retry = 0;
+    // 保留 query 的原始值；不同 provider 的编码不能直接解释为微秒。
+    std::uint32_t queried_err_timeout = 0;
+    std::uint32_t state_checks = 0;
     std::uint64_t quota_rejections = 0;
     std::uint64_t recovery_sends = 0;
     std::uint64_t provider_eagain = 0;
@@ -113,6 +120,11 @@ public:
 private:
     std::expected<void, ToolError> RunQuota(ControlChannel& channel);
     std::expected<void, ToolError> RunDelay(ControlChannel& channel);
+    std::expected<void, ToolError> RunRnrContinue(ControlChannel& channel);
+    std::expected<void, ToolError> CheckContinueState();
+    std::expected<void, ToolError> FinishContinueTx();
+    std::expected<std::size_t, ToolError> PollContinueTx();
+    BackpressureTraffic& Traffic(bool cleanup) noexcept;
     std::expected<void, ToolError> Refill(std::uint32_t count);
     void Prepare(std::uint32_t first, std::uint32_t count, bool cleanup);
     std::expected<void, ToolError> Send(std::uint32_t first, std::uint32_t count, bool cleanup);
@@ -149,9 +161,11 @@ private:
     std::array<std::array<std::uint64_t, 4>, 2> peer_success_{};
     std::array<raw::TxSendRequest, kSlots> requests_{};
     std::array<raw::TxCompletionEvent, raw::TxCompletionProcessor::kMaxPollBatch> tx_events_{};
+    std::array<urma_cr_t, raw::TxCompletionProcessor::kMaxPollBatch> continue_completions_{};
     std::array<raw::RxBufferEvent, raw::RxBufferPool::kPollBatch> rx_events_{};
     std::uint32_t round_ = 0;
     std::uint32_t cleanup_count_ = 0;
+    urma_jetty_t* continue_jetty_ = nullptr;
     bool ready_ = false;
     bool started_ = false;
     bool peer_quiescent_ = true;

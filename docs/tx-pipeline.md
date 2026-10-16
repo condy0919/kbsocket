@@ -38,7 +38,9 @@ sequenceDiagram
 
 已知接受边界的 `URMA_EAGAIN` 是普通提交失败，不会独自令 `blocked_` 置位。`blocked_` 表示接受范围不可信或内部记账失败，此时不能通过重新 Open 就认为旧请求已安全消失。当前没有 `errno=EAGAIN` 的 socket 适配、等待队列或 `NotifyWritable()`；退休额度只是后续实现可写通知的输入。
 
-[背压硬件工具](../tools/backpressure_test/README.md) 分别验证本地 SQ 配额与远端 RX 延迟：`tx_quota` 将账本容量设为 `tx_depth+1`，暂停 TX poll 后验证额外 WR 在 SQ 预留阶段被拒绝，再退休前一批并提交这条未被接受的 WR。`rx_delay` 则先接受发送，再延迟补投远端 RX，区分成功完成与异步错误排空。两者都不要求 provider 返回 `URMA_EAGAIN`；同步 post 失败单独报告，不冒充本地配额拒绝。工具尚待真实硬件验证。
+[背压硬件工具](../tools/backpressure_test/README.md) 分别验证本地 SQ 配额与远端 RX 延迟：`tx_quota` 将账本容量设为 `tx_depth+1`，暂停 TX poll 后验证额外 WR 在 SQ 预留阶段被拒绝，再退休前一批并提交这条未被接受的 WR。`rx_delay` 则先接受发送，再延迟补投远端 RX，区分成功完成与异步错误排空。两者都不要求 provider 返回 `URMA_EAGAIN`；同步 post 失败单独报告，不冒充本地配额拒绝。用户已确认两组硬件测试通过，其中 `rx_delay` 观察到原始 WR 全部 RNR、另一条 SQ 的清理消息全部成功。
+
+`rnr_continue` 单独验证 error continue 下同一条 SQ 在 RNR 后是否仍能发送：服务端不投 RX，等客户端逐条收到全批 RNR 后再补投；客户端不切 ERROR，使用同一 jetty 提交具有新身份的第二批消息，要求全部成功且远端 payload 校验通过。该模式只在工具内直接消费 TX CQE 并退休账本，避免生产 `TxCompletionProcessor` 的主动排空改变实验条件。提交前、首批 RNR 后、第二批成功后均通过 `QueryJetty` 检查 READY，仍需真实硬件运行确认。
 
 ## AttemptLedger 发送账本
 

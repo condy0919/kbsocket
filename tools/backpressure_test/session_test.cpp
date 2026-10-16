@@ -40,6 +40,7 @@ public:
     MOCK_METHOD(urma_target_jetty_t*, Import, (urma_context_t*, urma_rjetty_t*, urma_token_t*));
     MOCK_METHOD(urma_status_t, PostSend, (urma_jetty_t*, urma_jfs_wr_t*, urma_jfs_wr_t**));
     MOCK_METHOD(urma_status_t, PostRecv, (urma_jfr_t*, urma_jfr_wr_t*, urma_jfr_wr_t**));
+    MOCK_METHOD(urma_status_t, Query, (urma_jetty_t*, urma_jetty_cfg_t*, urma_jetty_attr_t*));
     MOCK_METHOD(urma_status_t, Modify, (urma_jetty_t*, urma_jetty_attr_t*));
     MOCK_METHOD(int, Poll, (urma_jfc_t*, int, urma_cr_t*));
     MOCK_METHOD(int, Flush, (urma_jetty_t*, int, urma_cr_t*));
@@ -58,7 +59,14 @@ protected:
         kPayload,
         kProviderEagain,
         kProviderPartial,
-        kMissingSuccessfulRx
+        kMissingSuccessfulRx,
+        kRnrQuery,
+        kRnrState,
+        kRnrSuspend,
+        kRnrInitialError,
+        kRnrContinuationError,
+        kRnrBoundary,
+        kRnrDuplicate
     };
     struct PostedBuffer {
         urma_sge_t sge;
@@ -104,6 +112,8 @@ protected:
         std::size_t unregistered = 0;
         std::size_t sends_before_rx = 0;
         std::size_t tx_polls = 0;
+        std::size_t rnr_polled = 0;
+        std::size_t queries = 0;
         bool created_jfr = false;
         bool deleted_jfr = false;
     };
@@ -117,6 +127,7 @@ protected:
         functions.import_jetty = [](auto* c, auto* r, auto* t) { return active_->Import(c, r, t); };
         functions.post_jetty_send_wr = [](auto* q, auto* w, auto** b) { return active_->PostSend(q, w, b); };
         functions.post_jfr_wr = [](auto* q, auto* w, auto** b) { return active_->PostRecv(q, w, b); };
+        functions.query_jetty = [](auto* q, auto* cfg, auto* attr) { return active_->Query(q, cfg, attr); };
         functions.modify_jetty = [](auto* q, auto* a) { return active_->Modify(q, a); };
         functions.poll_jfc = [](auto* q, int n, auto* cr) { return active_->Poll(q, n, cr); };
         functions.flush_jetty = [](auto* q, int n, auto* cr) {
@@ -175,7 +186,7 @@ protected:
         }
         EXPECT_CALL(*this, CreateJfc(_, _)).Times(AnyNumber()).WillRepeatedly([&](auto* ctx, auto* cfg) {
             auto& endpoint = Find(ctx);
-            const auto lanes = options_.mode == BackpressureMode::kTxQuota ? 1u : 2u;
+            const auto lanes = options_.mode == BackpressureMode::kRxDelay ? 2u : 1u;
             const auto rx_depth = options_.tx_depth + (options_.mode == BackpressureMode::kTxQuota);
             EXPECT_EQ(cfg->depth, endpoint.created_cqs == 0 ? lanes * (options_.tx_depth + 1) : rx_depth);
             return &endpoint.cqs.at(endpoint.created_cqs++);
@@ -229,6 +240,13 @@ protected:
             std::lock_guard lock(mutex_);
             auto& server = endpoints_[0];
             EXPECT_EQ(jfr, &server.jfr);
+            if (options_.mode == BackpressureMode::kRnrContinue) {
+                // 必须先从 CQ 取回整批 RNR，才能补投 RX；否则测到的可能只是重试成功。
+                EXPECT_EQ(endpoints_[1].rnr_polled, options_.tx_depth);
+                EXPECT_EQ(endpoints_[1].queries, 2u);
+                EXPECT_TRUE(endpoints_[1].completions[0].empty());
+                EXPECT_TRUE(server.recv_batches.empty());
+            }
             std::size_t count = 0;
             for (; wr; wr = wr->next) {
                 EXPECT_EQ(wr->src.num_sge, 1u);
@@ -264,6 +282,35 @@ protected:
         });
         EXPECT_CALL(*this, PostSend(_, _, _)).Times(AnyNumber()).WillRepeatedly([&](auto* jetty, auto* wr, auto** bad) {
             return Submit(jetty, wr, bad);
+        });
+        EXPECT_CALL(*this, Query(_, _, _)).Times(AnyNumber()).WillRepeatedly([&](auto* jetty, auto* cfg, auto* attr) {
+            std::lock_guard lock(mutex_);
+            auto& client = endpoints_[1];
+            EXPECT_EQ(options_.mode, BackpressureMode::kRnrContinue);
+            EXPECT_EQ(jetty, &client.jetties[0]);
+            ++client.queries;
+            if (client.queries == 1) {
+                EXPECT_TRUE(client.send_batches.empty());
+            } else {
+                EXPECT_EQ(client.rnr_polled, options_.tx_depth);
+            }
+            *cfg = jetty->jetty_cfg;
+            // 模拟 provider 对配置的转换，工具必须记录查询值而非原始请求值。
+            cfg->jfs_cfg.rnr_retry = 2;
+            cfg->jfs_cfg.err_timeout = 5;
+            attr->state = URMA_JETTY_STATE_READY;
+            if (client.queries == 2) {
+                if (failure_ == Failure::kRnrQuery) {
+                    return URMA_EINVAL;
+                }
+                if (failure_ == Failure::kRnrState) {
+                    attr->state = URMA_JETTY_STATE_ERROR;
+                }
+                if (failure_ == Failure::kRnrSuspend) {
+                    cfg->jfs_cfg.flag.bs.error_suspend = 1;
+                }
+            }
+            return URMA_SUCCESS;
         });
         EXPECT_CALL(*this, Modify(_, _)).Times(AnyNumber()).WillRepeatedly([&](auto* jetty, auto* attr) {
             return EnterError(jetty, attr);
@@ -372,7 +419,38 @@ protected:
                                   (static_cast<std::uint64_t>(frame->round) << 32) | frame->index;
             EXPECT_TRUE(client.submitted_frames.insert(identity).second) << "accepted data must never be replayed";
             const Work work{sge, wr->user_ctx, wr->send.imm_data, *frame};
-            if (options_.mode == BackpressureMode::kRxDelay && lane == 0) {
+            if (options_.mode == BackpressureMode::kRnrContinue && frame->round == 0) {
+                EXPECT_EQ(lane, 0u);
+                EXPECT_TRUE(server.recv_batches.empty());
+                EXPECT_TRUE(server.buffers.empty());
+                ++client.sends_before_rx;
+                auto completion = Completion(lane, work.user_ctx, URMA_CR_RNR_RETRY_CNT_EXC_ERR);
+                if (count == 0 && failure_ == Failure::kRnrInitialError) {
+                    completion.status = URMA_CR_ACK_TIMEOUT_ERR;
+                }
+                if (count == 0 && failure_ == Failure::kRnrBoundary) {
+                    // 伪完成不能按普通 RNR 处理，更不能解引用它携带的无效 user_ctx。
+                    completion.status = URMA_CR_WR_FLUSH_ERR_DONE;
+                    completion.user_ctx = UINT64_MAX;
+                }
+                client.completions[0].push_back(completion);
+                if (count == 0 && failure_ == Failure::kRnrDuplicate) {
+                    client.completions[0].push_back(completion);
+                }
+            } else if (options_.mode == BackpressureMode::kRnrContinue) {
+                // 后续消息必须来自同一个物理 SQ，并使用与已失败消息不同的 round。
+                EXPECT_EQ(lane, 0u);
+                EXPECT_EQ(frame->round, 1u);
+                EXPECT_EQ(client.queries, 2u);
+                EXPECT_EQ(client.rnr_polled, options_.tx_depth);
+                EXPECT_EQ(server.recv_batches.size(), 1u);
+                EXPECT_FALSE(server.buffers.empty());
+                if (failure_ == Failure::kRnrContinuationError) {
+                    client.completions[0].push_back(Completion(lane, work.user_ctx, URMA_CR_RNR_RETRY_CNT_EXC_ERR));
+                } else {
+                    Deliver(work, lane, false);
+                }
+            } else if (options_.mode == BackpressureMode::kRxDelay && lane == 0) {
                 EXPECT_TRUE(server.recv_batches.empty());
                 ++client.sends_before_rx;
                 if (terminal_error_ && count == 0) {
@@ -456,6 +534,10 @@ protected:
                     if (out[i].status == URMA_CR_WR_FLUSH_ERR_DONE) {
                         const auto lane = static_cast<std::size_t>(out[i].local_id == endpoint.jetties[1].jetty_id.id);
                         endpoint.boundary_polled[lane] = true;
+                    }
+                    if (options_.mode == BackpressureMode::kRnrContinue && index == 0 &&
+                        endpoint.send_batches.size() == 1 && out[i].status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
+                        ++endpoint.rnr_polled;
                     }
                 }
                 return static_cast<int>(count);
@@ -627,6 +709,51 @@ protected:
         std::_Exit(retained && !HasFailure() ? 0 : 1);
     }
 
+    void ConfigureRnrContinue() {
+        options_.mode = BackpressureMode::kRnrContinue;
+        options_.expect = BackpressureExpectation::kEither;
+        // 此实验必须保留 SQ 原状态；进入 ERROR 或 flush 都会破坏要验证的前提。
+        EXPECT_CALL(*this, Modify(_, _)).Times(0);
+        EXPECT_CALL(*this, Flush(_, _, _)).Times(0);
+    }
+
+    void RunRnrFailureCase(Failure failure) {
+        ConfigureRnrContinue();
+        failure_ = failure;
+        options_.timeout_ms = 100;
+        if (!OpenBoth()) {
+            std::_Exit(2);
+        }
+        const auto results = RunBoth();
+        bool retained = !results[0] && !results[1];
+        for (std::size_t side = 0; side < sessions_.size(); ++side) {
+            const auto closed = sessions_[side].Close();
+            const auto& endpoint = endpoints_[side];
+            // 失败后没有双端静默证明；不能因本端账本为空就释放仍可能被 peer 使用的资源。
+            retained &= !closed && closed.error().code == EBUSY && endpoint.registration.live &&
+                        endpoint.unregistered == 0 && endpoint.unimported == 0 && !endpoint.deleted_jfr &&
+                        endpoint.created_jetties == 1 && !endpoint.deleted_jetties[0] && !endpoint.deleted_cqs[0] &&
+                        !endpoint.deleted_cqs[1] && !endpoint.modified[0] && endpoint.flush_calls[0] == 0;
+        }
+        const auto& client = sessions_[1].stats();
+        retained &= client.accepted_known && client.traffic.accepted == options_.tx_depth &&
+                    client.traffic.flush_done == 0 && client.cleanup.accepted == 0;
+        if (failure == Failure::kRnrContinuationError) {
+            // post 成功不等于实验成功：同一 SQ 后续仍产生 RNR 时必须判为失败。
+            retained &= client.traffic.retired == options_.tx_depth &&
+                        client.continuation.accepted == options_.tx_depth &&
+                        client.continuation.retired == options_.tx_depth && client.continuation.success == 0 &&
+                        client.continuation.rnr_retry_count_exceeded_error == options_.tx_depth;
+        } else {
+            retained &= client.continuation.accepted == 0 && endpoints_[0].recv_batches.empty();
+        }
+        if (failure == Failure::kRnrQuery) {
+            retained &= !results[1] && results[1].error().code == URMA_EINVAL;
+        }
+        // 与其它 DMA 失败用例相同，依赖链留给进程退出，避免夹具析构掩盖提前释放错误。
+        std::_Exit(retained && !HasFailure() ? 0 : 1);
+    }
+
     static inline BackpressureHardwareTest* active_;
     BackpressureOptions options_{.bytes = 64, .tx_depth = 3, .rounds = 3, .rx_delay_us = 1, .timeout_ms = 1000};
     urma_device_cap_t cap_{};
@@ -680,6 +807,54 @@ TEST_P(BackpressureQuotaTest, ExhaustsSqQuotaAndRetriesOnlyTheUnacceptedExtraMes
 }
 
 INSTANTIATE_TEST_SUITE_P(QueueDepths, BackpressureQuotaTest, ::testing::Values(1, 32, 256));
+
+class BackpressureRnrContinueTest : public BackpressureHardwareTest, public ::testing::WithParamInterface<int> {};
+
+TEST_P(BackpressureRnrContinueTest, SameSqSendsNewMessagesAfterOriginalAttemptsRetireWithRnr) {
+    ConfigureRnrContinue();
+    options_.tx_depth = GetParam();
+    options_.bytes = options_.tx_depth == 1 ? 64 : 4096;
+    ASSERT_TRUE(OpenBoth());
+    const auto results = RunBoth();
+    for (const auto& result : results) {
+        ASSERT_TRUE(result) << result.error().operation << ": " << result.error().code;
+    }
+    const auto& client = sessions_[1].stats();
+    const auto& server = sessions_[0].stats();
+    // 原始批次全部因无 RX 耗尽 RNR 重试；这里只退休 WR，不制造 ERROR/FLUSH 边界。
+    EXPECT_EQ(client.traffic.accepted, options_.tx_depth);
+    EXPECT_EQ(client.traffic.retired, options_.tx_depth);
+    EXPECT_EQ(client.traffic.rnr_retry_count_exceeded_error, options_.tx_depth);
+    EXPECT_EQ(client.traffic.success, 0u);
+    EXPECT_EQ(client.traffic.flush_done, 0u);
+    EXPECT_EQ(server.traffic.received, 0u);
+    EXPECT_EQ(endpoints_[1].sends_before_rx, options_.tx_depth);
+    EXPECT_EQ(endpoints_[1].rnr_polled, options_.tx_depth);
+    // 第二批是 round=1 的新消息；同一 jetty 成功收发，并且两端只创建过一个物理 jetty。
+    EXPECT_EQ(client.continuation.accepted, options_.tx_depth);
+    EXPECT_EQ(client.continuation.retired, options_.tx_depth);
+    EXPECT_EQ(client.continuation.success, options_.tx_depth);
+    EXPECT_EQ(client.continuation.flush_done, 0u);
+    EXPECT_EQ(server.continuation.received, options_.tx_depth);
+    EXPECT_EQ(client.cleanup.accepted, 0u);
+    EXPECT_EQ(endpoints_[1].send_batches, (std::vector<std::size_t>{options_.tx_depth, options_.tx_depth}));
+    EXPECT_EQ(endpoints_[0].recv_batches, (std::vector<std::size_t>{options_.tx_depth}));
+    EXPECT_EQ(endpoints_[1].submitted_frames.size(), 2 * options_.tx_depth);
+    EXPECT_EQ(endpoints_[0].created_jetties, 1u);
+    EXPECT_EQ(endpoints_[1].created_jetties, 1u);
+    // 三个阶段都查询同一个对象；输出采用 provider 返回值，不能拿创建参数冒充硬件读回值。
+    EXPECT_EQ(client.jetty_id, endpoints_[1].jetties[0].jetty_id.id);
+    EXPECT_EQ(client.state_checks, 3u);
+    EXPECT_EQ(endpoints_[1].queries, 3u);
+    EXPECT_EQ(client.queried_rnr_retry, 2u);
+    EXPECT_EQ(client.queried_err_timeout, 5u);
+    EXPECT_EQ(server.state_checks, 0u);
+    EXPECT_TRUE(client.accepted_known);
+    EXPECT_EQ(client.provider_eagain, 0u);
+    CloseBoth();
+}
+
+INSTANTIATE_TEST_SUITE_P(QueueDepths, BackpressureRnrContinueTest, ::testing::Values(1, 32, 256));
 
 TEST_F(BackpressureHardwareTest, DelayedReceivePostingCompletesAcceptedSendsWithoutReplay) {
     options_.mode = BackpressureMode::kRxDelay;
@@ -822,6 +997,34 @@ TEST_F(BackpressureHardwareTest, ProviderEagainPreservesTrustedAcceptedPrefixWit
 
 TEST_F(BackpressureHardwareTest, ErrorReceiveCannotSubstituteForMissingSuccessfulAttemptByMatchingCounts) {
     EXPECT_EXIT(RunFailureCase(Failure::kMissingSuccessfulRx), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(BackpressureHardwareTest, RnrContinueQueryFailureCannotReportVerifiedRecovery) {
+    EXPECT_EXIT(RunRnrFailureCase(Failure::kRnrQuery), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(BackpressureHardwareTest, RnrContinueRejectsSqThatChangedToErrorWithoutSoftwareModification) {
+    EXPECT_EXIT(RunRnrFailureCase(Failure::kRnrState), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(BackpressureHardwareTest, RnrContinueRejectsErrorSuspendModeReportedByProvider) {
+    EXPECT_EXIT(RunRnrFailureCase(Failure::kRnrSuspend), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(BackpressureHardwareTest, RnrContinueDoesNotAcceptOtherTerminalErrorsAsRnrEvidence) {
+    EXPECT_EXIT(RunRnrFailureCase(Failure::kRnrInitialError), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(BackpressureHardwareTest, RnrContinuePostSuccessWithRnrCompletionsIsNotSuccessfulContinuation) {
+    EXPECT_EXIT(RunRnrFailureCase(Failure::kRnrContinuationError), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(BackpressureHardwareTest, RnrContinueRejectsFlushBoundaryWithoutInterpretingItsUserContext) {
+    EXPECT_EXIT(RunRnrFailureCase(Failure::kRnrBoundary), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(BackpressureHardwareTest, RnrContinueRejectsDuplicateCompletionInsteadOfRetiringTwice) {
+    EXPECT_EXIT(RunRnrFailureCase(Failure::kRnrDuplicate), ::testing::ExitedWithCode(0), "");
 }
 } // namespace
 } // namespace tools

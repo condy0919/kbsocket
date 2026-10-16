@@ -58,7 +58,9 @@ flowchart TD
 
 [同池 SQ 故障隔离工具](../tools/sq_isolation_test/README.md) 将共享队列与排空组合：两条 SQ 先正常收发，再将其中一条置 ERROR，另一条继续提交并收发；同时按 SQ 区分普通完成、硬件边界和软件 flush。故障流量使用独立且不投 RX 的远端 sink，正常流量只进入健康目标，避免遗留无法确定消费数量的接收 WR。它验证主动置错的物理 SQ 隔离，不代表同 SQ 内连接隔离或远端掉线后的影响范围。
 
-[背压工具](../tools/backpressure_test/README.md) 分开验证两种条件：`tx_quota` 暂停 TX poll，填满软件 SQ 配额后检查额外 WR 被拒绝，再退休完成并仅重试此前未被接受的 WR；`rx_delay` 先发送再延迟投递 RX，区分原始数据全部成功与异步错误后的终结排空。后者使用另一条 SQ 发送具有独立身份的清理消息，消费剩余 RX 槽位；清理流量不计为原始数据恢复，已接受的原始 WR 不会重放。迟到的原始 RX 可能使清理 SQ 遇到 RNR，因此清理 SQ 也支持排空，只有全部 RX 槽位和 TX attempts 归还后才能关闭资源。软件配额拒绝、provider 的同步 EAGAIN 与远端缺 RX 的异步结果分别统计；provider EAGAIN 非零不是通过条件。该工具尚待硬件验证。
+[背压工具](../tools/backpressure_test/README.md) 的 `tx_quota` 模式暂停 TX poll，填满软件 SQ 配额后检查额外 WR 被拒绝，再退休完成并仅重试此前未被接受的 WR；`rx_delay` 先发送再延迟投递 RX，区分原始数据全部成功与异步错误后的终结排空。后者使用另一条 SQ 发送具有独立身份的清理消息，消费剩余 RX 槽位；清理流量不计为原始数据恢复，已接受的原始 WR 不会重放。迟到的原始 RX 可能使清理 SQ 遇到 RNR，因此清理 SQ 也支持排空，只有全部 RX 槽位和 TX attempts 归还后才能关闭资源。软件配额拒绝、provider 的同步 EAGAIN 与远端缺 RX 的异步结果分别统计；provider EAGAIN 非零不是通过条件。
+
+新增 `rnr_continue` 模式在首批 WR 全部返回 RNR 后才补投 RX，再用同一条 SQ 发送新消息。它在工具内消费完成并查询硬件状态，验证期间不调用 modify ERROR 或 flush，也不创建替代 SQ；用于区分 WR 终结错误与 SQ 不可用。此模式尚待硬件验证，生产完成层的主动排空策略保持不变。
 
 发送组件之间的调用和失败处理见 [TX 数据路径](tx-pipeline.md)；接收内存及 lease 见 [RX buffer 池](rx-buffer-pool.md)；队列容量、票据和故障隔离见 [JettyPool](jetty-pool.md)。
 
@@ -88,4 +90,6 @@ flowchart TD
 
 同池 SQ 故障隔离工具的三组配置随后也已获得用户确认，两端最终均输出 PASS。`batch=256、rounds=8` 时，两端正常流量的 accepted=retired=received 分别为 before 512、during 2048、after 512；故障 SQ 均 accepted=retired=256、flush_done=1、rejected_sends=3，服务端及客户端分别观察到 253、254 条 FLUSH_ERR。该结果补充验证了非零硬件 FLUSH_ERR、故障 SQ 排空与健康 SQ/共享 RX 持续可用，以及双方正常关闭资源。`healthy_retired_before_drained` 分别为 53、256，表示软件观察到故障 SQ 进入 Drained 前已有健康 TX 退休，不代表硬件同时执行的时间线保证。两端 WR_UNHANDLED 仍为 0。
 
-未据此验证的能力包括背压工具的本地配额恢复与延迟 RX、多设备或独立 peer 并行、持续无批间屏障收发、EAGAIN 到 EPOLLOUT 唤醒、非零软件 flush、异步事件及带未消费 WR 的共享 JFR 关闭。单元测试中的故障注入用于验证代码契约，不能替代这些硬件专项测试。
+背压工具的 `tx_quota` 与 `rx_delay` 两组测试已获得用户通过反馈。`rx_delay_us=0、tx_depth=32` 的日志中，原始 accepted=retired=32、RNR=32、success=0、flush_done=1，另一条 SQ 的清理 accepted=retired=success=received=32；`rx_delay_us=10000` 也报告终结失败分支。该结果验证缺 RX 后的错误排空与独立清理，不证明 RNR 后原 SQ 能继续发送，也不覆盖延迟 RX 后原始流量全部成功的分支。
+
+未据此验证的能力包括 RNR 后同 SQ 继续发送、延迟 RX 后原始流量成功、多设备或独立 peer 并行、持续无批间屏障收发、EAGAIN 到 EPOLLOUT 唤醒、非零软件 flush、异步事件及带未消费 WR 的共享 JFR 关闭。单元测试中的故障注入用于验证代码契约，不能替代这些硬件专项测试。
