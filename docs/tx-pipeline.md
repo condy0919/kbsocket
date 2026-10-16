@@ -38,6 +38,8 @@ sequenceDiagram
 
 已知接受边界的 `URMA_EAGAIN` 是普通提交失败，不会独自令 `blocked_` 置位。`blocked_` 表示接受范围不可信或内部记账失败，此时不能通过重新 Open 就认为旧请求已安全消失。当前没有 `errno=EAGAIN` 的 socket 适配、等待队列或 `NotifyWritable()`；退休额度只是后续实现可写通知的输入。
 
+[背压硬件工具](../tools/backpressure_test/README.md) 分别验证本地 SQ 配额与远端 RX 延迟：`tx_quota` 将账本容量设为 `tx_depth+1`，暂停 TX poll 后验证额外 WR 在 SQ 预留阶段被拒绝，再退休前一批并提交这条未被接受的 WR。`rx_delay` 则先接受发送，再延迟补投远端 RX，区分成功完成与异步错误排空。两者都不要求 provider 返回 `URMA_EAGAIN`；同步 post 失败单独报告，不冒充本地配额拒绝。工具尚待真实硬件验证。
+
 ## AttemptLedger 发送账本
 
 Bazel 目标为 `//kbsocket/transport/raw:attempt_ledger`。账本绑定一个 JettyPool，由相同 owner 推进。`Open(pool, capacity)` 预分配固定数量记录；容量不足在 post 前失败，不动态扩容。通常按池内发送额度总量设置容量。
@@ -124,4 +126,4 @@ stateDiagram-v2
 
 单测覆盖正常错误 → modify → FLUSH_ERR → FLUSH_ERR_DONE → WR_UNHANDLED → 排空、modify/flush 失败与重试、错误/重复边界、错误完成身份、残留票据，以及共享 JFC 中健康 SQ 继续发送。Close 在仍有票据、等待硬件边界或尚未确认软件队列为空时拒绝关闭并保留 poll 能力。
 
-这些是 gMock 契约验证；此前三组真实硬件测试只覆盖成功路径。[独立 TX 排空工具](../tools/tx_drain_test/README.md) 已支持双端主动切 ERROR 的硬件验证和有界等待，尚未取得真实硬件运行结果；生产侧异步事件与排空调度仍未实现。基础 SEND 工具遇到这类错误仍按原策略失败并保留无法安全释放的资源。
+[独立 TX 排空工具](../tools/tx_drain_test/README.md) 和 [同池 SQ 故障隔离工具](../tools/sq_isolation_test/README.md) 已获得用户的真实硬件通过反馈，后者观察到了非零 `FLUSH_ERR`，且健康 SQ 和共享 RX 保持可用。非零 `WR_UNHANDLED` 仍只有 gMock 覆盖，生产侧异步事件与排空调度仍未实现。基础 SEND 工具遇到这类错误仍按原策略失败并保留无法安全释放的资源；硬件记录见 [当前验证范围](raw-transport-flow.md)。

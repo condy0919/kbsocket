@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+cc_library(
+    name = "backpressure_test_support",
+    srcs = [
+        "backpressure_protocol.cpp",
+        "backpressure_test.cpp",
+    ],
+    hdrs = ["backpressure_test.hpp"],
+    deps = [
+        "//kbsocket/transport/raw:attempt_ledger",
+        "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:rx_buffer_pool",
+        "//kbsocket/transport/raw:tx_completion_processor",
+        "//kbsocket/transport/raw:tx_sender",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+    ],
+)
+
+cc_binary(
+    name = "backpressure_test",
+    srcs = ["main.cpp"],
+    deps = [
+        ":backpressure_test_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:raw_runtime",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+        "@gflags",
+    ],
+)
+
+cc_test(
+    name = "protocol_test",
+    srcs = ["protocol_test.cpp"],
+    deps = [
+        ":backpressure_test_support",
+        "//tools/common:control_channel",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "session_test",
+    srcs = ["session_test.cpp"],
+    deps = [
+        ":backpressure_test_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:urma_api",
+        "//kbsocket/transport/raw:urma_test_support",
+        "//tools/common:control_channel",
+        "@googletest//:gtest_main",
+    ],
+)

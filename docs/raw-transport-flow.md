@@ -2,7 +2,7 @@
 
 [文档入口](README.md)
 
-目前已实现显式裸设备选择、context 生命周期、共享队列池，SEND/SEND_WITH_IMM 的提交和 TX 完成回收，以及 RX buffer 池。双端工具把这些组件与测试用 TCP 控制协议、内存注册和接收循环串成了硬件验证闭环。正式连接协议与 socket/epoll 接入仍未实现；RX 内存管理已进入 raw 层，工具中的控制协议和 payload 校验仍属于测试逻辑。单 SQ TX 排空已通过用户的硬件测试；共享 JFR 带未消费接收 WR 的显式关闭尚未实现，正常收发不依赖这项能力。
+目前已实现显式裸设备选择、context 生命周期、共享队列池，SEND/SEND_WITH_IMM 的提交和 TX 完成回收，以及 RX buffer 池。双端工具把这些组件与测试用 TCP 控制协议、内存注册和接收循环串成了硬件验证闭环。正式连接协议与 socket/epoll 接入仍未实现；RX 内存管理已进入 raw 层，工具中的控制协议和 payload 校验仍属于测试逻辑。单 SQ TX 排空及同池 SQ 故障隔离已通过用户的硬件测试；共享 JFR 带未消费接收 WR 的显式关闭尚未实现，正常收发不依赖这项能力。
 
 ## 组件与所有权
 
@@ -58,6 +58,8 @@ flowchart TD
 
 [同池 SQ 故障隔离工具](../tools/sq_isolation_test/README.md) 将共享队列与排空组合：两条 SQ 先正常收发，再将其中一条置 ERROR，另一条继续提交并收发；同时按 SQ 区分普通完成、硬件边界和软件 flush。故障流量使用独立且不投 RX 的远端 sink，正常流量只进入健康目标，避免遗留无法确定消费数量的接收 WR。它验证主动置错的物理 SQ 隔离，不代表同 SQ 内连接隔离或远端掉线后的影响范围。
 
+[背压工具](../tools/backpressure_test/README.md) 分开验证两种条件：`tx_quota` 暂停 TX poll，填满软件 SQ 配额后检查额外 WR 被拒绝，再退休完成并仅重试此前未被接受的 WR；`rx_delay` 先发送再延迟投递 RX，区分原始数据全部成功与异步错误后的终结排空。后者使用另一条 SQ 发送具有独立身份的清理消息，消费剩余 RX 槽位；清理流量不计为原始数据恢复，已接受的原始 WR 不会重放。迟到的原始 RX 可能使清理 SQ 遇到 RNR，因此清理 SQ 也支持排空，只有全部 RX 槽位和 TX attempts 归还后才能关闭资源。软件配额拒绝、provider 的同步 EAGAIN 与远端缺 RX 的异步结果分别统计；provider EAGAIN 非零不是通过条件。该工具尚待硬件验证。
+
 发送组件之间的调用和失败处理见 [TX 数据路径](tx-pipeline.md)；接收内存及 lease 见 [RX buffer 池](rx-buffer-pool.md)；队列容量、票据和故障隔离见 [JettyPool](jetty-pool.md)。
 
 ## 退出路径
@@ -80,8 +82,10 @@ flowchart TD
 
 接收端报告 payload validated，发送端报告 TX and remote RX confirmed。这支持当前配置下初始化、普通 SEND、完成回收、数据校验和正常清理路径可用。记录来自用户硬件运行反馈，本地未重复进行硬件测试；尚未记录设备型号、驱动/URMA 版本及对应提交号。用户随后确认接入 RxBufferPool 后，同样三组配置也已全部通过。
 
-共享队列 SEND_WITH_IMM 工具的单 SQ、双 SQ、四 SQ 三组配置也已获得用户确认，两端最终均输出 PASS。双 SQ 记录为 accepted=retired=received=2002、imm_mask=0xff，四组源—目标计数分别为 501/500/500/501。该结果覆盖单 context 的多 jetty 正常收发；新增同池故障隔离工具尚待硬件验证。
+共享队列 SEND_WITH_IMM 工具的单 SQ、双 SQ、四 SQ 三组配置也已获得用户确认，两端最终均输出 PASS。双 SQ 记录为 accepted=retired=received=2002、imm_mask=0xff，四组源—目标计数分别为 501/500/500/501。该结果覆盖单 context 的多 jetty 正常收发。
 
 独立 TX 排空工具另已获得用户反馈：accepted=retired=256，ACK_TIMEOUT_ERR=253、RNR_RETRY_CNT_EXC_ERR=3、flush_done=1，ERROR SQ 拒绝新发送且两端资源关闭。该次运行没有非零 FLUSH_ERR 或 WR_UNHANDLED。
 
-未据此验证的能力包括多设备或独立 peer 并行、同池 SQ 故障隔离、持续无批间屏障收发、EAGAIN 到 EPOLLOUT 唤醒、非零软件 flush、异步事件及带未消费 WR 的共享 JFR 关闭。单元测试中的故障注入用于验证代码契约，不能替代这些硬件专项测试。
+同池 SQ 故障隔离工具的三组配置随后也已获得用户确认，两端最终均输出 PASS。`batch=256、rounds=8` 时，两端正常流量的 accepted=retired=received 分别为 before 512、during 2048、after 512；故障 SQ 均 accepted=retired=256、flush_done=1、rejected_sends=3，服务端及客户端分别观察到 253、254 条 FLUSH_ERR。该结果补充验证了非零硬件 FLUSH_ERR、故障 SQ 排空与健康 SQ/共享 RX 持续可用，以及双方正常关闭资源。`healthy_retired_before_drained` 分别为 53、256，表示软件观察到故障 SQ 进入 Drained 前已有健康 TX 退休，不代表硬件同时执行的时间线保证。两端 WR_UNHANDLED 仍为 0。
+
+未据此验证的能力包括背压工具的本地配额恢复与延迟 RX、多设备或独立 peer 并行、持续无批间屏障收发、EAGAIN 到 EPOLLOUT 唤醒、非零软件 flush、异步事件及带未消费 WR 的共享 JFR 关闭。单元测试中的故障注入用于验证代码契约，不能替代这些硬件专项测试。
