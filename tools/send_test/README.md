@@ -53,7 +53,7 @@ bazel build //tools/send_test:send_test
 --bytes=4096 --messages=1024 --batch=256
 ```
 
-上述三组配置此前已由用户在真实双端环境验证通过，接入 RxBufferPool 后须重新回归：接收端输出 `payload validated`，发送端输出 `TX and remote RX confirmed`。此记录未包含设备型号、驱动/URMA 版本及提交号，验证范围见 [当前流程中的说明](../../docs/raw-transport-flow.md#已验证范围)。
+上述三组配置已由用户在真实双端环境验证通过，接入 RxBufferPool 后也已重新运行并全部通过：接收端输出 `payload validated`，发送端输出 `TX and remote RX confirmed`。此记录未包含设备型号、驱动/URMA 版本及提交号，验证范围见 [当前流程中的说明](../../docs/raw-transport-flow.md#已验证范围)。
 
 最后一组需要设备支持至少 256 个工作队列槽和 257 个 TX CQ 槽。参数或设备能力不满足时显式失败，不自动裁剪。退出码 2 表示命令行参数错误，1 表示初始化、通信、校验或清理失败。
 

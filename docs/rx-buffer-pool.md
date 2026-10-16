@@ -43,7 +43,7 @@ Lease 是校验身份，不是 `shared_ptr`；复制不增加引用计数，只�
 - `Stop()` 仅关闭软件投递入口。它不取消已投递 WR，也不自动切 JFR ERROR。
 - `Close()` 要求 `posted()==0 && held()==0`。内存注销成功后才释放 slab 并解绑 JettyPool；注销失败保留资源供重试，并禁止再次投递。JettyPool 在 RX 池仍绑定时返回 `kInUse`。
 
-**RX 硬件故障排空尚未实现。** 空 CQ、对端断开或 TX 的 FLUSH_ERR_DONE 都不证明 RX buffer 安全；不能推测回收仍在 Posted 的槽位。若剩余 WR 没有终结证据，调用方须保留 RX 池、JettyPool、context 和 URMA 会话到进程退出。析构清理失败会记录日志并保留 DMA slab，但不代替让整个依赖链常驻的退出契约。
+**带未消费接收 WR 的共享 JFR 关闭尚未实现。** 正常收发持续 poll、归还并补投，单连接关闭不撤销 JFR 中的 buffer；该关闭能力用于整个接收域显式停用。空 CQ、对端断开或 TX 的 FLUSH_ERR_DONE 都不证明 RX buffer 安全；不能推测回收仍在 Posted 的槽位。若剩余 WR 没有终结证据，调用方须保留 RX 池、JettyPool、context 和 URMA 会话到进程退出。析构清理失败会记录日志并保留 DMA slab，但不代替让整个依赖链常驻的退出契约。
 
 ## 验证
 
@@ -54,4 +54,4 @@ bazel build //tools/send_test:send_test
 
 单元测试使用 gMock，覆盖持有期间不复用、接收额度、乱序/重复/迟到完成、IMM 保留、部分 post、边界不明、错误完成、注册回滚和注销重试。SEND 工具服务端已使用本组件，每轮只投递本轮所需 WR，校验后归还 lease，因而正常结束时不会遗留未使用的接收 WR。
 
-此前三组 SEND 硬件 PASS 属于工具直接管理 RX buffer 的实现；接入本组件后仍需重新运行同样三组配置。当前不包含分片、连接重排或无批间屏障的持续收发验证。
+用户已确认接入本组件后，SEND README 中同样三组配置也全部通过真实硬件测试。当前不包含分片、连接重排或无批间屏障的持续收发验证。

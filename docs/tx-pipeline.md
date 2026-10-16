@@ -59,7 +59,7 @@ AttemptId 在同一账本对象存活期间单调增加且不回绕，Close/Open
 
 Bazel 目标为 `//kbsocket/transport/raw:tx_sender`。同一个账本由一个 TxSender 管理提交顺序，与 post、poll、账本修改共用单 owner。WR 描述符内嵌于 `std::array`，`Open(ledger)` 仅绑定账本，不分配内存；单次请求数量由调用方传入的 span 决定，硬上限 `TxSender::kMaxBatch = 256` 对齐 UMQ 的 `UMQ_BATCH_SIZE`；之后 `Send(requests, ids, optional_lane)` 不分配内存、不加锁、不自动重试。单条发送使用长度为 1 的 span。
 
-每条请求携带 AttemptMetadata 和本地已注册内存的 SGE。首版仅支持普通非 inline SEND，强制全 signal，不支持 SEND_WITH_IMM、READ/WRITE 或 jetty group。目标必须由宿主正确导入为当前 context 的 RM_CTP 端点，注册段、payload 和目标必须覆盖在途 attempt 生命周期；SGE 描述符仅需覆盖 Send 调用。
+每条请求携带 AttemptMetadata 和本地已注册内存的 SGE。目前支持非 inline 的普通 SEND 与 SEND_WITH_IMM，允许同批混合，强制全 signal，不支持 READ/WRITE 或 jetty group。`metadata.opcode` 选择 `URMA_OPC_SEND` 或 `URMA_OPC_SEND_IMM`；后者将 `imm_data` 按 URMA 契约以主机字节序完整传递为 64 位值，普通 SEND 忽略该字段。发送器不规定 IMM 的连接标识或 SN 位布局。目标必须由宿主正确导入为当前 context 的 RM_CTP 端点，注册段、payload 和目标必须覆盖在途 attempt 生命周期；SGE 描述符仅需覆盖 Send 调用。
 
 一批 WR 在同一个 SQ 上 post，逐条设置远端目标和 `user_ctx = AttemptId`。未指定 lane 时由第一个预留选择 SQ，余下请求固定在该 SQ 上预留；不会跨 SQ 拆分或因容量不足自动换队列。整批预留失败时撤销本批已有预留，不调用 provider；不会影响此前已在途的记录。
 
@@ -120,7 +120,7 @@ stateDiagram-v2
 
 ### 当前范围与验证
 
-本版排空已提交的、全 signal 的普通 SEND，不会从一个边界或空 flush 推导所有请求已结束。post 接受范围不可信时，TxSender 留下的 Prepared 记录仍保留；本版没有增加“不确定提交”状态及其证据对账，因此不会自动 Cancel 或 Complete 它们。这类异常仍须保留依赖资源，不能宣称排空成功。
+本版排空已提交的、全 signal 的 SEND/SEND_WITH_IMM，不会从一个边界或空 flush 推导所有请求已结束。post 接受范围不可信时，TxSender 留下的 Prepared 记录仍保留；本版没有增加“不确定提交”状态及其证据对账，因此不会自动 Cancel 或 Complete 它们。这类异常仍须保留依赖资源，不能宣称排空成功。
 
 单测覆盖正常错误 → modify → FLUSH_ERR → FLUSH_ERR_DONE → WR_UNHANDLED → 排空、modify/flush 失败与重试、错误/重复边界、错误完成身份、残留票据，以及共享 JFC 中健康 SQ 继续发送。Close 在仍有票据、等待硬件边界或尚未确认软件队列为空时拒绝关闭并保留 poll 能力。
 

@@ -63,8 +63,10 @@ std::expected<std::size_t, TxSendError> TxSender::Send(std::span<const TxSendReq
     ids = ids.first(requests.size());
     std::ranges::fill(ids, 0);
     for (const auto& request : requests) {
-        if (!request.metadata.target || request.metadata.opcode != URMA_OPC_SEND || !request.metadata.signaled ||
-            request.sges.empty() || request.sges.size() > std::numeric_limits<std::uint32_t>::max()) {
+        const auto opcode = request.metadata.opcode;
+        if (!request.metadata.target || (opcode != URMA_OPC_SEND && opcode != URMA_OPC_SEND_IMM) ||
+            !request.metadata.signaled || request.sges.empty() ||
+            request.sges.size() > std::numeric_limits<std::uint32_t>::max()) {
             return Error(TxSendErrorCode::kInvalidArgument);
         }
         for (const auto& sge : request.sges) {
@@ -107,12 +109,15 @@ std::expected<std::size_t, TxSendError> TxSender::Send(std::span<const TxSendReq
         }
         auto& wr = wrs_[i];
         wr = {};
-        wr.opcode = URMA_OPC_SEND;
+        wr.opcode = requests[i].metadata.opcode;
         wr.flag.bs.complete_enable = 1;
         wr.tjetty = requests[i].metadata.target;
         wr.user_ctx = *id;
         wr.send.src.sge = requests[i].sges.data();
         wr.send.src.num_sge = static_cast<std::uint32_t>(requests[i].sges.size());
+        if (wr.opcode == URMA_OPC_SEND_IMM) {
+            wr.send.imm_data = requests[i].imm_data;
+        }
         wr.next = i + 1 < requests.size() ? &wrs_[i + 1] : nullptr;
     }
     auto jetty = pool_->Get(*lane);
