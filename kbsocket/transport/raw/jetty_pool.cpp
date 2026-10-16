@@ -2,6 +2,7 @@
 
 #include "kbsocket/transport/raw/jetty_pool.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <limits>
 #include <new>
@@ -551,8 +552,11 @@ std::expected<int, JettyPoolFailure> JettyPool::FlushSend(JettyLane lane, std::s
     if (slot.state != JettyLaneState::kFlushReady) {
         return std::unexpected(Failure(JettyPoolErrorCode::kInvalidState, lane.index));
     }
-    const int count = UrmaApi::FlushJetty(slot.jetty, static_cast<int>(completions.size()), completions.data());
-    if (count < 0 || static_cast<std::size_t>(count) > completions.size()) {
+    // liburma 要求 cr_cnt 不超过 SQ 深度；共享 CQ 的 poll 缓冲可以比单个 SQ 更大。
+    // 使用创建时的 TX 深度限制批次，票据归零后也保留合法正数请求，以确认软件队列为空。
+    const auto budget = std::min(completions.size(), static_cast<std::size_t>(tx_depth_));
+    const int count = UrmaApi::FlushJetty(slot.jetty, static_cast<int>(budget), completions.data());
+    if (count < 0 || static_cast<std::size_t>(count) > budget) {
         return std::unexpected(Failure(JettyPoolErrorCode::kFlushFailed, lane.index, count));
     }
     if (count == 0) {

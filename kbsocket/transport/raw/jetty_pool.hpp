@@ -153,6 +153,7 @@ public:
     std::expected<void, JettyPoolFailure> ObserveFlushDone(JettyLane lane) noexcept;
 
     /// 仅在边界之后调用软件 flush；返回的 WR_UNHANDLED 仍须逐条核验并退休。
+    /// 实际请求数量同时受输出缓冲和创建时的 TX 深度限制，不能直接复用共享 CQ 的 poll 数量。
     /// 返回 0 且该 SQ 无残留票据才进入 kDrained；残留票据返回 kInUse，禁止推测释放。
     std::expected<int, JettyPoolFailure> FlushSend(JettyLane lane, std::span<urma_cr_t> completions) noexcept;
 

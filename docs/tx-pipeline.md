@@ -97,7 +97,7 @@ Poll 的 expected 错误表示本次未成功取得 CQE；成功结果包含 `co
 1. `JettyPool::BeginDrain(lane)` 先阻断 Reserve/ReserveOn/Get，再调用 `ModifyJetty`，属性为 `mask=JETTY_STATE, state=URMA_JETTY_STATE_ERROR`。modify 失败保留隔离状态，owner 可显式重试；成功后重复调用不重复 modify。
 2. owner 继续 poll 共享 TX JFC。该 SQ 的 `WR_FLUSH_ERR` 是逐 WR 的终结错误，user_ctx 有效，照常核验身份并退休。
 3. 后续 `WR_FLUSH_ERR_DONE` 只标记硬件 FLUSH_ERR 的终结，user_ctx 无效，输出始终清零。只有本地已切 ERROR 才接受此边界；意外或重复边界返回拒绝事件，不清空任何记录。
-4. owner 在收到 kFlushDone 后调用 `TxCompletionProcessor::Flush(lane, events)`。每次最多 64 条，仅接受指定 SQ、TX jetty 方向、状态 `WR_UNHANDLED` 且匹配活跃已提交记录的返回项。普通 poll 中的 WR_UNHANDLED 仍不作为退休依据。
+4. owner 在收到 kFlushDone 后调用 `TxCompletionProcessor::Flush(lane, events)`。实际请求数量为 `min(events.size(), 64, tx_depth)`：liburma 要求 flush 数量不超过单个 SQ 深度，不能直接沿用共享 CQ 的 poll 缓冲大小；票据已清零时也用合法正数请求来确认软件队列为空。仅接受指定 SQ、TX jetty 方向、状态 `WR_UNHANDLED` 且匹配活跃已提交记录的返回项。普通 poll 中的 WR_UNHANDLED 仍不作为退休依据。
 5. 每条合法软件完成通过 ledger.Complete 归还额度并返回资源引用。重复、未知、错误通道或 Prepared 记录均拒绝；不会因为一条错误丢弃同批后续合法返回项。
 6. 持续 Flush，直到返回 count=0 且无错误。只有 provider 返回 0 且该 SQ 没有残留票据才标记排空；其他 SQ 仍有在途请求不会妨碍此 SQ 排空。已排空 jetty 永久不可发送，本版不在线重建。
 

@@ -572,35 +572,45 @@ TEST_F(TxCompletionProcessorTest, SoftwareFlushValidatesEveryRecordAndContinuesA
     });
     ASSERT_TRUE(processor_.Poll(events));
     EXPECT_FALSE(processor_.Flush(*lane, {}));
-    // 非法数量不能让调用方读取越界，也不能归还任何额度。
-    EXPECT_CALL(*this, Flush(&jetty_, 6, _)).WillOnce(Return(7));
+    // SQ 深度为 3，即使输出缓冲有 6 个元素，provider 返回 4 也违反本次请求的边界。
+    EXPECT_CALL(*this, Flush(&jetty_, 3, _)).WillOnce(Return(4));
     EXPECT_FALSE(processor_.Flush(*lane, events));
     EXPECT_EQ(ledger_.size(), 2u);
-    EXPECT_CALL(*this, Flush(&jetty_, 6, _)).WillOnce([&](auto*, int, auto* out) {
+    EXPECT_CALL(*this, Flush(&jetty_, 3, _)).WillOnce([&](auto*, int, auto* out) {
         out[0] = Completion(ids[0]); // 软件 flush 只认 WR_UNHANDLED。
         out[1] = Completion(ids[0], URMA_CR_WR_UNHANDLED);
         out[1].flag.bs.s_r = 1;
         out[2] = Completion(999, URMA_CR_WR_UNHANDLED);
-        out[3] = Completion(ids[0], URMA_CR_WR_UNHANDLED);
-        out[4] = out[3]; // 重复完成不能再次归还额度。
-        out[5] = Completion(ids[1], URMA_CR_WR_UNHANDLED);
-        return 6;
+        return 3;
     });
     auto batch = processor_.Flush(*lane, events);
     ASSERT_TRUE(batch);
-    EXPECT_EQ(batch->count, 6u);
-    EXPECT_EQ(batch->retired, 2u);
-    for (const auto i : {0, 1, 2, 4}) {
+    EXPECT_EQ(batch->count, 3u);
+    EXPECT_EQ(batch->retired, 0u);
+    for (const auto i : {0, 1, 2}) {
         EXPECT_EQ(events[i].kind, TxCompletionKind::kRejected);
         EXPECT_FALSE(events[i].record);
     }
-    ASSERT_TRUE(events[3].record);
-    ASSERT_TRUE(events[5].record);
-    EXPECT_EQ(events[3].record->id, ids[0]);
-    EXPECT_EQ(events[5].record->id, ids[1]);
-    // 分批 flush 直到明确返回 0；调用方输出大于 64 时仍限制 provider 批次。
+    // 分成两个符合 SQ 深度的批次；第二批中的重复完成也不能阻止后续合法 WR 退休。
+    EXPECT_CALL(*this, Flush(&jetty_, 3, _)).WillOnce([&](auto*, int, auto* out) {
+        out[0] = Completion(ids[0], URMA_CR_WR_UNHANDLED);
+        out[1] = out[0];
+        out[2] = Completion(ids[1], URMA_CR_WR_UNHANDLED);
+        return 3;
+    });
+    batch = processor_.Flush(*lane, events);
+    ASSERT_TRUE(batch);
+    EXPECT_EQ(batch->count, 3u);
+    EXPECT_EQ(batch->retired, 2u);
+    ASSERT_TRUE(events[0].record);
+    EXPECT_EQ(events[1].kind, TxCompletionKind::kRejected);
+    EXPECT_FALSE(events[1].record);
+    ASSERT_TRUE(events[2].record);
+    EXPECT_EQ(events[0].record->id, ids[0]);
+    EXPECT_EQ(events[2].record->id, ids[1]);
+    // 分批 flush 直到明确返回 0；大输出缓冲也不能突破单个 SQ 的深度限制。
     std::array<TxCompletionEvent, TxCompletionProcessor::kMaxPollBatch + 1> large{};
-    EXPECT_CALL(*this, Flush(&jetty_, TxCompletionProcessor::kMaxPollBatch, _)).WillOnce(Return(0));
+    EXPECT_CALL(*this, Flush(&jetty_, 3, _)).WillOnce(Return(0));
     ASSERT_TRUE(processor_.Flush(*lane, large));
     EXPECT_EQ(pool_.lane_state(*lane), JettyLaneState::kDrained);
 }

@@ -104,7 +104,13 @@ protected:
         f.post_jfr_wr = [](auto* q, auto* w, auto** b) { return active_->PostRecv(q, w, b); };
         f.modify_jetty = [](auto* q, auto* a) { return active_->Modify(q, a); };
         f.poll_jfc = [](auto* q, int n, auto* cr) { return active_->Poll(q, n, cr); };
-        f.flush_jetty = [](auto* q, int n, auto* cr) { return active_->Flush(q, n, cr); };
+        f.flush_jetty = [](auto* q, int n, auto* cr) {
+            // 原 mock 未检查 liburma 的深度上限，导致小 SQ 使用 64 条 flush 预算也能通过测试。
+            if (q == nullptr || cr == nullptr || n <= 0 || static_cast<unsigned>(n) > q->jetty_cfg.jfs_cfg.depth) {
+                return -URMA_EINVAL;
+            }
+            return active_->Flush(q, n, cr);
+        };
         f.unimport_jetty = [](auto* q) { return active_->Unimport(q); };
         f.delete_jetty = [](auto* q) { return active_->DeleteJetty(q); };
         f.delete_jfr = [](auto* q) { return active_->DeleteJfr(q); };
@@ -196,7 +202,9 @@ protected:
             EXPECT_EQ(cfg->shared.jfc, &endpoint.cqs[2 * domain + 1]);
             EXPECT_EQ(cfg->jfs_cfg.jfc, &endpoint.cqs[2 * domain]);
             EXPECT_EQ(cfg->jfs_cfg.flag.bs.error_suspend, 0u);
-            return &endpoint.jetties.at(endpoint.created_jetties++);
+            auto& jetty = endpoint.jetties.at(endpoint.created_jetties++);
+            jetty.jetty_cfg = *cfg;
+            return &jetty;
         });
         EXPECT_CALL(*this, Register(_, _)).Times(AnyNumber()).WillRepeatedly([&](auto* ctx, auto* cfg) {
             auto& endpoint = Find(ctx);
@@ -624,8 +632,8 @@ TEST_P(SqIsolationDistributionTest, FaultedSqDrainsWhileSharedQueuesContinueBidi
     EXPECT_TRUE(client_closed);
 }
 
-// batch=1 仅软件回收；batch=3 跨健康轮次延迟故障边界；batch=65 跨过 poll 的 64 条预算。
-INSTANTIATE_TEST_SUITE_P(CompletionDistributions, SqIsolationDistributionTest, ::testing::Values(1, 3, 65));
+// batch=1 仅软件回收；batch=3 跨轮延迟边界；batch=32 复现硬件参数错误；batch=65 跨过 64 条预算。
+INSTANTIATE_TEST_SUITE_P(CompletionDistributions, SqIsolationDistributionTest, ::testing::Values(1, 3, 32, 65));
 
 TEST_F(SqIsolationHardwareTest, PeerMismatchRejectsBeforeImportOrPosting) {
     ASSERT_TRUE(sessions_[0].Open(&endpoints_[0].ctx, cap_, options_, true));
