@@ -15,5 +15,6 @@
 | [双端 SEND 测试](../tools/send_test/README.md) | 编译、运行参数、结果判定与故障诊断 |
 | [共享队列双向测试](../tools/shared_queue_test/README.md) | SEND_WITH_IMM、多 jetty 共享 JFR/CQ、逐 WR 切换目标与双向完成归属 |
 | [TX 故障排空测试](../tools/tx_drain_test/README.md) | 独立双端工具，验证主动 ERROR、硬件边界、软件 flush 和关闭 |
+| [同池 SQ 故障隔离测试](../tools/sq_isolation_test/README.md) | 一条 SQ 排空时，共享 JFR/JFC 的健康 SQ 持续双向收发 |
 
 长期架构与协议规划见 [kbsocket 设计 v1](design/kbsocket-design-v1.md)。当前实现范围以本目录的流程和组件文档、对应源码为准。

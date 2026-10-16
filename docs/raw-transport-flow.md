@@ -56,6 +56,8 @@ flowchart TD
 
 [共享队列双向工具](../tools/shared_queue_test/README.md) 在上述组件之上补充 SEND_WITH_IMM 验证：每端多个 jetty 共用 JFR/TX JFC/RX JFC，同一 SQ 逐 WR 轮换远端目标，双方同时收发，并检查 IMM 与 CQE 端点归属。它使用工具专用 payload 头，不冻结正式连接协议；仍是单 context、逐轮同步的正确性测试。
 
+[同池 SQ 故障隔离工具](../tools/sq_isolation_test/README.md) 将共享队列与排空组合：两条 SQ 先正常收发，再将其中一条置 ERROR，另一条继续提交并收发；同时按 SQ 区分普通完成、硬件边界和软件 flush。故障流量使用独立且不投 RX 的远端 sink，正常流量只进入健康目标，避免遗留无法确定消费数量的接收 WR。它验证主动置错的物理 SQ 隔离，不代表同 SQ 内连接隔离或远端掉线后的影响范围。
+
 发送组件之间的调用和失败处理见 [TX 数据路径](tx-pipeline.md)；接收内存及 lease 见 [RX buffer 池](rx-buffer-pool.md)；队列容量、票据和故障隔离见 [JettyPool](jetty-pool.md)。
 
 ## 退出路径
@@ -76,8 +78,10 @@ flowchart TD
 | 4096       | 1000     | 32    | 多轮额度/内存复用及最后不足一批 |
 | 4096       | 1024     | 256   | 当前 256 条批次上限             |
 
-接收端报告 payload validated，发送端报告 TX and remote RX confirmed。这支持当前配置下初始化、普通 SEND、完成回收、数据校验和正常清理路径可用。记录来自用户硬件运行反馈，本地未重复进行硬件测试；尚未记录设备型号、驱动/URMA 版本及对应提交号。用户随后确认接入 RxBufferPool 后，同样三组配置也已全部通过。新共享队列 SEND_WITH_IMM 工具尚待硬件验证。
+接收端报告 payload validated，发送端报告 TX and remote RX confirmed。这支持当前配置下初始化、普通 SEND、完成回收、数据校验和正常清理路径可用。记录来自用户硬件运行反馈，本地未重复进行硬件测试；尚未记录设备型号、驱动/URMA 版本及对应提交号。用户随后确认接入 RxBufferPool 后，同样三组配置也已全部通过。
+
+共享队列 SEND_WITH_IMM 工具的单 SQ、双 SQ、四 SQ 三组配置也已获得用户确认，两端最终均输出 PASS。双 SQ 记录为 accepted=retired=received=2002、imm_mask=0xff，四组源—目标计数分别为 501/500/500/501。该结果覆盖单 context 的多 jetty 正常收发；新增同池故障隔离工具尚待硬件验证。
 
 独立 TX 排空工具另已获得用户反馈：accepted=retired=256，ACK_TIMEOUT_ERR=253、RNR_RETRY_CNT_EXC_ERR=3、flush_done=1，ERROR SQ 拒绝新发送且两端资源关闭。该次运行没有非零 FLUSH_ERR 或 WR_UNHANDLED。
 
-未据此验证的能力包括多设备/多远端并行、持续无批间屏障收发、EAGAIN 到 EPOLLOUT 唤醒、非零软件 flush、异步事件及 RX 故障排空。单元测试中的故障注入用于验证代码契约，不能替代这些硬件专项测试。
+未据此验证的能力包括多设备或独立 peer 并行、同池 SQ 故障隔离、持续无批间屏障收发、EAGAIN 到 EPOLLOUT 唤醒、非零软件 flush、异步事件及带未消费 WR 的共享 JFR 关闭。单元测试中的故障注入用于验证代码契约，不能替代这些硬件专项测试。

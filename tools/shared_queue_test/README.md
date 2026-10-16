@@ -98,6 +98,8 @@ PASS: bidirectional shared queue SEND_WITH_IMM; payload, immediate and completio
 
 两端都 PASS 且退出码为 0 才算通过。退出码 2 是参数错误，1 是初始化、协议、收发、校验或清理失败。失败也会尽量输出已完成的计数；接受范围不可信时 `accepted=unknown`。如果不能证明 DMA 与对端访问已终结，会保留队列、注册内存及下层依赖到进程退出，不重放 WR，也不在错误路径强行释放内存。
 
+用户已确认上述三组配置在真实硬件上运行，两端最后均输出 PASS。双 SQ 日志中两端 accepted=retired=received=2002、imm_mask=0xff，四组源—目标计数与示例一致。这是用户提供的运行结果，本地未重复硬件测试；共享队列的故障场景另见 [同池 SQ 故障隔离工具](../sq_isolation_test/README.md)。
+
 异常完成会保留并打印首条 TX/RX CQE 的状态、标志和归属字段；RX 还打印实际 opcode、远端 EID/ID、原始 IMM，以及可解析 payload 的 source/target/sequence/方向和期望 IMM。`raw_imm` 仅在对应接收 opcode 下具有 IMM 语义，其他情况下只作为原始诊断信息。排查高位丢失或路由不匹配时，应一起保存这些行。
 
 建议每次保存两端完整 stdout/stderr、退出码、运行命令、代码提交号及未提交差异，另记录设备名、EID 索引/EID、内核与驱动版本、liburma 路径及版本。之后没有硬件时，这些记录可帮助区分协议假设与实际观察。
