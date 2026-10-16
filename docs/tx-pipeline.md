@@ -40,7 +40,7 @@ sequenceDiagram
 
 [背压硬件工具](../tools/backpressure_test/README.md) 分别验证本地 SQ 配额与远端 RX 延迟：`tx_quota` 将账本容量设为 `tx_depth+1`，暂停 TX poll 后验证额外 WR 在 SQ 预留阶段被拒绝，再退休前一批并提交这条未被接受的 WR。`rx_delay` 则先接受发送，再延迟补投远端 RX，区分成功完成与异步错误排空。两者都不要求 provider 返回 `URMA_EAGAIN`；同步 post 失败单独报告，不冒充本地配额拒绝。用户已确认两组硬件测试通过，其中 `rx_delay` 观察到原始 WR 全部 RNR、另一条 SQ 的清理消息全部成功。
 
-`rnr_continue` 单独验证 error continue 下同一条 SQ 在 RNR 后是否仍能发送：服务端不投 RX，等客户端逐条收到全批 RNR 后再补投；客户端不切 ERROR，使用同一 jetty 提交具有新身份的第二批消息，要求全部成功且远端 payload 校验通过。该模式只在工具内直接消费 TX CQE 并退休账本，避免生产 `TxCompletionProcessor` 的主动排空改变实验条件。提交前、首批 RNR 后、第二批成功后均通过 `QueryJetty` 检查 READY，仍需真实硬件运行确认。
+`rnr_continue` 单独验证 error continue 下同一条 SQ 在 RNR 后是否仍能发送：服务端不投 RX，等客户端逐条收到全批 RNR 后再补投；客户端不切 ERROR，使用同一 jetty 提交具有新身份的第二批消息，要求全部成功且远端 payload 校验通过。该模式只在工具内直接消费 TX CQE 并退休账本，避免生产 `TxCompletionProcessor` 的主动排空改变实验条件。提交前、首批 RNR 后、第二批成功后均通过 `QueryJetty` 检查 READY。用户已反馈 `rnr_continue_success`，证明本次硬件与配置下 RNR 终结原始 WR 后，同一条 SQ 仍能成功发送新消息；生产侧仍按当前策略主动排空，其他错误是否可继续发送没有因此得到证明。证据与限制见 [硬件观测记录](hardware-observations.md)。
 
 ## AttemptLedger 发送账本
 
@@ -128,4 +128,4 @@ stateDiagram-v2
 
 单测覆盖正常错误 → modify → FLUSH_ERR → FLUSH_ERR_DONE → WR_UNHANDLED → 排空、modify/flush 失败与重试、错误/重复边界、错误完成身份、残留票据，以及共享 JFC 中健康 SQ 继续发送。Close 在仍有票据、等待硬件边界或尚未确认软件队列为空时拒绝关闭并保留 poll 能力。
 
-[独立 TX 排空工具](../tools/tx_drain_test/README.md) 和 [同池 SQ 故障隔离工具](../tools/sq_isolation_test/README.md) 已获得用户的真实硬件通过反馈，后者观察到了非零 `FLUSH_ERR`，且健康 SQ 和共享 RX 保持可用。非零 `WR_UNHANDLED` 仍只有 gMock 覆盖，生产侧异步事件与排空调度仍未实现。基础 SEND 工具遇到这类错误仍按原策略失败并保留无法安全释放的资源；硬件记录见 [当前验证范围](raw-transport-flow.md)。
+[独立 TX 排空工具](../tools/tx_drain_test/README.md) 和 [同池 SQ 故障隔离工具](../tools/sq_isolation_test/README.md) 已获得用户的真实硬件通过反馈，后者观察到了非零 `FLUSH_ERR`，且健康 SQ 和共享 RX 保持可用。非零 `WR_UNHANDLED` 仍只有 gMock 覆盖，生产侧异步事件与排空调度仍未实现。基础 SEND 工具遇到这类错误仍按原策略失败并保留无法安全释放的资源；硬件记录见 [硬件观测记录](hardware-observations.md)。

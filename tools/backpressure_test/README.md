@@ -5,6 +5,10 @@
 RM_CTP。每个消息包含 32 字节测试头，校验完整正文、消息身份和 64 位 IMM。
 `rnr_continue` 进一步验证同一条 SQ 在 RNR 重试耗尽后，是否仍能发送新的消息。
 
+用户已反馈 `tx_quota`、`rx_delay` 测试通过，以及 `rnr_continue_success`。其中 `rx_delay`
+观察到的是原始 WR 的 RNR 终结与另一条 SQ 的清理成功；同 SQ 续发由 `rnr_continue` 独立验证。
+已有日志、反馈范围及尚未验证的分支见 [硬件观测记录](../../docs/hardware-observations.md)。
+
 ## 测试语义
 
 ### `tx_quota`：本地配额耗尽与恢复

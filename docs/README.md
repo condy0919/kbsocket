@@ -5,6 +5,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [Raw 传输流程](raw-transport-flow.md) | 所有权、初始化、双端 SEND、退出和当前验证范围 |
+| [硬件观测记录](hardware-observations.md) | 用户实测结果、RNR 后同 SQ 续发、错误排空及验证边界 |
 | [URMA 加载与运行时](urma-runtime.md) | 动态加载、gMock 替换、context 校验、会话与进程退出 |
 | [DeviceCatalog](device-catalog-reference.md) | 裸设备筛选、EID 快照、查找与指针生命周期 |
 | [JettyPool](jetty-pool.md) | 两个 JFC、共享 JFR、多 jetty、配置与逐 WR 额度 |
@@ -16,5 +17,6 @@
 | [共享队列双向测试](../tools/shared_queue_test/README.md) | SEND_WITH_IMM、多 jetty 共享 JFR/CQ、逐 WR 切换目标与双向完成归属 |
 | [TX 故障排空测试](../tools/tx_drain_test/README.md) | 独立双端工具，验证主动 ERROR、硬件边界、软件 flush 和关闭 |
 | [同池 SQ 故障隔离测试](../tools/sq_isolation_test/README.md) | 一条 SQ 排空时，共享 JFR/JFC 的健康 SQ 持续双向收发 |
+| [背压与 RNR 续发测试](../tools/backpressure_test/README.md) | 本地 TX 配额、延迟投递 RX、RNR 后同一条 SQ 发送新消息 |
 
 长期架构与协议规划见 [kbsocket 设计 v1](design/kbsocket-design-v1.md)。当前实现范围以本目录的流程和组件文档、对应源码为准。
