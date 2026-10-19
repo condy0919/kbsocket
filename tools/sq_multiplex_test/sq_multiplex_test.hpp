@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -45,6 +46,17 @@ std::expected<void, ToolError> MultiplexBarrier(ControlChannel& channel, std::ui
                                                 std::uint32_t timeout_ms) noexcept;
 std::expected<void, ToolError> ConfirmMultiplexClosed(ControlChannel& channel, std::uint32_t timeout_ms) noexcept;
 
+struct MultiplexPhaseResult {
+    std::uint32_t phase_id = 0;
+    bool success = false;
+    // 本阶段已接受 TX 均有终结证明；任一端报告失败后双方不再发送，断连不代替此确认。
+    bool tx_quiescent = false;
+    int error_code = 0;
+};
+std::expected<MultiplexPhaseResult, ToolError> ExchangeMultiplexPhaseResult(ControlChannel& channel,
+                                                                            const MultiplexPhaseResult& local,
+                                                                            std::uint32_t timeout_ms) noexcept;
+
 enum class MultiplexPhase : std::uint32_t { kBefore = 0, kMixed = 1, kAfter = 2 };
 struct MultiplexFrame {
     MultiplexPhase phase = MultiplexPhase::kBefore;
@@ -61,6 +73,9 @@ struct MultiplexTraffic {
     std::uint64_t retired = 0;
     std::uint64_t success = 0;
     std::uint64_t rnr = 0;
+    std::uint64_t loc_access_error = 0;
+    std::uint64_t remote_access_abort_error = 0;
+    std::uint64_t ack_timeout_error = 0;
     std::uint64_t received = 0;
     std::uint64_t other_error = 0;
     int last_other_status = 0;
@@ -69,10 +84,18 @@ struct MultiplexTraffic {
     std::uint64_t max_cqe_ns = 0;
 };
 struct MultiplexRound {
+    bool started = false;
+    std::uint32_t healthy_retired = 0;
+    std::uint32_t sink_retired = 0;
+    std::uint32_t healthy_success = 0;
+    std::uint32_t sink_rnr = 0;
+    // healthy 时序包含其所有合法终结状态，不能把错误完成漏掉后仍称为最后完成。
     std::uint64_t first_healthy_ns = 0;
     std::uint64_t last_healthy_ns = 0;
     std::uint64_t first_rnr_ns = 0;
     std::uint64_t last_rnr_ns = 0;
+    std::uint64_t first_sink_ns = 0;
+    std::uint64_t last_sink_ns = 0;
     std::uint32_t healthy_before_first_rnr = 0;
     std::uint32_t healthy_before_last_rnr = 0;
 };
@@ -83,8 +106,11 @@ struct SqMultiplexStats {
     std::vector<MultiplexRound> rounds;
     std::uint32_t jetty_id = 0;
     std::uint32_t state_checks = 0;
+    std::uint32_t requested_rnr_retry = 0;
+    std::uint32_t requested_err_timeout = 0;
     std::uint32_t queried_rnr_retry = 0;
     std::uint32_t queried_err_timeout = 0;
+    std::optional<std::uint32_t> queried_state;
     std::uint64_t provider_eagain = 0;
     bool accepted_known = true;
 };
@@ -104,6 +130,7 @@ public:
 private:
     std::expected<void, ToolError> CheckState();
     std::expected<void, ToolError> RunPhase(ControlChannel& channel);
+    std::expected<void, ToolError> TransferPhase(ControlChannel& channel, bool& rx_ready);
     std::expected<void, ToolError> Send();
     std::expected<void, ToolError> FinishTx();
     std::expected<std::size_t, ToolError> PollTx();
@@ -142,6 +169,8 @@ private:
     std::uint32_t phase_received_ = 0;
     std::uint32_t mixed_healthy_ = 0;
     std::uint32_t mixed_rnr_ = 0;
+    // 预期状态不匹配不破坏逐 WR 终结证明；延迟到整批收齐后才上报阶段失败。
+    std::optional<ToolError> phase_error_;
     std::chrono::steady_clock::time_point submitted_{};
     bool ready_ = false;
     bool started_ = false;

@@ -54,6 +54,9 @@ protected:
     enum class Failure {
         kNone,
         kOtherStatus,
+        kAccessErrors,
+        kSplitAckErrors,
+        kSplitAckMissingCompletion,
         kPseudoBoundary,
         kDuplicateCompletion,
         kWrongLocalId,
@@ -62,7 +65,9 @@ protected:
         kQueryState,
         kProviderPartial,
         kUnknownAccepted,
-        kMissingCompletion
+        kMissingCompletion,
+        kExtraPollError,
+        kPreReadyRecvFailure
     };
     struct PostedBuffer {
         urma_sge_t sge;
@@ -136,6 +141,10 @@ protected:
         const auto& registration = endpoint.registration;
         return registration.live && sge.tseg == &registration.segment && sge.addr >= registration.address &&
                sge.len <= registration.length && sge.addr - registration.address <= registration.length - sge.len;
+    }
+
+    bool SplitAckCompletions() const {
+        return failure_ == Failure::kSplitAckErrors || failure_ == Failure::kSplitAckMissingCompletion;
     }
 
     void SetUp() override {
@@ -289,7 +298,7 @@ protected:
         EXPECT_EQ(jetty, &client.queues[0].jetty);
         EXPECT_TRUE(client.queues[0].completions[0].empty());
         EXPECT_TRUE(endpoints_[0].queues[1].buffers.empty());
-        std::deque<urma_cr_t> healthy, sink;
+        std::deque<urma_cr_t> healthy, sink, interleaved;
         std::size_t count = 0;
         bool mixed = false;
         for (; wr; wr = wr->next) {
@@ -332,12 +341,23 @@ protected:
                     ++completion.local_id;
                 }
             }
+            if (mixed && failure_ == Failure::kAccessErrors && count < 2) {
+                completion.status = frame->sink ? URMA_CR_LOC_ACCESS_ERR : URMA_CR_REM_ACCESS_ABORT_ERR;
+            }
+            if (mixed && SplitAckCompletions() && frame->index == 3) {
+                // 首次 poll 在三对正常完成后同时出现 sink/healthy ACK 超时，后续 CQE 必须继续统计。
+                completion.status = URMA_CR_ACK_TIMEOUT_ERR;
+            }
             auto& target = frame->sink ? sink : healthy;
             if (!(mixed && count == 0 && failure_ == Failure::kMissingCompletion)) {
                 target.push_front(completion);
             }
             if (mixed && count == 0 && failure_ == Failure::kDuplicateCompletion) {
                 target.push_back(completion);
+            }
+            if (!(mixed && failure_ == Failure::kSplitAckMissingCompletion && frame->sink &&
+                  frame->index + 1 == options_.batch)) {
+                interleaved.push_back(completion);
             }
             ++count;
             if (mixed && failure_ == Failure::kProviderPartial) {
@@ -351,7 +371,9 @@ protected:
         const auto append = [&](const auto& completions) {
             output.insert(output.end(), completions.begin(), completions.end());
         };
-        if (healthy_first_) {
+        if (mixed && SplitAckCompletions()) {
+            append(interleaved);
+        } else if (healthy_first_) {
             append(healthy);
             append(sink);
         } else {
@@ -375,7 +397,27 @@ protected:
                         continue;
                     }
                     auto& completions = queue.completions[index];
-                    const auto count = std::min(completions.size(), static_cast<std::size_t>(limit));
+                    if (failure_ == Failure::kExtraPollError && &endpoint == &endpoints_[1] && index == 0 &&
+                        endpoint.send_batches.size() == 2 && completions.empty()) {
+                        // 账本已空时最后一次补查失败，仍然不能把“已退休”误当成“CQ 观测无异常”。
+                        const auto& stats = (*sessions_)[1].stats();
+                        EXPECT_EQ(stats.healthy[1].retired, options_.batch);
+                        EXPECT_EQ(stats.sink.retired, options_.batch);
+                        EXPECT_EQ(++extra_poll_failures_, 1u);
+                        return -EIO;
+                    }
+                    auto budget = static_cast<std::size_t>(limit);
+                    if (SplitAckCompletions() && &endpoint == &endpoints_[1] && index == 0 &&
+                        endpoint.send_batches.size() == 2) {
+                        ++split_poll_calls_;
+                        if (split_poll_calls_ == 1) {
+                            budget = std::min(budget, std::size_t{8});
+                        } else if (split_poll_calls_ == 2) {
+                            // 故意隔一次空 poll，防止仅处理“包含错误的当前 CQ 批次”也通过回归。
+                            return 0;
+                        }
+                    }
+                    const auto count = std::min(completions.size(), budget);
                     for (std::size_t i = 0; i < count; ++i) {
                         out[i] = completions.front();
                         completions.pop_front();
@@ -509,6 +551,9 @@ protected:
     void RunFailureCase(Failure failure) {
         failure_ = failure;
         options_.timeout_ms = 100;
+        if (SplitAckCompletions()) {
+            options_.batch = 32;
+        }
         if (failure == Failure::kUnknownAccepted) {
             // provider 违反 bad_wr 契约时，TxSender 必须封锁 SQ；这条保护与普通 RNR 的观测路径不同。
             EXPECT_CALL(*this, Modify(&endpoints_[1].queues[0].jetty, _)).WillOnce([&](auto*, auto* attr) {
@@ -517,6 +562,15 @@ protected:
                 modified_ = true;
                 return URMA_SUCCESS;
             });
+        }
+        if (failure == Failure::kPreReadyRecvFailure) {
+            // 首批 RX 一条都没接受，服务端不能用阶段结果帧替代尚未发送的 READY。
+            EXPECT_CALL(*this, PostRecv(&endpoints_[0].queues[0].jfr, _, _)).WillOnce([&](auto*, auto* wr, auto** bad) {
+                ++pre_ready_recv_failures_;
+                *bad = wr;
+                return URMA_EINVAL;
+            });
+            EXPECT_CALL(*this, PostSend(_, _, _)).Times(0);
         }
         if (!OpenBoth()) {
             std::_Exit(2);
@@ -536,7 +590,21 @@ protected:
             }
         }
         const auto& client = (*sessions_)[1].stats();
+        if (failure == Failure::kPreReadyRecvFailure) {
+            // RunBoth 在 join 前保持控制连接，客户端应等待 READY 超时，不能误读结果 magic 成 marker。
+            retained &= pre_ready_recv_failures_ == 1 && !results[0] && results[0].error().code == URMA_EINVAL &&
+                        std::strcmp(results[0].error().operation, "post healthy RX buffers") == 0 && !results[1] &&
+                        results[1].error().code == ETIMEDOUT && endpoints_[1].queries == 1 &&
+                        endpoints_[1].send_batches.empty() && endpoints_[0].recv_batches.empty() &&
+                        client.healthy[0].accepted == 0 && client.sink.accepted == 0;
+            // 尚未交换停止发送的证明，双方资源仍留到进程退出。
+            std::_Exit(retained && !HasFailure() ? 0 : 1);
+        }
         retained &= client.healthy[0].success == options_.batch && client.healthy[2].accepted == 0;
+        if (failure != Failure::kPayload && failure != Failure::kImmediate) {
+            // TX 所有权或 CQ 观测存在异常时不再查询/宣称 SQ 可续发，仅保留初始和 before 的两次查询。
+            retained &= endpoints_[1].queries == 2;
+        }
         if (failure == Failure::kProviderPartial) {
             retained &= client.accepted_known && client.provider_eagain == 1 && client.sink.accepted == 1 &&
                         client.healthy[1].accepted == 0 && endpoints_[1].send_batches.size() == 2 &&
@@ -546,6 +614,21 @@ protected:
         } else if (failure == Failure::kMissingCompletion) {
             retained &=
                 !results[1] && results[1].error().code == ETIMEDOUT && client.sink.retired == options_.batch - 1;
+        } else if (failure == Failure::kSplitAckMissingCompletion) {
+            // ACK 是已退休 WR 的结果；缺少另一条 CQE 时必须继续等到超时，而非提前返回第一次 ACK。
+            retained &= !results[1] && results[1].error().code == ETIMEDOUT && split_poll_calls_ > 2 &&
+                        client.sink.accepted == 32 && client.sink.retired == 31 && client.sink.rnr == 30 &&
+                        client.sink.ack_timeout_error == 1 && client.healthy[1].retired == 32 &&
+                        client.healthy[1].success == 31 && client.healthy[1].ack_timeout_error == 1 &&
+                        (*sessions_)[0].stats().healthy[1].received == 32 && !results[0] &&
+                        results[0].error().code == ETIMEDOUT;
+        } else if (failure == Failure::kExtraPollError) {
+            // 双方均已收齐正常完成，但 poll 失败必须阻止静默确认和资源释放，且不继续查询 SQ。
+            retained &= extra_poll_failures_ == 1 && !results[0] && results[0].error().code == -EIO && !results[1] &&
+                        results[1].error().code == -EIO && client.healthy[1].retired == options_.batch &&
+                        client.healthy[1].success == options_.batch && client.sink.retired == options_.batch &&
+                        client.sink.rnr == options_.batch &&
+                        (*sessions_)[0].stats().healthy[1].received == options_.batch;
         } else if (failure == Failure::kPayload || failure == Failure::kImmediate) {
             retained &= corrupted_;
         }
@@ -561,6 +644,9 @@ protected:
     bool healthy_first_ = true;
     bool corrupted_ = false;
     bool modified_ = false;
+    std::size_t split_poll_calls_ = 0;
+    std::size_t extra_poll_failures_ = 0;
+    std::size_t pre_ready_recv_failures_ = 0;
     Failure failure_ = Failure::kNone;
     raw::test_support::ScopedUrmaOverride scope_{MockedFunctions()};
     NoDestructor<std::array<SqMultiplexSession, 2>> sessions_;
@@ -627,7 +713,90 @@ INSTANTIATE_TEST_SUITE_P(BatchesAndCompletionOrders, SqMultiplexOrderingTest,
                          ::testing::Combine(::testing::Values(1, 32, 128), ::testing::Bool()));
 
 TEST_F(SqMultiplexHardwareTest, UnexpectedSinkErrorDoesNotMasqueradeAsRnrObservation) {
-    EXPECT_EXIT(RunFailureCase(Failure::kOtherStatus), ::testing::ExitedWithCode(0), "");
+    failure_ = Failure::kOtherStatus;
+    ASSERT_TRUE(OpenBoth());
+    const auto results = RunBoth();
+    for (const auto& result : results) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, URMA_CR_ACK_TIMEOUT_ERR);
+    }
+    EXPECT_THAT(results[0].error().operation, ::testing::HasSubstr("peer rejected"));
+    const auto& client = (*sessions_)[1].stats();
+    EXPECT_EQ(client.sink.retired, options_.batch);
+    EXPECT_EQ(client.sink.rnr, options_.batch - 1);
+    EXPECT_EQ(client.sink.ack_timeout_error, 1u);
+    EXPECT_EQ(client.sink.other_error, 0u);
+    EXPECT_EQ(client.healthy[1].success, options_.batch);
+    EXPECT_EQ(client.healthy[2].accepted, 0u);
+    EXPECT_EQ(client.state_checks, 3u);
+    // 观测目标未满足仍必须 FAIL；完整退休和双端停发确认则允许安全释放本次实验资源。
+    CloseBoth();
+}
+
+TEST_F(SqMultiplexHardwareTest, AckErrorsDoNotDiscardLaterCompletionBatchesOrAllowTheNextPhase) {
+    failure_ = Failure::kSplitAckErrors;
+    options_.batch = 32;
+    ASSERT_TRUE(OpenBoth());
+    const auto results = RunBoth();
+    for (const auto& result : results) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, URMA_CR_ACK_TIMEOUT_ERR);
+    }
+    EXPECT_THAT(results[0].error().operation, ::testing::HasSubstr("peer rejected"));
+    const auto& client = (*sessions_)[1].stats();
+    const auto& healthy = client.healthy[1];
+    // 首次 poll 只有 4+4 条，后面空 poll 再补齐 28+28 条；旧实现会停在 retired=4。
+    EXPECT_GT(split_poll_calls_, 2u);
+    EXPECT_EQ(healthy.accepted, 32u);
+    EXPECT_EQ(healthy.retired, 32u);
+    EXPECT_EQ(healthy.success, 31u);
+    EXPECT_EQ(healthy.ack_timeout_error, 1u);
+    EXPECT_EQ(healthy.other_error, 0u);
+    EXPECT_EQ(client.sink.accepted, 32u);
+    EXPECT_EQ(client.sink.retired, 32u);
+    EXPECT_EQ(client.sink.rnr, 31u);
+    EXPECT_EQ(client.sink.ack_timeout_error, 1u);
+    EXPECT_EQ(client.sink.other_error, 0u);
+    EXPECT_EQ((*sessions_)[0].stats().healthy[1].received, 32u);
+    // 接收端实际收齐不能把发送 ACK 超时改成成功；失败阶段不允许续发 after 或下一轮。
+    EXPECT_EQ(client.healthy[2].accepted, 0u);
+    EXPECT_EQ(endpoints_[1].send_batches, (std::vector<std::size_t>{32, 64}));
+    EXPECT_EQ(endpoints_[1].submitted_frames.size(), 96u);
+    EXPECT_EQ(client.state_checks, 3u);
+    EXPECT_EQ(endpoints_[1].queries, 3u);
+    EXPECT_EQ(client.queried_state, URMA_JETTY_STATE_READY);
+    ASSERT_EQ(client.rounds.size(), options_.rounds);
+    EXPECT_TRUE(client.rounds[0].started);
+    EXPECT_FALSE(client.rounds[1].started);
+    EXPECT_EQ(client.rounds[0].healthy_retired, 32u);
+    EXPECT_EQ(client.rounds[0].sink_retired, 32u);
+    EXPECT_EQ(client.rounds[0].healthy_success, 31u);
+    EXPECT_EQ(client.rounds[0].sink_rnr, 31u);
+    EXPECT_GT(client.rounds[0].last_healthy_ns, client.rounds[0].first_healthy_ns);
+    EXPECT_GT(client.rounds[0].last_sink_ns, client.rounds[0].first_sink_ns);
+    CloseBoth();
+}
+
+TEST_F(SqMultiplexHardwareTest, AccessErrorsAreCountedSeparatelyAndStillFailTheExperiment) {
+    failure_ = Failure::kAccessErrors;
+    ASSERT_TRUE(OpenBoth());
+    const auto results = RunBoth();
+    for (const auto& result : results) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, URMA_CR_REM_ACCESS_ABORT_ERR);
+    }
+    const auto& client = (*sessions_)[1].stats();
+    // 健康目标与空 RX 目标分别注入远端/本地访问错误，验证它们不再混入 other_error。
+    EXPECT_EQ(client.healthy[1].retired, options_.batch);
+    EXPECT_EQ(client.healthy[1].success, options_.batch - 1);
+    EXPECT_EQ(client.healthy[1].remote_access_abort_error, 1u);
+    EXPECT_EQ(client.healthy[1].other_error, 0u);
+    EXPECT_EQ(client.sink.retired, options_.batch);
+    EXPECT_EQ(client.sink.rnr, options_.batch - 1);
+    EXPECT_EQ(client.sink.loc_access_error, 1u);
+    EXPECT_EQ(client.sink.other_error, 0u);
+    EXPECT_EQ(client.healthy[2].accepted, 0u);
+    CloseBoth();
 }
 
 TEST_F(SqMultiplexHardwareTest, PseudoCompletionCannotUseInvalidContextToRetireAnAttempt) {
@@ -651,7 +820,21 @@ TEST_F(SqMultiplexHardwareTest, ImmediateCorruptionFailsDespiteValidPayload) {
 }
 
 TEST_F(SqMultiplexHardwareTest, SqLeavingReadyCannotBeReportedAsSuccessfulContinuation) {
-    EXPECT_EXIT(RunFailureCase(Failure::kQueryState), ::testing::ExitedWithCode(0), "");
+    failure_ = Failure::kQueryState;
+    ASSERT_TRUE(OpenBoth());
+    const auto results = RunBoth();
+    for (const auto& result : results) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, URMA_JETTY_STATE_ERROR);
+    }
+    const auto& client = (*sessions_)[1].stats();
+    EXPECT_EQ(client.healthy[1].success, options_.batch);
+    EXPECT_EQ(client.sink.rnr, options_.batch);
+    EXPECT_EQ(client.healthy[2].accepted, 0u);
+    EXPECT_EQ(endpoints_[1].queries, 3u);
+    EXPECT_EQ(client.queried_state, URMA_JETTY_STATE_ERROR);
+    // 状态查询失败禁止继续发新批次；已终结全部 WR 且双方停发后可以正常删除队列。
+    CloseBoth();
 }
 
 TEST_F(SqMultiplexHardwareTest, PartialAcceptancePreservesTheAcceptedPrefixWithoutReplay) {
@@ -664,6 +847,18 @@ TEST_F(SqMultiplexHardwareTest, UnknownAcceptedPrefixRetainsAllDmaDependencies) 
 
 TEST_F(SqMultiplexHardwareTest, MissingCompletionTimesOutWithoutReleasingOutstandingMemory) {
     EXPECT_EXIT(RunFailureCase(Failure::kMissingCompletion), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(SqMultiplexHardwareTest, AckErrorsDoNotHideAStillMissingCompletionAtTheDeadline) {
+    EXPECT_EXIT(RunFailureCase(Failure::kSplitAckMissingCompletion), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(SqMultiplexHardwareTest, ExtraPollErrorAfterAllRetirementsStillRetainsDmaDependencies) {
+    EXPECT_EXIT(RunFailureCase(Failure::kExtraPollError), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(SqMultiplexHardwareTest, PreReadyRecvFailureDoesNotSendPhaseResultInPlaceOfReady) {
+    EXPECT_EXIT(RunFailureCase(Failure::kPreReadyRecvFailure), ::testing::ExitedWithCode(0), "");
 }
 } // namespace
 } // namespace tools

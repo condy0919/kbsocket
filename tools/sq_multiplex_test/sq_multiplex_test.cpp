@@ -17,7 +17,6 @@ using Clock = std::chrono::steady_clock;
 constexpr std::uint32_t kStart = 0x4d580000;
 constexpr std::uint32_t kRxReady = 0x4d580001;
 constexpr std::uint32_t kDone = 0x4d580002;
-constexpr std::uint32_t kPhaseDone = 0x4d590000;
 
 auto Error(const char* operation, int code) noexcept {
     return std::unexpected(ToolError{operation, code});
@@ -236,6 +235,35 @@ std::expected<void, ToolError> SqMultiplexSession::RunPhase(ControlChannel& chan
     rx_seen_.fill(false);
     ids_.fill(0);
     phase_received_ = mixed_healthy_ = mixed_rnr_ = 0;
+    phase_error_.reset();
+    bool rx_ready = false;
+    const auto result = TransferPhase(channel, rx_ready);
+    if (!rx_ready) {
+        // 对端还在读取 READY marker 时不能混入阶段结果，否则控制流会错位。
+        return result;
+    }
+    const MultiplexPhaseResult local{
+        .phase_id = round_ * 3 + static_cast<std::uint32_t>(phase_),
+        .success = result.has_value(),
+        .tx_quiescent = !unsafe_ && stats_.accepted_known && ledger_.size() == 0,
+        .error_code = result ? 0 : result.error().code,
+    };
+    // 接收可能比 TX 重试早结束。留出对端数据超时和结果传输的预算，不用断 TCP 传递失败。
+    const auto peer = ExchangeMultiplexPhaseResult(channel, local, 2 * options_.timeout_ms);
+    if (!peer) {
+        // 通知失败不覆盖本地已知的 CQE/超时原因，也不能被当作远端停止 DMA 的证明。
+        return result ? std::unexpected(peer.error()) : result;
+    }
+    if (!result || !peer->success) {
+        // 双方都看到失败才停止后续阶段；只有明确的 TX 终结证明允许拆除依赖链。
+        // 本地剩余 RX、未知 CQE 等情况仍由 Close 的所有权检查拒绝回收。
+        peer_quiescent_ = local.tx_quiescent && peer->tx_quiescent;
+        return result ? Error("peer rejected SQ multiplex phase", peer->error_code) : result;
+    }
+    return {};
+}
+
+std::expected<void, ToolError> SqMultiplexSession::TransferPhase(ControlChannel& channel, bool& rx_ready) {
     if (local_.server) {
         auto posted = rx_.Refill(options_.batch);
         if (!posted) {
@@ -250,6 +278,7 @@ std::expected<void, ToolError> SqMultiplexSession::RunPhase(ControlChannel& chan
         if (!ready) {
             return ready;
         }
+        rx_ready = true;
         auto received = Receive();
         if (!received) {
             return received;
@@ -259,6 +288,7 @@ std::expected<void, ToolError> SqMultiplexSession::RunPhase(ControlChannel& chan
         if (!ready) {
             return ready;
         }
+        rx_ready = true;
         auto sent = Send();
         if (!sent) {
             return sent;
@@ -271,9 +301,11 @@ std::expected<void, ToolError> SqMultiplexSession::RunPhase(ControlChannel& chan
         if (!state) {
             return state;
         }
+        if (phase_error_) {
+            return std::unexpected(*phase_error_);
+        }
     }
-    // 只有本批所有 TX 及每个健康 RX 身份都通过校验，双方才能进入下一阶段和复用内存。
-    return MultiplexBarrier(channel, kPhaseDone + round_ * 3 + static_cast<std::uint32_t>(phase_), options_.timeout_ms);
+    return {};
 }
 
 std::size_t SqMultiplexSession::RequestCount() const noexcept {
@@ -305,6 +337,9 @@ std::expected<void, ToolError> SqMultiplexSession::Send() {
                         .imm_data = MultiplexImmediate(frame)};
     }
     // 同一 post 中交替选择 rjetty，不在每个 WR 间插入 TCP 同步或 poll。
+    if (phase_ == MultiplexPhase::kMixed) {
+        stats_.rounds[round_].started = true;
+    }
     submitted_ = Clock::now();
     auto sent = sender_.Send(std::span(requests_).first(count), std::span(ids_).first(count), lane_);
     const auto accepted = sent ? std::optional<std::size_t>(*sent) : sent.error().accepted;
@@ -336,6 +371,8 @@ std::expected<void, ToolError> SqMultiplexSession::CheckState() {
     if (jetty_->jetty_cfg.jfs_cfg.flag.bs.error_suspend) {
         return Error("multiplex experiment requires error_suspend=0 at creation", EPROTO);
     }
+    stats_.requested_rnr_retry = jetty_->jetty_cfg.jfs_cfg.rnr_retry;
+    stats_.requested_err_timeout = jetty_->jetty_cfg.jfs_cfg.err_timeout;
     urma_jetty_cfg_t cfg{};
     urma_jetty_attr_t attr{};
     const auto status = UrmaApi::QueryJetty(jetty_, &cfg, &attr);
@@ -344,6 +381,7 @@ std::expected<void, ToolError> SqMultiplexSession::CheckState() {
     }
     stats_.queried_rnr_retry = cfg.jfs_cfg.rnr_retry;
     stats_.queried_err_timeout = cfg.jfs_cfg.err_timeout;
+    stats_.queried_state = static_cast<std::uint32_t>(attr.state);
     if (attr.state != URMA_JETTY_STATE_READY) {
         return Error("hardware jetty is not READY", static_cast<int>(attr.state));
     }
@@ -387,31 +425,50 @@ std::expected<void, ToolError> SqMultiplexSession::ObserveTx(const urma_cr_t& cr
         ++traffic.success;
     } else if (cr.status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
         ++traffic.rnr;
+    } else if (cr.status == URMA_CR_LOC_ACCESS_ERR) {
+        ++traffic.loc_access_error;
+    } else if (cr.status == URMA_CR_REM_ACCESS_ABORT_ERR) {
+        ++traffic.remote_access_abort_error;
+    } else if (cr.status == URMA_CR_ACK_TIMEOUT_ERR) {
+        ++traffic.ack_timeout_error;
     } else {
         ++traffic.other_error;
         traffic.last_other_status = static_cast<int>(cr.status);
     }
     const auto expected = frame.sink ? URMA_CR_RNR_RETRY_CNT_EXC_ERR : URMA_CR_SUCCESS;
-    if (cr.status != expected) {
-        return Error(frame.sink ? "empty sink WR did not complete with RNR" : "healthy WR did not succeed",
-                     static_cast<int>(cr.status));
+    if (cr.status != expected && !phase_error_) {
+        // 状态不符合实验预期，但 CQE 身份与终结证明仍有效。收齐剩余尝试后再 FAIL，不能截断观测。
+        phase_error_ = ToolError{frame.sink ? "empty sink WR did not complete with RNR" : "healthy WR did not succeed",
+                                 static_cast<int>(cr.status)};
     }
     if (phase_ == MultiplexPhase::kMixed) {
         auto& round = stats_.rounds[round_];
         if (frame.sink) {
-            if (!mixed_rnr_) {
-                round.first_rnr_ns = ns;
-                round.healthy_before_first_rnr = mixed_healthy_;
+            if (!round.sink_retired) {
+                round.first_sink_ns = ns;
             }
-            round.last_rnr_ns = ns;
-            round.healthy_before_last_rnr = mixed_healthy_;
-            ++mixed_rnr_;
+            round.last_sink_ns = ns;
+            ++round.sink_retired;
+            if (cr.status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
+                if (!mixed_rnr_) {
+                    round.first_rnr_ns = ns;
+                    round.healthy_before_first_rnr = mixed_healthy_;
+                }
+                round.last_rnr_ns = ns;
+                round.healthy_before_last_rnr = mixed_healthy_;
+                ++mixed_rnr_;
+                ++round.sink_rnr;
+            }
         } else {
-            if (!mixed_healthy_) {
+            if (!round.healthy_retired) {
                 round.first_healthy_ns = ns;
             }
             round.last_healthy_ns = ns;
-            ++mixed_healthy_;
+            ++round.healthy_retired;
+            if (cr.status == URMA_CR_SUCCESS) {
+                ++mixed_healthy_;
+                ++round.healthy_success;
+            }
         }
     }
     return {};
@@ -422,6 +479,7 @@ std::expected<std::size_t, ToolError> SqMultiplexSession::PollTx() {
     completions_.fill({});
     auto polled = pool_.PollSend(completions_);
     if (!polled) {
+        unsafe_ = true;
         return Error("poll TX JFC", PoolError(polled.error()));
     }
     std::optional<ToolError> failure;

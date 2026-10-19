@@ -73,9 +73,10 @@ void PrintTraffic(std::string_view label, const kbsocket::tools::MultiplexTraffi
         return;
     }
     const auto accepted = accepted_known ? std::to_string(traffic.accepted) : "unknown";
-    std::println("{}: accepted={} retired={} success={} rnr={} other_error={} last_other_status={} "
-                 "min_cqe_ns={} max_cqe_ns={}",
-                 label, accepted, traffic.retired, traffic.success, traffic.rnr, traffic.other_error,
+    std::println("{}: accepted={} retired={} success={} rnr={} loc_access_err={} remote_access_abort_err={} "
+                 "ack_timeout_err={} other_error={} last_other_status={} min_cqe_ns={} max_cqe_ns={}",
+                 label, accepted, traffic.retired, traffic.success, traffic.rnr, traffic.loc_access_error,
+                 traffic.remote_access_abort_error, traffic.ack_timeout_error, traffic.other_error,
                  traffic.last_other_status, traffic.min_cqe_ns, traffic.max_cqe_ns);
 }
 
@@ -89,16 +90,25 @@ void PrintStats(const kbsocket::tools::SqMultiplexStats& stats) {
         return;
     }
     PrintTraffic("Sink mixed", stats.sink, stats.accepted_known);
-    std::println("Same SQ: jetty_id={} state_checks={} queried_rnr_retry={} queried_err_timeout={} "
-                 "accepted_known={} provider_eagain={}",
-                 stats.jetty_id, stats.state_checks, stats.queried_rnr_retry, stats.queried_err_timeout,
-                 stats.accepted_known, stats.provider_eagain);
+    const auto queried_state = stats.queried_state ? std::to_string(*stats.queried_state) : "unknown";
+    std::println(
+        "Same SQ: jetty_id={} state_checks={} requested_rnr_retry={} requested_err_timeout={} "
+        "queried_rnr_retry={} queried_err_timeout={} last_queried_state={} accepted_known={} provider_eagain={}",
+        stats.jetty_id, stats.state_checks, stats.requested_rnr_retry, stats.requested_err_timeout,
+        stats.queried_rnr_retry, stats.queried_err_timeout, queried_state, stats.accepted_known, stats.provider_eagain);
     for (std::size_t i = 0; i < stats.rounds.size(); ++i) {
         const auto& round = stats.rounds[i];
-        std::println("Mixed round {}: first_healthy_ns={} last_healthy_ns={} first_rnr_ns={} last_rnr_ns={} "
+        if (!round.started) {
+            continue;
+        }
+        std::println("Mixed round {}: healthy_retired={} healthy_success={} sink_retired={} sink_rnr={} "
+                     "first_healthy_ns={} last_healthy_ns={} first_sink_ns={} last_sink_ns={} "
+                     "first_rnr_ns={} last_rnr_ns={} "
                      "healthy_before_first_rnr={} healthy_before_last_rnr={}",
-                     i, round.first_healthy_ns, round.last_healthy_ns, round.first_rnr_ns, round.last_rnr_ns,
-                     round.healthy_before_first_rnr, round.healthy_before_last_rnr);
+                     i, round.healthy_retired, round.healthy_success, round.sink_retired, round.sink_rnr,
+                     round.first_healthy_ns, round.last_healthy_ns, round.first_sink_ns, round.last_sink_ns,
+                     round.first_rnr_ns, round.last_rnr_ns, round.healthy_before_first_rnr,
+                     round.healthy_before_last_rnr);
     }
     std::println("Timing is measured from before post to software CQE consumption; CQE order alone does not "
                  "establish hardware head-of-line blocking.");
@@ -167,13 +177,18 @@ int Run() {
         std::println(stderr, "FAIL: {}: {}", result.error().operation, result.error().code);
     }
     PrintStats(hardware->session.stats());
-    if (!CloseResources(*hardware) || !result) {
+    if (!CloseResources(*hardware) || !connected) {
         return 1;
     }
+    // 观测失败与资源未决分别处理：已安全关闭时仍确认对端收尾，但不能因此把实验判为通过。
     auto confirmed = kbsocket::tools::ConfirmMultiplexClosed(channel, FLAGS_timeout_ms);
     if (!confirmed) {
         std::println(stderr, "FAIL: peer cleanup confirmation: {}: {}", confirmed.error().operation,
                      confirmed.error().code);
+        return 1;
+    }
+    if (!result) {
+        std::println("FAIL: experiment failed; both endpoints closed resources");
         return 1;
     }
     std::println("PASS: healthy traffic succeeded before, during and after same-SQ RNR; sink attempts retired "

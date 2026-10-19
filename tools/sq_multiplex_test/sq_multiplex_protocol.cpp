@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -15,11 +17,13 @@ namespace tools {
 namespace {
 constexpr std::uint32_t kHelloMagic = 0x4b424d58;   // KBMX
 constexpr std::uint32_t kPayloadMagic = 0x4b424d46; // KBMF
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kPhaseMagic = 0x4b424d52;   // KBMR
+constexpr std::uint32_t kVersion = 2;
 constexpr std::uint32_t kClosedMarker = 0x4d58434c;
 constexpr std::uint32_t kMaxBatch = 128;
 constexpr std::uint32_t kMaxRounds = 1000;
 constexpr std::uint32_t kMaxTimeoutMs = 3600000;
+using PhaseResultBytes = std::array<std::byte, 24>;
 
 auto Error(const char* operation, int code) noexcept {
     return std::unexpected(ToolError{operation, code});
@@ -38,6 +42,37 @@ std::uint32_t Get32(std::span<const std::byte> wire) noexcept {
         value = (value << 8) | std::to_integer<unsigned>(wire[i]);
     }
     return value;
+}
+
+PhaseResultBytes EncodePhaseResult(const MultiplexPhaseResult& result) noexcept {
+    PhaseResultBytes wire{};
+    Put32(wire, kPhaseMagic);
+    Put32(std::span(wire).subspan(4), kVersion);
+    Put32(std::span(wire).subspan(8), result.phase_id);
+    Put32(std::span(wire).subspan(12), (result.success ? 1u : 0u) | (result.tx_quiescent ? 2u : 0u));
+    Put32(std::span(wire).subspan(16), static_cast<std::uint32_t>(result.error_code));
+    return wire;
+}
+
+std::expected<MultiplexPhaseResult, ToolError> DecodePhaseResult(const PhaseResultBytes& wire) noexcept {
+    if (Get32(wire) != kPhaseMagic || Get32(std::span(wire).subspan(4)) != kVersion) {
+        return Error("SQ multiplex phase result version", EPROTO);
+    }
+    const auto phase_id = Get32(std::span(wire).subspan(8));
+    const auto flags = Get32(std::span(wire).subspan(12));
+    if (phase_id >= 3 * kMaxRounds || (flags & ~3u) != 0 || Get32(std::span(wire).subspan(20)) != 0) {
+        return Error("SQ multiplex phase result flags", EPROTO);
+    }
+    MultiplexPhaseResult result{
+        .phase_id = phase_id,
+        .success = (flags & 1u) != 0,
+        .tx_quiescent = (flags & 2u) != 0,
+        .error_code = std::bit_cast<std::int32_t>(Get32(std::span(wire).subspan(16))),
+    };
+    if (result.success && (!result.tx_quiescent || result.error_code != 0)) {
+        return Error("SQ multiplex phase result success", EPROTO);
+    }
+    return result;
 }
 
 bool SameEndpoint(const urma_jetty_id_t& first, const urma_jetty_id_t& second) noexcept {
@@ -164,6 +199,33 @@ std::expected<void, ToolError> MultiplexBarrier(ControlChannel& channel, std::ui
         return sent;
     }
     return channel.ExpectMarker(marker, timeout_ms);
+}
+
+std::expected<MultiplexPhaseResult, ToolError> ExchangeMultiplexPhaseResult(ControlChannel& channel,
+                                                                            const MultiplexPhaseResult& local,
+                                                                            std::uint32_t timeout_ms) noexcept {
+    const auto outgoing = EncodePhaseResult(local);
+    auto checked = DecodePhaseResult(outgoing);
+    if (!checked) {
+        return std::unexpected(checked.error());
+    }
+    auto sent = channel.Write(outgoing, timeout_ms);
+    if (!sent) {
+        return std::unexpected(sent.error());
+    }
+    PhaseResultBytes incoming{};
+    auto received = channel.Read(incoming, timeout_ms);
+    if (!received) {
+        return std::unexpected(received.error());
+    }
+    auto peer = DecodePhaseResult(incoming);
+    if (!peer) {
+        return std::unexpected(peer.error());
+    }
+    if (peer->phase_id != local.phase_id) {
+        return Error("SQ multiplex peer phase", EPROTO);
+    }
+    return peer;
 }
 
 std::expected<void, ToolError> ConfirmMultiplexClosed(ControlChannel& channel, std::uint32_t timeout_ms) noexcept {

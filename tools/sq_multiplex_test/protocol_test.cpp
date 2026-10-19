@@ -6,7 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <span>
+#include <thread>
 
 #include "tools/common/control_channel.hpp"
 #include "tools/sq_multiplex_test/sq_multiplex_test.hpp"
@@ -44,6 +46,44 @@ std::expected<SqMultiplexHello, ToolError> ExchangeWithPeer(const SqMultiplexHel
     return ExchangeMultiplexHello(channel, local);
 }
 
+using PhaseWire = std::array<std::byte, 24>;
+
+PhaseWire PhaseResultWire(std::uint32_t phase_id = 0, std::uint32_t flags = 3, int error_code = 0) {
+    const std::array<std::uint32_t, 6> fields{0x4b424d52, 2, phase_id, flags, static_cast<std::uint32_t>(error_code),
+                                              0};
+    PhaseWire wire{};
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        for (std::size_t j = 0; j < 4; ++j) {
+            wire[4 * i + j] = static_cast<std::byte>((fields[i] >> (24 - 8 * j)) & 255);
+        }
+    }
+    return wire;
+}
+
+std::expected<MultiplexPhaseResult, ToolError>
+ExchangePhaseWithWire(const MultiplexPhaseResult& local, const PhaseWire& remote, PhaseWire* outgoing = nullptr) {
+    int fds[2]{};
+    const int status = ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds);
+    EXPECT_EQ(status, 0);
+    if (status != 0) {
+        return std::unexpected(ToolError{"test socketpair", errno});
+    }
+    ControlChannel channel(fds[0]), peer(fds[1]);
+    auto written = peer.Write(remote, 100);
+    if (!written) {
+        return std::unexpected(written.error());
+    }
+    auto result = ExchangeMultiplexPhaseResult(channel, local, 100);
+    if (outgoing != nullptr) {
+        auto received = peer.Read(*outgoing, 100);
+        EXPECT_TRUE(received);
+        if (!received) {
+            return std::unexpected(received.error());
+        }
+    }
+    return result;
+}
+
 TEST(MultiplexProtocol, OptionsBoundTheCombinedMixedBatchAndReceiveSlot) {
     EXPECT_TRUE(ValidateMultiplexOptions({}));
     EXPECT_TRUE(ValidateMultiplexOptions({.bytes = 32, .batch = 1, .rounds = 1, .timeout_ms = 1}));
@@ -65,6 +105,7 @@ TEST(MultiplexProtocol, HelloUsesNetworkOrderAndKeepsTimeoutLocal) {
     EXPECT_EQ(wire.size(), 72u);
     EXPECT_EQ(wire[0], std::byte{'K'});
     EXPECT_EQ(wire[3], std::byte{'X'});
+    EXPECT_EQ(wire[7], std::byte{2});
     EXPECT_EQ(wire[11], std::byte{1});
     EXPECT_EQ(wire[15], std::byte{64});
     EXPECT_EQ(wire[19], std::byte{3});
@@ -99,6 +140,10 @@ TEST(MultiplexProtocol, HelloRejectsUnknownVersionFlagsAndOptions) {
         wire[offset] = std::byte{0};
         EXPECT_FALSE(DecodeMultiplexHello(wire)) << "offset=" << offset;
     }
+    // 阶段结果引入新报文，旧版本必须在 hello 阶段拒绝，避免后续报文错位。
+    auto old_version = valid;
+    old_version[7] = std::byte{1};
+    EXPECT_FALSE(DecodeMultiplexHello(old_version));
     auto invalid = Hello(true);
     invalid.options.batch = 129;
     EXPECT_FALSE(DecodeMultiplexHello(EncodeMultiplexHello(invalid)));
@@ -147,6 +192,109 @@ TEST(MultiplexProtocol, ExchangeMatchesRoleAndAllTrafficParameters) {
     local = Hello();
     local.options.timeout_ms = 0;
     EXPECT_FALSE(ExchangeWithPeer(local, peer));
+}
+
+TEST(MultiplexProtocol, BothEndpointsExchangeSuccessfulPhaseResults) {
+    int fds[2]{};
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
+    ControlChannel first(fds[0]), second(fds[1]);
+    const MultiplexPhaseResult local{.phase_id = 2999, .success = true, .tx_quiescent = true};
+    // 两端同时交换，验证双方先写后读，无需依赖固定的客户端/服务端先后顺序。
+    std::expected<MultiplexPhaseResult, ToolError> remote;
+    std::jthread peer([&] { remote = ExchangeMultiplexPhaseResult(second, local, 1000); });
+    const auto result = ExchangeMultiplexPhaseResult(first, local, 1000);
+    peer.join();
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(remote);
+    EXPECT_EQ(result->phase_id, 2999u);
+    EXPECT_TRUE(result->success);
+    EXPECT_TRUE(result->tx_quiescent);
+    EXPECT_EQ(result->error_code, 0);
+    EXPECT_EQ(remote->phase_id, 2999u);
+    EXPECT_TRUE(remote->success);
+    EXPECT_TRUE(remote->tx_quiescent);
+    EXPECT_EQ(remote->error_code, 0);
+}
+
+TEST(MultiplexProtocol, PhaseResultPreservesFailureCodesInBothDirections) {
+    const MultiplexPhaseResult success{.phase_id = 256, .success = true, .tx_quiescent = true};
+    for (const int code :
+         {0, 9, -22, std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max()}) {
+        for (const bool quiescent : {false, true}) {
+            SCOPED_TRACE(code);
+            SCOPED_TRACE(quiescent);
+            // CQE 状态码与负 provider 返回值必须原样传递；失败不等于 DMA 已经终结。
+            PhaseWire outgoing{};
+            auto received = ExchangePhaseWithWire(success, PhaseResultWire(256, quiescent ? 2 : 0, code), &outgoing);
+            ASSERT_TRUE(received);
+            EXPECT_FALSE(received->success);
+            EXPECT_EQ(received->tx_quiescent, quiescent);
+            EXPECT_EQ(received->error_code, code);
+            EXPECT_EQ(outgoing, PhaseResultWire(256));
+
+            const MultiplexPhaseResult failure{
+                .phase_id = 256, .success = false, .tx_quiescent = quiescent, .error_code = code};
+            received = ExchangePhaseWithWire(failure, PhaseResultWire(256), &outgoing);
+            ASSERT_TRUE(received);
+            EXPECT_TRUE(received->success);
+            EXPECT_TRUE(received->tx_quiescent);
+            EXPECT_EQ(received->error_code, 0);
+            EXPECT_EQ(outgoing, PhaseResultWire(256, quiescent ? 2 : 0, code));
+        }
+    }
+}
+
+TEST(MultiplexProtocol, PhaseResultRejectsUnknownMagicVersionFlagsAndReservedBits) {
+    const MultiplexPhaseResult local{.success = true, .tx_quiescent = true};
+    const auto valid = PhaseResultWire();
+    for (const auto offset : {0u, 7u, 15u, 23u}) {
+        auto corrupted = valid;
+        corrupted[offset] = std::byte{255};
+        const auto result = ExchangePhaseWithWire(local, corrupted);
+        ASSERT_FALSE(result) << "offset=" << offset;
+        EXPECT_EQ(result.error().code, EPROTO);
+    }
+}
+
+TEST(MultiplexProtocol, PhaseResultRejectsDifferentAndOutOfRangePhase) {
+    const MultiplexPhaseResult local{.phase_id = 2999, .success = true, .tx_quiescent = true};
+    // 不接受上一阶段迟到的结果，也不允许超出 1000 轮、每轮 3 个阶段的身份范围。
+    for (const auto phase_id : {2998u, 3000u, std::numeric_limits<std::uint32_t>::max()}) {
+        const auto result = ExchangePhaseWithWire(local, PhaseResultWire(phase_id));
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, EPROTO);
+    }
+    const auto invalid_local = ExchangePhaseWithWire({.phase_id = 3000}, PhaseResultWire());
+    ASSERT_FALSE(invalid_local);
+    EXPECT_EQ(invalid_local.error().code, EPROTO);
+}
+
+TEST(MultiplexProtocol, PhaseSuccessRequiresQuiescentTxAndZeroError) {
+    const MultiplexPhaseResult local{.success = true, .tx_quiescent = true};
+    // 成功是下一阶段可安全开始的承诺，不能与未终结 TX 或错误码同时出现。
+    for (const auto wire : {PhaseResultWire(0, 1), PhaseResultWire(0, 3, 9), PhaseResultWire(0, 3, -22)}) {
+        const auto result = ExchangePhaseWithWire(local, wire);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, EPROTO);
+    }
+    for (const auto invalid : {MultiplexPhaseResult{.success = true},
+                               MultiplexPhaseResult{.success = true, .tx_quiescent = true, .error_code = 9}}) {
+        const auto result = ExchangePhaseWithWire(invalid, PhaseResultWire());
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, EPROTO);
+    }
+}
+
+TEST(MultiplexProtocol, PhaseResultExchangePropagatesControlTimeout) {
+    int fds[2]{};
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
+    ControlChannel local(fds[0]), peer(fds[1]);
+    const auto result = ExchangeMultiplexPhaseResult(local, {.success = true, .tx_quiescent = true}, 1);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, ETIMEDOUT);
+    PhaseWire outgoing{};
+    ASSERT_TRUE(peer.Read(outgoing, 100));
+    EXPECT_EQ(outgoing, PhaseResultWire());
 }
 
 TEST(MultiplexProtocol, ImmediateKeepsTargetPhaseRoundAndIndexDistinct) {

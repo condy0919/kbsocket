@@ -2,21 +2,23 @@
 
 [文档入口](README.md)
 
-整理日期：2026-10-16。本文记录当前开发过程中用户反馈的真实硬件结果，以及为解释这些结果做的源码对照。测试命令仍以各工具 README 为准。
+整理日期：2026-10-19。本文记录当前开发过程中用户反馈的真实硬件结果，以及为解释这些结果做的源码对照。测试命令仍以各工具 README 为准。
 
 最重要的新证据是：**在本次裸设备 RM_CTP、`error_suspend=0` 配置下，WR 返回 RNR 重试耗尽后，同一条 SQ 仍能成功发送新消息。WR 失败、逻辑连接失败、SQ 进入 ERROR 和物理端口故障必须分别判断。**
+
+后续同 SQ 多目标实验出现了新的边界：健康目标已收到完整 mixed 批次，但发送端同时观察到健康目标和空 JFR 目标的 ACK_TIMEOUT。该实验失败，不能由单目标 RNR 后续发成功推导同 SQ 多目标错误隔离已经成立。
 
 ## 证据与环境范围
 
 - 硬件结果来自用户运行反馈和贴出的日志；本地 gMock 测试不计作硬件证据。
-- 已贴出的近期日志使用裸设备 `udmac0d1e4`，服务端 `eid_index=65`、客户端 `eid_index=61`。这些值是该环境的选择，不是设备型号或通用配置要求。
+- 已贴出的日志使用裸设备 `udmac0d1e4`；先前测试服务端 `eid_index=65`、客户端 `eid_index=61`，最新同 SQ 多目标实验为服务端 `38`、客户端 `60`。这些值是该环境的选择，不是设备型号或通用配置要求。
 - 工具使用 RM_CTP、单 context；每个 JettyPool 内的多个 jetty 共用 JFR，TX/RX 各有一个 JFC。同池隔离工具另有独立的 sink pool。四个裸设备同时运行尚无测试记录。
 - 未完整记录网卡型号、固件、内核、UDMA、liburma 版本、每轮实际命令及运行二进制的提交号。以下结论仅覆盖已反馈的环境和场景。
 - `rnr_continue` 实现在提交 `aacb1c0` 中；用户反馈了 `rnr_continue_success`，但尚未贴出该次完整双端日志和参数。不能把 README 中建议的 `tx_depth=1/32/256` 三组都记作已通过，也不能补写实际查询值。
 
 本文使用三个证据层次：**日志数值**是用户贴出的数据；**通过反馈**是用户确认 PASS，具体行为由工具的通过条件解释；**源码对照**说明软件如何处理结果，不表示已经在服务器上验证了对应分支。
 
-## 已完成的硬件验证
+## 已记录的硬件验证
 
 | 工具 / 场景 | 已记录结果 | 支持的结论 |
 | --- | --- | --- |
@@ -27,6 +29,7 @@
 | [本地 TX 配额](../tools/backpressure_test/README.md) | 用户确认 `tx_quota` 测试通过，未附独立详细计数 | SQ 软件配额耗尽后拒绝额外请求，退休完成后可提交此前未被接受的请求 |
 | 延迟投递 RX | `rx_delay_us=0` 和 `10000` 均反馈 `rx_delay_terminal_failure`；0 的详细日志见下文 | 缺 RX 可以表现为 post 已接受、随后异步 RNR；错误排空及独立清理可完成 |
 | 同 SQ 的 RNR 后续发 | 用户反馈 `rnr_continue_success` | 首批 RNR 终结后，补投远端 RX，同一 jetty 可成功发送新批次；没有重建或切换 SQ |
+| [同 SQ 多目标](../tools/sq_multiplex_test/README.md) | `batch=32` 首轮 mixed 失败；healthy 与 sink 各观察到 1 条 ACK_TIMEOUT，剩余完成未收齐 | 健康目标收到全部 32 条消息不保证发送端报告 SUCCESS；尚不能确认同 SQ 多目标错误隔离 |
 
 共享队列双 SQ 日志中，每端 `messages_per_jetty=1001`；源 jetty 到目标 jetty 的 TX/RX 计数均为 `0→0:501`、`0→1:500`、`1→0:500`、`1→1:501`。这证明不同源/目标组合被实际使用，不是仅创建了多个空闲 jetty。
 
@@ -100,6 +103,31 @@
 
 测试仅在工具分支直接消费原始 CQE，并通过 AttemptLedger 逐条退休。当前生产 `TxCompletionProcessor` 仍对普通错误执行隔离和 ERROR 排空；本次记录没有修改该策略。
 
+## 同 SQ 多目标：接收完成后仍出现 ACK_TIMEOUT
+
+用户在 `sq_multiplex_test` 的旧版完成收集逻辑下运行 `bytes=4096、batch=32、rounds=8`，mixed 阶段一次提交 64 个 WR，按 sink/healthy 交替排列。服务端两个目标使用独立 JFR，仅 healthy 预先投递 RX。首轮结果如下，ACK_TIMEOUT 计数由日志中的 `other_error=1、last_other_status=9` 解释而来：
+
+| 流量 | 客户端 accepted | retired | SUCCESS | RNR | ACK_TIMEOUT | 服务端 received |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Healthy before | 32 | 32 | 32 | 0 | 0 | 32 |
+| Healthy mixed | 32 | 4 | 3 | 0 | 1 | 32 |
+| Sink mixed | 32 | 4 | 0 | 3 | 1 | 无 RX 投递 |
+| Healthy after | 0 | 0 | 0 | 0 | 0 | 0 |
+
+客户端首先报告 `empty sink WR did not complete with RNR: 9`。旧逻辑消费完当前 poll 返回的 CQE 后退出，因此本轮仅观察到 8 条终结 CQE，剩余 56 条（healthy/sink 各 28 条）结果未知，不能记作成功、失败或丢失 CQE。服务端已经收到并通过消息身份、payload、路由和 IMM 校验的 healthy 消息为 32 条；随后控制读取失败，错误码为 `104`（ECONNRESET）。双方 Close 均以 `16`（EBUSY）保留资源，最终没有 PASS。
+
+本轮客户端额外打印：
+
+- `jetty_id=55646、state_checks=2、queried_rnr_retry=0、queried_err_timeout=0、accepted_known=true、provider_eagain=0`。
+- healthy mixed 的 CQE 观察耗时为 `24450..129601842 ns`，sink mixed 为 `24050..129601322 ns`。
+- 旧版只对符合预期的 CQE 更新轮次时序：`first_healthy_ns=24450、last_healthy_ns=25590`，`first_rnr_ns=24050、last_rnr_ns=25290`；`healthy_before_first_rnr=0、healthy_before_last_rnr=2`。其中 healthy 的最后时间不包含后来的 ACK_TIMEOUT。
+
+`state_checks=2` 仅对应初始检查和 before 完成后的检查；错误发生后未查询 SQ，不能从该值断言此时仍为 READY 或已经进入 ERROR。旧版随后打印的第 1 至 7 轮全零记录来自预分配统计项，并不表示执行了这些轮次。
+
+这些日志明确区分了远端已接收与本地确认成功：至少一条已经送达 healthy 的 WR 在发送侧得到 ACK_TIMEOUT。不能因此重放已接受的数据。两类目标接近同时出现约 129.6 ms 的完成延迟，与下节本地驱动的 128 ms 超时档位相符，但这只是源码对照；是否涉及 ACK 路径、同 SQ 完成追踪或驱动/固件问题，当前证据无法确定，也不能单凭 CQE 时序认定硬件队头阻塞。
+
+针对旧版提前结束观测的问题，工具代码已调整为：对合法但非预期的终结状态继续收集本批完成，分类统计 ACK_TIMEOUT 等错误，收齐本批后再次查询 SQ，并在控制面交换阶段失败与 TX 静默状态。超时或完整性异常时不新增查询，最后查询值可能仍来自出错前。完整性异常会停止后续 poll；healthy ACK_TIMEOUT 或 sink 非 RNR 仍判 FAIL，失败后不进入 after。上述调整尚无真实硬件复测结果，不能将本次失败改记为通过。
+
 ## 接口与查询值的解释边界
 
 本节来自接口文档和本地源码分析。服务器实际加载的库版本、配置仍需对应确认。下列外部源码链接采用工作区中 `kbsocket`、`kernel` 并列的目录布局。
@@ -108,7 +136,12 @@ URMA 对 RNR 的公共定义是远端 JFR 无 buffer、重试次数耗尽；`err
 
 本地内核 [uburma_cmd.c](../../kernel/drivers/ub/urma/uburma/uburma_cmd.c) 的 jetty query 路径将 `arg.out.jfs_flag` 固定填为 0。因此查询返回 `error_suspend=0` 不能独立证明硬件模式；工具同时检查创建配置，最终用同一 SQ 的成功续发及远端校验提供行为证据。
 
-本地 UDMA 的 query 实现从硬件 context 读取 state、RNR retry 和 timeout，但 `err_timeout` 返回值可能是硬件档位，不能直接套用创建参数的时间编码。当前没有用户提供的查询数值，不推导实际重试时间。
+本地 UDMA [udma_dfx.c](../../kernel/drivers/ub/urma/hw/udma/udma_dfx.c) 从硬件 context 读取 state、`rnr_retry_num` 和 `ta_timeout`。同 SQ 多目标日志的两个查询值均为 0，不能据此认定查询未实现或参数没有配置：
+
+- 当前 JettyPool 创建请求为 `rnr_retry=6、err_timeout=2`。[udma_jetty.h](../../kernel/drivers/ub/urma/hw/udma/udma_jetty.h) 使用 `err_timeout / 8` 转换为硬件档位，所以请求 2 对应查询档位 0。[udma_jetty.c](../../kernel/drivers/ub/urma/hw/udma/udma_jetty.c) 的档位时间表为 128/1000/8000/64000 ms。日志中的约 129.6 ms 与档位 0 的 128 ms 相符；实际服务器版本未核实，不能把这一对应关系当作已测得的硬件计时保证，也不能对查询值 0 套用 `4.096us * 2^0`。
+- 同一驱动仅在设备具备私有 `UDMA_CAP_FEATURE_RNR_RETRY` 能力时写入请求的 RNR 重试值。因此查询 0 可能来自能力限制，仍需核对现场版本和能力，不能从它推算实际 RNR 重试次数或窗口。
+
+status 9 是 ACK_TIMEOUT，status 10 才是 RNR 重试耗尽：[urma_opcode.h](../../umdk/src/urma/lib/urma/core/include/urma_opcode.h)。provider 分别映射硬件 transaction ACK timeout 与 RNR 状态，二者不能互换解释。
 
 ## 对 kbsocket 设计的约束
 
@@ -124,10 +157,10 @@ URMA 对 RNR 的公共定义是远端 JFR 无 buffer、重试次数耗尽；`err
 - 延迟 RX 后原始批次全部成功，以及 RNR 的实际重试次数和时间窗口。
 - 非零 `WR_UNHANDLED` 软件 flush；绕过软件门禁向 ERROR SQ post 的具体返回行为。
 - provider 同步 `URMA_EAGAIN` 与部分接受边界；socket 的 EAGAIN 到 EPOLLOUT/NotifyWritable 闭环。
-- 同一共享 SQ 上一个 peer 发生 RNR、其他 peer 同时持续成功的连接级隔离。
+- 同一共享 SQ 上一个 peer 发生 RNR、其他 peer 同时持续成功的连接级隔离；已有 mixed 失败记录，尚无完整通过结果。
 - 四个裸设备并行、持续无批间屏障收发、对端异常退出、链路/端口真实故障及异步事件。
 - 尚有未消费 WR 的共享 JFR 关闭，以及 brpc worker 仍访问资源时的进程退出。
 
 后续记录至少保留两端完整命令、工具提交号、硬件/软件版本、关键创建参数及查询值、完整计数、最终 PASS/FAIL 和退出码。新结果与本记录冲突时，应先核对配置和版本，再修订适用范围。
 
-已新增[同 SQ 多目标观测工具](../tools/sq_multiplex_test/README.md)，通过独立健康 JFR 与空 JFR 观测混合批次的健康完成和 RNR 完成。当前仅有本地 gMock 验证，尚未补充真实硬件结论；它也不等同于对端进程退出或端口故障实验。
+后续同 SQ 多目标复测需使用双方同时更新的工具，保留完整退休计数、分类错误和出错后查询状态，补足本次提前停止所缺少的证据。该实验仍不等同于对端进程退出或端口故障实验。
