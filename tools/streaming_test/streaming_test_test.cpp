@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -25,13 +26,9 @@ using ::testing::_;
 using ::testing::AnyNumber;
 
 TEST(StreamProtocolTest, RejectsInvalidDeviceListsAndOptions) {
-    for (auto input : {"", "udma", "udma:-1", "udma:0,", "udma:0,udma:1", "udma:1x", "udma:4294967296"}) {
+    for (auto input : {"", "udma", "udma:-1", "udma:0,", "udma:1x", "udma:4294967296"}) {
         EXPECT_FALSE(ParseStreamDevices(input)) << input;
     }
-    auto devices = ParseStreamDevices("udma0:38,udma1:9,udma2:10,udma3:11");
-    ASSERT_TRUE(devices);
-    EXPECT_EQ(devices->size(), 4u);
-    EXPECT_EQ((*devices)[0].eid_index, 38u);
     StreamOptions options;
     options.messages = 31;
     EXPECT_FALSE(ValidateStreamOptions(options));
@@ -40,6 +37,57 @@ TEST(StreamProtocolTest, RejectsInvalidDeviceListsAndOptions) {
     EXPECT_FALSE(ValidateStreamOptions(options));
     options.events = true;
     EXPECT_TRUE(ValidateStreamOptions(options));
+}
+
+TEST(StreamProtocolTest, MultipleDistinctDevicesPreservePairingOrder) {
+    // hello 按列表位置配对；解析两设备及四设备时不得重排设备或混用 EID 索引。
+    auto devices = ParseStreamDevices("udmac0d1e4:11,udmac0d1e5:14");
+    ASSERT_TRUE(devices);
+    ASSERT_EQ(devices->size(), 2u);
+    EXPECT_EQ((*devices)[0].device_name, "udmac0d1e4");
+    EXPECT_EQ((*devices)[0].eid_index, 11u);
+    EXPECT_EQ((*devices)[1].device_name, "udmac0d1e5");
+    EXPECT_EQ((*devices)[1].eid_index, 14u);
+
+    // EID 索引是设备内的索引；不同设备使用相同索引不应被视为重复设备。
+    devices = ParseStreamDevices("udma3:38,udma1:9,udma2:9,udma0:11");
+    ASSERT_TRUE(devices);
+    ASSERT_EQ(devices->size(), 4u);
+    const std::array names{"udma3", "udma1", "udma2", "udma0"};
+    const std::array indices{38u, 9u, 9u, 11u};
+    for (std::size_t i = 0; i < devices->size(); ++i) {
+        EXPECT_EQ((*devices)[i].device_name, names[i]);
+        EXPECT_EQ((*devices)[i].eid_index, indices[i]);
+    }
+}
+
+TEST(StreamProtocolTest, SameDeviceWithDifferentEidsPreservesEndpointOrder) {
+    // 同一个裸设备可以有多个独立 context；不能再以设备名去重而丢掉后面的 EID。
+    auto devices = ParseStreamDevices("udmac0d1e4:14,udmac0d1e4:11");
+    ASSERT_TRUE(devices);
+    ASSERT_EQ(devices->size(), 2u);
+    EXPECT_EQ((*devices)[0].device_name, "udmac0d1e4");
+    EXPECT_EQ((*devices)[0].eid_index, 14u);
+    EXPECT_EQ((*devices)[1].device_name, "udmac0d1e4");
+    EXPECT_EQ((*devices)[1].eid_index, 11u);
+}
+
+TEST(StreamProtocolTest, DuplicateDeviceEidPairReportsActualError) {
+    // 对解析后的索引判重，避免同一端点因数字前导零而被重复配置。
+    for (auto input : {"udmac0d1e4:11,udmac0d1e4:11", "udmac0d1e4:11,udmac0d1e4:011"}) {
+        auto devices = ParseStreamDevices(input);
+        ASSERT_FALSE(devices) << input;
+        EXPECT_EQ(devices.error().code, EINVAL);
+        EXPECT_STREQ(devices.error().operation, "duplicate device/EID pair");
+    }
+}
+
+TEST(StreamProtocolTest, TooManyContextsReportsCountLimit) {
+    // 工具限制的是会话数；即使全部属于同一设备，第五个端点也超过容量。
+    auto devices = ParseStreamDevices("udma0:0,udma0:1,udma0:2,udma0:3,udma0:4");
+    ASSERT_FALSE(devices);
+    EXPECT_EQ(devices.error().code, EINVAL);
+    EXPECT_STREQ(devices.error().operation, "use at most four device/EID pairs");
 }
 
 TEST(StreamProtocolTest, FourEndpointsRoundTripAndReservedBytesAreChecked) {
@@ -322,6 +370,12 @@ TEST_F(StreamHardwareTest, ServerWaitsForOldEchoTxCompletionBeforeReusingItsBuff
 }
 
 TEST_F(StreamHardwareTest, MultipleContextsProgressInOneOwnerLoopAndRetainSeparateIdentities) {
+    // 多个 context 可以属于同一设备；队列和消息身份仍按 context 独立管理。
+    urma_device_t device{};
+    for (std::size_t i = 0; i < nodes_.size(); ++i) {
+        nodes_[i].ctx.dev = &device;
+        nodes_[i].ctx.eid_index = i;
+    }
     std::array<StreamSession, 4> owners;
     std::array<StreamSession*, 4> sessions;
     StreamOptions options{.bytes = 1024, .messages = 65, .window = 3};
@@ -333,7 +387,7 @@ TEST_F(StreamHardwareTest, MultipleContextsProgressInOneOwnerLoopAndRetainSepara
         ASSERT_TRUE(owners[i].Connect(owners[i ^ 1].endpoint()));
         ASSERT_TRUE(owners[i].Start());
     }
-    // 同一 owner 推进两个独立设备配对；payload 的 channel 区分设备，不能只看累计总数。
+    // 同一 owner 推进两个独立端点配对；payload 的 channel 区分会话，不能只看累计总数。
     auto result = RunStreams(sessions, options);
     ASSERT_TRUE(result);
     for (auto& owner : owners) {

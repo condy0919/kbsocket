@@ -17,7 +17,7 @@
 
 namespace kbsocket {
 namespace tools {
-inline constexpr std::size_t kStreamMaxDevices = 4;
+inline constexpr std::size_t kStreamMaxContexts = 4;
 inline constexpr std::size_t kStreamMaxWindow = 256;
 
 struct StreamOptions {
@@ -36,7 +36,7 @@ struct StreamHello {
     StreamOptions options;
     bool server = false;
     std::uint32_t count = 1;
-    std::array<urma_jetty_id_t, kStreamMaxDevices> endpoints{};
+    std::array<urma_jetty_id_t, kStreamMaxContexts> endpoints{};
 };
 using StreamHelloBytes = std::array<std::byte, 112>;
 StreamHelloBytes EncodeStreamHello(const StreamHello& hello) noexcept;

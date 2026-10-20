@@ -98,6 +98,33 @@ public:
         }
     }
 
+    void ExpectSharedDeviceDiscovery() {
+        ::testing::InSequence order;
+        EXPECT_CALL(mock_, Init(_)).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, Devices(_)).WillOnce([this](int* n) {
+            *n = 4;
+            return pointers_;
+        });
+        // 配置先出现 raw1，再出现 raw0；能力和 EID 查询应保持首次出现顺序，且每个设备仅查询一次。
+        // raw1 的两个 EID 共用一份列表，后续创建顺序由配置决定，不受列表中的 EID 排序影响。
+        for (int device : {1, 0}) {
+            EXPECT_CALL(mock_, Query(&devices_[device], _)).WillOnce([](auto*, auto* attr) {
+                *attr = {};
+                attr->dev_cap.trans_mode = URMA_TM_RM;
+                attr->dev_cap.rm_tp_cap.bs.ctp = 1;
+                attr->dev_cap.max_eid_cnt = 256;
+                return URMA_SUCCESS;
+            });
+            auto* first_eid = &eids_[device == 1 ? 0 : 2];
+            EXPECT_CALL(mock_, Eids(&devices_[device], _)).WillOnce([first_eid, device](auto*, auto* n) {
+                *n = device == 1 ? 2 : 1;
+                return first_eid;
+            });
+            EXPECT_CALL(mock_, FreeEids(first_eid));
+        }
+        EXPECT_CALL(mock_, FreeDevices(pointers_));
+    }
+
     void ExpectCloseAll() {
         ::testing::InSequence order;
         for (int i = 3; i >= 0; --i) {
@@ -180,7 +207,7 @@ TEST_F(RawRuntimeTest, FourContextsPublishTogetherAndCloseInReverseOrder) {
     // 验证多设备端点原子发布与边界保护。
     ASSERT_TRUE(runtime.Initialize(configs_));
     EXPECT_TRUE(runtime.ready());
-    ASSERT_EQ(runtime.device_count(), 4u);
+    ASSERT_EQ(runtime.context_count(), 4u);
     for (int i = 0; i < 4; ++i) {
         EXPECT_EQ(runtime.context(i), &contexts_[i]);
     }
@@ -196,6 +223,95 @@ TEST_F(RawRuntimeTest, FourContextsPublishTogetherAndCloseInReverseOrder) {
     ASSERT_TRUE(runtime.Close());
     EXPECT_EQ(runtime.context(0), nullptr);
     EXPECT_TRUE(runtime.Close());
+}
+
+TEST_F(RawRuntimeTest, SharedDeviceEidsUseOneSnapshotAndKeepConfigOrder) {
+    test_support::ScopedUrmaOverride scope(Functions());
+    const std::vector<DeviceConfig> configs{{"raw1", 5}, {"raw0", 8}, {"raw1", 2}};
+    ExpectSharedDeviceDiscovery();
+    {
+        ::testing::InSequence order;
+        EXPECT_CALL(mock_, Create(&devices_[1], 5)).WillOnce(Return(&contexts_[1]));
+        EXPECT_CALL(mock_, Create(&devices_[0], 8)).WillOnce(Return(&contexts_[2]));
+        EXPECT_CALL(mock_, Create(&devices_[1], 2)).WillOnce(Return(&contexts_[0]));
+        // 同设备的两个 EID 拥有独立 context，关闭顺序必须是完整配置的逆序，不能按设备合并关闭。
+        EXPECT_CALL(mock_, Delete(&contexts_[0])).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, Delete(&contexts_[2])).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, Delete(&contexts_[1])).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, Uninit()).WillOnce(Return(URMA_SUCCESS));
+    }
+    RawRuntime runtime;
+    ASSERT_TRUE(runtime.Initialize(configs));
+    EXPECT_TRUE(runtime.ready());
+    // 两个物理设备的三个端点应发布三个独立条目，不能把 context 数量压缩为物理设备数量。
+    EXPECT_EQ(runtime.context_count(), 3u);
+    EXPECT_EQ(runtime.context(0), &contexts_[1]);
+    EXPECT_EQ(runtime.context(1), &contexts_[2]);
+    EXPECT_EQ(runtime.context(2), &contexts_[0]);
+    EXPECT_EQ(runtime.context(3), nullptr);
+    EXPECT_TRUE(runtime.Close());
+}
+
+TEST_F(RawRuntimeTest, SharedDeviceCreateFailureRollsBackAndAllowsRetry) {
+    test_support::ScopedUrmaOverride scope(Functions());
+    const std::vector<DeviceConfig> configs{{"raw1", 5}, {"raw0", 8}, {"raw1", 2}};
+    ExpectSharedDeviceDiscovery();
+    {
+        ::testing::InSequence order;
+        EXPECT_CALL(mock_, Create(&devices_[1], 5)).WillOnce(Return(&contexts_[1]));
+        EXPECT_CALL(mock_, Create(&devices_[0], 8)).WillOnce(Return(&contexts_[2]));
+        // 同一设备的第二个端点创建失败，不得影响首个 context 的归属判断；回滚完整配置的已创建前缀。
+        EXPECT_CALL(mock_, Create(&devices_[1], 2)).WillOnce([](auto*, auto) -> urma_context_t* {
+            errno = ENOMEM;
+            return nullptr;
+        });
+        EXPECT_CALL(mock_, Delete(&contexts_[2])).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, Delete(&contexts_[1])).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, Uninit()).WillOnce(Return(URMA_SUCCESS));
+    }
+    RawRuntime runtime;
+    const auto failed = runtime.Initialize(configs);
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.error().code, RuntimeErrorCode::kContextFailed);
+    EXPECT_EQ(failed.error().device_index, 2u);
+    ASSERT_TRUE(failed.error().context_error);
+    EXPECT_EQ(failed.error().context_error->provider_error, ENOMEM);
+    EXPECT_FALSE(failed.error().cleanup_error);
+    EXPECT_FALSE(runtime.ready());
+    EXPECT_EQ(runtime.context_count(), 0u);
+    EXPECT_EQ(runtime.context(0), nullptr);
+    ASSERT_TRUE(::testing::Mock::VerifyAndClearExpectations(&mock_));
+
+    // 彻底回滚后重新查询每个设备一次，并重新创建全部端点，验证独占标记与部分 context 均已释放。
+    ExpectSharedDeviceDiscovery();
+    {
+        ::testing::InSequence order;
+        EXPECT_CALL(mock_, Create(&devices_[1], 5)).WillOnce(Return(&contexts_[1]));
+        EXPECT_CALL(mock_, Create(&devices_[0], 8)).WillOnce(Return(&contexts_[2]));
+        EXPECT_CALL(mock_, Create(&devices_[1], 2)).WillOnce(Return(&contexts_[0]));
+        EXPECT_CALL(mock_, Delete(&contexts_[0])).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, Delete(&contexts_[2])).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, Delete(&contexts_[1])).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, Uninit()).WillOnce(Return(URMA_SUCCESS));
+    }
+    ASSERT_TRUE(runtime.Initialize(configs));
+    EXPECT_EQ(runtime.context_count(), 3u);
+    EXPECT_TRUE(runtime.Close());
+}
+
+TEST_F(RawRuntimeTest, MissingSharedDeviceEidCreatesNoContexts) {
+    test_support::ScopedUrmaOverride scope(Functions());
+    ExpectSharedDeviceDiscovery();
+    // 已缓存的同设备 EID 列表不包含最后一项；全量预检应在创建任何 context 前失败，无需重新查询。
+    EXPECT_CALL(mock_, Uninit()).WillOnce(Return(URMA_SUCCESS));
+    RawRuntime runtime;
+    const auto failed = runtime.Initialize({{"raw1", 5}, {"raw0", 8}, {"raw1", 200}});
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.error().device_index, 2u);
+    ASSERT_TRUE(failed.error().catalog_error);
+    EXPECT_EQ(failed.error().catalog_error->code, CatalogErrorCode::kNotFound);
+    EXPECT_FALSE(runtime.ready());
+    EXPECT_EQ(runtime.context_count(), 0u);
 }
 
 TEST_F(RawRuntimeTest, ThirdCreateFailureRollsBackAndAllowsRetry) {
@@ -370,9 +486,12 @@ TEST_F(RawRuntimeTest, UninitFailureEndsSessionWithoutRepeatingUninit) {
 TEST_F(RawRuntimeTest, InvalidConfigDoesNotTouchProvider) {
     test_support::ScopedUrmaOverride scope(Functions());
     RawRuntime runtime;
-    // 零副作用防御：空配置、重复设备名、含 '\0' 畸形名称在进入任何底层 provider API 之前即被前置拦截。
+    // 零副作用防御：空配置、重复设备/EID 组合、含 '\0' 畸形名称在调用任何 provider API 之前即被拦截。
     EXPECT_FALSE(runtime.Initialize({}));
-    EXPECT_FALSE(runtime.Initialize({{"raw0", 2}, {"raw0", 5}}));
+    const auto duplicate = runtime.Initialize({{"raw0", 2}, {"raw1", 5}, {"raw0", 2}});
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error().code, RuntimeErrorCode::kInvalidArgument);
+    EXPECT_EQ(duplicate.error().device_index, 2u);
     EXPECT_FALSE(runtime.Initialize({{std::string("raw\0x", 5), 2}}));
 }
 

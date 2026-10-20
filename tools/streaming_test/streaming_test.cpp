@@ -50,7 +50,7 @@ std::expected<std::uint64_t, ToolError> Check(std::span<const std::byte> data, s
 
 std::expected<void, ToolError> StreamSession::Open(urma_context_t* ctx, const urma_device_cap_t& cap,
                                                    const StreamOptions& options, bool server, std::uint32_t channel) {
-    if (ctx_ || started_ || !ctx || channel >= kStreamMaxDevices || !ValidateStreamOptions(options)) {
+    if (ctx_ || started_ || !ctx || channel >= kStreamMaxContexts || !ValidateStreamOptions(options)) {
         return Error("invalid stream open", EINVAL);
     }
     if (options.window > cap.max_jfs_depth || options.window > cap.max_jfr_depth ||
@@ -472,12 +472,12 @@ std::expected<void, ToolError> StreamSession::Close() {
 }
 
 std::expected<StreamRunStats, ToolError> RunStreams(std::span<StreamSession*> sessions, const StreamOptions& options) {
-    if (sessions.empty() || sessions.size() > kStreamMaxDevices) {
+    if (sessions.empty() || sessions.size() > kStreamMaxContexts) {
         return Error("stream session count", EINVAL);
     }
     StreamRunStats stats;
     auto deadline = Clock::now() + std::chrono::milliseconds(options.timeout_ms);
-    std::array<pollfd, kStreamMaxDevices> descriptors{};
+    std::array<pollfd, kStreamMaxContexts> descriptors{};
     for (;;) {
         bool done = true;
         std::size_t progress = 0;

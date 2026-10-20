@@ -53,9 +53,9 @@ auto* result = UrmaApi::CreateJfr(&context, &config);
 
 ## 裸设备 context 生命周期
 
-`UrmaContext` 独占一个 context，`RawRuntime` 用 `unique_ptr` 持有各设备的封装，无需在收发路径维护 `shared_ptr` 引用计数。配置采用 `DeviceConfig{device_name, eid_index}` 数组，四个裸设备对应四项；数量不硬编码，每个设备暂时选择一个 EID。`eid_index` 是 provider 返回的实际索引，不是 EID 数组下标。
+`UrmaContext` 独占一个 context，`RawRuntime` 用 `unique_ptr` 持有各端点的封装，无需在收发路径维护 `shared_ptr` 引用计数。配置采用 `DeviceConfig{device_name, eid_index}` 数组，以 `(device_name, eid_index)` 为唯一键，允许同一裸设备的不同 EID 分别创建 context，但拒绝重复配置同一个端点。端点数量不硬编码，也不等于物理设备数量。`eid_index` 是 provider 返回的实际索引，不是 EID 数组下标。
 
-宿主先调用并检查 `UrmaApi::Load()`，再调用 `runtime.Initialize(configs)`。Runtime 独占本次 `Init/Uninit`，枚举指定设备并缓存目录，先验证所有端点，再依次创建 context 并校验实际 EID。全部成功后才允许通过 `runtime.context(index)` 借用句柄，索引对应配置顺序。当前只管理资源生命周期，不负责四设备调度、队列池或故障迁移。
+宿主先调用并检查 `UrmaApi::Load()`，再调用 `runtime.Initialize(configs)`。Runtime 独占本次 `Init/Uninit`，先按设备名去重后构建 DeviceCatalog，每个设备只查询一次 EID 列表。同一设备的各端点共享目录快照，分别验证 EID 并创建、校验各自的 context。全部成功后才允许通过 `runtime.context(index)` 借用句柄；context 顺序始终对应原始配置顺序，不随设备名去重改变。`runtime.context_count()` 返回 context 数量，不是去重后的设备数量。当前只管理资源生命周期，不负责多端点调度、队列池或故障迁移。
 
 初始化失败会逆序回滚。`RuntimeError` 保留启动失败信息，`cleanup_error` 额外报告回滚失败。删除 context 失败时保留句柄，不提前 `Uninit`；调用方处理残留引用后重试 `Close()`。已成功删除的 context 不会重复删除。URMA core 的 `Uninit()` 即使返回 provider 错误，也已经释放全局设备和卸载 provider，因此这类错误仍会上报，但不会重试 `Uninit()`。
 

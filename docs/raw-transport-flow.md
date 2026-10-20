@@ -9,7 +9,7 @@
 | 组件                  | 拥有的资源                                                      | 借用或引用的资源                      |
 |-----------------------|-----------------------------------------------------------------|---------------------------------------|
 | UrmaApi               | 动态库加载引用、唯一函数表                                      | 不接管业务硬件资源                    |
-| RawRuntime            | URMA 会话、DeviceCatalog、各设备的 UrmaContext                  | 宿主已加载的库                        |
+| RawRuntime            | URMA 会话、DeviceCatalog、各设备/EID 端点的 UrmaContext         | 宿主已加载的库                        |
 | DeviceCatalog         | 设备属性、EID/index 快照                                        | URMA 会话中的 device 指针             |
 | UrmaContext           | 一个通过 EID/index 校验的 context；失败时可能保留待清理 context | 对应设备                              |
 | JettyPool             | TX JFC、RX JFC、共享 JFR、多个 jetty、票据槽                    | context                               |
@@ -34,7 +34,7 @@ flowchart TD
     G --> H[交换端点、导入 RM_CTP 远端，进入收发]
 ```
 
-四个裸设备配置为四个 `DeviceConfig`，每项选择一个实际 `eid_index`，对应一个 context；当前没有四设备自动调度或故障迁移。目录只在初始化时查询 EID，收发路径不重复枚举。`RawRuntime::context(index)` 的 index 是配置顺序，和 provider 的 EID 索引是两回事。
+每个 `DeviceConfig` 用设备名和实际 `eid_index` 选择一个端点，对应一个独立 context。允许同一裸设备配置多个不同 EID，只有重复的 `(device_name, eid_index)` 会被拒绝；四个 context 不一定来自四个物理设备。目录按设备名去重，只在初始化时对每个设备查询一次 EID 列表，收发路径不重复枚举。`RawRuntime::context(index)` 始终按原始配置顺序排列，index 和 provider 的 EID 索引是两回事。当前没有多端点自动调度或故障迁移。
 
 `UrmaContext::Open` 成功才对外提供可用 context；实际 EID/index 不符时立即尝试删除。删除失败仍保留所有权供后续 Close，但不会通过 get 暴露该 context。初始化回滚同时保留原始错误和清理错误。
 

@@ -18,11 +18,13 @@
 DEFINE_bool(server, false, "Echo server; omit for request sender");
 DEFINE_string(address, "127.0.0.1", "Numeric IPv4 control bind/peer address");
 DEFINE_uint32(port, 18543, "TCP control port");
-DEFINE_string(devices, "", "One to four distinct raw name:eid_index pairs, comma separated; pair by list order");
+DEFINE_string(devices, "",
+              "One to four distinct raw name:eid_index pairs, comma separated; same device with different EIDs "
+              "allowed; pair by list order");
 DEFINE_string(library, "liburma.so", "URMA library path");
 DEFINE_uint32(bytes, 4096, "Payload bytes, 32..4096");
-DEFINE_uint32(messages, 100000, "Messages per device per direction, window..10000000");
-DEFINE_uint32(window, 32, "Per-device outstanding request window, 1..256");
+DEFINE_uint32(messages, 100000, "Messages per context per direction, window..10000000");
+DEFINE_uint32(window, 32, "Per-context outstanding request window, 1..256");
 DEFINE_bool(events, false, "Use JFCE arm/recheck/fd wait; report actual notification coverage");
 DEFINE_uint32(arm_delay_us, 0, "Delay between rearm and recheck, events only, 0..1000000");
 DEFINE_uint32(timeout_ms, 10000, "No-progress/control timeout, 1..3600000 ms");
@@ -32,7 +34,7 @@ namespace {
 using kbsocket::raw::UrmaApi;
 struct Hardware {
     kbsocket::raw::RawRuntime runtime;
-    std::array<kbsocket::tools::StreamSession, kbsocket::tools::kStreamMaxDevices> sessions;
+    std::array<kbsocket::tools::StreamSession, kbsocket::tools::kStreamMaxContexts> sessions;
 };
 int Fail(const kbsocket::tools::ToolError& error) {
     std::println(stderr, "FAIL: {}: {}; unresolved resources retained until process exit", error.operation, error.code);
@@ -42,9 +44,24 @@ int Run() {
     kbsocket::tools::StreamOptions options{FLAGS_bytes,      FLAGS_messages, FLAGS_window,
                                            FLAGS_timeout_ms, FLAGS_events,   FLAGS_arm_delay_us};
     auto devices = kbsocket::tools::ParseStreamDevices(FLAGS_devices);
-    if (!devices || !kbsocket::tools::ValidateStreamOptions(options) || !FLAGS_port || FLAGS_port > 65535 ||
-        FLAGS_library.empty() || !FLAGS_process_timeout_sec || FLAGS_process_timeout_sec > 86400) {
-        std::println(stderr, "Invalid options; --devices=name:eid_index[,name:eid_index] is required");
+    if (!devices) {
+        std::println(stderr, "Invalid --devices='{}': {}", FLAGS_devices, devices.error().operation);
+        return 2;
+    }
+    if (auto validated = kbsocket::tools::ValidateStreamOptions(options); !validated) {
+        std::println(stderr, "Invalid options: {}; use --help for limits", validated.error().operation);
+        return 2;
+    }
+    if (!FLAGS_port || FLAGS_port > 65535) {
+        std::println(stderr, "Invalid --port: expected 1..65535");
+        return 2;
+    }
+    if (FLAGS_library.empty()) {
+        std::println(stderr, "Invalid --library: expected a nonempty URMA library path");
+        return 2;
+    }
+    if (!FLAGS_process_timeout_sec || FLAGS_process_timeout_sec > 86400) {
+        std::println(stderr, "Invalid --process_timeout_sec: expected 1..86400");
         return 2;
     }
     // 系统默认 SIGALRM 直接终止进程；不在 provider 卡住时触发不安全的 C++ 栈析构。
@@ -64,7 +81,7 @@ int Run() {
     }
     kbsocket::tools::StreamHello hello{
         .options = options, .server = FLAGS_server, .count = static_cast<std::uint32_t>(devices->size())};
-    std::array<kbsocket::tools::StreamSession*, kbsocket::tools::kStreamMaxDevices> sessions{};
+    std::array<kbsocket::tools::StreamSession*, kbsocket::tools::kStreamMaxContexts> sessions{};
     for (std::size_t i = 0; i < devices->size(); ++i) {
         urma_device_attr_t attributes{};
         auto* ctx = hardware->runtime.context(i);
@@ -117,10 +134,10 @@ int Run() {
     for (std::size_t i = 0; i < devices->size(); ++i) {
         const auto& s = sessions[i]->stats();
         std::println(
-            "Device {} {}: accepted={} retired={} received={} rx_posted={} rearms={} tx_events={} rx_events={} "
+            "Context {} {}:{}: accepted={} retired={} received={} rx_posted={} rearms={} tx_events={} rx_events={} "
             "acks={} recheck_progress={}",
-            i, (*devices)[i].device_name, s.accepted, s.retired, s.received, s.rx_posted, s.rearms, s.tx_notifications,
-            s.rx_notifications, s.event_acks, s.recheck_progress);
+            i, (*devices)[i].device_name, (*devices)[i].eid_index, s.accepted, s.retired, s.received, s.rx_posted,
+            s.rearms, s.tx_notifications, s.rx_notifications, s.event_acks, s.recheck_progress);
     }
     if (!result) {
         return Fail(result.error());
@@ -155,7 +172,7 @@ int Run() {
         for (std::size_t i = 0; i < devices->size(); ++i) {
             const auto& s = sessions[i]->stats();
             notifications += s.event_acks;
-            std::println("{}: device {} JFC notification path; fd_wakes={} tx_events={} rx_events={} acks={}",
+            std::println("{}: context {} JFC notification path; fd_wakes={} tx_events={} rx_events={} acks={}",
                          s.fd_wakes && s.event_acks ? "OBSERVED" : "NOT_OBSERVED", i, s.fd_wakes, s.tx_notifications,
                          s.rx_notifications, s.event_acks);
         }

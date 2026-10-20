@@ -17,8 +17,8 @@
 | 提交后发生退出的时间窗口 | 同上 `inflight_exit` | post 在 kill 前，分别报告退出请求前已退休和确认后软件未退休；不能据未 poll 断言硬件仍在途 |
 | 真实链路/端口故障 | 同上 `external` | 现场手工注入与无故障对照；工具不操作网口，也不能自己证明故障注入有效 |
 | 持续发送、RX 补投和 buffer 复用 | [streaming_test](../tools/streaming_test/README.md) | 无逐批 TCP 屏障；每条消息身份/payload/IMM、TX 退休和 RX 补投全部核对 |
-| JFC rearm/recheck/wait/ack | 同上 `--events` | 实际通知等待、每设备事件数/ack数、arm后发现完成的次数；不能用忙 poll 掩盖通知丢失 |
-| 四裸设备多 context 同时工作 | 同上 `--devices=...` | 同进程同时推进四套资源，按设备独立计数；不等同故障迁移或跨 CPU 性能测试 |
+| JFC rearm/recheck/wait/ack | 同上 `--events` | 实际通知等待、每 context 事件数/ack数、arm后发现完成的次数；不能用忙 poll 掩盖通知丢失 |
+| 多 context 同时工作 | 同上 `--devices=...` | 支持 1–4 个设备/EID 端点，同一设备可选择多个不同 EID；按 context 独立计数，另行验证四个真实裸设备，不等同故障迁移或跨 CPU 性能测试 |
 | 单 WR 大于 4 KiB 的 READ/WRITE | [rma_test](../tools/rma_test/README.md) | MR 导出/导入、能力范围、实际传输长度、完成后数据与越界 guard 校验 |
 
 ## 统一准备
@@ -70,10 +70,30 @@ bazel-bin/tools/streaming_test/streaming_test \
 | E1 | 1 | 1001 | `--events` |
 | E2 | 32 | 100001 | `--events` |
 | E3 | 32 | 10001 | `--events --arm_delay_us=100` |
+| C1 | 32 | 100001 | 两端分别配置同一裸设备的两个不同 EID |
+| C2 | 32 | 100001 | 同设备双 EID + `--events` |
 | M1 | 32 | 100001 | 两端分别使用四个真实裸设备的 `--devices` 列表 |
 | M2 | 32 | 100001 | 四设备 + `--events` |
 
-多设备先逐个运行 S2，再运行 M1/M2；列表按位置配对。每端、每设备应有 `accepted=retired=received=rx_posted=messages`。事件组另外要求对应设备出现 `OBSERVED: device N JFC notification path`；只有流量 PASS 但通知 NOT_OBSERVED 时，不能登记该设备的事件路径已验证。
+`--devices` 接受 1–4 个逗号分隔的 `device:eid_index` 端点，同一设备名可重复，但设备名与 EID 索引的组合不能重复。两端列表长度必须一致，并按位置配对；各端的实际设备名和 EID 索引可以不同。例如 C1 可使用：
+
+```bash
+# 服务端：两个 EID 均属于同一裸设备；请替换为本机实际可用索引。
+bazel-bin/tools/streaming_test/streaming_test \
+  --server --address=0.0.0.0 --port=8894 \
+  --devices=udmac0d1e4:11,udmac0d1e4:14 \
+  --window=32 --messages=100001 --bytes=4096
+
+# 客户端：同样选择本机的两个有效 EID，与服务端列表按位置配对。
+bazel-bin/tools/streaming_test/streaming_test \
+  --address=141.62.33.25 --port=8894 \
+  --devices=udmac0d1e4:25,udmac0d1e4:26 \
+  --window=32 --messages=100001 --bytes=4096
+```
+
+多 context 测试先逐个端点运行 S2，再运行 C1/C2 或 M1/M2。日志以 `Context N device:eid_index` 标明原始配置顺序，每端、每 context 应有 `accepted=retired=received=rx_posted=messages`。事件组另外要求对应 context 出现 `OBSERVED: context N JFC notification path`；只有流量 PASS 但通知 NOT_OBSERVED 时，不能登记该 context 的事件路径已验证。
+
+同设备多 EID 验证的是同一物理设备上的多 context 资源与推进；即使配置四个端点，也不能替代 M1/M2 的四个物理设备验证。以上命令是待执行的验证步骤，不代表同设备多 EID 已通过真机测试。
 
 READ/WRITE 按 [rma_test README](../tools/rma_test/README.md) 分别运行 `--operation=read` 和 `--operation=write`，每种操作 `--bytes=4096/16384/1048576/8388608 --rounds=8`。这里是**一条 WR 的实际长度**，不是 SEND 拆成若干 4 KiB。能力不足的组记录 SKIP；实际 post、CQE 或数据错误仍为 FAIL。READ 源 MR 在远端确认完成前不复用，WRITE 在发送端完成后由远端校验可见数据。
 

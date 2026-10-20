@@ -54,9 +54,12 @@ std::expected<std::vector<raw::DeviceConfig>, ToolError> ParseStreamDevices(std:
             return Error("invalid device EID index");
         }
         const auto name = item.substr(0, colon);
-        if (result.size() == kStreamMaxDevices ||
-            std::any_of(result.begin(), result.end(), [&](const auto& d) { return d.device_name == name; })) {
-            return Error("use at most four distinct raw devices");
+        if (result.size() == kStreamMaxContexts) {
+            return Error("use at most four device/EID pairs");
+        }
+        if (std::any_of(result.begin(), result.end(),
+                        [&](const auto& d) { return d.device_name == name && d.eid_index == eid; })) {
+            return Error("duplicate device/EID pair");
         }
         result.push_back({std::string(name), eid});
         if (comma == std::string_view::npos) {
@@ -83,7 +86,7 @@ StreamHelloBytes EncodeStreamHello(const StreamHello& hello) noexcept {
     Put32(wire.subspan(16), hello.options.bytes);
     Put32(wire.subspan(20), hello.options.messages);
     Put32(wire.subspan(24), hello.options.window);
-    for (std::size_t i = 0; i < std::min<std::size_t>(hello.count, kStreamMaxDevices); ++i) {
+    for (std::size_t i = 0; i < std::min<std::size_t>(hello.count, kStreamMaxContexts); ++i) {
         std::memcpy(bytes.data() + 32 + 20 * i, hello.endpoints[i].eid.raw, 16);
         Put32(wire.subspan(48 + 20 * i), hello.endpoints[i].id);
     }
@@ -103,7 +106,7 @@ std::expected<StreamHello, ToolError> DecodeStreamHello(const StreamHelloBytes& 
     hello.options.bytes = Get32(wire.subspan(16));
     hello.options.messages = Get32(wire.subspan(20));
     hello.options.window = Get32(wire.subspan(24));
-    if (!hello.count || hello.count > kStreamMaxDevices || !ValidateStreamOptions(hello.options)) {
+    if (!hello.count || hello.count > kStreamMaxContexts || !ValidateStreamOptions(hello.options)) {
         return Error("stream hello options", EPROTO);
     }
     for (std::size_t i = 0; i < hello.count; ++i) {
