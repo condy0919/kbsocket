@@ -35,16 +35,21 @@ bazel-bin/tools/streaming_test/streaming_test \
 
 | window | messages | arm_delay_us | 观察 |
 | ---: | ---: | ---: | --- |
-| 1 | 1001 | 0 | 低并发，尽量进入真正的通知等待 |
+| 1 | 1001 | 0 | 低并发，增加进入 fd 等待分支的机会 |
 | 32 | 100001 | 0 | 连续负载与通知合并 |
 | 32 | 10001 | 100 | 放大 arm 到 recheck 的软件间隔 |
 
-循环执行 `poll → rearm → recheck → poll(JFCE fd) → WaitJfc(timeout=0) → AckJfc`。recheck 已看到 CQE 时继续推进；只有空 CQ 才睡眠。等待超时直接失败，不靠定时重新 poll 掩盖丢通知。`WaitJfc` 每个返回项 ack 一次，ack 的单位是通知而非 CQE。[URMA API 文档](https://docs.openeuler.org/zh/docs/24.03_LTS_SP3/unifiedbus/unifiedbus/urma/URMA%20API%20Guide.ch.html)
+每轮先通过 `WaitJfc(timeout=0) → AckJfc` 消费已有通知，再 poll CQ 并推进流量。无进展时执行 `rearm → recheck`；recheck 仍无进展才调用 `poll(JFCE fd)`，fd 就绪后再次消费通知。等待超时直接失败，不靠定时重新 poll 掩盖丢通知。`WaitJfc` 每个返回项 ack 一次，ack 的单位是通知而非 CQE。[URMA API 文档](https://docs.openeuler.org/zh/docs/24.03_LTS_SP3/unifiedbus/unifiedbus/urma/URMA%20API%20Guide.ch.html)
+
+`--arm_delay_us` 主动延迟 rearm 到 recheck 之间的时间，供 CQE 在这个窗口到达。延迟较大时，recheck 常常已经消费 CQE，循环直接继续推进，无须进入 fd 等待分支；已有通知仍会在下一轮由 `WaitJfc(timeout=0)` 消费并 ack。这种情况下，`recheck_progress` 非零、通知存在而 `fd_wakes=0` 是有效结果，不表示丢通知。
 
 检查每个 context 的 `tx_events/rx_events/acks/fd_wakes/recheck_progress` 和最终 `waits/empty_wakes`：
 
-- 每个 `OBSERVED: context N JFC notification path` 表示该 context 的 fd 实际唤醒且消费了通知；多 context 需逐项检查，总计 OBSERVED 不代表每个 context 都观察到。
-- `NOT_OBSERVED` 表示流量仍可能全部成功，但没有充分走到事件等待路径；应重跑 window=1。不能只看最后的流量 PASS。
+- `OBSERVED: context N JFC notifications` 表示该 context 取得并 ack 了通知，即 `acks>0`。
+- `OBSERVED: context N JFCE fd readiness` 表示该 context 的 fd 在 `poll` 中返回过 `POLLIN`，即 `fd_wakes>0`；fd 可能在调用前已经就绪，不能据此断言线程实际睡眠过。
+- 两项分别报告 `OBSERVED/NOT_OBSERVED`，总计也分别判断通知与 fd 就绪。`waits` 仅统计 `poll` 调用次数，不能代替 `fd_wakes`。多 context 需逐项检查，总计 OBSERVED 不代表每个 context 都观察到。
+- 服务端持续接收并 echo 时可能一直有进展，无须进入 fd 等待分支。`NOT_OBSERVED` 只表示对应项目未取得证据，不能只看最终流量 PASS，也不应把它当作流量失败。`window=1` 或互换客户端/服务端能增加覆盖机会，不能保证每端、每 context 都进入该分支。
+- 延迟组重点检查 `recheck_progress>0`，观察 arm 后 recheck 发现完成的路径，不要求同时观察到 fd 就绪。需要验证 fd 路径的组则应同时检查每个 context 的通知与 fd 就绪。
 - `acks` 应等于本端 `tx_events + rx_events`，不要求等于消息数。通知合并、CQE 比通知先被消费都不构成错误。
 - 单次成功只覆盖本次到达时序，不证明所有可能竞态或硬件延迟上界。事件模式仍保持 `non_blocking` 默认值。
 

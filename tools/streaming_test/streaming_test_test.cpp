@@ -466,6 +466,62 @@ TEST_F(StreamHardwareTest, EventRecheckFindsCompletionBeforeWaiting) {
     FinishPair(client, server, 1);
 }
 
+TEST_F(StreamHardwareTest, DelayedRecheckCollectsNotificationsWithoutFdReadiness) {
+    StreamSession client, server;
+    StreamOptions options{
+        .bytes = 32, .messages = 1, .window = 1, .timeout_ms = 1000, .events = true, .arm_delay_us = 1000};
+    OpenPair(client, server, options);
+    // 在 arm 时让请求到达，保证延迟后的 recheck 能收到 CQE；此时不应再进入 fd 等待。
+    EXPECT_CALL(*this, Rearm(&nodes_[1].cq[1], false))
+        .WillOnce([&](auto*, bool) {
+            EXPECT_TRUE(client.Advance());
+            return URMA_SUCCESS;
+        })
+        .RetiresOnSaturation();
+    // CQE 已在 recheck 中消费，但下一轮 WaitJfc(0) 仍需领取并确认对应通知。
+    EXPECT_CALL(*this, Wait(&nodes_[1].event, 16, 0, _))
+        .WillOnce(::testing::Return(0))
+        .WillOnce([&](auto*, auto, int, auto** out) {
+            out[0] = &nodes_[1].cq[1];
+            return 1;
+        })
+        .WillRepeatedly(::testing::Return(0));
+    EXPECT_CALL(*this, Ack(_, _, 1)).WillOnce([&](auto** out, auto* counts, auto) {
+        EXPECT_EQ(out[0], &nodes_[1].cq[1]);
+        EXPECT_EQ(counts[0], 1u);
+    });
+    std::array<StreamSession*, 1> sessions{&server};
+    auto result = RunStreams(sessions, options);
+    ASSERT_TRUE(result);
+    // 通知消费、fd 就绪是独立观测项；前者已验证，不应因为后者未走到而被一并标成未观测。
+    EXPECT_EQ(server.stats().recheck_progress, 1u);
+    EXPECT_EQ(server.stats().rx_notifications, 1u);
+    EXPECT_EQ(server.stats().event_acks, 1u);
+    EXPECT_EQ(server.stats().fd_wakes, 0u);
+    EXPECT_EQ(result->waits, 0u);
+    FinishPair(client, server, 1);
+}
+
+TEST_F(StreamHardwareTest, ContinuousProgressDoesNotRequireArmingOrFdReadiness) {
+    StreamSession client, server;
+    StreamOptions options{.bytes = 32, .messages = 5, .window = 1, .events = true};
+    OpenPair(client, server, options);
+    // 模拟始终有请求/回包可推进的时序：即使启用 events，也无需为了覆盖标记强行 arm 或等待。
+    EXPECT_CALL(*this, Rearm(_, _)).Times(0);
+    std::array<StreamSession*, 2> sessions{&client, &server};
+    auto result = RunStreams(sessions, options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->waits, 0u);
+    for (auto* session : sessions) {
+        EXPECT_TRUE(session->done());
+        EXPECT_EQ(session->stats().rearms, 0u);
+        EXPECT_EQ(session->stats().event_acks, 0u);
+        EXPECT_EQ(session->stats().fd_wakes, 0u);
+        session->ConfirmPeerQuiescent();
+        EXPECT_TRUE(session->Close());
+    }
+}
+
 TEST_F(StreamHardwareTest, ReadyFdIsConsumedAndAcknowledgedBeforeNextPoll) {
     StreamSession client, server;
     StreamOptions options{.bytes = 32, .messages = 1, .window = 1, .timeout_ms = 50, .events = true};
@@ -491,6 +547,7 @@ TEST_F(StreamHardwareTest, ReadyFdIsConsumedAndAcknowledgedBeforeNextPoll) {
     auto result = RunStreams(sessions, options);
     ASSERT_TRUE(result);
     EXPECT_EQ(result->waits, 1u);
+    EXPECT_EQ(server.stats().fd_wakes, 1u);
     EXPECT_EQ(server.stats().event_acks, 1u);
     FinishPair(client, server, 1);
     ::close(nodes_[1].event.fd);

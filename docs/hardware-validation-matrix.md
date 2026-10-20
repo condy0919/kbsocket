@@ -17,7 +17,7 @@
 | 提交后发生退出的时间窗口 | 同上 `inflight_exit` | post 在 kill 前，分别报告退出请求前已退休和确认后软件未退休；不能据未 poll 断言硬件仍在途 |
 | 真实链路/端口故障 | 同上 `external` | 现场手工注入与无故障对照；工具不操作网口，也不能自己证明故障注入有效 |
 | 持续发送、RX 补投和 buffer 复用 | [streaming_test](../tools/streaming_test/README.md) | 无逐批 TCP 屏障；每条消息身份/payload/IMM、TX 退休和 RX 补投全部核对 |
-| JFC rearm/recheck/wait/ack | 同上 `--events` | 实际通知等待、每 context 事件数/ack数、arm后发现完成的次数；不能用忙 poll 掩盖通知丢失 |
+| JFC rearm/recheck/wait/ack | 同上 `--events` | 分别记录每 context 的通知/ack、JFCE fd 就绪与 arm 后 recheck 发现完成；fd 就绪不证明实际睡眠，不能用忙 poll 掩盖通知丢失 |
 | 多 context 同时工作 | 同上 `--devices=...` | 支持 1–4 个设备/EID 端点，同一设备可选择多个不同 EID；按 context 独立计数，另行验证四个真实裸设备，不等同故障迁移或跨 CPU 性能测试 |
 | 单 WR 大于 4 KiB 的 READ/WRITE | [rma_test](../tools/rma_test/README.md) | MR 导出/导入、能力范围、实际传输长度、完成后数据与越界 guard 校验 |
 
@@ -91,7 +91,13 @@ bazel-bin/tools/streaming_test/streaming_test \
   --window=32 --messages=100001 --bytes=4096
 ```
 
-多 context 测试先逐个端点运行 S2，再运行 C1/C2 或 M1/M2。日志以 `Context N device:eid_index` 标明原始配置顺序，每端、每 context 应有 `accepted=retired=received=rx_posted=messages`。事件组另外要求对应 context 出现 `OBSERVED: context N JFC notification path`；只有流量 PASS 但通知 NOT_OBSERVED 时，不能登记该 context 的事件路径已验证。
+多 context 测试先逐个端点运行 S2，再运行 C1/C2 或 M1/M2。日志以 `Context N device:eid_index` 标明原始配置顺序，每端、每 context 应有 `accepted=retired=received=rx_posted=messages`。
+
+事件覆盖分开记录：`OBSERVED: context N JFC notifications` 表示取得并 ack 通知（`acks>0`）；`OBSERVED: context N JFCE fd readiness` 表示 fd 在 `poll` 中返回过 `POLLIN`（`fd_wakes>0`），不证明线程实际睡眠过。总计也分别报告这两项；`waits>0` 不能代替 fd 就绪证据，总计 OBSERVED 不能代替逐 context 的结果。
+
+E1/E2/C2/M2 若要登记完整 fd 通知路径，应在每端、每 context 同时观察到上述两项；否则只记录流量检查通过和实际覆盖的部分。服务端持续 echo 时可能一直有进展，不进入 fd 等待分支；`window=1` 或互换两端角色可以增加机会，但不保证覆盖。
+
+E3 重点覆盖 arm/recheck：检查每个 context 的 `recheck_progress>0`。`arm_delay_us` 延迟 rearm 到 recheck，可能使 CQE 已被 recheck 消费，无须等待 fd；已有通知仍由循环中的 `WaitJfc(timeout=0)` 消费并 ack。因此 E3 不要求 `fd_wakes>0`。单次运行只覆盖实际到达时序，不证明所有竞态均已验证。
 
 同设备多 EID 验证的是同一物理设备上的多 context 资源与推进；即使配置四个端点，也不能替代 M1/M2 的四个物理设备验证。以上命令是待执行的验证步骤，不代表同设备多 EID 已通过真机测试。
 

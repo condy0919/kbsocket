@@ -26,7 +26,8 @@ DEFINE_uint32(bytes, 4096, "Payload bytes, 32..4096");
 DEFINE_uint32(messages, 100000, "Messages per context per direction, window..10000000");
 DEFINE_uint32(window, 32, "Per-context outstanding request window, 1..256");
 DEFINE_bool(events, false, "Use JFCE arm/recheck/fd wait; report actual notification coverage");
-DEFINE_uint32(arm_delay_us, 0, "Delay between rearm and recheck, events only, 0..1000000");
+DEFINE_uint32(arm_delay_us, 0,
+              "Delay between rearm and recheck, events only; recheck progress skips fd wait, 0..1000000");
 DEFINE_uint32(timeout_ms, 10000, "No-progress/control timeout, 1..3600000 ms");
 DEFINE_uint32(process_timeout_sec, 300, "Hard process deadline including provider calls, 1..86400 seconds");
 
@@ -96,9 +97,10 @@ int Run() {
         sessions[i] = &hardware->sessions[i];
         hello.endpoints[i] = sessions[i]->endpoint();
     }
-    std::println("{} ready for continuous SEND: devices={} bytes={} messages={} window={} events={} control={}:{}",
+    std::println("{} ready for continuous SEND: devices={} bytes={} messages={} window={} events={} arm_delay_us={} "
+                 "control={}:{}",
                  FLAGS_server ? "Server" : "Client", FLAGS_devices, FLAGS_bytes, FLAGS_messages, FLAGS_window,
-                 FLAGS_events, FLAGS_address, FLAGS_port);
+                 FLAGS_events, FLAGS_arm_delay_us, FLAGS_address, FLAGS_port);
     std::fflush(stdout);
     kbsocket::tools::ControlChannel channel;
     auto connected = channel.Open(FLAGS_server, FLAGS_address.c_str(), FLAGS_port, FLAGS_timeout_ms);
@@ -169,16 +171,21 @@ int Run() {
     ::alarm(0);
     if (FLAGS_events) {
         std::uint64_t notifications = 0;
+        std::uint64_t fd_wakes = 0;
         for (std::size_t i = 0; i < devices->size(); ++i) {
             const auto& s = sessions[i]->stats();
             notifications += s.event_acks;
-            std::println("{}: context {} JFC notification path; fd_wakes={} tx_events={} rx_events={} acks={}",
-                         s.fd_wakes && s.event_acks ? "OBSERVED" : "NOT_OBSERVED", i, s.fd_wakes, s.tx_notifications,
-                         s.rx_notifications, s.event_acks);
+            fd_wakes += s.fd_wakes;
+            // WaitJfc(0) 可以在未进入 fd 等待时取得通知；两种覆盖分别报告。
+            std::println("{}: context {} JFC notifications; tx_events={} rx_events={} acks={}",
+                         s.event_acks ? "OBSERVED" : "NOT_OBSERVED", i, s.tx_notifications, s.rx_notifications,
+                         s.event_acks);
+            std::println("{}: context {} JFCE fd readiness; fd_wakes={}", s.fd_wakes ? "OBSERVED" : "NOT_OBSERVED", i,
+                         s.fd_wakes);
         }
-        std::println("{}: JFC notification path; waits={} events={} empty_wakes={}",
-                     result->waits && notifications ? "OBSERVED" : "NOT_OBSERVED", result->waits, notifications,
-                     result->empty_wakes);
+        std::println("{}: JFC notifications; events={}", notifications ? "OBSERVED" : "NOT_OBSERVED", notifications);
+        std::println("{}: JFCE fd readiness; waits={} fd_wakes={} empty_wakes={}",
+                     fd_wakes ? "OBSERVED" : "NOT_OBSERVED", result->waits, fd_wakes, result->empty_wakes);
     }
     std::println("PASS: continuous request/echo on {} raw contexts; all payloads validated; both endpoints closed",
                  devices->size());

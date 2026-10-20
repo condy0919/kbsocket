@@ -52,6 +52,7 @@ struct StreamStats {
     std::uint64_t tx_notifications = 0;
     std::uint64_t rx_notifications = 0;
     std::uint64_t event_acks = 0;
+    // poll 返回该 fd 的 POLLIN 次数；不表示 poll 一定曾阻塞，也不等于通知条数。
     std::uint64_t fd_wakes = 0;
     std::uint64_t recheck_progress = 0;
 };
@@ -125,6 +126,7 @@ private:
 };
 
 struct StreamRunStats {
+    // 调用 poll 等待 fd 的次数；是否返回就绪由各 context 的 fd_wakes 单独记录。
     std::uint64_t waits = 0;
     std::uint64_t empty_wakes = 0;
 };
