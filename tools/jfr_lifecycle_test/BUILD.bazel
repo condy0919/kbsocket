@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+cc_library(
+    name = "jfr_lifecycle_support",
+    srcs = [
+        "jfr_lifecycle_test.cpp",
+        "watchdog.cpp",
+    ],
+    hdrs = ["jfr_lifecycle_test.hpp"],
+    deps = [
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+    ],
+)
+
+cc_binary(
+    name = "jfr_lifecycle_test",
+    srcs = ["main.cpp"],
+    deps = [
+        ":jfr_lifecycle_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:raw_runtime",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+        "@gflags",
+    ],
+)
+
+cc_test(
+    name = "session_test",
+    srcs = ["session_test.cpp"],
+    deps = [
+        ":jfr_lifecycle_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:urma_api",
+        "//kbsocket/transport/raw:urma_test_support",
+        "//tools/common:control_channel",
+        "@googletest//:gtest_main",
+    ],
+)

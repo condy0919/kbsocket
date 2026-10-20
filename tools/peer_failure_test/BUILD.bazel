@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+cc_library(
+    name = "peer_failure_support",
+    srcs = [
+        "peer_failure_test.cpp",
+        "process.cpp",
+    ],
+    hdrs = [
+        "peer_failure_test.hpp",
+        "process.hpp",
+    ],
+    deps = [
+        "//kbsocket/transport/raw:attempt_ledger",
+        "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:rx_buffer_pool",
+        "//kbsocket/transport/raw:tx_sender",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+    ],
+)
+
+cc_binary(
+    name = "peer_failure_test",
+    srcs = ["main.cpp"],
+    deps = [
+        ":peer_failure_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:raw_runtime",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+        "@gflags",
+    ],
+)
+
+cc_test(
+    name = "peer_failure_unit_test",
+    srcs = ["peer_failure_unit_test.cpp"],
+    deps = [
+        ":peer_failure_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:urma_api",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)

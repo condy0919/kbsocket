@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+cc_library(
+    name = "streaming_test_support",
+    srcs = [
+        "streaming_protocol.cpp",
+        "streaming_test.cpp",
+    ],
+    hdrs = ["streaming_test.hpp"],
+    deps = [
+        "//kbsocket/transport/raw:raw_runtime",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+    ],
+)
+
+cc_binary(
+    name = "streaming_test",
+    srcs = ["main.cpp"],
+    deps = [
+        ":streaming_test_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:raw_runtime",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+        "@gflags",
+    ],
+)
+
+cc_test(
+    name = "streaming_test_test",
+    srcs = ["streaming_test_test.cpp"],
+    deps = [
+        ":streaming_test_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:urma_api",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)

@@ -6,7 +6,7 @@
 
 最重要的新证据是：**在本次裸设备 RM_CTP、`error_suspend=0` 配置下，WR 返回 RNR 重试耗尽后，同一条 SQ 仍能成功发送新消息。WR 失败、逻辑连接失败、SQ 进入 ERROR 和物理端口故障必须分别判断。**
 
-后续同 SQ 多目标实验出现了新的边界：健康目标已收到完整 mixed 批次，但发送端同时观察到健康目标和空 JFR 目标的 ACK_TIMEOUT。该实验失败，不能由单目标 RNR 后续发成功推导同 SQ 多目标错误隔离已经成立。
+同 SQ 多目标实验先出现过 ACK_TIMEOUT；修正完成收集后，用户再次运行 `batch=32、rounds=8`，健康目标的 before/mixed/after 全部成功，空 JFR 目标的 256 条 WR 全部 RNR，同一 SQ 在 25 次查询中保持 READY。**这支持本次配置下同 SQ 多目标 RNR 隔离；旧 ACK_TIMEOUT 的原因仍未查明，不能由复测成功宣称已修复。**
 
 ## 证据与环境范围
 
@@ -29,7 +29,7 @@
 | [本地 TX 配额](../tools/backpressure_test/README.md) | 用户确认 `tx_quota` 测试通过，未附独立详细计数 | SQ 软件配额耗尽后拒绝额外请求，退休完成后可提交此前未被接受的请求 |
 | 延迟投递 RX | `rx_delay_us=0` 和 `10000` 均反馈 `rx_delay_terminal_failure`；0 的详细日志见下文 | 缺 RX 可以表现为 post 已接受、随后异步 RNR；错误排空及独立清理可完成 |
 | 同 SQ 的 RNR 后续发 | 用户反馈 `rnr_continue_success` | 首批 RNR 终结后，补投远端 RX，同一 jetty 可成功发送新批次；没有重建或切换 SQ |
-| [同 SQ 多目标](../tools/sq_multiplex_test/README.md) | `batch=32` 首轮 mixed 失败；healthy 与 sink 各观察到 1 条 ACK_TIMEOUT，剩余完成未收齐 | 健康目标收到全部 32 条消息不保证发送端报告 SUCCESS；尚不能确认同 SQ 多目标错误隔离 |
+| [同 SQ 多目标](../tools/sq_multiplex_test/README.md) | 首次 mixed 曾出现 ACK_TIMEOUT；复测 `batch=32、rounds=8` 双端 PASS，健康 768 条全部成功、sink 256 条全部 RNR | 本次同 SQ 可交替服务健康/缺 RX 的不同 JFR，失败 WR 未阻止健康流量；旧 ACK_TIMEOUT 原因未明 |
 
 共享队列双 SQ 日志中，每端 `messages_per_jetty=1001`；源 jetty 到目标 jetty 的 TX/RX 计数均为 `0→0:501`、`0→1:500`、`1→0:500`、`1→1:501`。这证明不同源/目标组合被实际使用，不是仅创建了多个空闲 jetty。
 
@@ -126,7 +126,30 @@
 
 这些日志明确区分了远端已接收与本地确认成功：至少一条已经送达 healthy 的 WR 在发送侧得到 ACK_TIMEOUT。不能因此重放已接受的数据。两类目标接近同时出现约 129.6 ms 的完成延迟，与下节本地驱动的 128 ms 超时档位相符，但这只是源码对照；是否涉及 ACK 路径、同 SQ 完成追踪或驱动/固件问题，当前证据无法确定，也不能单凭 CQE 时序认定硬件队头阻塞。
 
-针对旧版提前结束观测的问题，工具代码已调整为：对合法但非预期的终结状态继续收集本批完成，分类统计 ACK_TIMEOUT 等错误，收齐本批后再次查询 SQ，并在控制面交换阶段失败与 TX 静默状态。超时或完整性异常时不新增查询，最后查询值可能仍来自出错前。完整性异常会停止后续 poll；healthy ACK_TIMEOUT 或 sink 非 RNR 仍判 FAIL，失败后不进入 after。上述调整尚无真实硬件复测结果，不能将本次失败改记为通过。
+针对旧版提前结束观测的问题，工具代码已调整为：对合法但非预期的终结状态继续收集本批完成，分类统计 ACK_TIMEOUT 等错误，收齐本批后再次查询 SQ，并在控制面交换阶段失败与 TX 静默状态。超时或完整性异常时不新增查询，最后查询值可能仍来自出错前。完整性异常会停止后续 poll；healthy ACK_TIMEOUT 或 sink 非 RNR 仍判 FAIL，失败后不进入 after。随后复测结果见下一节；该次通过不抹去本次失败记录。
+
+## 同 SQ 多目标复测：RNR 与健康完成共存
+
+用户随后贴出完整双端 PASS 日志，参数仍为 `bytes=4096、batch=32、rounds=8`，每轮 mixed 为同一次 post 的 64 条交替 WR：
+
+| 流量 | accepted | retired | SUCCESS | RNR | 服务端 received |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Healthy before | 256 | 256 | 256 | 0 | 256 |
+| Healthy mixed | 256 | 256 | 256 | 0 | 256 |
+| Healthy after | 256 | 256 | 256 | 0 | 256 |
+| Sink mixed | 256 | 256 | 0 | 256 | 无 RX 投递 |
+
+全部其他错误计数为 0；`jetty_id=55647、state_checks=25、requested_rnr_retry=6、requested_err_timeout=2、queried_rnr_retry=0、queried_err_timeout=0、last_queried_state=1、accepted_known=true、provider_eagain=0`。每轮 `healthy_retired=healthy_success=sink_retired=sink_rnr=32`，健康完成在最后一条 RNR 之前已观察到 31 条。两端都完成正常资源关闭。
+
+软件从 post 前到 CQE 消费的累计区间为：healthy before `18.220..41.530 μs`、mixed `17.190..39.980 μs`、after `18.020..33.040 μs`，sink `16.900..39.760 μs`。这些是软件观察耗时，不是硬件网络延迟或精确重试时间。
+
+本轮支持三个有限结论：
+
+- 同一 RM_CTP SQ 可逐 WR 指向两个独立 JFR；缺 RX 目标的 RNR 没有使本轮健康目标 WR 失败。
+- 首轮到末轮均未主动 modify ERROR、flush 或重建 SQ，检查点查询仍为 READY，后续健康流量继续成功。
+- RNR 终结逐 WR，不能仅据此断言整条 SQ 或物理端口失效。
+
+不能由这些日志推出严格完成顺序、普遍无队头阻塞、所有错误隔离或跨主机/端口故障隔离。两个目标仍位于同一远端主机/EID；查询是检查点采样，不能证明期间没有瞬时状态变化。本次未复现 ACK_TIMEOUT，而前次工具修复只改善完成收集及失败同步，不是 ACK 路径的硬件修复。
 
 ## 接口与查询值的解释边界
 
@@ -157,10 +180,10 @@ status 9 是 ACK_TIMEOUT，status 10 才是 RNR 重试耗尽：[urma_opcode.h](.
 - 延迟 RX 后原始批次全部成功，以及 RNR 的实际重试次数和时间窗口。
 - 非零 `WR_UNHANDLED` 软件 flush；绕过软件门禁向 ERROR SQ post 的具体返回行为。
 - provider 同步 `URMA_EAGAIN` 与部分接受边界；socket 的 EAGAIN 到 EPOLLOUT/NotifyWritable 闭环。
-- 同一共享 SQ 上一个 peer 发生 RNR、其他 peer 同时持续成功的连接级隔离；已有 mixed 失败记录，尚无完整通过结果。
+- 同一共享 SQ 的不同远端主机/链路故障隔离；已有同一远端主机上两个独立 JFR 的 mixed 通过记录，不能跨范围推导。
 - 四个裸设备并行、持续无批间屏障收发、对端异常退出、链路/端口真实故障及异步事件。
 - 尚有未消费 WR 的共享 JFR 关闭，以及 brpc worker 仍访问资源时的进程退出。
 
 后续记录至少保留两端完整命令、工具提交号、硬件/软件版本、关键创建参数及查询值、完整计数、最终 PASS/FAIL 和退出码。新结果与本记录冲突时，应先核对配置和版本，再修订适用范围。
 
-后续同 SQ 多目标复测需使用双方同时更新的工具，保留完整退休计数、分类错误和出错后查询状态，补足本次提前停止所缺少的证据。该实验仍不等同于对端进程退出或端口故障实验。
+剩余观察已集中到 [硬件验证矩阵](hardware-validation-matrix.md)：新增工具覆盖 provider 提交边界、残留 JFR、真实进程退出/外部故障、持续多设备收发/JFC 通知和 READ/WRITE。工具实现与本地 mock 通过不计为硬件通过；运行后按各项 OBSERVED/NOT_OBSERVED/SKIP/FAIL 记录新证据。socket 的 EAGAIN→EPOLLOUT 与 brpc worker 退出属于后续软件集成，不是再增加一个硬件观察就能证明的契约。

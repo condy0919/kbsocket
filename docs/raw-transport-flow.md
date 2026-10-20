@@ -62,7 +62,7 @@ flowchart TD
 
 `rnr_continue` 模式在首批 WR 全部返回 RNR 后才补投 RX，再用同一条 SQ 发送新消息。它在工具内消费完成并查询硬件状态，验证期间不调用 modify ERROR 或 flush，也不创建替代 SQ；用于区分 WR 终结错误与 SQ 不可用。用户已反馈 `rnr_continue_success`，表明本次硬件与配置下同一条 SQ 在 RNR 后仍可成功发送新消息；生产完成层的主动排空策略保持不变。
 
-[同 SQ 多目标工具](../tools/sq_multiplex_test/README.md) 在一条 SQ 的同一次 post 中交替选择健康与缺 RX 的目标，两者使用独立 JFR。每轮对照混合流量前后的正常发送，逐条检查健康 SUCCESS、sink RNR、远端 payload 和同一 SQ 的 READY 状态，并记录软件消费 CQE 的顺序与耗时。工具不因普通 RNR 主动排空 SQ；时序统计用于硬件观测，不能单凭 CQE 顺序判断硬件执行是否阻塞。已有一次失败反馈：健康目标收到完整数据，但发送端出现 ACK timeout，详见[硬件观测记录](hardware-observations.md)。工具已修正提前停止统计的问题，仍待修正后的硬件复测。
+[同 SQ 多目标工具](../tools/sq_multiplex_test/README.md) 在一条 SQ 的同一次 post 中交替选择健康与缺 RX 的目标，两者使用独立 JFR。每轮对照混合流量前后的正常发送，逐条检查健康 SUCCESS、sink RNR、远端 payload 和同一 SQ 的 READY 状态，并记录软件消费 CQE 的顺序与耗时。工具不因普通 RNR 主动排空 SQ；时序统计用于硬件观测，不能单凭 CQE 顺序判断硬件执行是否阻塞。已有一次失败反馈：健康目标收到完整数据，但发送端出现 ACK timeout，详见[硬件观测记录](hardware-observations.md)。修正完成收集后的复测已双端 PASS：健康 before/mixed/after 各 256 条全部成功，sink 256 条全部 RNR，原 SQ 的 25 次状态检查均为 READY；前次 ACK_TIMEOUT 的根因仍未知。
 
 发送组件之间的调用和失败处理见 [TX 数据路径](tx-pipeline.md)；接收内存及 lease 见 [RX buffer 池](rx-buffer-pool.md)；队列容量、票据和故障隔离见 [JettyPool](jetty-pool.md)。
 
@@ -86,5 +86,8 @@ flowchart TD
 | 同池 SQ 故障隔离 | 非零 FLUSH_ERR，故障 SQ 排空期间健康 SQ 和共享 RX 保持可用 |
 | TX 配额与延迟 RX | 配额测试通过；延迟 RX 观察到原始 WR 全部 RNR，再由另一条 SQ 的独立清理流量消费 RX 槽 |
 | 同 SQ 的 RNR 后续发 | 用户反馈 `rnr_continue_success`；原始 WR RNR 终结后，未切 ERROR 或重建的同一条 SQ 成功发送新消息 |
+| 同 SQ 多目标 RNR | `batch=32、rounds=8` 双端 PASS，健康流量 768 条成功、sink 256 条 RNR；不推广到其他错误/独立主机故障 |
 
 尚未验证延迟 RX 后原始流量全部成功、多设备或独立 peer 并行、持续无批间屏障收发、EAGAIN 到 EPOLLOUT 唤醒、非零软件 flush、异步事件及带未消费 WR 的共享 JFR 关闭。RNR 后续发成功不能推广到其他错误，也不代表原始消息被重放或恢复。单元测试中的故障注入用于验证代码契约，不能替代硬件专项测试。
+
+新增观察工具及完整运行顺序见 [硬件验证矩阵](hardware-validation-matrix.md)。它们直接观察当前 raw provider 的边界，不改变生产错误隔离、RX 关闭或 socket 语义。
