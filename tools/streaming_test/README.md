@@ -67,14 +67,88 @@ bazel-bin/tools/streaming_test/streaming_test \
 日志中的 `Context N name:eid_index` 标明计数属于哪个端点。
 工具的上限是四个 context，`RawRuntime` 本身没有四端点限制。
 
-两端各提供四个实际存在、允许使用的裸设备与 EID 索引：
+### 两裸设备、每设备两个 EID：四 context 验证
+
+实际部署优先使用这一组，不需要四个物理设备。增加 `--two_devices_two_eids` 后，工具要求每端恰好两个不同设备名、每设备两个不同 EID，创建四个独立 context，同时推进四条 request/echo 流。少于四端点、单设备四 EID、三加一分布、四设备各一 EID均会在加载 URMA 前被拒绝。
+
+两端按列表位置配对，设备名和 EID 索引可以不同，但设备分组必须一致，例如双方都是 `A0,A1,B0,B1`，或双方都是 `A0,B0,A1,B1`。握手交换设备分组与严格模式标记；只在一端启用严格模式、或两端分组位置不同都会失败。控制协议已升级为 v2，需要两端使用本次构建的工具。
+
+先在每台机器上确认两个实际可用的裸设备和各自两个 EID。下面第二设备名及索引都是占位符，必须替换为对应机器的实际值，不能直接照抄；不假定现场第二个裸设备的名字。
+
+服务端先设置本机端点，依次运行三条命令；每条等待对应客户端完成后，再运行下一条：
 
 ```bash
-# 两端均使用相同 window/messages/events；设备名与索引分别替换。
---devices=udma0:38,udma1:39,udma2:40,udma3:41 --window=32 --messages=100001
+SERVER_DEVICE_A='udmac0d1e4'
+SERVER_DEVICE_B='<服务端第二个裸设备名>'
+SERVER_A_EID0='<A 的第一个 EID 索引>'
+SERVER_A_EID1='<A 的第二个 EID 索引>'
+SERVER_B_EID0='<B 的第一个 EID 索引>'
+SERVER_B_EID1='<B 的第二个 EID 索引>'
+SERVER_ENDPOINTS="${SERVER_DEVICE_A}:${SERVER_A_EID0},${SERVER_DEVICE_A}:${SERVER_A_EID1},${SERVER_DEVICE_B}:${SERVER_B_EID0},${SERVER_DEVICE_B}:${SERVER_B_EID1}"
+
+# T1：四路持续轮询、RX 补投及非整倍数窗口收尾。
+bazel-bin/tools/streaming_test/streaming_test \
+  --server --address=0.0.0.0 --port=8894 \
+  --devices="${SERVER_ENDPOINTS}" --two_devices_two_eids \
+  --window=32 --messages=100001 --bytes=4096
+
+# T2：逐 context 观察通知领取/ack 和 JFCE fd 就绪。
+bazel-bin/tools/streaming_test/streaming_test \
+  --server --address=0.0.0.0 --port=8894 \
+  --devices="${SERVER_ENDPOINTS}" --two_devices_two_eids \
+  --events --arm_delay_us=0 --window=1 --messages=100001 --bytes=4096
+
+# T3：放大 arm/recheck 窗口，不要求额外进入 fd 等待。
+bazel-bin/tools/streaming_test/streaming_test \
+  --server --address=0.0.0.0 --port=8894 \
+  --devices="${SERVER_ENDPOINTS}" --two_devices_two_eids \
+  --events --arm_delay_us=1000 --window=32 --messages=100001 --bytes=4096
 ```
 
-先每个端点独立跑通，再一起跑轮询模式与事件模式。工具同时推进各会话，每 context 独立计数和校验；它验证多 context 共存与持续工作。同设备四个 EID 的测试不能替代四个物理设备测试，也不验证跨设备故障隔离或四个 CPU owner 的并行性能。
+客户端分别配合服务端的 T1、T2、T3：
+
+```bash
+CLIENT_DEVICE_A='udmac0d1e4'
+CLIENT_DEVICE_B='<客户端第二个裸设备名>'
+CLIENT_A_EID0='<A 的第一个 EID 索引>'
+CLIENT_A_EID1='<A 的第二个 EID 索引>'
+CLIENT_B_EID0='<B 的第一个 EID 索引>'
+CLIENT_B_EID1='<B 的第二个 EID 索引>'
+CLIENT_ENDPOINTS="${CLIENT_DEVICE_A}:${CLIENT_A_EID0},${CLIENT_DEVICE_A}:${CLIENT_A_EID1},${CLIENT_DEVICE_B}:${CLIENT_B_EID0},${CLIENT_DEVICE_B}:${CLIENT_B_EID1}"
+SERVER_ADDRESS='141.62.33.25'
+
+# T1
+bazel-bin/tools/streaming_test/streaming_test \
+  --address="${SERVER_ADDRESS}" --port=8894 \
+  --devices="${CLIENT_ENDPOINTS}" --two_devices_two_eids \
+  --window=32 --messages=100001 --bytes=4096
+
+# T2
+bazel-bin/tools/streaming_test/streaming_test \
+  --address="${SERVER_ADDRESS}" --port=8894 \
+  --devices="${CLIENT_ENDPOINTS}" --two_devices_two_eids \
+  --events --arm_delay_us=0 --window=1 --messages=100001 --bytes=4096
+
+# T3
+bazel-bin/tools/streaming_test/streaming_test \
+  --address="${SERVER_ADDRESS}" --port=8894 \
+  --devices="${CLIENT_ENDPOINTS}" --two_devices_two_eids \
+  --events --arm_delay_us=1000 --window=32 --messages=100001 --bytes=4096
+```
+
+验收时保留双端完整日志，逐一检查四个 context，不能用累计总数代替：
+
+| 组别 | 每端、每 context 的流量要求 | 通知观察要求 |
+| --- | --- | --- |
+| T1 | `accepted=retired=received=rx_posted=100001`，`rx_reposts=99969`，最终 PASS | 不启用事件 |
+| T2 | 四项流量计数均为 `100001`，`rx_reposts=100000`，最终 PASS | 四个 context 各自出现通知及 fd 就绪的 OBSERVED；缺项记为未覆盖，流量 PASS 仍有效 |
+| T3 | 四项流量计数均为 `100001`，`rx_reposts=99969`，最终 PASS | 逐 context 检查通知/ack 与 `recheck_progress>0`；`fd_wakes=0` 可以正常，不要求强行等待 |
+
+启动时 `Context N mapping` 打印实际设备组、设备名、EID 索引、jetty ID 及 JFCE fd；事件未启用时 fd 为 -1。结束时同一 context 打印全部流量计数，`rx_reposts` 为初始窗口之后成功补投的次数。事件模式每端有八条逐 context 的覆盖行和两条总计行；总计 OBSERVED 不能代替四路各自的覆盖证据。
+
+先保证每个端点独立可通信，再跑这三组。两设备四 context 验证的是单 owner 下四路共存、独立身份与持续复用，不验证四个 CPU owner 并行性能，也不验证跨设备故障隔离。当前本地 gMock 已覆盖八个独立 `StreamSession`（两端各四个 context），一条延迟不阻塞其他三条，以及四个独立 eventfd 的归属、通知 ack 和 RX 补投；这些单测通过不等于物理硬件已经通过。
+
+不加 `--two_devices_two_eids` 时，保留原有任意 1–4 context 用法，包括同设备多个 EID。四个物理设备测试目前暂缓，同设备四 EID 也不能替代这里的两设备各两 EID。
 
 ## 生命周期与退出
 

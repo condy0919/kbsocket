@@ -21,6 +21,8 @@ DEFINE_uint32(port, 18543, "TCP control port");
 DEFINE_string(devices, "",
               "One to four distinct raw name:eid_index pairs, comma separated; same device with different EIDs "
               "allowed; pair by list order");
+DEFINE_bool(two_devices_two_eids, false,
+            "Require two raw devices with two EIDs each on both endpoints; matching device grouping by list order");
 DEFINE_string(library, "liburma.so", "URMA library path");
 DEFINE_uint32(bytes, 4096, "Payload bytes, 32..4096");
 DEFINE_uint32(messages, 100000, "Messages per context per direction, window..10000000");
@@ -42,11 +44,21 @@ int Fail(const kbsocket::tools::ToolError& error) {
     return 1;
 }
 int Run() {
-    kbsocket::tools::StreamOptions options{FLAGS_bytes,      FLAGS_messages, FLAGS_window,
-                                           FLAGS_timeout_ms, FLAGS_events,   FLAGS_arm_delay_us};
+    kbsocket::tools::StreamOptions options{FLAGS_bytes,
+                                           FLAGS_messages,
+                                           FLAGS_window,
+                                           FLAGS_timeout_ms,
+                                           FLAGS_events,
+                                           FLAGS_arm_delay_us,
+                                           FLAGS_two_devices_two_eids};
     auto devices = kbsocket::tools::ParseStreamDevices(FLAGS_devices);
     if (!devices) {
         std::println(stderr, "Invalid --devices='{}': {}", FLAGS_devices, devices.error().operation);
+        return 2;
+    }
+    auto device_groups = kbsocket::tools::BuildStreamDeviceGroups(*devices, FLAGS_two_devices_two_eids);
+    if (!device_groups) {
+        std::println(stderr, "Invalid --devices topology: {}", device_groups.error().operation);
         return 2;
     }
     if (auto validated = kbsocket::tools::ValidateStreamOptions(options); !validated) {
@@ -80,8 +92,10 @@ int Run() {
                      static_cast<int>(initialized.error().code), initialized.error().provider_error);
         return 1;
     }
-    kbsocket::tools::StreamHello hello{
-        .options = options, .server = FLAGS_server, .count = static_cast<std::uint32_t>(devices->size())};
+    kbsocket::tools::StreamHello hello{.options = options,
+                                       .server = FLAGS_server,
+                                       .count = static_cast<std::uint32_t>(devices->size()),
+                                       .device_groups = *device_groups};
     std::array<kbsocket::tools::StreamSession*, kbsocket::tools::kStreamMaxContexts> sessions{};
     for (std::size_t i = 0; i < devices->size(); ++i) {
         urma_device_attr_t attributes{};
@@ -98,9 +112,15 @@ int Run() {
         hello.endpoints[i] = sessions[i]->endpoint();
     }
     std::println("{} ready for continuous SEND: devices={} bytes={} messages={} window={} events={} arm_delay_us={} "
-                 "control={}:{}",
+                 "two_devices_two_eids={} control={}:{}",
                  FLAGS_server ? "Server" : "Client", FLAGS_devices, FLAGS_bytes, FLAGS_messages, FLAGS_window,
-                 FLAGS_events, FLAGS_arm_delay_us, FLAGS_address, FLAGS_port);
+                 FLAGS_events, FLAGS_arm_delay_us, FLAGS_two_devices_two_eids, FLAGS_address, FLAGS_port);
+    for (std::size_t i = 0; i < devices->size(); ++i) {
+        const auto endpoint = sessions[i]->endpoint();
+        std::println("Context {} mapping: device_group={} device={} eid_index={} jetty_id={} jfce_fd={}", i,
+                     (*device_groups)[i], (*devices)[i].device_name, (*devices)[i].eid_index, endpoint.id,
+                     sessions[i]->event_fd());
+    }
     std::fflush(stdout);
     kbsocket::tools::ControlChannel channel;
     auto connected = channel.Open(FLAGS_server, FLAGS_address.c_str(), FLAGS_port, FLAGS_timeout_ms);
@@ -137,9 +157,10 @@ int Run() {
         const auto& s = sessions[i]->stats();
         std::println(
             "Context {} {}:{}: accepted={} retired={} received={} rx_posted={} rearms={} tx_events={} rx_events={} "
-            "acks={} recheck_progress={}",
+            "acks={} recheck_progress={} rx_reposts={} device_group={}",
             i, (*devices)[i].device_name, (*devices)[i].eid_index, s.accepted, s.retired, s.received, s.rx_posted,
-            s.rearms, s.tx_notifications, s.rx_notifications, s.event_acks, s.recheck_progress);
+            s.rearms, s.tx_notifications, s.rx_notifications, s.event_acks, s.recheck_progress,
+            s.rx_posted >= options.window ? s.rx_posted - options.window : 0, (*device_groups)[i]);
     }
     if (!result) {
         return Fail(result.error());

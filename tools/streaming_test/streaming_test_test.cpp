@@ -90,6 +90,60 @@ TEST(StreamProtocolTest, TooManyContextsReportsCountLimit) {
     EXPECT_STREQ(devices.error().operation, "use at most four device/EID pairs");
 }
 
+TEST(StreamProtocolTest, StrictTopologyAcceptsTwoDevicesWithTwoDistinctEidsEach) {
+    // 每台机器可以使用不同的设备名与 EID；只保留配对位置上的设备分组关系。
+    auto devices = ParseStreamDevices("raw_b:9,raw_a:3,raw_b:11,raw_a:9");
+    ASSERT_TRUE(devices);
+    auto groups = BuildStreamDeviceGroups(*devices, true);
+    ASSERT_TRUE(groups);
+    EXPECT_EQ(*groups, (StreamDeviceGroups{0, 1, 0, 1}));
+    for (auto input : {"raw_a:1,raw_a:2", "raw_a:1,raw_a:2,raw_a:3,raw_a:4", "raw_a:1,raw_a:2,raw_a:3,raw_b:1",
+                       "raw_a:1,raw_b:1,raw_c:1,raw_d:1"}) {
+        devices = ParseStreamDevices(input);
+        ASSERT_TRUE(devices);
+        EXPECT_FALSE(BuildStreamDeviceGroups(*devices, true)) << input;
+        EXPECT_TRUE(BuildStreamDeviceGroups(*devices, false)) << input;
+    }
+}
+
+TEST(StreamProtocolTest, StrictTopologyIsPreservedAndMustMatchAcrossPeers) {
+    StreamHello local{.count = 4, .device_groups = {0, 0, 1, 1}};
+    local.options.two_devices_two_eids = true;
+    for (std::size_t i = 0; i < local.count; ++i) {
+        local.endpoints[i].id = i + 1;
+    }
+    auto decoded = DecodeStreamHello(EncodeStreamHello(local));
+    ASSERT_TRUE(decoded);
+    EXPECT_TRUE(decoded->options.two_devices_two_eids);
+    EXPECT_EQ(decoded->device_groups, local.device_groups);
+    auto peer = *decoded;
+    peer.server = true;
+    EXPECT_TRUE(ValidateStreamPeer(local, peer));
+    // 同为四个 context，但设备分组配错时不能宣称验证了两设备各两 EID 的对应流量。
+    peer.device_groups = {0, 1, 0, 1};
+    EXPECT_FALSE(ValidateStreamPeer(local, peer));
+    peer.device_groups = local.device_groups;
+    peer.options.two_devices_two_eids = false;
+    EXPECT_FALSE(ValidateStreamPeer(local, peer));
+    local.options.two_devices_two_eids = false;
+    EXPECT_TRUE(ValidateStreamPeer(local, peer));
+
+    // 不同旧版本、未知 flag、非法/缺失分组都必须在导入远端端点前拒绝。
+    local.options.two_devices_two_eids = true;
+    for (const StreamDeviceGroups groups :
+         {StreamDeviceGroups{0, 0, 0, 1}, StreamDeviceGroups{1, 1, 0, 0}, StreamDeviceGroups{0, 0, 1, 4}}) {
+        local.device_groups = groups;
+        EXPECT_FALSE(DecodeStreamHello(EncodeStreamHello(local)));
+    }
+    local.device_groups = {0, 0, 1, 1};
+    auto wire = EncodeStreamHello(local);
+    wire[7] = std::byte{1};
+    EXPECT_FALSE(DecodeStreamHello(wire));
+    wire = EncodeStreamHello(local);
+    wire[11] = std::byte{8};
+    EXPECT_FALSE(DecodeStreamHello(wire));
+}
+
 TEST(StreamProtocolTest, FourEndpointsRoundTripAndReservedBytesAreChecked) {
     StreamHello hello{.count = 4};
     hello.options.events = true;
@@ -156,6 +210,7 @@ protected:
         bool mr_live = false;
         bool jetty_live = false;
         bool jfr_live = false;
+        std::size_t delayed_rx_polls = 0;
     };
     static raw::UrmaFunctions MockedFunctions() {
         raw::UrmaFunctions f{};
@@ -187,6 +242,21 @@ protected:
         }
         ADD_FAILURE() << "unknown mock context";
         return nodes_[0];
+    }
+    int PollCompletions(urma_jfc_t* cq, int max, urma_cr_t* out) {
+        auto& n = Find(cq->urma_ctx);
+        const auto index = cq == &n.cq[0] ? 0 : 1;
+        if (index == 1 && n.delayed_rx_polls) {
+            --n.delayed_rx_polls;
+            return 0;
+        }
+        auto& pending = n.completions[index];
+        const auto count = std::min<int>(max, pending.size());
+        for (int i = 0; i < count; ++i) {
+            out[i] = pending.back();
+            pending.pop_back();
+        }
+        return count;
     }
     void SetUp() override {
         active_ = this;
@@ -236,7 +306,10 @@ protected:
         });
         EXPECT_CALL(*this, Import(_, _, _)).Times(AnyNumber()).WillRepeatedly([&](auto* c, auto* r, auto*) {
             EXPECT_EQ(r->tp_type, URMA_CTP);
-            return &Find(c).target;
+            auto& target = Find(c).target;
+            target.urma_ctx = c;
+            target.id = r->jetty_id;
+            return &target;
         });
         EXPECT_CALL(*this, PostRecv(_, _, _)).Times(AnyNumber()).WillRepeatedly([&](auto* j, auto* w, auto**) {
             auto& n = Find(j->urma_ctx);
@@ -246,7 +319,20 @@ protected:
         });
         EXPECT_CALL(*this, PostSend(_, _, _)).Times(AnyNumber()).WillRepeatedly([&](auto* j, auto* w, auto**) {
             auto& source = Find(j->urma_ctx);
-            auto& target = nodes_[(j->jetty_id.id - 100) ^ 1];
+            // 依据实际导入的端点路由，不能用预设配对掩盖 Connect 或 tjetty 选错导致的跨 context 串线。
+            EXPECT_EQ(w->tjetty, &source.target);
+            if (w->tjetty != &source.target) {
+                return URMA_EINVAL;
+            }
+            const auto remote = std::find_if(nodes_.begin(), nodes_.end(), [&](const auto& node) {
+                return node.jetty.jetty_id.id == source.target.id.id &&
+                       !std::memcmp(node.jetty.jetty_id.eid.raw, source.target.id.eid.raw, 16);
+            });
+            EXPECT_NE(remote, nodes_.end());
+            if (remote == nodes_.end()) {
+                return URMA_EINVAL;
+            }
+            auto& target = *remote;
             EXPECT_TRUE(source.mr_live);
             EXPECT_TRUE(target.mr_live);
             EXPECT_FALSE(target.buffers.empty());
@@ -279,14 +365,7 @@ protected:
             return URMA_SUCCESS;
         });
         EXPECT_CALL(*this, Poll(_, _, _)).Times(AnyNumber()).WillRepeatedly([&](auto* cq, int max, auto* out) {
-            auto& n = Find(cq->urma_ctx);
-            auto& pending = n.completions[cq == &n.cq[0] ? 0 : 1];
-            const auto count = std::min<int>(max, pending.size());
-            for (int i = 0; i < count; ++i) {
-                out[i] = pending.back();
-                pending.pop_back();
-            }
-            return count;
+            return PollCompletions(cq, max, out);
         });
         EXPECT_CALL(*this, Wait(_, _, 0, _)).Times(AnyNumber()).WillRepeatedly(::testing::Return(0));
         EXPECT_CALL(*this, Rearm(_, false)).Times(AnyNumber()).WillRepeatedly(::testing::Return(URMA_SUCCESS));
@@ -336,7 +415,7 @@ protected:
     }
     inline static StreamHardwareTest* active_;
     std::unique_ptr<raw::test_support::ScopedUrmaOverride> override_;
-    std::array<Node, 4> nodes_;
+    std::array<Node, 8> nodes_;
     urma_device_cap_t cap_{};
 };
 
@@ -395,6 +474,140 @@ TEST_F(StreamHardwareTest, MultipleContextsProgressInOneOwnerLoopAndRetainSepara
         EXPECT_EQ(owner.stats().retired, options.messages);
         owner.ConfirmPeerQuiescent();
         EXPECT_TRUE(owner.Close());
+    }
+}
+
+TEST_F(StreamHardwareTest, FourContextsAcrossTwoDevicesRecycleIndependentlyDespiteDelayedPeer) {
+    std::array<urma_device_t, 4> devices{};
+    std::array<StreamSession, 8> owners;
+    std::array<StreamSession*, 4> clients{};
+    StreamOptions options{.bytes = 4096, .messages = 65, .window = 3, .two_devices_two_eids = true};
+    for (std::size_t i = 0; i < owners.size(); ++i) {
+        // 偶数为客户端、奇数为服务端；每端两个设备，各含两个不同 EID 的 context。
+        nodes_[i].ctx.dev = &devices[(i & 1) * 2 + i / 4];
+        nodes_[i].ctx.eid_index = (i / 2) % 2;
+        ASSERT_TRUE(owners[i].Open(&nodes_[i].ctx, cap_, options, i & 1, i / 2));
+    }
+    for (std::size_t i = 0; i < owners.size(); ++i) {
+        ASSERT_TRUE(owners[i].Connect(owners[i ^ 1].endpoint()));
+        ASSERT_TRUE(owners[i].Start());
+    }
+    // 第一条流延迟接收；其余三条流必须先完成，不允许共享进度门槛把全部会话拖住。
+    nodes_[1].delayed_rx_polls = 100;
+    bool healthy_finished_while_delayed = false;
+    for (std::size_t i = 0; i < clients.size(); ++i) {
+        clients[i] = &owners[2 * i];
+        EXPECT_CALL(*this, Poll(&nodes_[2 * i].cq[1], _, _)).WillRepeatedly([&, i](auto* cq, int max, auto* out) {
+            EXPECT_TRUE(owners[2 * i + 1].Advance());
+            if (!owners[0].done() && owners[2].done() && owners[4].done() && owners[6].done()) {
+                healthy_finished_while_delayed = true;
+            }
+            return PollCompletions(cq, max, out);
+        });
+    }
+    auto result = RunStreams(clients, options);
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(healthy_finished_while_delayed);
+    EXPECT_EQ(result->waits, 0u);
+    for (std::size_t i = 0; i < owners.size(); ++i) {
+        ASSERT_TRUE(owners[i].Advance());
+        ASSERT_TRUE(owners[i].done()) << i;
+        const auto& stats = owners[i].stats();
+        EXPECT_EQ(stats.accepted, options.messages) << i;
+        EXPECT_EQ(stats.retired, options.messages) << i;
+        EXPECT_EQ(stats.received, options.messages) << i;
+        EXPECT_EQ(stats.rx_posted, options.messages) << i;
+        EXPECT_GT(stats.rx_posted, options.window) << i;
+        EXPECT_EQ(nodes_[i].sends, options.messages) << i;
+        owners[i].ConfirmPeerQuiescent();
+    }
+    // 全部 peer 已确认静默再关闭；mock 还检查每个 MR 都在本 context 的队列删除后释放。
+    for (auto& owner : owners) {
+        EXPECT_TRUE(owner.Close());
+    }
+}
+
+TEST_F(StreamHardwareTest, FourIndependentEventFdsWakeOnlyTheirOwnContextAndKeepReposting) {
+    std::array<urma_device_t, 4> devices{};
+    std::array<StreamSession, 8> owners;
+    std::array<StreamSession*, 4> servers{};
+    std::array<bool, 4> notified{};
+    std::array<std::size_t, 4> acknowledgements{};
+    StreamOptions options{
+        .bytes = 1024, .messages = 5, .window = 1, .timeout_ms = 1000, .events = true, .two_devices_two_eids = true};
+    for (std::size_t i = 0; i < owners.size(); ++i) {
+        nodes_[i].ctx.dev = &devices[(i & 1) * 2 + i / 4];
+        nodes_[i].ctx.eid_index = (i / 2) % 2;
+        ASSERT_TRUE(owners[i].Open(&nodes_[i].ctx, cap_, options, i & 1, i / 2));
+    }
+    for (std::size_t i = 0; i < owners.size(); ++i) {
+        ASSERT_TRUE(owners[i].Connect(owners[i ^ 1].endpoint()));
+        ASSERT_TRUE(owners[i].Start());
+    }
+    for (std::size_t i = 0; i < servers.size(); ++i) {
+        servers[i] = &owners[2 * i + 1];
+        nodes_[2 * i + 1].event.fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        ASSERT_GE(nodes_[2 * i + 1].event.fd, 0);
+        EXPECT_CALL(*this, Wait(&nodes_[2 * i + 1].event, 16, 0, _))
+            .WillRepeatedly([&, i](auto*, auto, int, auto** out) {
+                if (!notified[i]) {
+                    return 0;
+                }
+                std::uint64_t value = 0;
+                EXPECT_EQ(::read(nodes_[2 * i + 1].event.fd, &value, sizeof(value)),
+                          static_cast<ssize_t>(sizeof(value)));
+                EXPECT_TRUE(owners[2 * i].Advance());
+                out[0] = &nodes_[2 * i + 1].cq[1];
+                notified[i] = false;
+                return 1;
+            });
+    }
+    std::size_t selected = 0;
+    // 每次只让一个独立 fd 就绪；recheck 尚无 CQE，因此必须实际走 poll，并只计入该 context。
+    EXPECT_CALL(*this, Rearm(&nodes_[7].cq[1], false)).WillRepeatedly([&](auto*, bool) {
+        while (servers[selected % servers.size()]->done()) {
+            ++selected;
+        }
+        const auto index = selected++ % servers.size();
+        const std::uint64_t value = 1;
+        EXPECT_EQ(::write(nodes_[2 * index + 1].event.fd, &value, sizeof(value)), static_cast<ssize_t>(sizeof(value)));
+        notified[index] = true;
+        return URMA_SUCCESS;
+    });
+    EXPECT_CALL(*this, Ack(_, _, 1))
+        .Times(options.messages * servers.size())
+        .WillRepeatedly([&](auto** cq, auto* counts, auto) {
+            EXPECT_EQ(counts[0], 1u);
+            auto& node = Find(cq[0]->urma_ctx);
+            const auto index = static_cast<std::size_t>(&node - nodes_.data());
+            EXPECT_EQ(index % 2, 1u);
+            EXPECT_EQ(cq[0], &node.cq[1]);
+            ++acknowledgements[index / 2];
+        });
+    auto result = RunStreams(servers, options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->waits, options.messages * servers.size());
+    EXPECT_EQ(result->empty_wakes, 0u);
+    for (std::size_t i = 0; i < servers.size(); ++i) {
+        ASSERT_TRUE(owners[2 * i].Advance());
+        for (auto* owner : {&owners[2 * i], servers[i]}) {
+            EXPECT_TRUE(owner->done());
+            EXPECT_EQ(owner->stats().accepted, options.messages);
+            EXPECT_EQ(owner->stats().retired, options.messages);
+            EXPECT_EQ(owner->stats().received, options.messages);
+            EXPECT_EQ(owner->stats().rx_posted, options.messages);
+            owner->ConfirmPeerQuiescent();
+        }
+        EXPECT_EQ(servers[i]->stats().fd_wakes, options.messages);
+        EXPECT_EQ(servers[i]->stats().rx_notifications, options.messages);
+        EXPECT_EQ(servers[i]->stats().event_acks, acknowledgements[i]);
+        EXPECT_EQ(acknowledgements[i], options.messages);
+    }
+    for (auto& owner : owners) {
+        EXPECT_TRUE(owner.Close());
+    }
+    for (std::size_t i = 0; i < servers.size(); ++i) {
+        ::close(nodes_[2 * i + 1].event.fd);
     }
 }
 

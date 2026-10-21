@@ -27,6 +27,26 @@ std::uint32_t Get32(std::span<const std::byte> bytes) {
 auto Error(const char* text, int code = EINVAL) {
     return std::unexpected(ToolError{text, code});
 }
+bool ValidGroups(const StreamDeviceGroups& groups, std::size_t count, bool strict) {
+    std::array<std::size_t, kStreamMaxContexts> sizes{};
+    std::size_t distinct = 0;
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+        if (i >= count) {
+            if (groups[i]) {
+                return false;
+            }
+            continue;
+        }
+        if (groups[i] > distinct || groups[i] >= sizes.size()) {
+            return false;
+        }
+        if (groups[i] == distinct) {
+            ++distinct;
+        }
+        ++sizes[groups[i]];
+    }
+    return !strict || (count == 4 && distinct == 2 && sizes[0] == 2 && sizes[1] == 2);
+}
 } // namespace
 
 std::expected<void, ToolError> ValidateStreamOptions(const StreamOptions& o) noexcept {
@@ -76,16 +96,48 @@ std::expected<std::vector<raw::DeviceConfig>, ToolError> ParseStreamDevices(std:
     return result;
 }
 
+std::expected<StreamDeviceGroups, ToolError> BuildStreamDeviceGroups(std::span<const raw::DeviceConfig> devices,
+                                                                     bool two_devices_two_eids) {
+    if (devices.empty() || devices.size() > kStreamMaxContexts) {
+        return Error("use one to four device/EID pairs");
+    }
+    StreamDeviceGroups groups{};
+    std::uint8_t distinct = 0;
+    for (std::size_t i = 0; i < devices.size(); ++i) {
+        bool found = false;
+        for (std::size_t j = 0; j < i; ++j) {
+            if (devices[i].device_name == devices[j].device_name) {
+                if (devices[i].eid_index == devices[j].eid_index) {
+                    return Error("duplicate device/EID pair");
+                }
+                groups[i] = groups[j];
+                found = true;
+            }
+        }
+        if (!found) {
+            groups[i] = distinct++;
+        }
+    }
+    if (!ValidGroups(groups, devices.size(), two_devices_two_eids)) {
+        return Error("--two_devices_two_eids requires exactly two devices with two distinct EIDs each");
+    }
+    return groups;
+}
+
 StreamHelloBytes EncodeStreamHello(const StreamHello& hello) noexcept {
     StreamHelloBytes bytes{};
     auto wire = std::span(bytes);
     Put32(wire, 0x4b425354); // KBST
-    Put32(wire.subspan(4), 1);
-    Put32(wire.subspan(8), (hello.server ? 1u : 0u) | (hello.options.events ? 2u : 0u));
+    Put32(wire.subspan(4), 2);
+    Put32(wire.subspan(8),
+          (hello.server ? 1u : 0u) | (hello.options.events ? 2u : 0u) | (hello.options.two_devices_two_eids ? 4u : 0u));
     Put32(wire.subspan(12), hello.count);
     Put32(wire.subspan(16), hello.options.bytes);
     Put32(wire.subspan(20), hello.options.messages);
     Put32(wire.subspan(24), hello.options.window);
+    for (std::size_t i = 0; i < kStreamMaxContexts; ++i) {
+        bytes[28 + i] = static_cast<std::byte>(hello.device_groups[i]);
+    }
     for (std::size_t i = 0; i < std::min<std::size_t>(hello.count, kStreamMaxContexts); ++i) {
         std::memcpy(bytes.data() + 32 + 20 * i, hello.endpoints[i].eid.raw, 16);
         Put32(wire.subspan(48 + 20 * i), hello.endpoints[i].id);
@@ -95,19 +147,25 @@ StreamHelloBytes EncodeStreamHello(const StreamHello& hello) noexcept {
 
 std::expected<StreamHello, ToolError> DecodeStreamHello(const StreamHelloBytes& bytes) noexcept {
     const auto wire = std::span(bytes);
-    if (Get32(wire) != 0x4b425354 || Get32(wire.subspan(4)) != 1 || Get32(wire.subspan(8)) > 3 ||
-        Get32(wire.subspan(28))) {
+    if (Get32(wire) != 0x4b425354 || Get32(wire.subspan(4)) != 2 || Get32(wire.subspan(8)) > 7) {
         return Error("stream hello header", EPROTO);
     }
     StreamHello hello;
     hello.server = Get32(wire.subspan(8)) & 1;
     hello.options.events = Get32(wire.subspan(8)) & 2;
+    hello.options.two_devices_two_eids = Get32(wire.subspan(8)) & 4;
     hello.count = Get32(wire.subspan(12));
     hello.options.bytes = Get32(wire.subspan(16));
     hello.options.messages = Get32(wire.subspan(20));
     hello.options.window = Get32(wire.subspan(24));
     if (!hello.count || hello.count > kStreamMaxContexts || !ValidateStreamOptions(hello.options)) {
         return Error("stream hello options", EPROTO);
+    }
+    for (std::size_t i = 0; i < kStreamMaxContexts; ++i) {
+        hello.device_groups[i] = std::to_integer<std::uint8_t>(bytes[28 + i]);
+    }
+    if (!ValidGroups(hello.device_groups, hello.count, hello.options.two_devices_two_eids)) {
+        return Error("stream hello device grouping", EPROTO);
     }
     for (std::size_t i = 0; i < hello.count; ++i) {
         std::memcpy(hello.endpoints[i].eid.raw, bytes.data() + 32 + 20 * i, 16);
@@ -125,6 +183,19 @@ std::expected<StreamHello, ToolError> DecodeStreamHello(const StreamHelloBytes& 
         }
     }
     return hello;
+}
+
+std::expected<void, ToolError> ValidateStreamPeer(const StreamHello& local, const StreamHello& peer) noexcept {
+    if (peer.server == local.server || peer.count != local.count || peer.options.bytes != local.options.bytes ||
+        peer.options.window != local.options.window || peer.options.messages != local.options.messages ||
+        peer.options.events != local.options.events ||
+        peer.options.two_devices_two_eids != local.options.two_devices_two_eids) {
+        return Error("stream peer options mismatch", EPROTO);
+    }
+    if (local.options.two_devices_two_eids && peer.device_groups != local.device_groups) {
+        return Error("stream peer device grouping mismatch; pair contexts by matching device groups", EPROTO);
+    }
+    return {};
 }
 
 std::expected<StreamHello, ToolError> ExchangeStreamHello(ControlChannel& channel, const StreamHello& hello) {
@@ -145,10 +216,8 @@ std::expected<StreamHello, ToolError> ExchangeStreamHello(ControlChannel& channe
     if (!peer) {
         return peer;
     }
-    if (peer->server == hello.server || peer->count != hello.count || peer->options.bytes != hello.options.bytes ||
-        peer->options.window != hello.options.window || peer->options.messages != hello.options.messages ||
-        peer->options.events != hello.options.events) {
-        return Error("stream peer options mismatch", EPROTO);
+    if (auto matched = ValidateStreamPeer(hello, *peer); !matched) {
+        return std::unexpected(matched.error());
     }
     return peer;
 }

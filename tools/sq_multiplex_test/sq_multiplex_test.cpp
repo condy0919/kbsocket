@@ -68,7 +68,8 @@ std::expected<urma_jetty_t*, ToolError> ReadEndpoint(raw::JettyPool& pool, raw::
 } // namespace
 
 std::expected<void, ToolError> SqMultiplexSession::Open(urma_context_t* ctx, const urma_device_cap_t& cap,
-                                                        const SqMultiplexOptions& options, bool server) {
+                                                        const SqMultiplexOptions& options, bool server,
+                                                        MultiplexFaultPeer* fault_peer) {
     if (ctx_) {
         return Error("session already open", EBUSY);
     }
@@ -79,6 +80,10 @@ std::expected<void, ToolError> SqMultiplexSession::Open(urma_context_t* ctx, con
     if (!ctx || options.bytes > cap.max_msg_size) {
         return Error("message exceeds device capability", EINVAL);
     }
+    if ((server && options.fault == MultiplexFault::kPeerExit) != (fault_peer != nullptr)) {
+        return Error("peer_exit server requires a disposable fault endpoint", EINVAL);
+    }
+    fault_peer_ = fault_peer;
     options_ = options;
     local_ = {.options = options, .server = server};
     peer_ = {};
@@ -109,18 +114,22 @@ std::expected<void, ToolError> SqMultiplexSession::Open(urma_context_t* ctx, con
     stats_.jetty_id = jetty_->jetty_id.id;
     if (server) {
         // 两个目标必须使用独立 JFR，否则健康目标的 RX 也会被 sink 消费。
-        config.tx_depth = config.rx_depth = config.rx_cq_depth = 1;
-        config.tx_cq_depth = 2;
-        auto sink = sink_.Open(ctx, cap, config);
-        if (!sink) {
-            return Error("create independent empty sink JFR", PoolError(sink.error().failure));
+        if (fault_peer_) {
+            local_.endpoints[1] = fault_peer_->endpoint();
+        } else {
+            config.tx_depth = config.rx_depth = config.rx_cq_depth = 1;
+            config.tx_cq_depth = 2;
+            auto sink = sink_.Open(ctx, cap, config);
+            if (!sink) {
+                return Error("create independent empty sink JFR", PoolError(sink.error().failure));
+            }
+            raw::JettyLane sink_lane;
+            auto sink_jetty = ReadEndpoint(sink_, sink_lane);
+            if (!sink_jetty) {
+                return std::unexpected(sink_jetty.error());
+            }
+            local_.endpoints[1] = (*sink_jetty)->jetty_id;
         }
-        raw::JettyLane sink_lane;
-        auto sink_jetty = ReadEndpoint(sink_, sink_lane);
-        if (!sink_jetty) {
-            return std::unexpected(sink_jetty.error());
-        }
-        local_.endpoints[1] = (*sink_jetty)->jetty_id;
         auto rx = rx_.Open(pool_);
         if (!rx) {
             return Error("open healthy RX buffers",
@@ -198,6 +207,12 @@ std::expected<void, ToolError> SqMultiplexSession::Run(ControlChannel& channel) 
     if (!start) {
         return start;
     }
+    if (options_.fault == MultiplexFault::kPeerExit) {
+        auto baseline = RunFaultBaseline(channel);
+        if (!baseline) {
+            return baseline;
+        }
+    }
     for (round_ = 0; round_ < options_.rounds; ++round_) {
         for (auto phase : {MultiplexPhase::kBefore, MultiplexPhase::kMixed, MultiplexPhase::kAfter}) {
             phase_ = phase;
@@ -215,8 +230,12 @@ std::expected<void, ToolError> SqMultiplexSession::Run(ControlChannel& channel) 
             return Error("healthy traffic totals mismatch", EPROTO);
         }
     }
-    if (!local_.server && (stats_.sink.accepted != expected || stats_.sink.retired != expected ||
-                           stats_.sink.rnr != expected || stats_.state_checks != 1 + 3 * options_.rounds)) {
+    const auto fault_count =
+        options_.fault == MultiplexFault::kPeerExit ? stats_.sink.remote_access_abort_error : stats_.sink.rnr;
+    const auto baseline_checks = options_.fault == MultiplexFault::kPeerExit ? 1u : 0u;
+    if (!local_.server &&
+        (stats_.sink.accepted != expected || stats_.sink.retired != expected || fault_count != expected ||
+         stats_.state_checks != 1 + baseline_checks + 3 * options_.rounds)) {
         return Error("sink traffic or same-SQ state checks mismatch", EPROTO);
     }
     if (!stats_.accepted_known || ledger_.size() || rx_.posted() || rx_.held()) {
@@ -227,6 +246,66 @@ std::expected<void, ToolError> SqMultiplexSession::Run(ControlChannel& channel) 
         return done;
     }
     peer_quiescent_ = true;
+    return {};
+}
+
+std::expected<void, ToolError> SqMultiplexSession::RunFaultBaseline(ControlChannel& channel) {
+    phase_ = MultiplexPhase::kBaseline;
+    round_ = 0;
+    tx_seen_.fill(false);
+    ids_.fill(0);
+    phase_error_.reset();
+    std::expected<void, ToolError> result;
+    if (!local_.server) {
+        result = Send();
+        if (result) {
+            result = FinishTx();
+        }
+        if (result) {
+            result = CheckState();
+        }
+        if (result && phase_error_) {
+            result = std::unexpected(*phase_error_);
+        }
+    }
+    const MultiplexPhaseResult local{
+        .phase_id = 3000,
+        .success = result.has_value(),
+        .tx_quiescent = !unsafe_ && stats_.accepted_known && ledger_.size() == 0,
+        .error_code = result ? 0 : result.error().code,
+    };
+    auto peer = ExchangeMultiplexPhaseResult(channel, local, 3 * options_.timeout_ms);
+    if (!peer) {
+        return result ? std::unexpected(peer.error()) : result;
+    }
+    if (!result || !peer->success) {
+        peer_quiescent_ = local.tx_quiescent && peer->tx_quiescent;
+        return result ? Error("peer rejected fault baseline/exit confirmation", peer->error_code) : result;
+    }
+    // 首个结果握手证明客户端 baseline 已成功完成；之后才允许校验子进程 RX 并 kill，
+    // 避免故障注入抢在 baseline 的成功 CQE 前面，使基线自身被进程退出干扰。
+    if (local_.server) {
+        result = fault_peer_->FinishBaselineAndExit(peer_.endpoints[0]);
+        if (result) {
+            stats_.fault_baseline.received = 1;
+        }
+    }
+    const MultiplexPhaseResult exited{
+        .phase_id = 3001,
+        .success = result.has_value(),
+        .tx_quiescent = true,
+        .error_code = result ? 0 : result.error().code,
+    };
+    peer = ExchangeMultiplexPhaseResult(channel, exited, 3 * options_.timeout_ms);
+    if (!peer) {
+        return result ? std::unexpected(peer.error()) : result;
+    }
+    if (!result || !peer->success) {
+        peer_quiescent_ = peer->tx_quiescent;
+        return result ? Error("peer rejected exit confirmation", peer->error_code) : result;
+    }
+    // 只有收到监督者的成功结果才允许复用已导入的旧 endpoint 发 mixed 流量。
+    stats_.peer_exit_confirmed = true;
     return {};
 }
 
@@ -309,9 +388,15 @@ std::expected<void, ToolError> SqMultiplexSession::TransferPhase(ControlChannel&
 }
 
 std::size_t SqMultiplexSession::RequestCount() const noexcept {
+    if (phase_ == MultiplexPhase::kBaseline) {
+        return 1;
+    }
     return options_.batch * (phase_ == MultiplexPhase::kMixed ? 2 : 1);
 }
 MultiplexFrame SqMultiplexSession::Frame(std::size_t slot) const noexcept {
+    if (phase_ == MultiplexPhase::kBaseline) {
+        return {.phase = phase_, .sink = true};
+    }
     const bool mixed = phase_ == MultiplexPhase::kMixed;
     return {.phase = phase_,
             .round = round_,
@@ -319,6 +404,9 @@ MultiplexFrame SqMultiplexSession::Frame(std::size_t slot) const noexcept {
             .sink = mixed && slot % 2 == 0};
 }
 MultiplexTraffic& SqMultiplexSession::Traffic(bool sink) noexcept {
+    if (phase_ == MultiplexPhase::kBaseline) {
+        return stats_.fault_baseline;
+    }
     return sink ? stats_.sink : stats_.healthy[static_cast<std::size_t>(phase_)];
 }
 
@@ -435,11 +523,18 @@ std::expected<void, ToolError> SqMultiplexSession::ObserveTx(const urma_cr_t& cr
         ++traffic.other_error;
         traffic.last_other_status = static_cast<int>(cr.status);
     }
-    const auto expected = frame.sink ? URMA_CR_RNR_RETRY_CNT_EXC_ERR : URMA_CR_SUCCESS;
+    const auto fault_status =
+        options_.fault == MultiplexFault::kPeerExit ? URMA_CR_REM_ACCESS_ABORT_ERR : URMA_CR_RNR_RETRY_CNT_EXC_ERR;
+    const auto expected = frame.sink && phase_ != MultiplexPhase::kBaseline ? fault_status : URMA_CR_SUCCESS;
     if (cr.status != expected && !phase_error_) {
         // 状态不符合实验预期，但 CQE 身份与终结证明仍有效。收齐剩余尝试后再 FAIL，不能截断观测。
-        phase_error_ = ToolError{frame.sink ? "empty sink WR did not complete with RNR" : "healthy WR did not succeed",
-                                 static_cast<int>(cr.status)};
+        const char* operation = "healthy or baseline WR did not succeed";
+        if (frame.sink && phase_ != MultiplexPhase::kBaseline) {
+            operation = options_.fault == MultiplexFault::kPeerExit
+                            ? "exited peer WR did not complete with REM_ACCESS_ABORT"
+                            : "empty sink WR did not complete with RNR";
+        }
+        phase_error_ = ToolError{operation, static_cast<int>(cr.status)};
     }
     if (phase_ == MultiplexPhase::kMixed) {
         auto& round = stats_.rounds[round_];
@@ -449,6 +544,9 @@ std::expected<void, ToolError> SqMultiplexSession::ObserveTx(const urma_cr_t& cr
             }
             round.last_sink_ns = ns;
             ++round.sink_retired;
+            if (cr.status == URMA_CR_REM_ACCESS_ABORT_ERR) {
+                ++round.sink_remote_access_abort;
+            }
             if (cr.status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
                 if (!mixed_rnr_) {
                     round.first_rnr_ns = ns;

@@ -22,12 +22,14 @@
 namespace kbsocket {
 namespace tools {
 inline constexpr std::size_t kMultiplexPayloadHeader = 32;
+enum class MultiplexFault : std::uint32_t { kRnr, kPeerExit };
 struct SqMultiplexOptions {
     std::uint32_t bytes = 4096;
     // 每个目标的消息数；混合阶段合计 2 * batch，一次 post 到同一 SQ。
     std::uint32_t batch = 32;
     std::uint32_t rounds = 8;
     std::uint32_t timeout_ms = 10000;
+    MultiplexFault fault = MultiplexFault::kRnr;
 };
 std::expected<void, ToolError> ValidateMultiplexOptions(const SqMultiplexOptions& options) noexcept;
 
@@ -57,7 +59,7 @@ std::expected<MultiplexPhaseResult, ToolError> ExchangeMultiplexPhaseResult(Cont
                                                                             const MultiplexPhaseResult& local,
                                                                             std::uint32_t timeout_ms) noexcept;
 
-enum class MultiplexPhase : std::uint32_t { kBefore = 0, kMixed = 1, kAfter = 2 };
+enum class MultiplexPhase : std::uint32_t { kBefore = 0, kMixed = 1, kAfter = 2, kBaseline = 3 };
 struct MultiplexFrame {
     MultiplexPhase phase = MultiplexPhase::kBefore;
     std::uint32_t round = 0;
@@ -89,6 +91,7 @@ struct MultiplexRound {
     std::uint32_t sink_retired = 0;
     std::uint32_t healthy_success = 0;
     std::uint32_t sink_rnr = 0;
+    std::uint32_t sink_remote_access_abort = 0;
     // healthy 时序包含其所有合法终结状态，不能把错误完成漏掉后仍称为最后完成。
     std::uint64_t first_healthy_ns = 0;
     std::uint64_t last_healthy_ns = 0;
@@ -103,6 +106,8 @@ struct SqMultiplexStats {
     // 三阶段健康流量与混合阶段的空 JFR 目标分别计数。
     std::array<MultiplexTraffic, 3> healthy{};
     MultiplexTraffic sink;
+    MultiplexTraffic fault_baseline;
+    bool peer_exit_confirmed = false;
     std::vector<MultiplexRound> rounds;
     std::uint32_t jetty_id = 0;
     std::uint32_t state_checks = 0;
@@ -115,12 +120,22 @@ struct SqMultiplexStats {
     bool accepted_known = true;
 };
 
+/// 服务端独立故障进程的控制边界。端点公布前必须已投递一个 baseline RX。
+/// 返回成功要求 baseline RX 校验通过且 SIGKILL/waitpid 均已确认。
+class MultiplexFaultPeer {
+public:
+    virtual ~MultiplexFaultPeer() = default;
+    virtual const urma_jetty_id_t& endpoint() const noexcept = 0;
+    virtual std::expected<void, ToolError> FinishBaselineAndExit(const urma_jetty_id_t& sender) = 0;
+};
+
 /// 单 owner 硬件实验：客户端一条 SQ，服务端两个独立 JFR，普通 RNR 不触发 ERROR 排空。
 /// 正常关闭前须证明所有 TX/RX 终结并完成双端屏障；未决资源由入口常驻保留。
 class SqMultiplexSession {
 public:
     std::expected<void, ToolError> Open(urma_context_t* ctx, const urma_device_cap_t& cap,
-                                        const SqMultiplexOptions& options, bool server);
+                                        const SqMultiplexOptions& options, bool server,
+                                        MultiplexFaultPeer* fault_peer = nullptr);
     std::expected<void, ToolError> Run(ControlChannel& channel);
     std::expected<void, ToolError> Close() noexcept;
     const SqMultiplexStats& stats() const noexcept {
@@ -129,6 +144,7 @@ public:
 
 private:
     std::expected<void, ToolError> CheckState();
+    std::expected<void, ToolError> RunFaultBaseline(ControlChannel& channel);
     std::expected<void, ToolError> RunPhase(ControlChannel& channel);
     std::expected<void, ToolError> TransferPhase(ControlChannel& channel, bool& rx_ready);
     std::expected<void, ToolError> Send();
@@ -145,6 +161,7 @@ private:
     SqMultiplexOptions options_;
     SqMultiplexHello local_, peer_;
     SqMultiplexStats stats_;
+    MultiplexFaultPeer* fault_peer_ = nullptr;
     urma_context_t* ctx_ = nullptr;
     urma_target_seg_t* segment_ = nullptr;
     std::array<urma_target_jetty_t*, 2> remotes_{};

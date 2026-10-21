@@ -18,7 +18,7 @@ namespace {
 constexpr std::uint32_t kHelloMagic = 0x4b424d58;   // KBMX
 constexpr std::uint32_t kPayloadMagic = 0x4b424d46; // KBMF
 constexpr std::uint32_t kPhaseMagic = 0x4b424d52;   // KBMR
-constexpr std::uint32_t kVersion = 2;
+constexpr std::uint32_t kVersion = 3;
 constexpr std::uint32_t kClosedMarker = 0x4d58434c;
 constexpr std::uint32_t kMaxBatch = 128;
 constexpr std::uint32_t kMaxRounds = 1000;
@@ -60,7 +60,7 @@ std::expected<MultiplexPhaseResult, ToolError> DecodePhaseResult(const PhaseResu
     }
     const auto phase_id = Get32(std::span(wire).subspan(8));
     const auto flags = Get32(std::span(wire).subspan(12));
-    if (phase_id >= 3 * kMaxRounds || (flags & ~3u) != 0 || Get32(std::span(wire).subspan(20)) != 0) {
+    if (phase_id > 3 * kMaxRounds + 1 || (flags & ~3u) != 0 || Get32(std::span(wire).subspan(20)) != 0) {
         return Error("SQ multiplex phase result flags", EPROTO);
     }
     MultiplexPhaseResult result{
@@ -100,7 +100,8 @@ std::byte NextPayloadByte(std::uint64_t& state) noexcept {
 std::expected<void, ToolError> ValidateMultiplexOptions(const SqMultiplexOptions& options) noexcept {
     if (options.bytes < kMultiplexPayloadHeader || options.bytes > 4096 || options.batch == 0 ||
         options.batch > kMaxBatch || options.rounds == 0 || options.rounds > kMaxRounds || options.timeout_ms == 0 ||
-        options.timeout_ms > kMaxTimeoutMs) {
+        options.timeout_ms > kMaxTimeoutMs ||
+        (options.fault != MultiplexFault::kRnr && options.fault != MultiplexFault::kPeerExit)) {
         return Error("invalid SQ multiplex limits", EINVAL);
     }
     return {};
@@ -114,6 +115,7 @@ MultiplexHelloBytes EncodeMultiplexHello(const SqMultiplexHello& hello) noexcept
     Put32(std::span(wire).subspan(12), hello.options.bytes);
     Put32(std::span(wire).subspan(16), hello.options.batch);
     Put32(std::span(wire).subspan(20), hello.options.rounds);
+    Put32(std::span(wire).subspan(24), static_cast<std::uint32_t>(hello.options.fault));
     for (std::size_t i = 0; i < hello.endpoints.size(); ++i) {
         const auto offset = 32 + i * 20;
         for (std::size_t j = 0; j < 16; ++j) {
@@ -129,7 +131,7 @@ std::expected<SqMultiplexHello, ToolError> DecodeMultiplexHello(const MultiplexH
         return Error("SQ multiplex hello version", EPROTO);
     }
     const auto role = Get32(std::span(wire).subspan(8));
-    if (role > 1 || Get32(std::span(wire).subspan(24)) != 0 || Get32(std::span(wire).subspan(28)) != 0) {
+    if (role > 1 || Get32(std::span(wire).subspan(28)) != 0) {
         return Error("SQ multiplex hello flags", EPROTO);
     }
     SqMultiplexHello hello;
@@ -137,6 +139,7 @@ std::expected<SqMultiplexHello, ToolError> DecodeMultiplexHello(const MultiplexH
     hello.options.bytes = Get32(std::span(wire).subspan(12));
     hello.options.batch = Get32(std::span(wire).subspan(16));
     hello.options.rounds = Get32(std::span(wire).subspan(20));
+    hello.options.fault = static_cast<MultiplexFault>(Get32(std::span(wire).subspan(24)));
     if (!ValidateMultiplexOptions(hello.options)) {
         return Error("SQ multiplex hello options", EPROTO);
     }
@@ -186,7 +189,7 @@ std::expected<SqMultiplexHello, ToolError> ExchangeMultiplexHello(ControlChannel
         return Error("SQ multiplex peer role", EPROTO);
     }
     if (peer->options.bytes != local.options.bytes || peer->options.batch != local.options.batch ||
-        peer->options.rounds != local.options.rounds) {
+        peer->options.rounds != local.options.rounds || peer->options.fault != local.options.fault) {
         return Error("SQ multiplex peer options", EPROTO);
     }
     return peer;
@@ -272,8 +275,10 @@ std::expected<MultiplexFrame, ToolError> CheckMultiplexPayload(std::span<const s
                          .round = Get32(data.subspan(12)),
                          .index = Get32(data.subspan(16)),
                          .sink = sink == 1};
-    if (phase > static_cast<std::uint32_t>(MultiplexPhase::kAfter) || sink > 1 || frame.round >= kMaxRounds ||
-        frame.index >= kMaxBatch || (frame.sink && frame.phase != MultiplexPhase::kMixed)) {
+    if (phase > static_cast<std::uint32_t>(MultiplexPhase::kBaseline) || sink > 1 || frame.round >= kMaxRounds ||
+        frame.index >= kMaxBatch ||
+        (frame.sink && frame.phase != MultiplexPhase::kMixed && frame.phase != MultiplexPhase::kBaseline) ||
+        (frame.phase == MultiplexPhase::kBaseline && (!frame.sink || frame.round != 0 || frame.index != 0))) {
         return Error("SQ multiplex payload identity", EPROTO);
     }
     auto seed = PayloadSeed(data.first(kMultiplexPayloadHeader));

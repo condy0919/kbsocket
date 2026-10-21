@@ -16,24 +16,28 @@ USE_BAZEL_VERSION=9.2.0 bazel build //tools/provider_boundary_test:provider_boun
 # 服务端
 bazel-bin/tools/provider_boundary_test/provider_boundary_test \
   --server --device=udmac0d1e4 --eid_index=38 --address=0.0.0.0 --port=18540 \
-  --tx_depth=32 --batch=33 --attempts=1024
+  --tx_depth=64 --batch=3 --attempts=1024
 
 # 客户端
 bazel-bin/tools/provider_boundary_test/provider_boundary_test \
   --device=udmac0d1e4 --eid_index=60 --address=141.62.33.25 --port=18540 \
-  --tx_depth=32 --batch=33 --attempts=1024
+  --tx_depth=64 --batch=3 --attempts=1024
 ```
+
+当前裸设备实测中，请求 `tx_depth=1`、连续 post 且不 poll 时，provider 接受了 64 条单 SGE、非 inline 的 4 KiB SEND，然后以 `ENOMEM` 拒绝后续 WR。`batch=3` 时还观察到了合法 `bad_wr` 指示的部分接受前缀。后续深度测试从 64 起，不再重复 1、32 等更小请求深度；这属于当前硬件/provider 和 WR 配置的测试取舍，不将 64 定义为 URMA 通用最小 JFS 深度。
 
 建议运行矩阵：
 
 | tx_depth | batch | attempts | error_post | 目的 |
 |---:|---:|---:|:---:|---|
-| 1 | 2 | 64 | false | 小 SQ、最小 flush 上限 |
-| 32 | 33 | 1024 | false | 跨越深度边界，尝试触发部分接受 |
+| 64 | 3 | 1024 | false | 基准容量拒绝；批次不整除 64，尝试触发部分接受 |
+| 128 | 127 | 2048 | false | 扩大请求深度，检查容量拒绝与部分接受 |
 | 256 | 255 | 4096 | false | 连续批次填满与较多未处理 WR |
-| 32 | 33 | 1024 | true | 正常排空后，额外向 ERROR SQ 直接 post 一次 |
+| 64 | 3 | 1024 | true | 正常排空后，额外向 ERROR SQ 直接 post 一次 |
 
-`attempts + 2` 必须不超过设备的 `max_jfc_depth`，不满足时减小 attempts，仍须大于 tx_depth。provider 可能将 SQ 深度取整，batch 大于请求深度不保证部分接受；硬件可能在软件切 ERROR 之前处理完全部请求，因而不保证产生 `WR_UNHANDLED`。工具会分别打印：
+`attempts + 2` 必须不超过设备的 `max_jfc_depth`，不满足时减小 attempts，仍须大于 tx_depth。`attempts` 是提供 WR 的数量上限，遇到首个 provider 拒绝就停止，不要求全部提供。
+
+provider 可能按内存分配粒度和 WR 配置调整实际容量；请求深度不等于直接 post 一定能接受的 WR 数量。选用不整除预期容量的 batch 是为了跨越边界，仍须用 `bad_wr` 确认部分接受，不能仅凭参数断言已经覆盖。如果达到 attempts 上限仍无拒绝，可在 CQ 能力范围内增大 attempts。硬件可能在软件切 ERROR 之前处理完全部请求，因而不保证产生 `WR_UNHANDLED`。工具会分别打印：
 
 - `OBSERVED/NOT_OBSERVED: provider_capacity_rejection`：只计实际 provider `EAGAIN/ENOMEM`，不计软件 quota。
 - `OBSERVED/NOT_OBSERVED: provider_partial_acceptance`：以合法 `bad_wr` 确认接受前缀。未知指针、失败却无 bad_wr、SUCCESS 却存在 bad_wr 都是失败并保留资源。

@@ -1,6 +1,8 @@
-# 同一 SQ 多目标 RNR 观测
+# 同一 SQ 多目标故障隔离观测
 
-`sq_multiplex_test` 验证一条 RM_CTP SQ 向两个远端目标发送时，缺少 RX buffer 的目标是否影响健康目标的完成进度。客户端只有一条发送 SQ；服务端使用两个独立 `JettyPool`，各自拥有 JFR 和 JFC：
+`sq_multiplex_test` 验证一条 RM_CTP SQ 向两个远端目标发送时，一个目标的错误是否影响健康目标的完成进度。`--fault=rnr` 保留原有空 JFR 实验；`--fault=peer_exit` 验证失效远端产生 status 8 时的同 SQ 隔离。两种模式都只有一条客户端发送 SQ，不重建、不重放，也不主动修改为 ERROR。
+
+默认 `--fault=rnr` 时服务端使用两个独立 `JettyPool`，各自拥有 JFR 和 JFC：
 
 - `healthy`：每阶段预先投递 `batch` 个 RX buffer，接收并校验消息。
 - `sink`：始终不投递 RX，预期对应发送以 `URMA_CR_RNR_RETRY_CNT_EXC_ERR` 终结。
@@ -20,15 +22,59 @@
 在仓库根目录执行：
 
 ```sh
-USE_BAZEL_VERSION=9.2.0 bazel build --lockfile_mode=off //tools/sq_multiplex_test:sq_multiplex_test
-USE_BAZEL_VERSION=9.2.0 bazel test --lockfile_mode=off //tools/sq_multiplex_test:protocol_test //tools/sq_multiplex_test:session_test --test_output=errors
+USE_BAZEL_VERSION=9.3.0 bazel build //tools/sq_multiplex_test:sq_multiplex_test
+USE_BAZEL_VERSION=9.3.0 bazel test //tools/sq_multiplex_test:all --test_output=errors
 ```
 
 本地单测使用 gMock，不需要 `liburma.so` 或 UB 硬件。双端运行时通过 `dlopen` 加载 URMA，可用 `--library=/path/to/liburma.so` 指定库。
 
-控制协议为版本 2，增加了阶段失败和 TX 静默确认。更新工具时必须同时更新两端；版本 1 与版本 2 不兼容，会在开始数据传输前拒绝握手。
+控制协议为版本 3，包含故障模式及独立的 baseline/退出确认。更新工具时必须同时更新两端；版本 1、2 与版本 3 不兼容，模式不匹配也会在开始数据传输前拒绝握手。
 
-## 双端硬件测试
+## 对端退出后的 status 8 隔离
+
+`--fault=peer_exit` 的服务端在任何 URMA 加载之前 fork 专用故障子进程。该子进程拥有自己的 context、JFR、jetty 和 MR，父 worker 创建健康端点并持有 TCP 控制连接。故障子进程不继承健康端点的 provider 状态，终止它不会同时销毁健康端点。
+
+严格执行以下顺序：
+
+1. 故障子进程预投递一个 baseline RX，再公布端点。客户端通过后续实验使用的同一 SQ 向它发送一条真实消息。
+2. 客户端收到 baseline SUCCESS CQE 并检查 SQ READY，通过专用结果握手确认。
+3. 服务端命令故障子进程消费并校验 baseline 的源端点、payload 和 IMM；收到成功确认后执行 SIGKILL，再通过 `waitpid` 确认退出。
+4. 双方交换退出结果，确认后才开始每轮 `before/mixed/after`。这里的 `before` 是混合目标流量前的健康基线，故障子进程已经退出。
+5. mixed 仍按旧故障目标/健康目标交替提交，旧目标预期 `URMA_CR_REM_ACCESS_ABORT_ERR`（status 8），健康目标必须 SUCCESS；after 继续用同一个 SQ 验证健康目标。
+
+以下使用服务端 EID 23、客户端 EID 1；按现场实际设备/EID 修改。第一组 `batch=32`：
+
+```sh
+# 服务端
+./bazel-bin/tools/sq_multiplex_test/sq_multiplex_test --server --address=0.0.0.0 --port=8889 --device=udmac0d1e4 --eid_index=23 --fault=peer_exit --batch=32 --rounds=8 --bytes=4096
+# 客户端
+./bazel-bin/tools/sq_multiplex_test/sq_multiplex_test --address=141.62.33.25 --port=8889 --device=udmac0d1e4 --eid_index=1 --fault=peer_exit --batch=32 --rounds=8 --bytes=4096
+```
+
+第二组 `batch=128`，mixed 覆盖单次 256 个 WR 的上限：
+
+```sh
+# 服务端
+./bazel-bin/tools/sq_multiplex_test/sq_multiplex_test --server --address=0.0.0.0 --port=8889 --device=udmac0d1e4 --eid_index=23 --fault=peer_exit --batch=128 --rounds=8 --bytes=4096
+# 客户端
+./bazel-bin/tools/sq_multiplex_test/sq_multiplex_test --address=141.62.33.25 --port=8889 --device=udmac0d1e4 --eid_index=1 --fault=peer_exit --batch=128 --rounds=8 --bytes=4096
+```
+
+预期客户端 `Fault baseline` 为 `accepted=retired=success=1`；三个 `Healthy` 阶段各有 `accepted=retired=success=batch*rounds`，`Sink mixed` 的 `accepted=retired=remote_access_abort_err=batch*rounds`，其余错误计数为零。服务端 `Fault baseline received=1`，三个健康阶段各 `received=batch*rounds`。两端 `Peer exit: confirmed=true`，客户端 `state_checks=2+3*rounds`；逐轮 `sink_remote_access_abort=batch`。baseline 单独计数，不混入三阶段统计。
+
+最终两端必须打印：
+
+```text
+PASS: healthy traffic succeeded before, during and after same-SQ REM_ACCESS_ABORT; fault baseline validated before SIGKILL/waitpid; old-target attempts retired once with status 8; same SQ remained READY without modification or recreation; payload validated; both endpoints closed resources
+```
+
+状态 8 是本次待验证的目标，不是已经证实的同 SQ 隔离契约。若健康目标也发生错误，或者旧目标返回 ACK_TIMEOUT/RNR 等其他结果，工具继续收齐当前已接受 WR，再向双方报告 FAIL，不继续 after/下一轮。若仍有未终结 DMA，保留整个依赖链到进程退出。
+
+进程模式有外层 watchdog、子进程 `PDEATHSIG` 和有界 `waitpid`。`--watchdog_ms=0` 根据 `timeout_ms` 与 `rounds` 计算整轮上限，也可以显式指定毫秒数。watchdog 超时返回 124，不能视作 PASS。启动、baseline、退出或控制协议失败时回收故障子进程，不用 TCP EOF 代替退出/静默证明。
+
+本模式不要求 async 事件。已知对端进程退出可能只表现为错误 CQE，本实验不触发 JFC 故障、不以 PORT_DOWN 事件作为通过门槛。
+
+## RNR 双端硬件测试
 
 以下示例沿用设备 `udmac0d1e4`、服务端 EID index `65`、客户端 EID index `61` 和服务端地址 `141.62.33.25`。请按实际环境修改。每组先启动服务端，再启动客户端；上一组结束后再开始下一组。
 
@@ -59,9 +105,9 @@ USE_BAZEL_VERSION=9.2.0 bazel test --lockfile_mode=off //tools/sq_multiplex_test
 ./bazel-bin/tools/sq_multiplex_test/sq_multiplex_test --address=141.62.33.25 --port=8889 --device=udmac0d1e4 --eid_index=61 --batch=128 --rounds=8 --bytes=4096
 ```
 
-两端的 `--batch`、`--rounds`、`--bytes` 必须一致。限制为 `batch=1..128`、`rounds=1..1000`、`bytes=32..4096`。`bytes` 包含 32 字节测试头，消息保持在单个 RX buffer 容量内。`--timeout_ms=1..3600000` 是每次控制/数据操作的本地超时，默认 10000 ms；两端可以不同。超时表示本次观测未完成，不代表硬件资源已可安全释放。
+两端的 `--fault`、`--batch`、`--rounds`、`--bytes` 必须一致。限制为 `batch=1..128`、`rounds=1..1000`、`bytes=32..4096`。`bytes` 包含 32 字节测试头，消息保持在单个 RX buffer 容量内。`--timeout_ms=1..3600000` 是每次控制/数据操作的本地超时，默认 10000 ms；两端可以不同。超时表示本次观测未完成，不代表硬件资源已可安全释放。
 
-## 输出与通过条件
+## RNR 模式的输出与通过条件
 
 客户端分别打印 `Healthy before`、`Healthy mixed`、`Healthy after` 和 `Sink mixed`：
 
@@ -97,10 +143,10 @@ PASS 要求所有阶段计数和状态正确、每个已接受 WR 恰好终结�
 
 实验失败不一定意味着资源无法关闭。只有双方确认不再发送且全部已接受 TX 已终结、本地 TX/RX 所有权归零时，工具才正常关闭资源并确认对端完成关闭；此时打印 `FAIL: experiment failed; both endpoints closed resources`，仍以非零退出码结束。不能证明 DMA 终结和对端静默时，工具保留整个资源依赖链到进程退出；控制连接断开不能代替静默确认。
 
-已有 `batch=32` 硬件运行出现 healthy 和 sink 的 ACK_TIMEOUT，旧版本在首个非预期状态后提前停止收集，详细数据见[硬件观测记录](../../docs/hardware-observations.md)。上述完整收集与失败握手是针对该问题的工具修正，尚未收到修正后的真实硬件复测结果。
+已有 `batch=32` 硬件运行出现 healthy 和 sink 的 ACK_TIMEOUT，旧版本在首个非预期状态后提前停止收集，详细数据见[硬件观测记录](../../docs/hardware-observations.md)。修正后 `batch=32 rounds=8` 的硬件复测已通过：三个健康阶段各 256 条 SUCCESS，sink 256 条 RNR，同 SQ 保持 READY，双方成功关闭。此结论属于 RNR 模式；新增 `peer_exit` 模式仍待真实硬件验证。
 
 ## 观测范围
 
 该实验补充已有 [同一 SQ 在 RNR 后续发](../backpressure_test/README.md) 和 [不同 SQ 故障隔离](../sq_isolation_test/README.md)：前者验证错误后的可用性，后者验证一条 SQ 主动 ERROR 排空时其他 SQ 仍可用，本工具关注同一 SQ 内两个目标之间的影响。
 
-结果仅适用于本次设备、驱动/固件、队列参数和负载。它不测量实际 provider EAGAIN 的部分接受边界、对端进程退出、链路故障、带剩余 RX 的 JFR 销毁，也不修改生产层如何处理 RNR 的策略。记录结果时建议保存两端完整输出、设备信息、URMA/provider 与驱动/固件版本。
+结果仅适用于本次设备、驱动/固件、队列参数和负载。它不测量实际 provider EAGAIN 的部分接受边界、物理链路故障或带剩余 RX 的 JFR 销毁，也不修改生产层如何处理 RNR/status 8 的策略。记录结果时建议保存两端完整输出、设备信息、URMA/provider 与驱动/固件版本。

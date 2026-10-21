@@ -13,7 +13,7 @@ RM_CTP。每个消息包含 32 字节测试头，校验完整正文、消息身�
 
 ### `tx_quota`：本地配额耗尽与恢复
 
-每轮服务端先准备 RX。客户端在深度为 `D=tx_depth` 的 SQ 上提交 `D` 个 WR，故意暂不 poll
+每轮服务端先准备 RX。客户端在软件配额为 `D=tx_depth` 的 SQ 上提交 `D` 个 WR，故意暂不 poll
 TX，随后尝试第 `D+1` 个 WR。Ledger 容量大于 `D`，因此这次拒绝必须来自 SQ 配额，且
 `accepted=0`，不能进入 provider。即使硬件已经完成发送，软件在消费 CQE 前也不能释放配额。
 
@@ -105,13 +105,19 @@ bazel test //tools/backpressure_test:protocol_test //tools/backpressure_test:ses
 先运行服务端，再运行客户端。以下沿用已有测试中的设备与 EID 索引；请替换成实际可访问的
 裸设备、本地 EID 索引和服务端 IPv4 地址。两端的 `mode/bytes/tx_depth/rounds` 必须一致。
 
+后续硬件测试从 `tx_depth=64` 起，推荐使用 `64/128/256`。当前 UDMA 实测在请求
+`tx_depth=1` 时，未 poll TX 的情况下仍可连续接受 64 个单 SGE SEND WR；因此不再把
+小于 64 的请求深度列为硬件复测组。这不意味着 URMA 通用最低深度为 64，也不改变
+`JettyPool` 按请求值执行的软件配额。本节验证软件配额耗尽，provider 实际容量及部分接受
+边界由 [provider_boundary_test](../provider_boundary_test/README.md) 验证。
+
 服务端：
 
 ```sh
 bazel-bin/tools/backpressure_test/backpressure_test \
   --server --address=0.0.0.0 --port=8889 \
   --device=udmac0d1e4 --eid_index=65 \
-  --mode=tx_quota --bytes=32 --tx_depth=1 --rounds=8
+  --mode=tx_quota --bytes=32 --tx_depth=64 --rounds=8
 ```
 
 客户端：
@@ -120,16 +126,16 @@ bazel-bin/tools/backpressure_test/backpressure_test \
 bazel-bin/tools/backpressure_test/backpressure_test \
   --address=141.62.33.25 --port=8889 \
   --device=udmac0d1e4 --eid_index=61 \
-  --mode=tx_quota --bytes=32 --tx_depth=1 --rounds=8
+  --mode=tx_quota --bytes=32 --tx_depth=64 --rounds=8
 ```
 
 依次重启两端，使用以下三组参数：
 
-| 组别 | `--bytes` | `--tx_depth` | `--rounds` | 客户端 accepted/retired/success、服务端 received |
-| --- | ---: | ---: | ---: | ---: |
-| 最小配额 | 32 | 1 | 8 | 16 |
-| 常用批次 | 4096 | 32 | 8 | 264 |
-| 最大批次 | 4096 | 256 | 8 | 2056 |
+| 组别     | `--bytes` | `--tx_depth` | `--rounds` | 客户端 accepted/retired/success、服务端 received |
+|----------|----------:|-------------:|-----------:|-------------------------------------------------:|
+| 基础配额 |        32 |           64 |          8 |                                              520 |
+| 常用批次 |      4096 |          128 |          8 |                                             1032 |
+| 最大批次 |      4096 |          256 |          8 |                                             2056 |
 
 三组客户端都应显示 `quota_rejections=8 recovery_sends=8`，两端最终均应输出
 `PASS: outcome=quota_recovery`。
@@ -142,7 +148,7 @@ bazel-bin/tools/backpressure_test/backpressure_test \
 bazel-bin/tools/backpressure_test/backpressure_test \
   --server --address=0.0.0.0 --port=8889 \
   --device=udmac0d1e4 --eid_index=65 \
-  --mode=rx_delay --bytes=4096 --tx_depth=32 \
+  --mode=rx_delay --bytes=4096 --tx_depth=64 \
   --rx_delay_us=1000 --expect=either --timeout_ms=10000
 ```
 
@@ -152,7 +158,7 @@ bazel-bin/tools/backpressure_test/backpressure_test \
 bazel-bin/tools/backpressure_test/backpressure_test \
   --address=141.62.33.25 --port=8889 \
   --device=udmac0d1e4 --eid_index=61 \
-  --mode=rx_delay --bytes=4096 --tx_depth=32 \
+  --mode=rx_delay --bytes=4096 --tx_depth=64 \
   --rx_delay_us=1000 --expect=either --timeout_ms=10000
 ```
 
@@ -168,7 +174,7 @@ bazel-bin/tools/backpressure_test/backpressure_test \
 
 ## 第三批：同一条 SQ 的 RNR 后续发
 
-先用最小批次确认状态转换，再扩大到常用和最大批次。两端的 `mode/bytes/tx_depth` 必须一致。
+先用 64 个 WR 确认状态转换，再扩大到 128 和 256 个 WR。两端的 `mode/bytes/tx_depth` 必须一致。
 以下命令先运行服务端，再运行客户端：
 
 服务端：
@@ -177,7 +183,7 @@ bazel-bin/tools/backpressure_test/backpressure_test \
 bazel-bin/tools/backpressure_test/backpressure_test \
   --server --address=0.0.0.0 --port=8889 \
   --device=udmac0d1e4 --eid_index=65 \
-  --mode=rnr_continue --bytes=4096 --tx_depth=1 --timeout_ms=10000
+  --mode=rnr_continue --bytes=4096 --tx_depth=64 --timeout_ms=10000
 ```
 
 客户端：
@@ -186,10 +192,10 @@ bazel-bin/tools/backpressure_test/backpressure_test \
 bazel-bin/tools/backpressure_test/backpressure_test \
   --address=141.62.33.25 --port=8889 \
   --device=udmac0d1e4 --eid_index=61 \
-  --mode=rnr_continue --bytes=4096 --tx_depth=1 --timeout_ms=10000
+  --mode=rnr_continue --bytes=4096 --tx_depth=64 --timeout_ms=10000
 ```
 
-每组重启两端，依次使用 `--tx_depth=1`、`32`、`256`。通过时，令 `D=tx_depth`：
+每组重启两端，依次使用 `--tx_depth=64`、`128`、`256`。通过时，令 `D=tx_depth`：
 
 - 客户端 `Original traffic`：`accepted=retired=rnr_retry_cnt_exc_err=D`，`success=0`，
   `flush_done=0`，其他错误计数为 0。

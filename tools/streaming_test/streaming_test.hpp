@@ -28,19 +28,26 @@ struct StreamOptions {
     bool events = false;
     // 只扰动 arm/recheck 间隔，不把软件时间解释为硬件完成时间。
     std::uint32_t arm_delay_us = 0;
+    bool two_devices_two_eids = false;
 };
 std::expected<void, ToolError> ValidateStreamOptions(const StreamOptions& options) noexcept;
 std::expected<std::vector<raw::DeviceConfig>, ToolError> ParseStreamDevices(std::string_view text);
+using StreamDeviceGroups = std::array<std::uint8_t, kStreamMaxContexts>;
+/// 按设备首次出现顺序分组；严格模式要求两个设备各配置两个不同 EID。
+std::expected<StreamDeviceGroups, ToolError> BuildStreamDeviceGroups(std::span<const raw::DeviceConfig> devices,
+                                                                     bool two_devices_two_eids);
 
 struct StreamHello {
     StreamOptions options;
     bool server = false;
     std::uint32_t count = 1;
+    StreamDeviceGroups device_groups{};
     std::array<urma_jetty_id_t, kStreamMaxContexts> endpoints{};
 };
 using StreamHelloBytes = std::array<std::byte, 112>;
 StreamHelloBytes EncodeStreamHello(const StreamHello& hello) noexcept;
 std::expected<StreamHello, ToolError> DecodeStreamHello(const StreamHelloBytes& wire) noexcept;
+std::expected<void, ToolError> ValidateStreamPeer(const StreamHello& local, const StreamHello& peer) noexcept;
 std::expected<StreamHello, ToolError> ExchangeStreamHello(ControlChannel& channel, const StreamHello& hello);
 
 struct StreamStats {

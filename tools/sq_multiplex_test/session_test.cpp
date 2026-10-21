@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -29,6 +30,15 @@ namespace tools {
 namespace {
 using ::testing::_;
 using ::testing::AnyNumber;
+
+class MockFaultPeer : public MultiplexFaultPeer {
+public:
+    urma_jetty_id_t id{};
+    const urma_jetty_id_t& endpoint() const noexcept override {
+        return id;
+    }
+    MOCK_METHOD((std::expected<void, ToolError>), FinishBaselineAndExit, (const urma_jetty_id_t&), (override));
+};
 
 // 两端运行真实 Session、账本和 RX 池；互斥锁仅串行化 mock 的跨端 DMA/CQE 操作。
 class SqMultiplexHardwareTest : public ::testing::Test {
@@ -67,7 +77,9 @@ protected:
         kUnknownAccepted,
         kMissingCompletion,
         kExtraPollError,
-        kPreReadyRecvFailure
+        kPreReadyRecvFailure,
+        kPeerHealthyError,
+        kBaselineError
     };
     struct PostedBuffer {
         urma_sge_t sge;
@@ -164,6 +176,7 @@ protected:
                 queue.jfr.jfr_id.id = 20 + pool;
             }
         }
+        fault_peer_.id = endpoints_[0].queues[1].jetty.jetty_id;
         EXPECT_CALL(*this, CreateJfc(_, _)).Times(AnyNumber()).WillRepeatedly([&](auto* ctx, auto* cfg) {
             auto& endpoint = Find(ctx);
             const auto index = endpoint.created_cqs++;
@@ -315,8 +328,9 @@ protected:
                 *bad = wr;
                 return URMA_EINVAL;
             }
+            const bool baseline = frame->phase == MultiplexPhase::kBaseline;
             mixed = frame->phase == MultiplexPhase::kMixed;
-            EXPECT_EQ(frame->sink, mixed && count % 2 == 0);
+            EXPECT_EQ(frame->sink, baseline || (mixed && count % 2 == 0));
             EXPECT_EQ(frame->index, mixed ? count / 2 : count);
             EXPECT_EQ(wr->tjetty, &client.imported[frame->sink]);
             EXPECT_EQ(wr->send.imm_data, MultiplexImmediate(*frame));
@@ -326,7 +340,19 @@ protected:
             completion.flag.bs.jetty = 1;
             completion.local_id = jetty->jetty_id.id;
             completion.user_ctx = wr->user_ctx;
-            completion.status = frame->sink ? URMA_CR_RNR_RETRY_CNT_EXC_ERR : URMA_CR_SUCCESS;
+            completion.status = frame->sink
+                                    ? (options_.fault == MultiplexFault::kPeerExit ? URMA_CR_REM_ACCESS_ABORT_ERR
+                                                                                   : URMA_CR_RNR_RETRY_CNT_EXC_ERR)
+                                    : URMA_CR_SUCCESS;
+            if (baseline) {
+                EXPECT_FALSE(fault_exited_);
+                fault_baseline_received_ = true;
+                completion.status =
+                    failure_ == Failure::kBaselineError ? URMA_CR_REM_ACCESS_ABORT_ERR : URMA_CR_SUCCESS;
+                baseline_ready_.notify_all();
+            } else if (options_.fault == MultiplexFault::kPeerExit) {
+                EXPECT_TRUE(fault_exited_) << "no probe traffic before SIGKILL/waitpid confirmation";
+            }
             if (!frame->sink) {
                 Deliver(sge, *frame, wr->send.imm_data);
             }
@@ -343,6 +369,9 @@ protected:
             }
             if (mixed && failure_ == Failure::kAccessErrors && count < 2) {
                 completion.status = frame->sink ? URMA_CR_LOC_ACCESS_ERR : URMA_CR_REM_ACCESS_ABORT_ERR;
+            }
+            if (mixed && failure_ == Failure::kPeerHealthyError && count == 1) {
+                completion.status = URMA_CR_REM_ACCESS_ABORT_ERR;
             }
             if (mixed && SplitAckCompletions() && frame->index == 3) {
                 // 首次 poll 在三对正常完成后同时出现 sink/healthy ACK 超时，后续 CQE 必须继续统计。
@@ -384,7 +413,9 @@ protected:
         if (mixed && (failure_ == Failure::kProviderPartial || failure_ == Failure::kUnknownAccepted)) {
             return URMA_EAGAIN;
         }
-        EXPECT_EQ(count, mixed ? 2 * options_.batch : options_.batch);
+        EXPECT_EQ(count, client.send_batches.size() == 1 && options_.fault == MultiplexFault::kPeerExit
+                             ? 1u
+                             : (mixed ? 2 * options_.batch : options_.batch));
         return URMA_SUCCESS;
     }
 
@@ -507,7 +538,9 @@ protected:
 
     std::expected<void, ToolError> OpenBoth() {
         for (std::size_t side = 0; side < sessions_->size(); ++side) {
-            const auto result = (*sessions_)[side].Open(&endpoints_[side].ctx, cap_, options_, side == 0);
+            const auto result = (*sessions_)[side].Open(
+                &endpoints_[side].ctx, cap_, options_, side == 0,
+                side == 0 && options_.fault == MultiplexFault::kPeerExit ? &fault_peer_ : nullptr);
             if (!result) {
                 return result;
             }
@@ -546,6 +579,27 @@ protected:
                 EXPECT_TRUE(queue.deleted_cqs[1]);
             }
         }
+    }
+
+    void ExpectFaultExit(bool fail = false) {
+        options_.fault = MultiplexFault::kPeerExit;
+        EXPECT_CALL(fault_peer_, FinishBaselineAndExit(_))
+            .WillOnce([&, fail](const auto& sender) -> std::expected<void, ToolError> {
+                std::unique_lock lock(mutex_);
+                EXPECT_TRUE(SameEndpoint(sender, endpoints_[1].queues[0].jetty.jetty_id));
+                EXPECT_EQ((*sessions_)[1].stats().fault_baseline.success, 1u);
+                EXPECT_EQ((*sessions_)[1].stats().fault_baseline.retired, 1u);
+                // 控制线程必须等到故障 endpoint 确实收到 baseline；单纯发送成功并不授权退出实验。
+                if (!baseline_ready_.wait_for(lock, std::chrono::seconds(1),
+                                              [&] { return fault_baseline_received_; })) {
+                    return std::unexpected(ToolError{"test baseline not received", ETIMEDOUT});
+                }
+                if (fail) {
+                    return std::unexpected(ToolError{"test waitpid confirmation failed", ECHILD});
+                }
+                fault_exited_ = true;
+                return {};
+            });
     }
 
     void RunFailureCase(Failure failure) {
@@ -640,6 +694,10 @@ protected:
     SqMultiplexOptions options_{.bytes = 64, .batch = 3, .rounds = 2, .timeout_ms = 1000};
     urma_device_cap_t cap_{};
     std::mutex mutex_;
+    std::condition_variable baseline_ready_;
+    MockFaultPeer fault_peer_;
+    bool fault_baseline_received_ = false;
+    bool fault_exited_ = false;
     std::array<Endpoint, 2> endpoints_{};
     bool healthy_first_ = true;
     bool corrupted_ = false;
@@ -651,6 +709,134 @@ protected:
     raw::test_support::ScopedUrmaOverride scope_{MockedFunctions()};
     NoDestructor<std::array<SqMultiplexSession, 2>> sessions_;
 };
+
+TEST_F(SqMultiplexHardwareTest, RemoteAbortOnExitedTargetLeavesHealthyTrafficOnTheSameSqUsable) {
+    ExpectFaultExit();
+    ASSERT_TRUE(OpenBoth());
+    const auto results = RunBoth();
+    for (const auto& result : results) {
+        ASSERT_TRUE(result) << result.error().operation;
+    }
+    const auto& client = (*sessions_)[1].stats();
+    const auto expected = options_.batch * options_.rounds;
+    // 所有三个阶段使用同一物理 SQ；失效目标每轮 status 8，健康目标持续成功且 payload 完整。
+    for (std::size_t phase = 0; phase < 3; ++phase) {
+        EXPECT_EQ(client.healthy[phase].success, expected);
+        EXPECT_EQ((*sessions_)[0].stats().healthy[phase].received, expected);
+    }
+    EXPECT_EQ(client.fault_baseline.success, 1u);
+    EXPECT_EQ(client.fault_baseline.retired, 1u);
+    EXPECT_TRUE(client.peer_exit_confirmed);
+    EXPECT_EQ(client.sink.accepted, expected);
+    EXPECT_EQ(client.sink.retired, expected);
+    EXPECT_EQ(client.sink.remote_access_abort_error, expected);
+    EXPECT_EQ(client.sink.rnr, 0u);
+    EXPECT_EQ(client.state_checks, 2 + 3 * options_.rounds);
+    EXPECT_EQ(endpoints_[0].created_jetties, 1u);
+    EXPECT_EQ(endpoints_[1].created_jetties, 1u);
+    for (const auto& round : client.rounds) {
+        EXPECT_EQ(round.sink_remote_access_abort, options_.batch);
+        EXPECT_EQ(round.healthy_success, options_.batch);
+    }
+    CloseBoth();
+}
+
+TEST_F(SqMultiplexHardwareTest, HealthyRemoteAbortCollectsTheWholeMixedBatchThenFailsWithoutContinuation) {
+    ExpectFaultExit();
+    failure_ = Failure::kPeerHealthyError;
+    ASSERT_TRUE(OpenBoth());
+    const auto results = RunBoth();
+    for (const auto& result : results) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, URMA_CR_REM_ACCESS_ABORT_ERR);
+    }
+    const auto& client = (*sessions_)[1].stats();
+    // 健康连接也出现 status 8 时不能宣称隔离成功；其他已接受 WR 仍须完整终结后才能收尾。
+    EXPECT_EQ(client.healthy[1].retired, options_.batch);
+    EXPECT_EQ(client.healthy[1].remote_access_abort_error, 1u);
+    EXPECT_EQ(client.healthy[1].success, options_.batch - 1);
+    EXPECT_EQ(client.sink.retired, options_.batch);
+    EXPECT_EQ(client.sink.remote_access_abort_error, options_.batch);
+    EXPECT_EQ(client.healthy[2].accepted, 0u);
+    EXPECT_EQ(endpoints_[1].send_batches, (std::vector<std::size_t>{1, options_.batch, 2 * options_.batch}));
+    CloseBoth();
+}
+
+TEST_F(SqMultiplexHardwareTest, FailedExitConfirmationStopsBothPeersBeforeAnyProbeTraffic) {
+    ExpectFaultExit(true);
+    ASSERT_TRUE(OpenBoth());
+    const auto results = RunBoth();
+    for (const auto& result : results) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, ECHILD);
+    }
+    const auto& client = (*sessions_)[1].stats();
+    EXPECT_FALSE(client.peer_exit_confirmed);
+    EXPECT_EQ(client.fault_baseline.success, 1u);
+    EXPECT_EQ(client.healthy[0].accepted, 0u);
+    EXPECT_EQ(client.sink.accepted, 0u);
+    EXPECT_EQ(endpoints_[1].send_batches, (std::vector<std::size_t>{1}));
+    // 失败握手仍能证明唯一 baseline 已终结；健康 session 未投 RX，可以安全收尾而非伪 PASS。
+    CloseBoth();
+}
+
+TEST_F(SqMultiplexHardwareTest, FailedBaselineCompletionNeverAuthorizesFaultInjection) {
+    options_.fault = MultiplexFault::kPeerExit;
+    failure_ = Failure::kBaselineError;
+    // 即使 mock 接收端已得到消息，客户端 baseline CQE 失败仍不能进入 kill/故障观测。
+    EXPECT_CALL(fault_peer_, FinishBaselineAndExit(_)).Times(0);
+    ASSERT_TRUE(OpenBoth());
+    const auto results = RunBoth();
+    for (const auto& result : results) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, URMA_CR_REM_ACCESS_ABORT_ERR);
+    }
+    const auto& client = (*sessions_)[1].stats();
+    EXPECT_EQ(client.fault_baseline.retired, 1u);
+    EXPECT_EQ(client.fault_baseline.success, 0u);
+    EXPECT_EQ(client.fault_baseline.remote_access_abort_error, 1u);
+    EXPECT_EQ(client.healthy[0].accepted, 0u);
+    EXPECT_FALSE(client.peer_exit_confirmed);
+    CloseBoth();
+}
+
+TEST_F(SqMultiplexHardwareTest, LostExitConfirmationRetainsClientDependenciesDespiteCompletedBaseline) {
+    EXPECT_EXIT(([&] {
+                    options_.fault = MultiplexFault::kPeerExit;
+                    options_.timeout_ms = 100;
+                    if (!OpenBoth()) {
+                        std::_Exit(2);
+                    }
+                    int fds[2]{};
+                    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) != 0) {
+                        std::_Exit(2);
+                    }
+                    ControlChannel client(fds[0]);
+                    std::thread supervisor([&] {
+                        ControlChannel server(fds[1]);
+                        SqMultiplexHello hello{.options = options_, .server = true};
+                        hello.endpoints = {endpoints_[0].queues[0].jetty.jetty_id, fault_peer_.id};
+                        auto peer = ExchangeMultiplexHello(server, hello);
+                        if (!peer || !MultiplexBarrier(server, 0x4d580000, 100)) {
+                            return;
+                        }
+                        // 只确认 baseline；退出证明发送前断开 TCP。不能用 EOF 代替 SIGKILL/waitpid。
+                        auto baseline = ExchangeMultiplexPhaseResult(
+                            server, {.phase_id = 3000, .success = true, .tx_quiescent = true}, 100);
+                        static_cast<void>(baseline);
+                    });
+                    auto result = (*sessions_)[1].Run(client);
+                    supervisor.join();
+                    auto closed = (*sessions_)[1].Close();
+                    const auto& stats = (*sessions_)[1].stats();
+                    const bool retained = !result && !closed && closed.error().code == EBUSY &&
+                                          stats.fault_baseline.success == 1 && !stats.peer_exit_confirmed &&
+                                          stats.healthy[0].accepted == 0 && endpoints_[1].registration.live &&
+                                          endpoints_[1].unregistered == 0 && !endpoints_[1].queues[0].deleted_jetty;
+                    std::_Exit(retained && !HasFailure() ? 0 : 1);
+                }()),
+                ::testing::ExitedWithCode(0), "");
+}
 
 class SqMultiplexOrderingTest : public SqMultiplexHardwareTest,
                                 public ::testing::WithParamInterface<std::tuple<int, bool>> {};

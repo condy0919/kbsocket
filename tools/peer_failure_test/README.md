@@ -18,6 +18,12 @@ RNR 实验当成真实进程退出，也不要求错误一定是 ACK_TIMEOUT、R
 `waitpid` 证明远端进程退出，不证明客户端 accepted WR 已终结；后者仍依赖各自 CQE。
 应用主动 DeleteJetty 和异常进程退出的内核回收路径不同，不互相替代。
 
+当前设备的 async 能力仅部分支持。用户提供的现场能力说明是：真实链路/端口故障后的 WR 通常以
+ACK_TIMEOUT 终结，但 PORT_DOWN async 明确无法观察；已确认支持 JFS error、JFR error、JFC error 和
+JFR 水线相关事件。当前 JFS/相关 jetty 的错误 AE 需先触发它绑定的 JFC error，再联动产生，不能按独立
+JFS 故障注入理解。这些是现场能力说明，不是本工具的新事件日志；工具保留实际采集结果，不要求任意故障
+都产生 async，也不将 PORT_DOWN 设为必测通过项。已有 `process_exit/inflight_exit` 运行的 async=0 仍是有效结果。
+
 ## 构建和运行
 
 ```bash
@@ -80,6 +86,8 @@ bazel test //tools/peer_failure_test:peer_failure_unit_test --test_output=errors
   单独报告；无法确认远端资源状态时不宣称双方正常收尾。
 - 外部模式不能验证操作者是否真的造成了预期链路故障。请保存现场注入时间、方法和设备状态；SUCCESS 也可能说明
   未成功注入、路径未受影响或链路已恢复，不能直接得出“链路故障透明恢复”的结论。
+- 对照用户提供的当前现场能力，链路故障通常产生 ACK_TIMEOUT，但工具仍逐项保留实际 CQE 状态；
+  PORT_DOWN async 不作为本组的通过条件。受支持队列错误或 JFR 水线事件需要各自的注入条件，不能由断链替代。
 - 服务端最后由监督进程回收子进程；未消费的 RX 不在应用层提前 unregister。此工具不负责验证 RX 正常关闭协议。
 
 ## 输出判读
@@ -101,3 +109,8 @@ bazel test //tools/peer_failure_test:peer_failure_unit_test --test_output=errors
 单测使用 gMock 替换真实 URMA 调用，覆盖协议校验、SIGKILL 后 waitpid、watchdog、async 可读检查与逐事件 Ack、
 普通错误收集而不 modify、部分接受不重放、post/poll 分离窗口、无可信接受边界，以及未终结时禁止释放。
 真实硬件结果必须单独记录。
+
+本工具只向一个故障目标观察状态；若要确认 status 8 是否影响同一 SQ 上的健康目标，使用
+[sq_multiplex_test 的 `--fault=peer_exit` 场景](../sq_multiplex_test/README.md)。该场景先验证故障目标
+曾可接收，再确认其进程退出，与存活健康目标混合发送，独立检查 healthy before/mixed/after；其硬件结果
+仍待记录，不能从本工具的 READY 查询或现有 RNR 隔离结果推定已通过。

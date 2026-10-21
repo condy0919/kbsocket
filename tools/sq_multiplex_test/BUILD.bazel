@@ -18,15 +18,33 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "fault_peer",
+    srcs = ["fault_peer.cpp"],
+    hdrs = ["fault_peer.hpp"],
+    deps = [
+        ":sq_multiplex_test_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:raw_runtime",
+        "//kbsocket/transport/raw:rx_buffer_pool",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+        "//tools/peer_failure_test:peer_process",
+    ],
+)
+
 cc_binary(
     name = "sq_multiplex_test",
     srcs = ["main.cpp"],
     deps = [
+        ":fault_peer",
         ":sq_multiplex_test_support",
         "//kbsocket/base:no_destructor",
         "//kbsocket/transport/raw:raw_runtime",
         "//kbsocket/transport/raw:urma_api",
         "//tools/common:control_channel",
+        "//tools/peer_failure_test:peer_process",
         "@gflags",
     ],
 )
@@ -35,8 +53,20 @@ cc_test(
     name = "protocol_test",
     srcs = ["protocol_test.cpp"],
     deps = [
+        ":fault_peer",
         ":sq_multiplex_test_support",
         "//tools/common:control_channel",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "fault_process_test",
+    srcs = ["fault_process_test.cpp"],
+    deps = [
+        ":fault_peer",
+        ":sq_multiplex_test_support",
+        "//tools/peer_failure_test:peer_process",
         "@googletest//:gtest_main",
     ],
 )

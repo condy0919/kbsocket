@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: MulanPSL-2.0
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <limits>
 #include <print>
 #include <string>
 #include <string_view>
 
 #include "tools/common/control_channel.hpp"
+#include "tools/peer_failure_test/process.hpp"
+#include "tools/sq_multiplex_test/fault_peer.hpp"
 #include "tools/sq_multiplex_test/sq_multiplex_test.hpp"
 #include <gflags/gflags.h>
 
@@ -28,6 +32,8 @@ DEFINE_uint32(bytes, 4096, "Bytes per SEND_WITH_IMM, 32 to 4096 including the te
 DEFINE_uint32(batch, 32, "Messages per target per phase, 1 to 128; mixed phase posts 2*batch WRs; must match peer");
 DEFINE_uint32(rounds, 8, "Before/mixed/after rounds, 1 to 1000; must match peer");
 DEFINE_uint32(timeout_ms, 10000, "Timeout per control or data operation, 1 to 3600000 ms");
+DEFINE_string(fault, "rnr", "rnr (empty JFR) or peer_exit (SIGKILL a baseline-validated endpoint); match peer");
+DEFINE_uint32(watchdog_ms, 0, "Whole worker deadline; zero computes a bounded deadline from operation limits");
 
 namespace {
 void UrmaLog(int level, char* message) noexcept {
@@ -81,12 +87,21 @@ void PrintTraffic(std::string_view label, const kbsocket::tools::MultiplexTraffi
 }
 
 void PrintStats(const kbsocket::tools::SqMultiplexStats& stats) {
+    if (FLAGS_fault == "peer_exit") {
+        PrintTraffic("Fault baseline", stats.fault_baseline, stats.accepted_known);
+        std::println("Peer exit: confirmed={}; mixed traffic starts only after SIGKILL/waitpid confirmation",
+                     stats.peer_exit_confirmed);
+    }
     constexpr std::array<std::string_view, 3> kLabels{"Healthy before", "Healthy mixed", "Healthy after"};
     for (std::size_t i = 0; i < kLabels.size(); ++i) {
         PrintTraffic(kLabels[i], stats.healthy[i], stats.accepted_known);
     }
     if (FLAGS_server) {
-        std::println("Sink JFR: no RX posted; detailed TX statuses and timing are reported by the client.");
+        std::println("{}; detailed TX statuses and timing are reported by the client.",
+                     FLAGS_fault == "peer_exit"
+                         ? (stats.peer_exit_confirmed ? "Fault endpoint: disposable URMA child exit confirmed"
+                                                      : "Fault endpoint: exit not confirmed")
+                         : "Sink JFR: no RX posted");
         return;
     }
     PrintTraffic("Sink mixed", stats.sink, stats.accepted_known);
@@ -102,12 +117,13 @@ void PrintStats(const kbsocket::tools::SqMultiplexStats& stats) {
             continue;
         }
         std::println("Mixed round {}: healthy_retired={} healthy_success={} sink_retired={} sink_rnr={} "
+                     "sink_remote_access_abort={} "
                      "first_healthy_ns={} last_healthy_ns={} first_sink_ns={} last_sink_ns={} "
                      "first_rnr_ns={} last_rnr_ns={} "
                      "healthy_before_first_rnr={} healthy_before_last_rnr={}",
                      i, round.healthy_retired, round.healthy_success, round.sink_retired, round.sink_rnr,
-                     round.first_healthy_ns, round.last_healthy_ns, round.first_sink_ns, round.last_sink_ns,
-                     round.first_rnr_ns, round.last_rnr_ns, round.healthy_before_first_rnr,
+                     round.sink_remote_access_abort, round.first_healthy_ns, round.last_healthy_ns, round.first_sink_ns,
+                     round.last_sink_ns, round.first_rnr_ns, round.last_rnr_ns, round.healthy_before_first_rnr,
                      round.healthy_before_last_rnr);
     }
     std::println("Timing is measured from before post to software CQE consumption; CQE order alone does not "
@@ -116,15 +132,30 @@ void PrintStats(const kbsocket::tools::SqMultiplexStats& stats) {
 
 int Run() {
     using kbsocket::raw::UrmaApi;
-    const kbsocket::tools::SqMultiplexOptions options{
-        .bytes = FLAGS_bytes, .batch = FLAGS_batch, .rounds = FLAGS_rounds, .timeout_ms = FLAGS_timeout_ms};
+    const kbsocket::tools::SqMultiplexOptions options{.bytes = FLAGS_bytes,
+                                                      .batch = FLAGS_batch,
+                                                      .rounds = FLAGS_rounds,
+                                                      .timeout_ms = FLAGS_timeout_ms,
+                                                      .fault = FLAGS_fault == "peer_exit"
+                                                                   ? kbsocket::tools::MultiplexFault::kPeerExit
+                                                                   : kbsocket::tools::MultiplexFault::kRnr};
     auto valid = kbsocket::tools::ValidateMultiplexOptions(options);
-    if (FLAGS_device.empty() || FLAGS_library.empty() || FLAGS_port == 0 || FLAGS_port > 65535 || !valid) {
+    if (FLAGS_device.empty() || FLAGS_library.empty() || FLAGS_port == 0 || FLAGS_port > 65535 || !valid ||
+        (FLAGS_fault != "rnr" && FLAGS_fault != "peer_exit")) {
         std::println(stderr, "Invalid options; --device is required. Use --help for limits.");
         if (!valid) {
             std::println(stderr, "{}", valid.error().operation);
         }
         return 2;
+    }
+    // 所有 fork 都在父 worker 加载 provider 前完成，子进程不继承健康端点和 TCP 控制通道。
+    kbsocket::tools::MultiplexPeerProcess fault_peer;
+    if (FLAGS_server && options.fault == kbsocket::tools::MultiplexFault::kPeerExit) {
+        auto opened = fault_peer.Open(FLAGS_library.c_str(), FLAGS_device.c_str(), FLAGS_eid_index, options);
+        if (!opened) {
+            std::println(stderr, "FAIL: prepare fault endpoint: {}: {}", opened.error().operation, opened.error().code);
+            return 1;
+        }
     }
     // 未证明所有 DMA 终结与对端静默时，入口保留注册内存、队列、context、动态库的完整依赖链。
     static kbsocket::NoDestructor<Hardware> hardware;
@@ -158,16 +189,17 @@ int Run() {
         CloseResources(*hardware);
         return 1;
     }
-    auto opened = hardware->session.Open(ctx, attributes.dev_cap, options, FLAGS_server);
+    auto opened = hardware->session.Open(ctx, attributes.dev_cap, options, FLAGS_server,
+                                         FLAGS_server && FLAGS_fault == "peer_exit" ? &fault_peer : nullptr);
     if (!opened) {
         std::println(stderr, "FAIL: open session: {}: {}", opened.error().operation, opened.error().code);
         CloseResources(*hardware);
         return 1;
     }
-    std::println("{} ready for same-SQ multiplex: device={} eid_index={} bytes={} batch={} rounds={} "
+    std::println("{} ready for same-SQ multiplex: fault={} device={} eid_index={} bytes={} batch={} rounds={} "
                  "mixed_wrs={} control={}:{}",
-                 FLAGS_server ? "Server" : "Client", FLAGS_device, FLAGS_eid_index, FLAGS_bytes, FLAGS_batch,
-                 FLAGS_rounds, 2 * FLAGS_batch, FLAGS_address, FLAGS_port);
+                 FLAGS_server ? "Server" : "Client", FLAGS_fault, FLAGS_device, FLAGS_eid_index, FLAGS_bytes,
+                 FLAGS_batch, FLAGS_rounds, 2 * FLAGS_batch, FLAGS_address, FLAGS_port);
     std::fflush(stdout);
     kbsocket::tools::ControlChannel channel;
     auto connected =
@@ -191,22 +223,36 @@ int Run() {
         std::println("FAIL: experiment failed; both endpoints closed resources");
         return 1;
     }
-    std::println("PASS: healthy traffic succeeded before, during and after same-SQ RNR; sink attempts retired "
-                 "once with RNR; same SQ remained READY without modification or recreation; payload validated; "
-                 "both endpoints closed resources");
+    if (FLAGS_fault == "peer_exit") {
+        std::println("PASS: healthy traffic succeeded before, during and after same-SQ REM_ACCESS_ABORT; "
+                     "fault baseline validated before SIGKILL/waitpid; old-target attempts retired once with status 8; "
+                     "same SQ remained READY without modification or recreation; payload validated; "
+                     "both endpoints closed resources");
+    } else {
+        std::println("PASS: healthy traffic succeeded before, during and after same-SQ RNR; sink attempts retired "
+                     "once with RNR; same SQ remained READY without modification or recreation; payload validated; "
+                     "both endpoints closed resources");
+    }
     return 0;
 }
 } // namespace
 
 int main(int argc, char** argv) {
     gflags::SetUsageMessage("--device RAW_DEVICE [--server] --address IPv4 [--port 18520] "
-                            "[--batch 32] [--rounds 8] [--bytes 4096]");
+                            "[--fault rnr|peer_exit] [--batch 32] [--rounds 8] [--bytes 4096]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     if (argc != 1) {
         std::println(stderr, "Unexpected positional arguments");
         return 2;
     }
     try {
+        if (FLAGS_fault == "peer_exit") {
+            const auto computed = static_cast<std::uint64_t>(FLAGS_timeout_ms) * (6ull * FLAGS_rounds + 12);
+            const auto deadline = FLAGS_watchdog_ms ? FLAGS_watchdog_ms
+                                                    : static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                                          computed, std::numeric_limits<std::uint32_t>::max()));
+            return kbsocket::tools::RunPeerWatchdog([](void*) { return Run(); }, nullptr, deadline);
+        }
         return Run();
     } catch (const std::exception& error) {
         std::println(stderr, "FAIL: {}; hardware resources retained until process exit", error.what());

@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "tools/common/control_channel.hpp"
+#include "tools/sq_multiplex_test/fault_peer.hpp"
 #include "tools/sq_multiplex_test/sq_multiplex_test.hpp"
 #include <gtest/gtest.h>
 
@@ -49,7 +50,7 @@ std::expected<SqMultiplexHello, ToolError> ExchangeWithPeer(const SqMultiplexHel
 using PhaseWire = std::array<std::byte, 24>;
 
 PhaseWire PhaseResultWire(std::uint32_t phase_id = 0, std::uint32_t flags = 3, int error_code = 0) {
-    const std::array<std::uint32_t, 6> fields{0x4b424d52, 2, phase_id, flags, static_cast<std::uint32_t>(error_code),
+    const std::array<std::uint32_t, 6> fields{0x4b424d52, 3, phase_id, flags, static_cast<std::uint32_t>(error_code),
                                               0};
     PhaseWire wire{};
     for (std::size_t i = 0; i < fields.size(); ++i) {
@@ -105,7 +106,7 @@ TEST(MultiplexProtocol, HelloUsesNetworkOrderAndKeepsTimeoutLocal) {
     EXPECT_EQ(wire.size(), 72u);
     EXPECT_EQ(wire[0], std::byte{'K'});
     EXPECT_EQ(wire[3], std::byte{'X'});
-    EXPECT_EQ(wire[7], std::byte{2});
+    EXPECT_EQ(wire[7], std::byte{3});
     EXPECT_EQ(wire[11], std::byte{1});
     EXPECT_EQ(wire[15], std::byte{64});
     EXPECT_EQ(wire[19], std::byte{3});
@@ -185,6 +186,12 @@ TEST(MultiplexProtocol, ExchangeMatchesRoleAndAllTrafficParameters) {
     peer = Hello(true);
     ++peer.options.rounds;
     EXPECT_FALSE(ExchangeWithPeer(local, peer));
+    // 新模式要求先做 baseline 并等待退出证明，不能与旧 RNR 控制序列混用。
+    peer = Hello(true);
+    peer.options.fault = MultiplexFault::kPeerExit;
+    EXPECT_FALSE(ExchangeWithPeer(local, peer));
+    local.options.fault = MultiplexFault::kPeerExit;
+    EXPECT_TRUE(ExchangeWithPeer(local, peer));
     // 本地配置也必须通过同一校验，不能只防御对端而发送自身非法端点。
     peer = Hello(true);
     local.endpoints[1].id = 1;
@@ -259,14 +266,65 @@ TEST(MultiplexProtocol, PhaseResultRejectsUnknownMagicVersionFlagsAndReservedBit
 TEST(MultiplexProtocol, PhaseResultRejectsDifferentAndOutOfRangePhase) {
     const MultiplexPhaseResult local{.phase_id = 2999, .success = true, .tx_quiescent = true};
     // 不接受上一阶段迟到的结果，也不允许超出 1000 轮、每轮 3 个阶段的身份范围。
-    for (const auto phase_id : {2998u, 3000u, std::numeric_limits<std::uint32_t>::max()}) {
+    for (const auto phase_id : {2998u, 3000u, 3001u, std::numeric_limits<std::uint32_t>::max()}) {
         const auto result = ExchangePhaseWithWire(local, PhaseResultWire(phase_id));
         ASSERT_FALSE(result);
         EXPECT_EQ(result.error().code, EPROTO);
     }
-    const auto invalid_local = ExchangePhaseWithWire({.phase_id = 3000}, PhaseResultWire());
+    const auto invalid_local = ExchangePhaseWithWire({.phase_id = 3002}, PhaseResultWire());
     ASSERT_FALSE(invalid_local);
     EXPECT_EQ(invalid_local.error().code, EPROTO);
+}
+
+TEST(MultiplexProtocol, BaselineResultHasDedicatedIdentityAndPreservesExitFailure) {
+    // 3000 只用于 baseline/退出确认；不能被普通 mixed/before/after 阶段结果替代。
+    const MultiplexPhaseResult local{.phase_id = 3000, .success = true, .tx_quiescent = true};
+    auto result = ExchangePhaseWithWire(local, PhaseResultWire(3000, 2, ECHILD));
+    ASSERT_TRUE(result);
+    EXPECT_FALSE(result->success);
+    EXPECT_TRUE(result->tx_quiescent);
+    EXPECT_EQ(result->error_code, ECHILD);
+    EXPECT_FALSE(ExchangePhaseWithWire(local, PhaseResultWire(0)));
+    const MultiplexPhaseResult exited{.phase_id = 3001, .success = true, .tx_quiescent = true};
+    EXPECT_TRUE(ExchangePhaseWithWire(exited, PhaseResultWire(3001)));
+    EXPECT_FALSE(ExchangePhaseWithWire(exited, PhaseResultWire(3000)));
+}
+
+TEST(MultiplexProtocol, FaultBaselineRequiresPayloadIdentityRouteAndImmediate) {
+    std::array<std::byte, 64> data{};
+    const MultiplexFrame frame{.phase = MultiplexPhase::kBaseline, .sink = true};
+    FillMultiplexPayload(data, frame);
+    auto decoded = CheckMultiplexPayload(data);
+    ASSERT_TRUE(decoded);
+    urma_jetty_id_t receiver{}, sender{};
+    receiver.id = 11;
+    sender.id = 22;
+    sender.eid.raw[15] = 3;
+    raw::RxBufferEvent event;
+    event.lease.emplace();
+    event.payload = data;
+    event.completion.flag.bs.jetty = 1;
+    event.completion.flag.bs.s_r = 1;
+    event.completion.opcode = URMA_CR_OPC_SEND_WITH_IMM;
+    event.completion.local_id = receiver.id;
+    event.completion.remote_id = sender;
+    event.completion.imm_data = MultiplexImmediate(frame);
+    ASSERT_TRUE(CheckMultiplexBaseline(event, receiver, sender, data.size()));
+    // 只有真正发到这个故障进程、来自当前 SQ 的正确消息才能授权 kill 后开展 status 8 实验。
+    auto wrong = event;
+    ++wrong.completion.remote_id.eid.raw[0];
+    EXPECT_FALSE(CheckMultiplexBaseline(wrong, receiver, sender, data.size()));
+    wrong = event;
+    wrong.completion.imm_data ^= 1;
+    EXPECT_FALSE(CheckMultiplexBaseline(wrong, receiver, sender, data.size()));
+    wrong = event;
+    wrong.lease.reset();
+    EXPECT_FALSE(CheckMultiplexBaseline(wrong, receiver, sender, data.size()));
+    wrong = event;
+    wrong.completion.status = URMA_CR_REM_ACCESS_ABORT_ERR;
+    EXPECT_FALSE(CheckMultiplexBaseline(wrong, receiver, sender, data.size()));
+    data.back() ^= std::byte{1};
+    EXPECT_FALSE(CheckMultiplexBaseline(event, receiver, sender, data.size()));
 }
 
 TEST(MultiplexProtocol, PhaseSuccessRequiresQuiescentTxAndZeroError) {
@@ -351,7 +409,7 @@ TEST(MultiplexProtocol, PayloadRejectsHeaderAndBodyCorruption) {
 
 TEST(MultiplexProtocol, PayloadRejectsOutOfRangeOrWrongStageTargets) {
     std::array<std::byte, 64> data{};
-    for (const auto frame : {MultiplexFrame{.phase = static_cast<MultiplexPhase>(3)}, MultiplexFrame{.round = 1000},
+    for (const auto frame : {MultiplexFrame{.phase = static_cast<MultiplexPhase>(4)}, MultiplexFrame{.round = 1000},
                              MultiplexFrame{.index = 128}, MultiplexFrame{.sink = true},
                              MultiplexFrame{.phase = MultiplexPhase::kAfter, .sink = true}}) {
         FillMultiplexPayload(data, frame);
