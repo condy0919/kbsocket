@@ -24,8 +24,8 @@
 | ERROR SQ 直接 post 与非零 WR_UNHANDLED | 已观察到 | P4 查询 ERROR 后 post 返回 SUCCESS，额外 WR 最终终结；整轮软件 flush 回收 1 条 WR_UNHANDLED，未单独打印该条 WR 的阶段归属 |
 | 目标进程退出后新投递 | 已通过 | process_exit 的 batch=32/256，SIGKILL/waitpid 确认后 post 仍成功，全部 CQE 为 status 8；前后查询均 READY，客户端资源关闭 |
 | 进程退出相关 async 事件 | 未观察到 | 上述故障 TX 轮询期间及其后默认 1 秒无事件；async fd 可用不代表必定产生通知 |
-| JFR 水线 async 事件与再次跨线 | 工具已实现，待硬件验证 | async_event_test 检查独立 async fd、JFR 归属和逐事件 Get/Ack；首次跨线必须观察到事件，再次跨线结果独立记录 |
-| status 8 经生产完成层后的隔离 | 工具已接入，待硬件验证 | 新版 sq_multiplex_test 的 peer_exit 使用 TxCompletionProcessor；既有 Q1/Q2 仅证明原始完成路径的硬件隔离 |
+| JFR 水线 async 事件与再次跨线 | 首次事件及数据路径已通过；重复未观察到 | depth=128/256、threshold=64，两组首次各取得并 Ack 1 个归属正确的 JFR_LIMIT；补投后收发正常，不重写阈值的第二次跨线均未取得事件；双方正常关闭 |
+| status 8 经生产完成层后的隔离 | 已通过 | Q3/Q4 使用 TxCompletionProcessor，processor_events=processor_retired=1025/4097，软件 lane 与硬件 SQ 均 READY；旧目标 256/1024 条 status 8，健康三阶段各 256/1024 条 SUCCESS，双方正常收尾 |
 | 提交后退出、硬件在途窗口 | 部分覆盖 | inflight_exit 的 256 条全部 SUCCESS；退出请求前已退休 32，确认时软件未退休 224，不能证明这 224 条仍由硬件处理 |
 | 两个裸设备、每设备两个 EID，共四个 context | 各路径已有通过证据，首次 D2 失败待查 | window=32 的 D1/D2a/D3 均通过；window=1 的 D2 第二次双端通过，各 context 四项流量计数 100001、补投 100000，通知与 fd 全覆盖；首次 D2 在设备组 0 停滞并失败 |
 | 四个物理裸设备同时工作 | 暂缓 | 用户明确暂不测试；与四个 context 区分，不作为当前部署验证要求 |
@@ -43,7 +43,7 @@
 
 同 SQ `peer_exit` 的 Q1/Q2，以及两设备四 context 的 D1–D3 都已有双端通过记录；D2 在首次失败后第二次通过，补齐各路 fd 就绪。用户随后反馈 streaming 错误暂未复现，保留原始失败与诊断，不要求持续追测到再次失败，也不据此认定根因已修复。
 
-当前优先运行 [async_event_test](../tools/async_event_test/README.md) 的 JFR 水线场景，以及新版 `sq_multiplex_test --fault=peer_exit` 经过正式 `TxCompletionProcessor` 的真机集成回归。工具和本地测试不构成硬件通过证据，也不能把已有原始 CQE 观测计作生产完成层验证。JFC/JFR 错误与关联 JFS/jetty 事件在确认可靠注入方式后补测。真实链路/端口故障构造成本较高，按用户要求降为低优先级可选项；不要求任意故障都产生 async，也不以没有 PORT_DOWN 否定错误 CQE。现有进程退出实验的 async=0 记录保持不变。
+JFR 水线的 depth=128/256 两组已有双端通过日志，覆盖首次事件归属与 Get/Ack、补投后续收发及关闭；不重写阈值的重复跨线均未观察到事件。新版 `sq_multiplex_test --fault=peer_exit` 的正式 `TxCompletionProcessor` 集成也已由 Q3/Q4 双端日志验证，与早期原始 CQE 路径的 Q1/Q2 分开登记。这两项近期优先验证已完成；水线显式重新使能可另设实验，JFC/JFR 错误与关联 JFS/jetty 事件在确认可靠注入方式后补测。真实链路/端口故障构造成本较高，按用户要求降为低优先级可选项；不要求任意故障都产生 async，也不以没有 PORT_DOWN 否定错误 CQE。现有进程退出实验的 async=0 记录保持不变。
 
 ## 统一准备
 
@@ -72,7 +72,7 @@ USE_BAZEL_VERSION=9.3.0 bazel test --lockfile_mode=off \
   //tools/rma_test:session_test --test_output=errors
 ```
 
-已有正常收发、JFR 关闭、provider 边界、进程退出、同 SQ status 8 隔离和两设备四 context 持续收发记录；当前优先验证 async 专用工具及生产完成层集成，不要求先重跑已通过的全部组。D2 暂未复现，常规复测保留诊断即可。物理故障为低优先级可选项，执行时放在普通测试之后。测试期间记录完整 stdout/stderr 和退出码，不只摘录 PASS。
+已有正常收发、JFR 关闭与首次水线事件、provider 边界、进程退出、同 SQ status 8 隔离（含生产完成层集成）和两设备四 context 持续收发记录；后续按下文剩余缺口安排，不要求先重跑已通过的全部组。D2 暂未复现，常规复测保留诊断即可。物理故障为低优先级可选项，执行时放在普通测试之后。测试期间记录完整 stdout/stderr 和退出码，不只摘录 PASS。
 
 ## 第一批：正常数据路径与事件
 
@@ -156,8 +156,12 @@ READ/WRITE 按 [rma_test README](../tools/rma_test/README.md) 分别运行 `--op
 
 | 组 | 两端共同参数 | 判定与当前覆盖 |
 | --- | --- | --- |
-| A1 | `--rx_depth=128 --threshold=64 --bytes=4096` | 待真机：投满后配置并查询水线，首次降至阈值以下必须取得归属正确的 JFR_LIMIT，逐事件 Get/Ack 配对；补投后继续收发 |
-| A2 | 同 A1，工具内第二次跨线 | 待观测：不重新配置水线，单独记录重复事件 OBSERVED/NOT_OBSERVED；未观察到重复事件不抹去首次事件的证据，也不推定 Ack 自动 rearm |
+| A1 | `--rx_depth=128 --threshold=64 --bytes=4096 --observe_ms=100` | 已通过：查询 depth/threshold=128/64；首次 JFR_LIMIT 取得并 Ack 1 次，context/JFR 匹配；服务端 posted=received=194，客户端 accepted=retired=194，双端 PASS |
+| A2 | 同 A1，工具内第二次跨线 | NOT_OBSERVED：补投到 128 后再消费到 63，不重新配置水线，本次未取得重复事件 |
+| A3 | `--rx_depth=256 --threshold=64 --bytes=4096 --observe_ms=100` | 已通过：查询 depth/threshold=256/64；首次 JFR_LIMIT 取得并 Ack 1 次，context/JFR 匹配；服务端 posted=received=450，客户端 accepted=retired=450，双端 PASS |
+| A4 | 同 A3，工具内第二次跨线 | NOT_OBSERVED：补投到 256 后再消费到 63，不重新配置水线，本次未取得重复事件 |
+
+两组端点均为服务端 `udmac0d1e4:39`、客户端 `udmac0d1e4:42`。首次事件 `last_type=3`，baseline/refill_control/repeat_crossing/cleanup 均未取得事件；最终 `threshold_disabled=true`。首次事件路径与补投恢复已验证，重复跨线的 NOT_OBSERVED 不使整组失败，也不能推定事件永久不会再次触发或 Ack 自动 rearm。显式重写水线后的触发行为尚未测试，详见[硬件观测记录](hardware-observations.md)。
 
 工具记录请求与查询的水线/深度、各阶段事件和流量计数。原始类型或对象归属异常、首次事件缺失、CQE/payload 错误及关闭失败均不能记为通过。结束时禁用水线，以独立收尾流量消费残留 RX，确认数据与控制面静默后释放资源；Ack async 本身不是 WR 终结或 DMA 静默证明。进程监督覆盖可能阻塞的 provider 调用。
 
@@ -234,14 +238,20 @@ F5/F6 使用 `--fault_delay_ms=10000`，控制 TCP 尽量走不受影响的链�
 
 上述 Q1/Q2 实测版本直接消费合法终结 CQE，保持 SQ 运行以观察隔离。生产 `TxCompletionProcessor` 随后已为合法 status 8 增加例外：只退休对应 WR，保留原始状态与 `AttemptRecord` 上报，不因该状态调用 `BeginDrain`；连接与操作的失败决策由上层负责，本层不自动关闭连接或重试。status 8 是远端访问中止错误类别，进程退出只是本次注入方式。RNR、ACK_TIMEOUT 等其他错误仍主动排空，硬件观测与生产错误处理分别验证。
 
-新版 `peer_exit` 已接入正式 `TxCompletionProcessor`，不再由工具重复退休；`rnr` 仍使用原始观测路径。两端同步更新后，用 Q1/Q2 的参数分别做 Q3/Q4 集成回归：客户端应打印 `completion_path=processor`，`processor_events=processor_retired` 分别为 1025/4097（包括 baseline），`last_lane_state=READY`。原有逐目标成功/错误计数、同 SQ 身份、后续健康发送及双端关闭判据仍须全部满足。Q3/Q4 尚无真机结果，不能由原始 Q1/Q2 或本地 gMock 通过推定通过。
+新版 `peer_exit` 已接入正式 `TxCompletionProcessor`，不再由工具重复退休；`rnr` 仍使用原始观测路径。用户随后反馈 Q3/Q4 的完整双端 PASS 日志，服务端仍为 `udmac0d1e4:39`，客户端改为 `udmac0d1e4:42`。两组均打印 `completion_path=processor`，新增完成层判据与原有逐目标流量、payload、退出确认及双端关闭判据全部满足：
+
+| 组 | batch / rounds / bytes | 客户端 SQ ID | 每个 healthy 阶段 SUCCESS / 服务端 received | 旧目标 status 8 | processor_events / processor_retired |
+| --- | --- | ---: | --- | ---: | --- |
+| Q3 | 32 / 8 / 4096 | 49496 | 256 / 256 | 256 | 1025 / 1025 |
+| Q4 | 128 / 8 / 4096 | 49497 | 1024 / 1024 | 1024 | 4097 / 4097 |
+
+两组 baseline 均成功 1 条，各有 `state_checks=26、last_queried_state=1、last_lane_state=READY、accepted_known=true、provider_eagain=0`。生产退休总数满足 `1+4*batch*rounds`；每个目标 accepted=retired，所有非预期错误计数为 0。Q4 的 mixed 每次 256 个 WR，跨多个最多 64 条的完成批次；连续 8 轮及 after 成功验证额度归还后可用同一 SQ 继续发送。Q3/Q4 是生产完成层集成的独立实测证据，不是对 Q1/Q2 的追认；它们不证明跨主机/链路故障、其他错误类型隔离、无性能干扰或上层连接回收已验证。
 
 ## 剩余硬件缺口
 
 | 项目 | 当前缺口 / 后续范围 |
 | --- | --- |
-| 受支持 async 类型的工具记录，优先 | A1/A2 工具已实现，待 JFR 水线事件归属与 Get/Ack 的真机记录；用户确认支持的 JFS/JFR/JFC error 仍待可靠注入方式。当前 JFS/相关 jetty AE 需通过绑定 JFC error 联动，不与链路故障绑定验收 |
-| 生产完成层 status 8 集成，优先 | 硬件 Q1/Q2 已通过；新版 peer_exit 已接入正式 TxCompletionProcessor，Q3/Q4 待真机确认逐 attempt 退休、软件 lane 保持可用及健康目标续发 |
+| 受支持 async 类型的工具记录 | JFR 水线 A1/A3 的首次事件、归属与 Get/Ack 已通过，A2/A4 重复事件未观察到；显式重新使能仍待独立实验。用户确认支持的 JFS/JFR/JFC error 仍待可靠注入方式，当前 JFS/相关 jetty AE 需通过绑定 JFC error 联动 |
 | 四 context D2 首次失败，保留观察 | 第二次已补齐双端四路通知/ack/fd；首次客户端 status 9、服务端 fd 超时仍未定位。工具已增加诊断，用户随后反馈暂未复现；不要求无限追测，不代表根因已修复；四物理设备组暂缓 |
 | 物理故障，低优先级可选 | 按用户要求降低优先级；F5/F6 工具日志尚未取得，用户说明通常 ACK_TIMEOUT，不将无法观察的 PORT_DOWN async 列为通过条件 |
 | 在途中断 | F4 已完成提交后退出流程，但未证实 SIGKILL 命中硬件仍在处理 WR 的窗口；延迟软件 poll 不能补齐这项证据 |

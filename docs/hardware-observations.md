@@ -4,7 +4,7 @@
 
 整理日期：2026-10-22。本文记录当前开发过程中用户反馈的真实硬件结果，以及为解释这些结果做的源码对照。测试命令仍以各工具 README 为准。
 
-当前已记录正常 SEND/READ/WRITE、共享队列、RNR 后续发、单 SQ 故障排空、provider 提交边界、残留 RX 的 JFR 关闭、持续多 EID 收发/JFC 通知和对端进程退出。**WR 失败、逻辑连接失败、SQ 进入 ERROR 和物理端口故障必须分别判断。** 在本次裸设备 RM_CTP、`error_suspend=0` 配置下，RNR 后同一 SQ 可继续发送；对端退出后的 SEND 可以异步报错而本地 SQ 仍为 READY；新增两组 peer_exit 实测还确认，同 SQ 上失效目标的 status 8 没有使健康目标的 before/mixed/after 流量失败。已主动置 ERROR 的 SQ 也可能接受 post，必须保留软件发送门禁。
+当前已记录正常 SEND/READ/WRITE、共享队列、RNR 后续发、单 SQ 故障排空、provider 提交边界、残留 RX 的 JFR 关闭与首次水线 async 事件、持续多 EID 收发/JFC 通知和对端进程退出。**WR 失败、逻辑连接失败、SQ 进入 ERROR 和物理端口故障必须分别判断。** 在本次裸设备 RM_CTP、`error_suspend=0` 配置下，RNR 后同一 SQ 可继续发送；对端退出后的 SEND 可以异步报错而本地 SQ 仍为 READY；peer_exit 的原始 CQE 路径和正式完成层集成均已实测确认，同 SQ 上失效目标的 status 8 没有使健康目标的 before/mixed/after 流量失败。已主动置 ERROR 的 SQ 也可能接受 post，必须保留软件发送门禁。
 
 同 SQ 多目标实验先出现过 ACK_TIMEOUT；修正完成收集后，用户再次运行 `batch=32、rounds=8`，健康目标的 before/mixed/after 全部成功，空 JFR 目标的 256 条 WR 全部 RNR，同一 SQ 在 25 次查询中保持 READY。**这支持本次配置下同 SQ 多目标 RNR 隔离；旧 ACK_TIMEOUT 的原因仍未查明，不能由复测成功宣称已修复。** 后续四 context 的 D2 首次运行也出现 status 9 和另一端事件等待超时；第二次完整通过并补齐 fd readiness，但首次失败仍需独立定位。
 
@@ -41,8 +41,10 @@
 | 同 SQ 的 RNR 后续发 | 用户反馈 `rnr_continue_success` | 首批 RNR 终结后，补投远端 RX，同一 jetty 可成功发送新批次；没有重建或切换 SQ |
 | [同 SQ 多目标](../tools/sq_multiplex_test/README.md) | 首次 mixed 曾出现 ACK_TIMEOUT；复测 `batch=32、rounds=8` 双端 PASS，健康 768 条全部成功、sink 256 条全部 RNR | 本次同 SQ 可交替服务健康/缺 RX 的不同 JFR，失败 WR 未阻止健康流量；旧 ACK_TIMEOUT 原因未明 |
 | 同 SQ 的 status 8 隔离 | peer_exit 的 Q1/Q2（`batch=32/128、rounds=8`）双端 PASS；每个健康阶段分别 256/1024 条 SUCCESS，失效目标分别 256/1024 条 status 8 | 本次已退出 endpoint 与健康 endpoint 共用客户端 SQ，健康收发在 mixed 前、期间及之后均成功；各 26 次状态检查为 READY，无主动 ERROR/flush/重建/重放 |
+| status 8 的生产完成层集成 | peer_exit 的 Q3/Q4（`batch=32/128、rounds=8`）双端 PASS；completion_path=processor，processor_events=processor_retired=1025/4097 | 真实完成经 TxCompletionProcessor 逐 WR 退休并归还额度，软件 lane 与硬件 SQ 保持 READY；健康三阶段均成功，跨完成批次及后续轮次继续可用 |
 | [Provider 提交边界](../tools/provider_boundary_test/README.md) | `tx_depth=64/128/256` 分别接受并退休 `128/256/512` 条，三组均容量拒绝和部分接受；额外 ERROR post 组也通过 | 真实容量拒绝为 `ENOMEM`；ERROR SQ 仍可能接受 post；已观察到非零 `WR_UNHANDLED` |
 | [残留 RX 的 JFR 关闭](../tools/jfr_lifecycle_test/README.md) | `rx_depth/consumed` 为 `1/0、32/0、256/0、32/7、256/255` 五组通过 | 对端静默、依赖 jetty 已删除后，残留 posted RX 不妨碍本次 DeleteJfr；之后释放 MR |
+| [JFR 水线 async 事件](../tools/async_event_test/README.md) | depth=128/256、threshold=64，两组首次各取得并 Ack 1 个匹配的 JFR_LIMIT；全部 194/450 条流量及双端关闭通过；重复跨线均 NOT_OBSERVED | 首次事件路径、归属与 Get/Ack、补投恢复可工作；仅 Ack 和补投未使本轮再次跨线产生可见事件，显式重新使能尚未测试 |
 | [持续收发与 JFC 通知](../tools/streaming_test/README.md) | 同设备双 context 已通过；两设备各双 EID 的四 context 在 D1、D3 及额外的 `window=32、events/延迟 0` 组均双端 PASS；D2 首次 status 9/事件等待超时，第二次双端 PASS、各十行 OBSERVED | 四路持续收发、补投、通知、recheck 与双端各路 fd readiness 均有通过证据；D2 首次失败仍未定位，不能据复测通过宣称问题已修复 |
 | [单 WR READ/WRITE](../tools/rma_test/README.md) | READ/WRITE 各 `4 KiB、16 KiB、1 MiB、8 MiB`，每组 8 轮 PASS，未投递 RX | 单 WR 可传输大于 4 KiB 的 RMA 数据；本地/远端 payload 与 guards 校验及关闭通过 |
 | [对端退出后提交](../tools/peer_failure_test/README.md) | `process_exit` 的 batch 32、256 均 post 成功，全部以 status 8 退休；本地查询前后 READY，无 async | 已确认对端退出后，本地仍可接受 SEND；故障通过逐 WR CQE 报告，不必伴随本地 SQ ERROR/async |
@@ -377,7 +379,60 @@ batch=128 时 healthy before 为 `32.280～63.670 μs`，after 为 `32.450～61.
 
 上述实测时的工具版本直接消费 CQE，验证结果独立于生产策略。随后[生产 TxCompletionProcessor](../kbsocket/transport/raw/tx_completion_processor.cpp)已调整为：合法 status 8 完成退休对应 WR，并携原始状态和 `AttemptRecord` 上报，不因该状态调用 `BeginDrain`；连接与操作的失败决策仍由上层负责，完成层不自动关闭连接或重试。status 8 不仅可能由进程退出产生，不能将本次故障注入方式作为该状态的唯一定义。RNR、ACK_TIMEOUT 等其他错误仍沿用主动排空策略。
 
-新版 `sq_multiplex_test --fault=peer_exit` 已使用正式完成处理器，并输出 `completion_path=processor`、生产退休计数和软件 lane 状态；这条集成路径仍待新的真机日志，不能将上述旧日志重新解释为已覆盖它。独立的 [JFR 水线工具](../tools/async_event_test/README.md) 也已实现，首次及重复事件的硬件结果待记录。
+### 正式 TxCompletionProcessor 集成
+
+随后用户提供新版 `sq_multiplex_test --fault=peer_exit` 的 Q3/Q4 双端 PASS 日志。两组仍为 `batch=32/128、rounds=8、bytes=4096`，服务端 `udmac0d1e4:39`，客户端改为 `udmac0d1e4:42`。该版本从 baseline 到最后一个 after 均使用正式 `TxCompletionProcessor`；日志明确为 `completion_path=processor`，与前述 Q1/Q2 原始完成路径分别登记。
+
+| 指标 | Q3 / batch=32 | Q4 / batch=128 |
+| --- | ---: | ---: |
+| 故障子进程 PID / jetty_id | 500266 / 23434 | 501610 / 23436 |
+| 客户端 SQ jetty_id | 49496 | 49497 |
+| baseline accepted / retired / SUCCESS / received | 1 / 1 / 1 / 1 | 1 / 1 / 1 / 1 |
+| 每个 healthy 阶段 accepted / retired / SUCCESS | 256 / 256 / 256 | 1024 / 1024 / 1024 |
+| 服务端每个 healthy 阶段 received | 256 | 1024 |
+| Sink mixed accepted / retired / status 8 | 256 / 256 / 256 | 1024 / 1024 / 1024 |
+| processor_events / processor_retired | 1025 / 1025 | 4097 / 4097 |
+| last_lane_state / last_queried_state | READY / 1 | READY / 1 |
+| state_checks | 26 | 26 |
+| accepted_known / provider_eagain | true / 0 | true / 0 |
+| 双端结果 | PASS | PASS |
+
+三个 healthy 阶段的其他错误计数全部为 0；sink 全部为 status 8，没有 RNR、ACK_TIMEOUT 或其他错误。每个 mixed round 都恰好退休 batch 条健康 SUCCESS 与 batch 条旧目标 status 8。故障 baseline payload 经服务端确认后才 SIGKILL/waitpid，双方 `Peer exit: confirmed=true`；存活客户端和服务端最终完成资源关闭。
+
+生产退休总数为 `1+4*batch*rounds`：baseline 的 1 条，加上三阶段健康流量与 mixed 中的故障目标流量。总数及逐目标身份检查支持全部已接受 WR 经正式完成层恰好退休一次。mixed 每次使用 `2*batch` 软件额度，后续 after 和下一轮仍能完整发送，验证了错误与成功完成均归还额度。Q4 的 mixed 一次提交 256 条 WR，跨多个最多 64 条的完成批次，仍保持同一 SQ 可用。
+
+这补齐了此前 status 8 不触发整 SQ `BeginDrain` 的生产集成证据：合法远端访问中止完成被逐 WR 退休并上报，软件 lane 保持 READY，硬件状态检查通过，健康目标能够继续成功发送。结论限于本轮配置与故障方式，尚不证明上层连接错误分发/回收、跨远端主机或链路隔离，也不改变生产 RNR、ACK_TIMEOUT 的主动排空策略。
+
+Q3 的 healthy/sink mixed 软件 CQE 耗时分别为 `20.610～41.130 / 20.420～41.040 μs`；Q4 为 `75.010～151.570 / 74.730～151.470 μs`。这些值包含软件完成处理与批次消费，mixed WR 数量也是普通阶段的两倍，不能据此认定硬件队头阻塞或量化生产完成层相对旧工具的性能开销。
+
+## JFR 水线 async 事件
+
+用户反馈 [async_event_test](../tools/async_event_test/README.md) 的两组完整双端日志。服务端为 `udmac0d1e4:39`，客户端为 `udmac0d1e4:42`，控制地址 `141.62.33.25:8889`；共同参数为 `threshold=64、bytes=4096、observe_ms=100`。每端创建两个 jetty，共享一个 JFR；本轮由客户端向服务端发送。
+
+| 指标 | rx_depth=128 | rx_depth=256 |
+| --- | ---: | ---: |
+| 服务端 jetty_id / jfr_id | 23430 / 9618 | 23432 / 9619 |
+| 客户端 jetty_id / jfr_id | 49492 / 21081 | 49494 / 21082 |
+| 查询 depth / threshold | 128 / 64 | 256 / 64 |
+| 首次跨线消费数量 / 剩余 RX | 65 / 63 | 193 / 63 |
+| first_crossing 的 retrieved / acked / jfr_limit | 1 / 1 / 1 | 1 / 1 / 1 |
+| 首次事件 last_type | 3 | 3 |
+| 首次事件 context / JFR 匹配 | true / true | true / true |
+| repeat_crossing 的 retrieved / acked / jfr_limit | 0 / 0 / 0 | 0 / 0 / 0 |
+| 服务端 posted / received | 194 / 194 | 450 / 450 |
+| 客户端 accepted / retired | 194 / 194 | 450 / 450 |
+| threshold_disabled / accepted_known | true / true | true / true |
+| 双端结果 | PASS | PASS |
+
+两组的 baseline、refill_control、cleanup 阶段也均为 `get_calls=retrieved=acked=jfr_limit=0`。没有取得事件时，`last_type=-1` 和归属字段 false 表示无事件可供判断，不是错误对象事件。服务端没有发送，所以 accepted/retired 为 0；客户端没有投递 RX，所以 posted/received 为 0，符合本工具的单向流量分工。
+
+首次事件通过 context 的 `async_fd`、`GetAsyncEvent` 和 `AckAsyncEvent` 取得并确认，类型 3 对应 JFR_LIMIT，且原事件的 context/JFR 归属正确。补投后的一条正常恢复流量、第二次跨线流量和关闭前的独立 cleanup 流量均通过 payload 与完成检查。最后禁用水线并消费剩余 63 个 RX，双方完成资源关闭。因此首次水线事件、事件确认及补投恢复可登记通过。
+
+两次跨线之间没有重新配置水线，只有 Ack 与 RX 补投；第二次窗口及后续 cleanup 均未取得更多事件。**本轮未验证水线通知会自动重复触发，不能依赖仅 Ack/补投就必有下一次通知。** 该现象与需要显式重新使能的行为相容，但尚不能据此认定硬件永久只触发一次，或某种重新配置方式必然有效；硬件版本和事件延迟上界未确认。需要继续研究时，应单独在补满后验证重写 64 或 `0→64`，并区分修改配置期间与随后再次跨线时取得的事件，不覆盖本轮“不重写阈值”的结果。
+
+源码对照：本地 [urma_cmd.c](../../umdk/src/urma/lib/urma/core/urma_cmd.c) 对 JFR_LIMIT 的 Ack 仅累计已确认事件数并唤醒资源销毁等待者，没有重新配置硬件；[udma_jfr.c](../../kernel/drivers/ub/urma/hw/udma/udma_jfr.c) 对显式设置 `JFR_RX_THRESHOLD` 会下发修改命令，即使仍写相同阈值，也未见跳过逻辑。但这不足以证明重新写 64 就会恢复通知。查询返回的 threshold 是配置值，不是下一次事件已使能的证明；当前工具在首次配置与关闭时查询，没有在首次事件后再次查询。上述是本地源码行为，尚未核对现场版本。
+
+水线事件也不代替 RX CQE、buffer 所有权归还或 DMA 静默证明。正常 RX 补投应由完成与可用槽位驱动，不能等到水线事件才推进。
 
 ## 接口与查询值的解释边界
 
@@ -400,7 +455,7 @@ status 9 是 ACK_TIMEOUT，status 10 才是 RNR 重试耗尽：[urma_opcode.h](.
 - SQ 仍能发送新消息，不代表失败的字节流可以无条件继续。原请求错误必须显式交给上层处理，不能跳过缺失数据或自动重放已接受的请求。
 - 继续保留软件发送门禁与逐 WR 退休规则；已实测 ERROR post 仍可成功返回。只有明确的 ERROR 排空契约才解释 FLUSH_ERR_DONE，不能从普通 RNR 或计数相等推导队列已经停机。
 - 对端退出不能代替逐 WR 终结证据，async 缺失也不能否定 CQE 已报告的远端故障；共享 JFR 删除要先满足整个资源域静默和依赖释放顺序。
-- status 8 同 SQ 隔离已有 Q1/Q2 通过证据。生产 `TxCompletionProcessor` 现在只退休并上报这类合法终结完成，不主动排空整 SQ；原始状态和 record 仍交给上层决定对应连接与操作如何失败。此调整不自动实现连接管理，也不使已经隔离的 SQ 恢复 READY；RNR/ACK_TIMEOUT 的排空策略未改，硬件通过也不能替代生产实现验证。
+- status 8 同 SQ 隔离已有 Q1/Q2 原始路径和 Q3/Q4 生产集成的通过证据。生产 `TxCompletionProcessor` 只退休并上报这类合法终结完成，不主动排空整 SQ；原始状态和 record 仍交给上层决定对应连接与操作如何失败。此调整不自动实现连接管理，也不使已经隔离的 SQ 恢复 READY；RNR/ACK_TIMEOUT 的排空策略未改，当前集成通过也不能替代上层连接状态机验证。
 
 ## 尚未覆盖与后续记录
 
@@ -414,7 +469,7 @@ status 9 是 ACK_TIMEOUT，status 10 才是 RNR 重试耗尽：[urma_opcode.h](.
 - 两设备各双 EID 的四 context 已有 D1、D3 和 D2 第二次运行的通过证据，双端各路 fd readiness 已覆盖；后续重点是 D2 首次失败的逐 context CQE/事件时序诊断，而非把原覆盖缺口继续列作未测。四个物理裸设备并行按用户部署范围暂缓。
 - 真正中断硬件在途 WR 的对端退出；`inflight_exit` 已验证提交后退出的控制时序，但本次全部 SUCCESS，硬件在途未确认。
 - 链路/端口真实故障的工具日志：用户说明通常为 ACK_TIMEOUT，现有 external 场景尚无日志，不把当前无法观察的 PORT_DOWN async 列作通过条件。
-- 对用户确认支持的 JFS/JFR/JFC error 和 JFR 水线事件，补独立 Get/Ack 工具记录时应遵循其注入条件；当前 JFS/相关 jetty AE 需通过绑定 JFC error 联动。既有进程退出测试未观测到 async，不要求为该故障强行触发事件。
+- JFR 水线首次事件及 Get/Ack 已有 depth=128/256 两组实测；不重写阈值的重复跨线未观察到事件，显式重新使能仍待独立实验。用户确认支持的 JFS/JFR/JFC error 还需遵循相应注入条件补记录；当前 JFS/相关 jetty AE 需通过绑定 JFC error 联动。既有进程退出测试未观测到 async，不要求为该故障强行触发事件。
 - 多 WR 并发 RMA、RMA 故障、WRITE 加数据面通知的可见性/lease 协议，以及大于 8 MiB 的传输。
 - 对端仍活跃时的共享 JFR 删除，以及 brpc worker 仍访问资源时的进程退出；已通过的是受控静默后的残留 RX 删除。
 

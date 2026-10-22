@@ -77,7 +77,9 @@ USE_BAZEL_VERSION=9.3.0 bazel test //tools/sq_multiplex_test:all --test_output=e
 PASS: healthy traffic succeeded before, during and after same-SQ REM_ACCESS_ABORT; fault baseline validated before SIGKILL/waitpid; old-target attempts retired once with status 8; client used TxCompletionProcessor; same SQ remained READY without modification or recreation; payload validated; both endpoints closed resources
 ```
 
-2026-10-22 反馈的两组硬件日志验证了原始 poll 路径：服务端 `udmac0d1e4:39`、客户端 `udmac0d1e4:61`，`batch=32/128` 各运行 8 轮。三个健康阶段各有 256/1024 条 SUCCESS 且服务端 payload 校验通过，旧目标分别产生 256/1024 条 status 8；各有 26 次同 SQ 状态检查通过，baseline 和退出确认完整，两端均 PASS。该历史结果不能代替本次正式完成层回归；需要使用更新后的两端工具重跑上述两组，并保留新增完成路径和计数输出。详细数据见[硬件观测记录](../../docs/hardware-observations.md)。
+2026-10-22 反馈的 Q1/Q2 验证了原始 poll 路径：服务端 `udmac0d1e4:39`、客户端 `udmac0d1e4:61`，`batch=32/128` 各运行 8 轮。三个健康阶段各有 256/1024 条 SUCCESS 且服务端 payload 校验通过，旧目标分别产生 256/1024 条 status 8；各有 26 次同 SQ 状态检查通过，baseline 和退出确认完整，两端均 PASS。
+
+随后新版正式完成层的 Q3/Q4 也取得完整双端 PASS 日志：服务端 `udmac0d1e4:39`、客户端 `udmac0d1e4:42`，同样使用 `batch=32/128、rounds=8、bytes=4096`。客户端 SQ ID 分别为 49496/49497，均为 `completion_path=processor`，`processor_events=processor_retired=1025/4097`，`last_lane_state=READY`；26 次硬件状态检查通过，最终 `last_queried_state=1`。三个健康阶段各 accepted=retired=success=256/1024，服务端 received 对应相等；旧目标 accepted=retired=remote_access_abort_err=256/1024，其余错误为 0。baseline 成功、退出确认和双方资源关闭均通过，正式完成层的 status 8 退休及同 SQ 健康续发可登记已验证。详细数据与历史原始路径分开记录于[硬件观测记录](../../docs/hardware-observations.md)。
 
 这确认了当前设备/provider 配置下的同 SQ 功能隔离，不将它扩展为所有环境或所有错误类型的契约。正式完成层回归只有健康目标 SUCCESS、旧目标 status 8 且同 SQ 保持 READY 才可继续 after/下一轮；任何其他结果都不能作为通过。若仍有未终结 DMA 或未完成 ERROR 排空，保留整个依赖链到进程退出。
 

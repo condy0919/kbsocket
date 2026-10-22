@@ -53,6 +53,12 @@ USE_BAZEL_VERSION=9.3.0 bazel test //tools/async_event_test:async_event_test_tes
 
 首次跨线没有取得事件时，输出 NOT_OBSERVED 并 FAIL；不能把数据流量成功代替事件路径验证。重复跨线没有事件仍可完成实验并 PASS，但该项必须保留 NOT_OBSERVED。第二次窗口出现事件，也只证明这个窗口实际取得了事件；阶段基于软件采集时间，不能推导硬件事件产生时间或所有重触发时序。
 
+## 已有硬件结果
+
+用户提供的 depth=128/256 两组双端日志均通过，端点为服务端 `udmac0d1e4:39`、客户端 `udmac0d1e4:42`，共同参数 `threshold=64、bytes=4096、observe_ms=100`。查询的深度/水线均与请求一致；首次各取得并 Ack 一个 context/JFR 匹配的 JFR_LIMIT（type=3），其他阶段均未取得事件。服务端 posted=received、客户端 accepted=retired 分别为 194/450，水线已禁用，双方正常关闭。
+
+首次事件与补投恢复已验证；两组第二次跨线都为 NOT_OBSERVED。这不妨碍本轮 PASS，但尚不能依赖 Ack/补投自动恢复水线通知，也不能将未测试的显式重新使能计为通过。详细计数与解释见[硬件观测记录](../../docs/hardware-observations.md)。
+
 ## 完成、Ack 与资源生命周期
 
 `AckAsyncEvent` 不是 CQE 退休，也不意味着 buffer 可以复用或 DMA 已结束。它不等于重新 arm JFR 水线。本实验在两次跨线之间只补投，不重写阈值；没有用 `ModifyJfr(READY)` 代替 rearm，因为本地 UDMA 的 READY 路径可能重置 RQ 索引。需要研究显式 `0→64` 对重复触发的影响时，应另设实验，不能与本轮结果混记。
