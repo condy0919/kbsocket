@@ -62,12 +62,12 @@ bazel build //tools/send_test:send_test
 
 保持双端参数一致，依次替换下列组合；超过设备 SGE 能力时显式拒绝，不自动降级：
 
-| 场景 | bytes | sges | header_bytes | batch | messages | send_imm |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| 小消息、两段拼接 | 64 | 2 | 32 | 64 | 1001 | 开启 |
-| 4 KiB 边界、两段拼接 | 4096 | 2 | 32 | 64 | 1001 | 开启 |
-| 不等长、不对齐分段 | 4096 | 3 | 33 | 128 | 1001 | 开启 |
-| 更多独立注册段 | 4096 | 8 | 32 | 256 | 1001 | 开启 |
+| 场景                 | bytes | sges | header_bytes | batch | messages | send_imm |
+|----------------------|------:|-----:|-------------:|------:|---------:|----------|
+| 小消息、两段拼接     |    64 |    2 |           32 |    64 |     1001 | 开启     |
+| 4 KiB 边界、两段拼接 |  4096 |    2 |           32 |    64 |     1001 | 开启     |
+| 不等长、不对齐分段   |  4096 |    3 |           33 |   128 |     1001 | 开启     |
+| 更多独立注册段       |  4096 |    8 |           32 |   256 |     1001 | 开启     |
 
 关闭 `--send_imm` 可对照普通 SEND。两端都输出 PASS，发送端 `accepted=retired=messages`、`accepted_known=true`、`guarded_segments=messages*sges`，接收端 `received=messages` 才算对应组合通过。发送端 guarded_segments 只统计 TX 源段的保护区；接收端沿用 RxBufferPool 的 4 KiB 槽位，验证收到的长度和整个 payload。上述新增组合目前仅通过无硬件测试，待真机观测，不计入历史单 SGE 的通过记录。
 

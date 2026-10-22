@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+cc_library(
+    name = "rma_failure_support",
+    srcs = [
+        "protocol.cpp",
+        "rma_failure_test.cpp",
+    ],
+    hdrs = ["rma_failure_test.hpp"],
+    deps = [
+        "//kbsocket/base:scope_exit",
+        "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+        "//tools/rma_test:rma_support",
+    ],
+)
+
+cc_library(
+    name = "fault_peer",
+    srcs = ["fault_peer.cpp"],
+    hdrs = ["fault_peer.hpp"],
+    deps = [
+        ":rma_failure_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:raw_runtime",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+        "//tools/peer_failure_test:peer_process",
+        "//tools/rma_test:rma_support",
+    ],
+)
+
+cc_binary(
+    name = "rma_failure_test",
+    srcs = ["main.cpp"],
+    deps = [
+        ":fault_peer",
+        ":rma_failure_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:raw_runtime",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+        "//tools/peer_failure_test:peer_process",
+        "@gflags",
+    ],
+)
+
+cc_test(
+    name = "protocol_test",
+    srcs = ["protocol_test.cpp"],
+    deps = [
+        ":rma_failure_support",
+        "//tools/rma_test:rma_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "session_test",
+    srcs = ["session_test.cpp"],
+    deps = [
+        ":rma_failure_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:urma_api",
+        "//kbsocket/transport/raw:urma_test_support",
+        "//tools/common:control_channel",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "fault_process_test",
+    srcs = ["fault_process_test.cpp"],
+    deps = [
+        ":fault_peer",
+        ":rma_failure_support",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/peer_failure_test:peer_process",
+        "@googletest//:gtest_main",
+    ],
+)

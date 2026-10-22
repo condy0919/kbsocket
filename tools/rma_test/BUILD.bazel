@@ -8,6 +8,7 @@ cc_library(
         "rma_test.cpp",
     ],
     hdrs = ["rma_test.hpp"],
+    visibility = ["//tools/rma_failure_test:__pkg__"],
     deps = [
         "//kbsocket/base:scope_exit",
         "//kbsocket/transport/raw:jetty_pool",

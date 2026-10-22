@@ -8,6 +8,7 @@ cc_library(
     visibility = [
         "//tools/async_error_test:__pkg__",
         "//tools/async_event_test:__pkg__",
+        "//tools/rma_failure_test:__pkg__",
         "//tools/sq_multiplex_test:__pkg__",
     ],
     deps = ["//tools/common:control_channel"],

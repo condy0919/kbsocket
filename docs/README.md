@@ -5,7 +5,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [Raw 传输流程](raw-transport-flow.md) | 所有权、初始化、双端 SEND、退出和当前验证范围 |
-| [硬件观测记录](hardware-observations.md) | 用户实测结果、RNR 后同 SQ 续发、错误排空及验证边界 |
+| [硬件观测记录](hardware-observations.md) | 用户实测的 SEND/RMA、水线重配、错误事件与隔离、资源回收及验证边界 |
 | [硬件验证矩阵](hardware-validation-matrix.md) | 残留 RX、provider 边界、进程/链路故障、持续多设备收发、JFC 通知与 READ/WRITE 的完整运行顺序 |
 | [URMA 加载与运行时](urma-runtime.md) | 动态加载、gMock 替换、context 校验、会话与进程退出 |
 | [DeviceCatalog](device-catalog-reference.md) | 裸设备筛选、EID 快照、查找与指针生命周期 |
@@ -27,5 +27,6 @@
 | [JFR 水线异步事件](../tools/async_event_test/README.md) | 独立 async fd、事件归属与 Get/Ack、多轮重新使能及未停发时的高/低位重配 |
 | [JFC/JFR 错误观测](../tools/async_error_test/README.md) | CQ 溢出候选、外部注入窗口、关联 jetty AE、独立队列隔离和终结证据 |
 | [READ/WRITE 测试](../tools/rma_test/README.md) | 串行 READ/WRITE、并发 READ 与同 SQ SEND 混合、双方数据校验 |
+| [READ 故障隔离测试](../tools/rma_failure_test/README.md) | 确认远端进程退出后，同 SQ 混合访问失效和健康 READ 目标、逐 WR 终结与回收 |
 
 长期架构与协议规划见 [kbsocket 设计 v1](design/kbsocket-design-v1.md)。当前实现范围以本目录的流程和组件文档、对应源码为准。
