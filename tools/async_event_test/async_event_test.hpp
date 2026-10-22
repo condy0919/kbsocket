@@ -20,6 +20,11 @@
 
 namespace kbsocket {
 namespace tools {
+enum class JfrLimitTraffic : std::uint32_t { kStaged, kConcurrent };
+enum class JfrLimitRearmAt : std::uint32_t { kAbove, kBelow };
+const char* JfrLimitTrafficName(JfrLimitTraffic traffic) noexcept;
+const char* JfrLimitRearmAtName(JfrLimitRearmAt at) noexcept;
+inline constexpr std::uint32_t kJfrLimitActiveSends = 32;
 enum class JfrLimitRearm : std::uint32_t { kNone, kRewrite, kToggle };
 const char* JfrLimitRearmName(JfrLimitRearm rearm) noexcept;
 struct JfrLimitOptions {
@@ -30,8 +35,13 @@ struct JfrLimitOptions {
     std::uint32_t timeout_ms = 10000;
     std::uint32_t crossings = 2;
     JfrLimitRearm rearm = JfrLimitRearm::kNone;
+    JfrLimitTraffic traffic = JfrLimitTraffic::kStaged;
+    JfrLimitRearmAt rearm_at = JfrLimitRearmAt::kAbove;
+    std::uint32_t send_interval_us = 100;
 };
 std::expected<void, ToolError> ValidateJfrLimitOptions(const JfrLimitOptions& options) noexcept;
+
+std::uint64_t ExpectedJfrLimitTraffic(const JfrLimitOptions& options) noexcept;
 
 enum class JfrLimitPhase : std::uint8_t {
     kBaseline,
@@ -40,6 +50,8 @@ enum class JfrLimitPhase : std::uint8_t {
     kRepeatCrossing,
     kAboveWater,
     kCleanup,
+    kActiveBeforeRearm,
+    kActiveRearm,
     kCount
 };
 const char* JfrLimitPhaseName(JfrLimitPhase phase) noexcept;
@@ -63,7 +75,7 @@ struct JfrLimitHello {
     bool server = false;
     urma_jetty_id_t endpoint{};
 };
-using JfrLimitHelloBytes = std::array<std::byte, 56>;
+using JfrLimitHelloBytes = std::array<std::byte, 68>;
 JfrLimitHelloBytes EncodeJfrLimitHello(const JfrLimitHello& hello) noexcept;
 std::expected<JfrLimitHello, ToolError> DecodeJfrLimitHello(const JfrLimitHelloBytes& wire) noexcept;
 std::expected<void, ToolError> ValidateJfrLimitPeer(const JfrLimitHello& local, const JfrLimitHello& peer) noexcept;
@@ -78,6 +90,21 @@ struct JfrLimitRoundStats {
     JfrThresholdSnapshot disabled;
     JfrThresholdSnapshot after_rearm;
     JfrThresholdSnapshot after_crossing;
+    JfrLimitEventStats active_before_rearm_events;
+    JfrLimitEventStats active_rearm_events;
+    JfrThresholdSnapshot after_active;
+    std::uint64_t active_received_before_rearm = 0;
+    std::uint64_t active_received_after_rearm = 0;
+    std::uint64_t software_posted_before_rearm = 0;
+    std::uint64_t software_posted_after_rearm = 0;
+    std::uint64_t first_rx_ns = 0;
+    std::uint64_t last_rx_ns = 0;
+    std::uint64_t rearm_begin_ns = 0;
+    std::uint64_t rearm_end_ns = 0;
+    std::uint64_t last_post_ns = 0;
+    bool active_rearm_attempted = false;
+    bool active_rearm_succeeded = false;
+    bool active_window_completed = false;
     JfrLimitEventStats refill_events;
     JfrLimitEventStats above_water_events;
     JfrLimitEventStats crossing_events;
@@ -92,6 +119,8 @@ struct JfrLimitRoundStats {
 };
 
 struct JfrLimitStats {
+    // 包括 payload 校验失败但已安全归还的可信终结 lease，不等于有效 received。
+    std::uint64_t rx_leases_released = 0;
     std::uint64_t posted = 0;
     std::uint64_t received = 0;
     std::uint64_t accepted = 0;
@@ -129,11 +158,15 @@ private:
     std::expected<void, ToolError> ConfigureThreshold(std::uint32_t threshold,
                                                       JfrThresholdSnapshot* snapshot = nullptr);
     std::expected<void, ToolError> PrepareCrossing(JfrLimitRoundStats& round, bool first);
+    std::expected<void, ToolError> RearmDuringTraffic(JfrLimitRoundStats& round);
+    std::expected<void, ToolError> ConcurrentCrossing(ControlChannel& channel, std::uint32_t& sequence,
+                                                      JfrLimitRoundStats& round);
     std::expected<void, ToolError> Refill();
     std::expected<void, ToolError> CollectEvents(JfrLimitPhase phase, JfrLimitEventStats* round_events = nullptr);
     std::expected<void, ToolError> Observe(JfrLimitPhase phase, JfrLimitEventStats* round_events = nullptr);
     std::expected<void, ToolError> Transfer(ControlChannel& channel, std::uint32_t sequence, std::uint32_t count,
-                                            JfrLimitPhase phase, JfrLimitEventStats* round_events = nullptr);
+                                            JfrLimitPhase phase, JfrLimitEventStats* round_events = nullptr,
+                                            JfrLimitRoundStats* active_round = nullptr);
     std::expected<void, ToolError> ReportCrossing(ControlChannel& channel, std::uint32_t index);
     std::expected<void, ToolError> Exchange(ControlChannel& channel);
 

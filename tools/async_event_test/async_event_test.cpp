@@ -21,7 +21,7 @@ namespace {
 using raw::UrmaApi;
 using Clock = std::chrono::steady_clock;
 constexpr std::uint32_t kMagic = 0x4b424145;
-constexpr std::uint32_t kVersion = 2;
+constexpr std::uint32_t kVersion = 3;
 constexpr std::uint32_t kReady = 0x41455200;
 constexpr std::uint32_t kDone = 0x41454400;
 constexpr std::uint32_t kQuiescent = 0x41455154;
@@ -74,7 +74,46 @@ std::expected<void, ToolError> ValidateJfrLimitOptions(const JfrLimitOptions& op
                      "2*observe_ms<timeout_ms<=3600000, crossings=2..1000, rearm=none|rewrite|toggle",
                      EINVAL);
     }
+    if ((options.traffic != JfrLimitTraffic::kStaged && options.traffic != JfrLimitTraffic::kConcurrent) ||
+        (options.rearm_at != JfrLimitRearmAt::kAbove && options.rearm_at != JfrLimitRearmAt::kBelow) ||
+        options.send_interval_us > 10000 ||
+        (options.traffic == JfrLimitTraffic::kConcurrent &&
+         (options.rearm != JfrLimitRearm::kRewrite ||
+          static_cast<std::uint64_t>(kJfrLimitActiveSends) * options.send_interval_us >=
+              static_cast<std::uint64_t>(options.timeout_ms) * 1000))) {
+        return Error("require traffic=staged|concurrent, rearm_at=above|below, send_interval_us<=10000; "
+                     "concurrent requires rearm=rewrite and 32*send_interval_us<timeout_ms*1000",
+                     EINVAL);
+    }
     return {};
+}
+
+std::uint64_t ExpectedJfrLimitTraffic(const JfrLimitOptions& options) noexcept {
+    const std::uint64_t crossing = options.rx_depth - options.threshold + 1;
+    const std::uint64_t repeats = options.crossings - 1;
+    const auto extra = options.traffic == JfrLimitTraffic::kStaged   ? 1U
+                       : options.rearm_at == JfrLimitRearmAt::kBelow ? kJfrLimitActiveSends
+                                                                     : 0U;
+    return options.crossings * crossing + repeats * extra + options.threshold - 1;
+}
+
+const char* JfrLimitTrafficName(JfrLimitTraffic traffic) noexcept {
+    switch (traffic) {
+    case JfrLimitTraffic::kStaged:
+        return "staged";
+    case JfrLimitTraffic::kConcurrent:
+        return "concurrent";
+    }
+    return "unknown";
+}
+const char* JfrLimitRearmAtName(JfrLimitRearmAt at) noexcept {
+    switch (at) {
+    case JfrLimitRearmAt::kAbove:
+        return "above";
+    case JfrLimitRearmAt::kBelow:
+        return "below";
+    }
+    return "unknown";
 }
 
 const char* JfrLimitRearmName(JfrLimitRearm rearm) noexcept {
@@ -103,6 +142,10 @@ const char* JfrLimitPhaseName(JfrLimitPhase phase) noexcept {
         return "above_water";
     case JfrLimitPhase::kCleanup:
         return "cleanup";
+    case JfrLimitPhase::kActiveBeforeRearm:
+        return "active_before_rearm";
+    case JfrLimitPhase::kActiveRearm:
+        return "active_rearm";
     case JfrLimitPhase::kCount:
         break;
     }
@@ -166,6 +209,9 @@ JfrLimitHelloBytes EncodeJfrLimitHello(const JfrLimitHello& hello) noexcept {
     Put(bytes, 44, hello.endpoint.id);
     Put(bytes, 48, hello.options.crossings);
     Put(bytes, 52, static_cast<std::uint32_t>(hello.options.rearm));
+    Put(bytes, 56, static_cast<std::uint32_t>(hello.options.traffic));
+    Put(bytes, 60, static_cast<std::uint32_t>(hello.options.rearm_at));
+    Put(bytes, 64, hello.options.send_interval_us);
     return bytes;
 }
 
@@ -181,6 +227,9 @@ std::expected<JfrLimitHello, ToolError> DecodeJfrLimitHello(const JfrLimitHelloB
     hello.options.observe_ms = Get(wire, 24);
     hello.options.crossings = Get(wire, 48);
     hello.options.rearm = static_cast<JfrLimitRearm>(Get(wire, 52));
+    hello.options.traffic = static_cast<JfrLimitTraffic>(Get(wire, 56));
+    hello.options.rearm_at = static_cast<JfrLimitRearmAt>(Get(wire, 60));
+    hello.options.send_interval_us = Get(wire, 64);
     std::memcpy(hello.endpoint.eid.raw, wire.data() + 28, 16);
     hello.endpoint.id = Get(wire, 44);
     if (auto valid = ValidateJfrLimitOptions(hello.options); !valid) {
@@ -193,7 +242,9 @@ std::expected<void, ToolError> ValidateJfrLimitPeer(const JfrLimitHello& local, 
     if (local.server == peer.server || local.options.rx_depth != peer.options.rx_depth ||
         local.options.threshold != peer.options.threshold || local.options.bytes != peer.options.bytes ||
         local.options.observe_ms != peer.options.observe_ms || local.options.crossings != peer.options.crossings ||
-        local.options.rearm != peer.options.rearm) {
+        local.options.rearm != peer.options.rearm || local.options.traffic != peer.options.traffic ||
+        local.options.rearm_at != peer.options.rearm_at ||
+        local.options.send_interval_us != peer.options.send_interval_us) {
         return Error("peer async role/options mismatch", EPROTO);
     }
     return {};
@@ -380,6 +431,83 @@ std::expected<void, ToolError> JfrLimitSession::PrepareCrossing(JfrLimitRoundSta
     return {};
 }
 
+std::expected<void, ToolError> JfrLimitSession::RearmDuringTraffic(JfrLimitRoundStats& round) {
+    if (auto result = QueryThreshold(round.before_rearm); !result) {
+        return result;
+    }
+    round.software_posted_before_rearm = rx_.posted();
+    urma_jfr_attr_t attr{};
+    attr.mask = JFR_RX_THRESHOLD;
+    attr.rx_threshold = options_.threshold;
+    round.active_rearm_attempted = true;
+    const auto status = UrmaApi::ModifyJfr(pool_.jfr(), &attr);
+    if (status != URMA_SUCCESS) {
+        return Error("rewrite JFR threshold during traffic", status);
+    }
+    round.active_rearm_succeeded = true;
+    stats_.threshold_disabled = false;
+    if (auto result = QueryThreshold(round.after_rearm); !result) {
+        return result;
+    }
+    round.software_posted_after_rearm = rx_.posted();
+    // 配置期间可能已经产生事件并清零；并发路径不能要求回读仍为 64。
+    if (round.after_rearm.depth < options_.rx_depth ||
+        (round.after_rearm.threshold != 0 && round.after_rearm.threshold != options_.threshold)) {
+        return Error("invalid concurrent threshold/depth readback", EPROTO);
+    }
+    stats_.queried_threshold = round.after_rearm.threshold;
+    stats_.queried_depth = round.after_rearm.depth;
+    return {};
+}
+
+std::expected<void, ToolError> JfrLimitSession::ConcurrentCrossing(ControlChannel& channel, std::uint32_t& sequence,
+                                                                   JfrLimitRoundStats& round) {
+    const bool above = options_.rearm_at == JfrLimitRearmAt::kAbove;
+    if (server_) {
+        if (above) {
+            if (auto filled = Refill(); !filled) {
+                return filled;
+            }
+        }
+        // below 保留前轮已收齐 CQE 后的 63 个 RX；在新配置之前独立采集迟到事件。
+        if (auto observed = Observe(JfrLimitPhase::kRefillControl, &round.refill_events); !observed) {
+            return observed;
+        }
+    }
+    // above 的整个窗口最多消耗 32 个 RX，剩余至少 96；below 从 63 降到 31。
+    // 阶段内部没有 TCP 停发握手，接收端在第一批 CQE 后直接重写，发送端继续按本地节奏投递。
+    if (auto transfer = Transfer(channel, sequence, kJfrLimitActiveSends, JfrLimitPhase::kActiveRearm,
+                                 &round.active_rearm_events, &round);
+        !transfer) {
+        return transfer;
+    }
+    sequence += kJfrLimitActiveSends;
+    if (server_) {
+        if (auto observed = Observe(JfrLimitPhase::kActiveRearm, &round.active_rearm_events); !observed) {
+            return observed;
+        }
+        if (auto queried = QueryThreshold(round.after_active); !queried) {
+            return queried;
+        }
+        if (!above) {
+            if (auto filled = Refill(); !filled) {
+                return filled;
+            }
+            if (auto observed = Observe(JfrLimitPhase::kRefillControl, &round.refill_events); !observed) {
+                return observed;
+            }
+        }
+    }
+    // below 重写后的事件与补满后再次跨线独立观察；这里故意不再次 Modify64。
+    const auto count = options_.rx_depth - options_.threshold + 1 - (above ? kJfrLimitActiveSends : 0U);
+    if (auto transfer = Transfer(channel, sequence, count, JfrLimitPhase::kRepeatCrossing, &round.crossing_events);
+        !transfer) {
+        return transfer;
+    }
+    sequence += count;
+    return {};
+}
+
 std::expected<void, ToolError> JfrLimitSession::Refill() {
     auto refilled = rx_.Refill(options_.rx_depth);
     if (!refilled) {
@@ -419,7 +547,8 @@ std::expected<void, ToolError> JfrLimitSession::Observe(JfrLimitPhase phase, Jfr
 
 std::expected<void, ToolError> JfrLimitSession::Transfer(ControlChannel& channel, std::uint32_t sequence,
                                                          std::uint32_t count, JfrLimitPhase phase,
-                                                         JfrLimitEventStats* round_events) {
+                                                         JfrLimitEventStats* round_events,
+                                                         JfrLimitRoundStats* active_round) {
     const auto marker = kReady ^ sequence;
     auto ready =
         server_ ? channel.SendMarker(marker, options_.timeout_ms) : channel.ExpectMarker(marker, options_.timeout_ms);
@@ -427,6 +556,11 @@ std::expected<void, ToolError> JfrLimitSession::Transfer(ControlChannel& channel
         return ready;
     }
     seen_.fill(false);
+    const auto transfer_start = Clock::now();
+    const auto elapsed_ns = [&]() {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - transfer_start).count());
+    };
     if (!server_) {
         for (std::uint32_t i = 0; i < count; ++i) {
             auto payload = memory_.subspan(i * options_.bytes, options_.bytes);
@@ -443,23 +577,36 @@ std::expected<void, ToolError> JfrLimitSession::Transfer(ControlChannel& channel
                                          .buffer_lease = i + 1},
                             .sges = std::span(sges_).subspan(i, 1)};
         }
-        auto sent = sender_.Send(std::span(requests_).first(count), std::span(ids_).first(count), lane_);
-        if (!sent) {
-            stats_.accepted_known = sent.error().accepted.has_value();
-            if (sent.error().accepted) {
-                stats_.accepted += *sent.error().accepted;
+        const auto batch = active_round ? 1U : count;
+        for (std::uint32_t first = 0; first < count; first += batch) {
+            auto sent =
+                sender_.Send(std::span(requests_).subspan(first, batch), std::span(ids_).subspan(first, batch), lane_);
+            if (!sent) {
+                stats_.accepted_known = sent.error().accepted.has_value();
+                if (sent.error().accepted) {
+                    stats_.accepted += *sent.error().accepted;
+                }
+                return Error("submit async SEND batch; retain accepted dependencies", sent.error().provider_status);
             }
-            return Error("submit async SEND batch; retain accepted dependencies", sent.error().provider_status);
+            stats_.accepted += *sent;
+            if (active_round) {
+                active_round->last_post_ns = elapsed_ns();
+                if (first + 1 < count && options_.send_interval_us) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(options_.send_interval_us));
+                }
+            }
         }
-        stats_.accepted += *sent;
     }
     std::uint32_t completed = 0;
-    const auto deadline = Clock::now() + std::chrono::milliseconds(options_.timeout_ms);
+    const auto deadline = transfer_start + std::chrono::milliseconds(options_.timeout_ms);
     std::array<raw::RxBufferEvent, raw::RxBufferPool::kPollBatch> rx_events{};
     std::array<raw::TxCompletionEvent, raw::TxCompletionProcessor::kMaxPollBatch> tx_events{};
     while (completed < count) {
         if (server_) {
-            auto async = CollectEvents(phase, round_events);
+            const bool before_rearm = active_round && !active_round->active_rearm_attempted;
+            auto async = before_rearm ? CollectEvents(JfrLimitPhase::kActiveBeforeRearm,
+                                                      &active_round->active_before_rearm_events)
+                                      : CollectEvents(phase, round_events);
             if (!async) {
                 return async;
             }
@@ -467,29 +614,75 @@ std::expected<void, ToolError> JfrLimitSession::Transfer(ControlChannel& channel
             if (!polled) {
                 return Error("poll async RX", polled.error().provider_error);
             }
+            std::optional<ToolError> first_error;
+            const auto remember_error = [&](const ToolError& error) {
+                if (!first_error) {
+                    first_error = error;
+                }
+            };
+            // RX 池已消费整批 CQE 并交出 lease；首条 payload 错误不能遗失同批后续 lease。
             for (std::size_t i = 0; i < *polled; ++i) {
                 auto& event = rx_events[i];
-                if (event.error || !event.lease || event.payload.size() != options_.bytes ||
-                    event.completion.remote_id.id != peer_.id ||
-                    std::memcmp(event.completion.remote_id.eid.raw, peer_.eid.raw, 16) ||
-                    Get(event.payload, 0) != kMagic) {
-                    return Error("invalid async RX completion/payload", EPROTO);
+                const auto validate = [&]() -> std::expected<std::uint32_t, ToolError> {
+                    if (event.error || !event.lease || event.payload.size() != options_.bytes ||
+                        event.completion.remote_id.id != peer_.id ||
+                        std::memcmp(event.completion.remote_id.eid.raw, peer_.eid.raw, 16) ||
+                        Get(event.payload, 0) != kMagic) {
+                        return Error("invalid async RX completion/payload", EPROTO);
+                    }
+                    const auto identity = Get(event.payload, 4);
+                    if (identity < sequence || identity - sequence >= count || seen_[identity - sequence]) {
+                        return Error("duplicate/foreign async RX identity", EPROTO);
+                    }
+                    for (std::size_t offset = 8; offset < event.payload.size(); ++offset) {
+                        if (event.payload[offset] != Pattern(identity, offset)) {
+                            return Error("corrupt async RX payload", EPROTO);
+                        }
+                    }
+                    return identity;
+                };
+                const auto identity = validate();
+                if (!identity) {
+                    remember_error(identity.error());
                 }
-                const auto identity = Get(event.payload, 4);
-                if (identity < sequence || identity - sequence >= count || seen_[identity - sequence]) {
-                    return Error("duplicate/foreign async RX identity", EPROTO);
-                }
-                for (std::size_t offset = 8; offset < event.payload.size(); ++offset) {
-                    if (event.payload[offset] != Pattern(identity, offset)) {
-                        return Error("corrupt async RX payload", EPROTO);
+                bool released = false;
+                if (event.lease) {
+                    const auto result = rx_.Release(*event.lease);
+                    if (!result) {
+                        remember_error({"release async RX lease", result.error().provider_error});
+                    } else {
+                        released = true;
+                        ++stats_.rx_leases_released;
                     }
                 }
-                if (auto released = rx_.Release(*event.lease); !released) {
-                    return Error("release async RX lease", released.error().provider_error);
+                if (!identity || !released) {
+                    continue;
                 }
-                seen_[identity - sequence] = true;
+                seen_[*identity - sequence] = true;
                 ++stats_.received;
                 ++completed;
+                if (active_round) {
+                    active_round->last_rx_ns = elapsed_ns();
+                    if (!active_round->first_rx_ns) {
+                        active_round->first_rx_ns = active_round->last_rx_ns;
+                    }
+                    if (active_round->active_rearm_attempted) {
+                        ++active_round->active_received_after_rearm;
+                    } else {
+                        ++active_round->active_received_before_rearm;
+                    }
+                }
+            }
+            if (first_error) {
+                return std::unexpected(*first_error);
+            }
+            if (active_round && completed && !active_round->active_rearm_attempted) {
+                active_round->rearm_begin_ns = elapsed_ns();
+                const auto rearmed = RearmDuringTraffic(*active_round);
+                active_round->rearm_end_ns = elapsed_ns();
+                if (!rearmed) {
+                    return rearmed;
+                }
             }
         } else {
             auto polled = processor_.Poll(tx_events);
@@ -537,7 +730,11 @@ std::expected<void, ToolError> JfrLimitSession::Transfer(ControlChannel& channel
         std::this_thread::yield();
     }
     // 只有双方真实 TX/RX CQE 与 payload 校验均完成，才允许复用本轮槽位和推进下一轮。
-    return Barrier(channel, kDone ^ sequence, options_.timeout_ms);
+    auto done = Barrier(channel, kDone ^ sequence, options_.timeout_ms);
+    if (done && active_round) {
+        active_round->active_window_completed = true;
+    }
+    return done;
 }
 
 std::expected<void, ToolError> JfrLimitSession::ReportCrossing(ControlChannel& channel, std::uint32_t index) {
@@ -585,42 +782,48 @@ std::expected<void, ToolError> JfrLimitSession::Run(ControlChannel& channel) {
             round.accepted = stats_.accepted - accepted_before;
             round.retired = stats_.retired - retired_before;
         });
-        if (server_) {
-            if (auto filled = Refill(); !filled) {
-                return filled;
+        const auto phase = index ? JfrLimitPhase::kRepeatCrossing : JfrLimitPhase::kFirstCrossing;
+        if (index && options_.traffic == JfrLimitTraffic::kConcurrent) {
+            if (auto concurrent = ConcurrentCrossing(channel, sequence, round); !concurrent) {
+                return concurrent;
             }
-            if (index) {
-                if (auto observed = Observe(JfrLimitPhase::kRefillControl, &round.refill_events); !observed) {
-                    return observed;
-                }
-            }
-        }
-        if (index) {
-            // 每次跨线后用新身份流量确认补投仍可接收，再补满并执行指定阈值操作。
-            if (auto transfer = Transfer(channel, sequence, 1, JfrLimitPhase::kRefillControl, &round.refill_events);
-                !transfer) {
-                return transfer;
-            }
-            ++sequence;
+        } else {
             if (server_) {
                 if (auto filled = Refill(); !filled) {
                     return filled;
                 }
-                if (auto observed = Observe(JfrLimitPhase::kRefillControl, &round.refill_events); !observed) {
-                    return observed;
+                if (index) {
+                    if (auto observed = Observe(JfrLimitPhase::kRefillControl, &round.refill_events); !observed) {
+                        return observed;
+                    }
                 }
             }
-        }
-        if (server_) {
-            if (auto prepared = PrepareCrossing(round, index == 0); !prepared) {
-                return prepared;
+            if (index) {
+                // 每次跨线后用新身份流量确认补投仍可接收，再补满并执行指定阈值操作。
+                if (auto transfer = Transfer(channel, sequence, 1, JfrLimitPhase::kRefillControl, &round.refill_events);
+                    !transfer) {
+                    return transfer;
+                }
+                ++sequence;
+                if (server_) {
+                    if (auto filled = Refill(); !filled) {
+                        return filled;
+                    }
+                    if (auto observed = Observe(JfrLimitPhase::kRefillControl, &round.refill_events); !observed) {
+                        return observed;
+                    }
+                }
             }
+            if (server_) {
+                if (auto prepared = PrepareCrossing(round, index == 0); !prepared) {
+                    return prepared;
+                }
+            }
+            if (auto transfer = Transfer(channel, sequence, crossing, phase, &round.crossing_events); !transfer) {
+                return transfer;
+            }
+            sequence += crossing;
         }
-        const auto phase = index ? JfrLimitPhase::kRepeatCrossing : JfrLimitPhase::kFirstCrossing;
-        if (auto transfer = Transfer(channel, sequence, crossing, phase, &round.crossing_events); !transfer) {
-            return transfer;
-        }
-        sequence += crossing;
         if (server_) {
             if (auto observed = Observe(phase, &round.crossing_events); !observed) {
                 return observed;
@@ -671,6 +874,11 @@ std::expected<void, ToolError> JfrLimitSession::Run(ControlChannel& channel) {
         if (rx_.posted() || rx_.held()) {
             return Error("RX ownership unresolved after cleanup", EBUSY);
         }
+    }
+    const auto expected = ExpectedJfrLimitTraffic(options_);
+    if ((server_ && (stats_.received != expected || stats_.posted != expected)) ||
+        (!server_ && (!stats_.accepted_known || stats_.accepted != expected || stats_.retired != expected))) {
+        return Error("async traffic totals differ from planned experiment", EPROTO);
     }
     if (auto stopped = Barrier(channel, kQuiescent, options_.timeout_ms); !stopped) {
         return stopped;

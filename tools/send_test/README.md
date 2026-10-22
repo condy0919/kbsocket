@@ -34,13 +34,51 @@ bazel build //tools/send_test:send_test
   --bytes=4096 --messages=1024 --batch=32 --timeout_ms=60000
 ```
 
-两端必须具有相同的 bytes/messages/batch；设备名、EID 索引、库路径和超时可不同。角色互换后再运行一次，可验证相反方向。TCP 端口仅用于一次测试连接，不实现认证或正式建链服务。
+两端必须具有相同的 bytes/messages/batch/sges/header_bytes/send_imm；设备名、EID 索引、库路径和超时可不同。角色互换后再运行一次，可验证相反方向。控制协议已升级为 v2，两端均须使用本次版本的工具；默认仍使用单 SGE 的普通 SEND。TCP 端口仅用于一次测试连接，不实现认证或正式建链服务。
+
+## 多 SGE：分散 header 与 payload
+
+每条 WR 可以包含 1–8 个源 SGE，还须不超过设备 `max_jfs_sge`。`--sges=2` 时第一段为 header，第二段为 payload；更多 SGE 时，header 后的剩余数据尽量均匀分配给其余段。每段使用独立分配、独立注册的 MR，单条消息的各段没有连续地址假设。发送端直接按整条报文中的偏移填充每段，不先复制合并成连续 TX buffer。
+
+`--bytes` 是所有 SGE 的总长度，仍不得超过 4096。header 是用于验证的报文前缀，前 8 字节携带序号，其余字节与序号、全局偏移关联；它尚未定义生产连接协议或分片格式。每条 WR 的每段数据前后都有 32 字节 guard，guard 不参与发送。收到 TX 完成后验证 guard，接收端按一个连续 RX buffer 验证拼接顺序、长度、来源端点、序号和数据。使用 `--send_imm` 时，还验证带非零高 32 位的 64 位 IMM 与报文序号一致。
+
+以下是一组完整双端命令；两个设备需要支持至少两个发送 SGE：
+
+```sh
+# 接收端
+./bazel-bin/tools/send_test/send_test \
+  --server --address=0.0.0.0 --port=18515 \
+  --device=RAW_DEVICE_A --eid_index=0 \
+  --bytes=4096 --messages=1001 --batch=64 \
+  --sges=2 --header_bytes=32 --send_imm --timeout_ms=60000
+
+# 发送端：192.0.2.10 替换为接收端 TCP 地址
+./bazel-bin/tools/send_test/send_test \
+  --address=192.0.2.10 --port=18515 \
+  --device=RAW_DEVICE_B --eid_index=0 \
+  --bytes=4096 --messages=1001 --batch=64 \
+  --sges=2 --header_bytes=32 --send_imm --timeout_ms=60000
+```
+
+保持双端参数一致，依次替换下列组合；超过设备 SGE 能力时显式拒绝，不自动降级：
+
+| 场景 | bytes | sges | header_bytes | batch | messages | send_imm |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 小消息、两段拼接 | 64 | 2 | 32 | 64 | 1001 | 开启 |
+| 4 KiB 边界、两段拼接 | 4096 | 2 | 32 | 64 | 1001 | 开启 |
+| 不等长、不对齐分段 | 4096 | 3 | 33 | 128 | 1001 | 开启 |
+| 更多独立注册段 | 4096 | 8 | 32 | 256 | 1001 | 开启 |
+
+关闭 `--send_imm` 可对照普通 SEND。两端都输出 PASS，发送端 `accepted=retired=messages`、`accepted_known=true`、`guarded_segments=messages*sges`，接收端 `received=messages` 才算对应组合通过。发送端 guarded_segments 只统计 TX 源段的保护区；接收端沿用 RxBufferPool 的 4 KiB 槽位，验证收到的长度和整个 payload。上述新增组合目前仅通过无硬件测试，待真机观测，不计入历史单 SGE 的通过记录。
 
 ## 参数与判定
 
 - `bytes`：每条 WR 的 payload 长度，范围 8–4096 字节，还必须不超过设备 max_msg_size。当前不实现大消息分片；前 8 字节是消息序号，其余内容由序号和偏移确定。
 - `messages`：总消息数，必须大于 0，可超过队列深度。默认 1024。
 - `batch`：每轮最多 1–256 条，默认 32。工具将 TX/RX 深度设为 batch，TX CQ 深度设为 batch+1，RX CQ 深度设为 batch，避免依赖宿主的默认深度 flags。
+- `sges`：每条 WR 的独立源段数，1–8，默认 1；不改变接收端每条 WR 使用一个 RX buffer 的方式。
+- `header_bytes`：多 SGE 模式第一段的长度，默认 32，至少为 8；其余每段至少保留 1 字节。单 SGE 时不参与布局，但仍要求双端配置一致。
+- `send_imm`：默认关闭；开启时使用 SEND_WITH_IMM，校验完整 64 位 IMM，不改变 payload 长度。
 - `timeout_ms`：每个 TCP 控制操作和每轮完成等待的超时，范围 1–3600000 毫秒。服务端等待客户端连接也使用此超时。
 
 每轮接收端先投递 RQ，发出 READY；发送端收到后提交 SEND。RxBufferPool 校验 CQE 的方向、队列和身份后交出 lease；接收端校验长度、消息序号、重复消息及所有数据字节后归还，允许批内接收顺序不同。发送端等待所有 TX attempt 退休，并收到对端校验 ACK，才复用 buffer 进入下一轮。
@@ -59,7 +97,7 @@ bazel build //tools/send_test:send_test
 
 ## 资源与失败语义
 
-本工具使用非 inline、全 signal、无 token 验证的普通 SEND，注册权限与 UMQ 一致，为 READ | WRITE | ATOMIC，不交换远端内存地址。注册地址和长度按系统页大小对齐，实际 SEND 长度仍由 bytes 指定。正常退出顺序为：数据路径排空、关闭发送器/账本、解除远端导入、关闭 RX buffer 池并注销接收内存、销毁 jetty/JFR/JFC、注销发送内存、关闭 runtime、卸载库。接收端与发送端分别分配所需内存，不重复注册两份 buffer。
+本工具使用非 inline、全 signal、无 token 验证的 SEND 或 SEND_WITH_IMM，注册权限与 UMQ 一致，为 READ | WRITE | ATOMIC，不交换远端内存地址。每个源段的注册地址和长度按系统页大小对齐，实际 SEND 总长度仍由 bytes 指定。正常退出顺序为：数据路径排空、关闭发送器/账本、解除远端导入、关闭 RX buffer 池并注销接收内存、销毁 jetty/JFR/JFC、逐个注销发送 MR、关闭 runtime、卸载库。接收端与发送端分别分配所需内存；默认单 SGE 仅注册一份发送内存。
 
 超时、post 部分成功、错误或边界 CQE 都导致测试失败；不重放、不自动恢复。若无法证明全部 DMA 已结束，Close 会拒绝清理；入口以 NoDestructor 保持会话和 buffer 到进程退出，交由进程/驱动回收，不能在这条路径上先 free buffer 或 Uninit/Unload。初始化中途失败也可能保留已创建对象至进程退出。报错中的 code 来自对应阶段的 errno、URMA 状态或内部错误枚举。
 
@@ -71,7 +109,7 @@ bazel build //tools/send_test:send_test
 bazel test //tools/send_test:send_test_test
 ```
 
-使用 gMock 替代 URMA 调用，使用真实 socketpair 检查控制协议。覆盖线格式、版本/参数拒绝、超时/EOF、数据损坏、发送端多批次、接收完成乱序和清理失败重试。这些测试不依赖本机 liburma.so，但不等价于真实设备验证。
+使用 gMock 替代 URMA 调用，使用真实 socketpair 检查控制协议。覆盖线格式、版本/参数/能力拒绝、超时/EOF、数据损坏、多个注册段的拼接与 IMM、TX guard 破坏、接收来源/IMM 失配、接收完成乱序、部分接受/未知接受边界保留 MR，以及清理失败重试。这些测试不依赖本机 liburma.so，但不等价于真实设备验证。
 
 ## 注册失败诊断
 

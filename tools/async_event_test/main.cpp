@@ -27,6 +27,9 @@ DEFINE_uint32(threshold, 64, "JFR low waterline; this experiment supports only t
 DEFINE_uint32(bytes, 4096, "SEND payload bytes, 32..4096");
 DEFINE_uint32(crossings, 2, "Number of waterline crossings, 2..1000");
 DEFINE_string(rearm, "none", "Before later crossings: none, rewrite (64), or toggle (0 then 64)");
+DEFINE_string(traffic, "staged", "Waterline traffic: staged or concurrent (requires rearm=rewrite)");
+DEFINE_string(rearm_at, "above", "Concurrent threshold rewrite with occupancy bounded above or below 64");
+DEFINE_uint32(send_interval_us, 100, "Concurrent window interval between 32 individual SEND posts, 0..10000 us");
 DEFINE_uint32(observe_ms, 100, "Per-phase async observation window, 1..1000 ms");
 DEFINE_uint32(timeout_ms, 10000, "Per control/traffic timeout; greater than twice observe_ms");
 DEFINE_uint32(watchdog_ms, 0, "Entire worker deadline; 0 derives a budget from crossings and observation windows");
@@ -58,13 +61,33 @@ std::expected<WorkerOptions, kbsocket::tools::ToolError> Options() {
     } else {
         return std::unexpected(kbsocket::tools::ToolError{"rearm must be none, rewrite or toggle", EINVAL});
     }
+    using kbsocket::tools::JfrLimitRearmAt;
+    using kbsocket::tools::JfrLimitTraffic;
+    if (FLAGS_traffic == "staged") {
+        options.traffic = JfrLimitTraffic::kStaged;
+    } else if (FLAGS_traffic == "concurrent") {
+        options.traffic = JfrLimitTraffic::kConcurrent;
+    } else {
+        return std::unexpected(kbsocket::tools::ToolError{"traffic must be staged or concurrent", EINVAL});
+    }
+    if (FLAGS_rearm_at == "above") {
+        options.rearm_at = JfrLimitRearmAt::kAbove;
+    } else if (FLAGS_rearm_at == "below") {
+        options.rearm_at = JfrLimitRearmAt::kBelow;
+    } else {
+        return std::unexpected(kbsocket::tools::ToolError{"rearm_at must be above or below", EINVAL});
+    }
+    options.send_interval_us = FLAGS_send_interval_us;
     if (auto valid = kbsocket::tools::ValidateJfrLimitOptions(options); !valid) {
         return std::unexpected(valid.error());
     }
     // 多轮会累积观察窗口；默认预算随轮数增长，避免合法实验被固定 60 秒上限截断。
     // 它不是每个操作都用满 timeout 的总和；显式值仍允许现场缩短整个实验的截止时间。
-    const auto automatic =
-        std::max<std::uint64_t>(60000, 4ULL * options.timeout_ms + (6ULL * options.crossings + 8) * options.observe_ms);
+    const auto paced_ms = options.traffic == JfrLimitTraffic::kConcurrent
+                              ? (32ULL * options.send_interval_us * (options.crossings - 1) + 999) / 1000
+                              : 0;
+    const auto automatic = std::max<std::uint64_t>(
+        60000, 4ULL * options.timeout_ms + (6ULL * options.crossings + 8) * options.observe_ms + paced_ms);
     const std::uint64_t watchdog = FLAGS_watchdog_ms ? FLAGS_watchdog_ms : automatic;
     if (watchdog <= options.timeout_ms || watchdog > 3600000) {
         return std::unexpected(kbsocket::tools::ToolError{
@@ -89,10 +112,11 @@ void PrintSnapshot(std::size_t crossing, const char* point, const kbsocket::tool
                  snapshot.depth, snapshot.threshold);
 }
 void PrintStats(const kbsocket::tools::JfrLimitStats& stats, const kbsocket::tools::JfrLimitOptions& options) {
-    const auto expected = static_cast<std::uint64_t>(options.crossings) * (options.rx_depth - options.threshold + 1) +
-                          options.crossings - 1 + options.threshold - 1;
-    std::println("Waterline traffic: posted={} received={} accepted={} accepted_known={} retired={} expected={}",
-                 stats.posted, stats.received, stats.accepted, stats.accepted_known, stats.retired, expected);
+    const auto expected = kbsocket::tools::ExpectedJfrLimitTraffic(options);
+    std::println("Waterline traffic: posted={} received={} accepted={} accepted_known={} retired={} expected={} "
+                 "rx_leases_released={}",
+                 stats.posted, stats.received, stats.accepted, stats.accepted_known, stats.retired, expected,
+                 stats.rx_leases_released);
     if (FLAGS_server) {
         std::println("Waterline configuration: requested_depth={} requested_threshold={} queried_depth={} "
                      "queried_threshold={} threshold_disabled={}",
@@ -117,6 +141,36 @@ void PrintStats(const kbsocket::tools::JfrLimitStats& stats, const kbsocket::too
         std::println("{}: crossing={} rearm={} completed={} posted={} received={} accepted={} retired={}", outcome,
                      i + 1, i ? kbsocket::tools::JfrLimitRearmName(options.rearm) : "initial", round.crossing_completed,
                      round.posted, round.received, round.accepted, round.retired);
+        if (i && options.traffic == kbsocket::tools::JfrLimitTraffic::kConcurrent) {
+            std::println("Active window crossing={}: completed={} traffic=concurrent rearm_at={} sends=32 "
+                         "send_interval_us={}",
+                         i + 1, round.active_window_completed, kbsocket::tools::JfrLimitRearmAtName(options.rearm_at),
+                         options.send_interval_us);
+            if (!FLAGS_server) {
+                std::println("Active sender crossing={}: last_post_ns={}", i + 1, round.last_post_ns);
+            }
+            if (FLAGS_server) {
+                const bool straddled = round.active_received_before_rearm && round.active_received_after_rearm;
+                std::println("{}: crossing={} RX completion consumption before/after rewrite; "
+                             "before={} after={} software_posted_before={} software_posted_after={} "
+                             "attempted={} succeeded={} first_rx_ns={} rearm_begin_ns={} "
+                             "rearm_end_ns={} last_rx_ns={}; hardware_overlap=UNPROVEN",
+                             straddled ? "OBSERVED" : "NOT_OBSERVED", i + 1, round.active_received_before_rearm,
+                             round.active_received_after_rearm, round.software_posted_before_rearm,
+                             round.software_posted_after_rearm, round.active_rearm_attempted,
+                             round.active_rearm_succeeded, round.first_rx_ns, round.rearm_begin_ns, round.rearm_end_ns,
+                             round.last_rx_ns);
+                const char* outcome = !round.active_window_completed           ? "INCOMPLETE"
+                                      : round.active_rearm_events.limit_events ? "OBSERVED"
+                                                                               : "NOT_OBSERVED";
+                std::println("{}: crossing={} JFR_LIMIT collected in active rearm window", outcome, i + 1);
+                PrintSnapshot(i + 1, "after_active", round.after_active);
+                std::print("Async crossing={} phase=active_before_rearm: ", i + 1);
+                PrintEventStats(round.active_before_rearm_events);
+                std::print("Async crossing={} phase=active_rearm: ", i + 1);
+                PrintEventStats(round.active_rearm_events);
+            }
+        }
         if (FLAGS_server) {
             PrintSnapshot(i + 1, "before_rearm", round.before_rearm);
             PrintSnapshot(i + 1, "disabled", round.disabled);
@@ -165,12 +219,14 @@ int RunWorker(void* argument) {
         return Fail(opened.error());
     }
     std::println("{} ready for shared-JFR waterline: device={} eid_index={} rx_depth={} threshold={} "
-                 "bytes={} observe_ms={} crossings={} rearm={} watchdog_ms={} jetty_id={} jfr_id={} async_fd={} "
+                 "bytes={} observe_ms={} crossings={} rearm={} traffic={} rearm_at={} send_interval_us={} "
+                 "watchdog_ms={} jetty_id={} jfr_id={} async_fd={} "
                  "control={}:{}",
                  FLAGS_server ? "Server" : "Client", FLAGS_device, FLAGS_eid_index, FLAGS_rx_depth, FLAGS_threshold,
                  FLAGS_bytes, FLAGS_observe_ms, options.crossings, kbsocket::tools::JfrLimitRearmName(options.rearm),
-                 settings.watchdog_ms, hardware->session.endpoint().id, hardware->session.jfr_id(), ctx->async_fd,
-                 FLAGS_address, FLAGS_port);
+                 kbsocket::tools::JfrLimitTrafficName(options.traffic),
+                 kbsocket::tools::JfrLimitRearmAtName(options.rearm_at), options.send_interval_us, settings.watchdog_ms,
+                 hardware->session.endpoint().id, hardware->session.jfr_id(), ctx->async_fd, FLAGS_address, FLAGS_port);
     std::fflush(stdout);
     kbsocket::tools::ControlChannel channel;
     auto result =
@@ -204,7 +260,8 @@ int RunWorker(void* argument) {
     }
     std::println("PASS: first JFR_LIMIT observed and acknowledged; payload and refill validated; "
                  "remaining RX consumed after disabling threshold; both endpoints closed. "
-                 "Inspect every crossing result; PASS does not require repeated events.");
+                 "Inspect every crossing and active-window result; PASS does not require repeated events "
+                 "or establish hardware overlap.");
     return 0;
 }
 } // namespace

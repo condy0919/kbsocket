@@ -36,6 +36,7 @@ public:
                 (urma_context_t*, urma_seg_t*, urma_token_t*, std::uint64_t, urma_import_seg_flag_t));
     MOCK_METHOD(urma_target_jetty_t*, ImportJetty, (urma_context_t*, urma_rjetty_t*, urma_token_t*));
     MOCK_METHOD(urma_status_t, Post, (urma_jetty_t*, urma_jfs_wr_t*, urma_jfs_wr_t**));
+    MOCK_METHOD(urma_status_t, PostRecv, (urma_jfr_t*, urma_jfr_wr_t*, urma_jfr_wr_t**));
     MOCK_METHOD(int, Poll, (urma_jfc_t*, int, urma_cr_t*));
     MOCK_METHOD(urma_status_t, DeleteJetty, (urma_jetty_t*));
     MOCK_METHOD(urma_status_t, DeleteJfr, (urma_jfr_t*));
@@ -58,6 +59,10 @@ protected:
         kCorruptGuard,
         kUnknownAcceptance,
         kRejected,
+        kUnknownStatus,
+        kWrongRemote,
+        kWrongImmediate,
+        kBadReceivePayload,
     };
     struct Node {
         urma_context_t ctx{};
@@ -65,7 +70,7 @@ protected:
         urma_jfr_t jfr{};
         urma_jetty_t jetty{};
         urma_target_jetty_t target{};
-        urma_target_seg_t segment{}, imported{};
+        urma_target_seg_t segment{}, imported{}, rx_segment{};
         urma_seg_t exported{};
         std::size_t created_cqs = 0;
         std::size_t deleted_cqs = 0;
@@ -73,7 +78,13 @@ protected:
         bool exported_released = false;
         bool deleted_jetty = false;
         bool deleted_jfr = false;
-        std::deque<urma_cr_t> completions;
+        std::deque<urma_cr_t> completions, receive_completions;
+        struct Receive {
+            urma_sge_t sge;
+            std::uint64_t id;
+        };
+        std::deque<Receive> receives;
+        bool rx_live = false;
     };
     raw::UrmaFunctions MockedFunctions() {
         raw::UrmaFunctions functions;
@@ -92,6 +103,7 @@ protected:
             return current_->ImportJetty(ctx, cfg, token);
         };
         functions.post_jetty_send_wr = [](auto* jetty, auto* wr, auto** bad) { return current_->Post(jetty, wr, bad); };
+        functions.post_jfr_wr = [](auto* jfr, auto* wr, auto** bad) { return current_->PostRecv(jfr, wr, bad); };
         functions.poll_jfc = [](auto* cq, int count, auto* cr) { return current_->Poll(cq, count, cr); };
         functions.delete_jetty = [](auto* jetty) { return current_->DeleteJetty(jetty); };
         functions.delete_jfr = [](auto* jfr) { return current_->DeleteJfr(jfr); };
@@ -109,8 +121,8 @@ protected:
         cap_.trans_mode = URMA_TM_RM;
         cap_.rm_tp_cap.bs.ctp = 1;
         cap_.max_jetty = 1;
-        cap_.max_jfs_depth = cap_.max_jfr_depth = 1;
-        cap_.max_jfc_depth = 2;
+        cap_.max_jfs_depth = cap_.max_jfr_depth = 256;
+        cap_.max_jfc_depth = 257;
         cap_.max_msg_size = 4096;
         cap_.max_read_size = cap_.max_write_size = 8U * 1024 * 1024;
         cap_.max_jfs_sge = cap_.max_jfr_sge = cap_.max_jfs_rsge = 1;
@@ -139,6 +151,13 @@ protected:
         });
         EXPECT_CALL(*this, Register(_, _)).Times(AnyNumber()).WillRepeatedly([this](auto* ctx, auto* cfg) {
             auto& node = ByContext(ctx);
+            if (node.live_memory) {
+                node.rx_segment.urma_ctx = ctx;
+                node.rx_segment.seg.ubva.va = cfg->va;
+                node.rx_segment.seg.len = cfg->len;
+                node.rx_live = true;
+                return &node.rx_segment;
+            }
             node.segment.urma_ctx = ctx;
             node.segment.seg.ubva = {.eid = ctx->eid, .uasid = 1, .va = cfg->va};
             node.segment.seg.len = cfg->len;
@@ -183,73 +202,145 @@ protected:
             EXPECT_EQ(cfg->jetty_id.id, nodes_[0].jetty.jetty_id.id);
             return &ByContext(ctx).target;
         });
-        ON_CALL(*this, Post(_, _, _)).WillByDefault([this](auto* jetty, auto* wr, auto** bad) {
+        ON_CALL(*this, Post(_, _, _)).WillByDefault([this](auto* jetty, auto* first, auto** bad) {
             std::lock_guard lock(mutex_);
             EXPECT_TRUE(nodes_[0].live_memory);
             EXPECT_TRUE(nodes_[1].live_memory);
-            EXPECT_EQ(wr->next, nullptr);
-            EXPECT_EQ(wr->rw.src.num_sge, 1U);
-            EXPECT_EQ(wr->rw.dst.num_sge, 1U);
-            EXPECT_EQ(wr->rw.src.sge[0].len, options_.bytes);
-            EXPECT_EQ(wr->rw.dst.sge[0].len, options_.bytes);
-            EXPECT_EQ(wr->opcode, options_.operation == RmaOperation::kRead ? URMA_OPC_READ : URMA_OPC_WRITE);
             if (fault_ == Fault::kUnknownAcceptance || fault_ == Fault::kRejected) {
-                *bad = fault_ == Fault::kRejected ? wr : nullptr;
+                *bad = fault_ == Fault::kRejected ? first : nullptr;
                 return URMA_EINVAL;
             }
-            auto* source = reinterpret_cast<std::byte*>(wr->rw.src.sge[0].addr);
-            auto* destination = reinterpret_cast<std::byte*>(wr->rw.dst.sge[0].addr);
-            // 地址正确还不够：READ/WRITE 两侧必须使用各自 context 的本地或 imported tseg。
-            const bool read = options_.operation == RmaOperation::kRead;
-            EXPECT_EQ(wr->rw.src.sge[0].tseg, read ? &nodes_[1].imported : &nodes_[1].segment);
-            EXPECT_EQ(wr->rw.dst.sge[0].tseg, read ? &nodes_[1].segment : &nodes_[1].imported);
-            EXPECT_EQ(wr->rw.src.sge[0].addr,
-                      (read ? nodes_[0].segment.seg.ubva.va : nodes_[1].segment.seg.ubva.va) + 64);
-            EXPECT_EQ(wr->rw.dst.sge[0].addr,
-                      (read ? nodes_[1].segment.seg.ubva.va : nodes_[0].segment.seg.ubva.va) + 64);
-            std::memcpy(destination, source, options_.bytes);
-            delayed_source_ = source;
-            delayed_destination_ = destination;
-            std::copy_n(source, delayed_snapshot_.size(), delayed_snapshot_.begin());
-            pending_delay_polls_ = delay_polls_;
-            if (fault_ == Fault::kCorruptPayload) {
-                destination[0] ^= std::byte{1};
+            std::uint32_t index = 0;
+            for (auto* wr = first; wr; wr = wr->next, ++index) {
+                if (partial_prefix_ >= 0 && index == static_cast<std::uint32_t>(partial_prefix_)) {
+                    *bad = wr;
+                    return URMA_ENOMEM;
+                }
+                const auto slot = index / (options_.mixed_send ? 2 : 1);
+                const bool send = options_.mixed_send && index % 2 == 1;
+                if (send) {
+                    EXPECT_EQ(wr->opcode, URMA_OPC_SEND_IMM);
+                    EXPECT_EQ(wr->send.src.num_sge, 1U);
+                    EXPECT_EQ(wr->send.src.sge[0].len, kRmaSendBytes);
+                    EXPECT_EQ(wr->send.src.sge[0].tseg, &nodes_[1].segment);
+                    auto& server = nodes_[0];
+                    if (server.receives.empty()) {
+                        ADD_FAILURE() << "SEND requires a posted RX before the ready barrier";
+                        *bad = wr;
+                        return URMA_EINVAL;
+                    }
+                    const auto receive = server.receives.front();
+                    server.receives.pop_front();
+                    auto* payload = reinterpret_cast<std::byte*>(receive.sge.addr);
+                    std::memcpy(payload, reinterpret_cast<void*>(wr->send.src.sge[0].addr), kRmaSendBytes);
+                    urma_cr_t rx{};
+                    rx.flag.bs.s_r = 1;
+                    rx.local_id = server.jfr.jfr_id.id;
+                    rx.remote_id = jetty->jetty_id;
+                    rx.user_ctx = receive.id;
+                    rx.opcode = URMA_CR_OPC_SEND_WITH_IMM;
+                    rx.completion_len = kRmaSendBytes;
+                    rx.imm_data = wr->send.imm_data;
+                    if (fault_ == Fault::kWrongRemote) {
+                        ++rx.remote_id.id;
+                    } else if (fault_ == Fault::kWrongImmediate) {
+                        ++rx.imm_data;
+                    } else if (fault_ == Fault::kBadReceivePayload) {
+                        payload[0] ^= std::byte{1};
+                    }
+                    if (reverse_cq_) {
+                        server.receive_completions.push_front(rx);
+                    } else {
+                        server.receive_completions.push_back(rx);
+                    }
+                } else {
+                    EXPECT_EQ(wr->rw.src.num_sge, 1U);
+                    EXPECT_EQ(wr->rw.dst.num_sge, 1U);
+                    EXPECT_EQ(wr->rw.src.sge[0].len, options_.bytes);
+                    EXPECT_EQ(wr->rw.dst.sge[0].len, options_.bytes);
+                    const bool read = options_.operation == RmaOperation::kRead;
+                    EXPECT_EQ(wr->opcode, read ? URMA_OPC_READ : URMA_OPC_WRITE);
+                    auto* source = reinterpret_cast<std::byte*>(wr->rw.src.sge[0].addr);
+                    auto* destination = reinterpret_cast<std::byte*>(wr->rw.dst.sge[0].addr);
+                    // 地址、长度和 tseg 都按独立槽核验，避免并发 WR 无意覆盖同一块内存。
+                    EXPECT_EQ(wr->rw.src.sge[0].tseg, read ? &nodes_[1].imported : &nodes_[1].segment);
+                    EXPECT_EQ(wr->rw.dst.sge[0].tseg, read ? &nodes_[1].segment : &nodes_[1].imported);
+                    EXPECT_EQ(wr->rw.src.sge[0].addr,
+                              (read ? nodes_[0].segment.seg.ubva.va : nodes_[1].segment.seg.ubva.va) + 64 +
+                                  slot * RmaSlotStride(options_));
+                    EXPECT_EQ(wr->rw.dst.sge[0].addr,
+                              (read ? nodes_[1].segment.seg.ubva.va : nodes_[0].segment.seg.ubva.va) + 64 +
+                                  slot * RmaSlotStride(options_));
+                    std::memcpy(destination, source, options_.bytes);
+                    delayed_source_ = source;
+                    delayed_destination_ = destination;
+                    std::copy_n(source, delayed_snapshot_.size(), delayed_snapshot_.begin());
+                    pending_delay_polls_ = delay_polls_;
+                    if (index == fault_index_ && fault_ == Fault::kCorruptPayload) {
+                        destination[0] ^= std::byte{1};
+                    }
+                    if (index == fault_index_ && fault_ == Fault::kCorruptGuard) {
+                        destination[-1] ^= std::byte{1};
+                    }
+                }
+                urma_cr_t cr{};
+                cr.status = URMA_CR_SUCCESS;
+                cr.flag.bs.jetty = 1;
+                cr.user_ctx = wr->user_ctx;
+                cr.local_id = jetty->jetty_id.id;
+                if (index == fault_index_) {
+                    if (fault_ == Fault::kWrongId) {
+                        ++cr.local_id;
+                    } else if (fault_ == Fault::kWrongUserContext) {
+                        cr.user_ctx += options_.window * 2;
+                    } else if (fault_ == Fault::kReceiveCompletion) {
+                        cr.flag.bs.s_r = 1;
+                    } else if (fault_ == Fault::kPseudoCompletion) {
+                        cr.status = URMA_CR_WR_FLUSH_ERR_DONE;
+                        cr.user_ctx = 0xffffffffffffffffULL;
+                    } else if (fault_ == Fault::kRnrCompletion) {
+                        cr.status = URMA_CR_RNR_RETRY_CNT_EXC_ERR;
+                    } else if (fault_ == Fault::kUnknownStatus) {
+                        cr.status = static_cast<urma_cr_status_t>(255);
+                    }
+                }
+                auto& node = ByContext(jetty->urma_ctx);
+                if (fault_ != Fault::kMissingCompletion || index != fault_index_) {
+                    if (reverse_cq_) {
+                        node.completions.push_front(cr);
+                    } else {
+                        node.completions.push_back(cr);
+                    }
+                }
+                if (fault_ == Fault::kDuplicateCompletion && index == fault_index_) {
+                    node.completions.push_back(cr);
+                }
             }
-            if (fault_ == Fault::kCorruptGuard) {
-                destination[-1] ^= std::byte{1};
-            }
-            urma_cr_t cr{};
-            cr.status = URMA_CR_SUCCESS;
-            cr.flag.bs.jetty = 1;
-            cr.user_ctx = wr->user_ctx;
-            cr.local_id = jetty->jetty_id.id;
-            if (fault_ == Fault::kWrongId) {
-                ++cr.local_id;
-            } else if (fault_ == Fault::kWrongUserContext) {
-                ++cr.user_ctx;
-            } else if (fault_ == Fault::kReceiveCompletion) {
-                cr.flag.bs.s_r = 1;
-            } else if (fault_ == Fault::kPseudoCompletion) {
-                cr.status = URMA_CR_WR_FLUSH_ERR_DONE;
-                cr.user_ctx = 0xffffffffffffffffULL;
-            } else if (fault_ == Fault::kRnrCompletion) {
-                cr.status = URMA_CR_RNR_RETRY_CNT_EXC_ERR;
-            }
-            auto& node = ByContext(jetty->urma_ctx);
-            if (fault_ != Fault::kMissingCompletion) {
-                node.completions.push_back(cr);
-            }
-            if (fault_ == Fault::kDuplicateCompletion) {
-                node.completions.push_back(cr);
-            }
+            EXPECT_EQ(index, options_.window * (options_.mixed_send ? 2 : 1));
             *bad = nullptr;
             return URMA_SUCCESS;
         });
+        EXPECT_CALL(*this, PostRecv(_, _, _))
+            .Times(AnyNumber())
+            .WillRepeatedly([this](auto* jfr, auto* first, auto** bad) {
+                std::lock_guard lock(mutex_);
+                auto& node = ByContext(jfr->urma_ctx);
+                EXPECT_TRUE(node.receives.empty());
+                for (auto* wr = first; wr; wr = wr->next) {
+                    EXPECT_EQ(wr->src.num_sge, 1U);
+                    EXPECT_EQ(wr->src.sge[0].tseg, &node.rx_segment);
+                    node.receives.push_back({wr->src.sge[0], wr->user_ctx});
+                }
+                EXPECT_EQ(node.receives.size(), options_.window);
+                *bad = nullptr;
+                return URMA_SUCCESS;
+            });
         EXPECT_CALL(*this, Post(_, _, _)).Times(AnyNumber());
         EXPECT_CALL(*this, Poll(_, _, _)).Times(AnyNumber()).WillRepeatedly([this](auto* cq, int limit, auto* output) {
             std::lock_guard lock(mutex_);
             auto& node = ByContext(cq->urma_ctx);
-            if (!node.completions.empty() && pending_delay_polls_) {
+            auto& completions = cq == &node.cqs[0] ? node.completions : node.receive_completions;
+            if (!completions.empty() && pending_delay_polls_) {
                 // CQE 未交还前，双方都不能按下一轮 pattern 改写仍在使用的 buffer。
                 EXPECT_EQ(std::memcmp(delayed_source_, delayed_snapshot_.data(), delayed_snapshot_.size()), 0);
                 EXPECT_EQ(std::memcmp(delayed_destination_, delayed_snapshot_.data(), delayed_snapshot_.size()), 0);
@@ -258,9 +349,9 @@ protected:
                 return 0;
             }
             int count = 0;
-            while (!node.completions.empty() && count < limit) {
-                output[count++] = node.completions.front();
-                node.completions.pop_front();
+            while (!completions.empty() && count < limit) {
+                output[count++] = completions.front();
+                completions.pop_front();
             }
             return count;
         });
@@ -283,6 +374,13 @@ protected:
         });
         EXPECT_CALL(*this, Unregister(_)).Times(AnyNumber()).WillRepeatedly([this](auto* seg) {
             auto& node = ByContext(seg->urma_ctx);
+            if (seg == &node.rx_segment) {
+                EXPECT_TRUE(safe_to_close_);
+                EXPECT_TRUE(node.receives.empty());
+                EXPECT_TRUE(node.receive_completions.empty());
+                node.rx_live = false;
+                return URMA_SUCCESS;
+            }
             // 即便本地未 post，服务端 MR 也必须等双端静默，再等本地队列关闭后释放。
             EXPECT_TRUE(safe_to_close_);
             EXPECT_EQ(node.deleted_cqs, 2U);
@@ -327,6 +425,9 @@ protected:
     urma_device_cap_t cap_{};
     RmaOptions options_{.rounds = 3, .timeout_ms = 1000};
     Fault fault_ = Fault::kNone;
+    std::uint32_t fault_index_ = 0;
+    int partial_prefix_ = -1;
+    bool reverse_cq_ = false;
     std::mutex mutex_;
     std::array<std::byte, 64> delayed_snapshot_{};
     const std::byte* delayed_source_ = nullptr;
@@ -400,6 +501,204 @@ TEST_F(RmaHardwareTest, DelayedCompletionKeepsBothBuffersUnchangedUntilTerminalP
     EXPECT_EQ(delay_checks_, options_.rounds * delay_polls_);
     ASSERT_TRUE(client_->Close());
     ASSERT_TRUE(server_->Close());
+}
+
+class RmaWindowTest : public RmaHardwareTest, public ::testing::WithParamInterface<std::pair<std::uint32_t, bool>> {};
+
+TEST_P(RmaWindowTest, IndependentSlotsAllowReversedReadAndMixedSendCompletions) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.window = GetParam().first;
+    options_.mixed_send = GetParam().second;
+    options_.bytes = 16384;
+    options_.timeout_ms = 5000;
+    reverse_cq_ = true;
+    OpenPair();
+    // CQE 与提交顺序相反，最大窗口还跨多个 poll 批次；所有槽必须按 identity 恰好退休一次。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(options_.rounds).WillRepeatedly(::testing::DoDefault());
+    RunPair();
+    ASSERT_TRUE(client_result_) << client_result_.error().operation;
+    ASSERT_TRUE(server_result_) << server_result_.error().operation;
+    const auto rma_count = options_.window * options_.rounds;
+    const auto send_count = options_.mixed_send ? rma_count : 0;
+    EXPECT_EQ(client_->stats().accepted, rma_count + send_count);
+    EXPECT_EQ(client_->stats().retired, rma_count + send_count);
+    EXPECT_EQ(client_->stats().verified, rma_count);
+    EXPECT_EQ(server_->stats().verified, rma_count);
+    EXPECT_EQ(client_->stats().send_accepted, send_count);
+    EXPECT_EQ(client_->stats().send_retired, send_count);
+    EXPECT_EQ(server_->stats().send_received, send_count);
+    EXPECT_TRUE(client_->stats().accepted_known);
+    EXPECT_FALSE(client_->stats().pending);
+    ASSERT_TRUE(client_->Close());
+    ASSERT_TRUE(server_->Close());
+    EXPECT_FALSE(nodes_[0].rx_live);
+}
+
+INSTANTIATE_TEST_SUITE_P(Windows, RmaWindowTest,
+                         ::testing::Values(std::pair{2U, false}, std::pair{128U, false}, std::pair{1U, true},
+                                           std::pair{4U, true}, std::pair{128U, true}));
+
+TEST_F(RmaHardwareTest, PartialMixedBatchRetiresOnlyAcceptedPrefixAndNeverReplays) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.window = 4;
+    options_.mixed_send = true;
+    options_.timeout_ms = 25;
+    partial_prefix_ = 3;
+    reverse_cq_ = true;
+    OpenPair();
+    // 接受 READ0/SEND0/READ1，拒绝 SEND1 及其后缀；不能把批次错误当成全部未接受。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(1).WillOnce(::testing::DoDefault());
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_FALSE(server_result_);
+    EXPECT_EQ(client_->stats().accepted, 3U);
+    EXPECT_EQ(client_->stats().retired, 3U);
+    EXPECT_EQ(client_->stats().send_accepted, 1U);
+    EXPECT_EQ(client_->stats().send_retired, 1U);
+    EXPECT_EQ(client_->stats().partial_batches, 1U);
+    EXPECT_TRUE(client_->stats().accepted_known);
+    EXPECT_FALSE(client_->stats().pending);
+    // 即使本地接受前缀都已完成，未达成双端静默、RX 仍在途，MR 仍必须保留。
+    ExpectRetained();
+}
+
+TEST_F(RmaHardwareTest, SuccessWithBadWrDoesNotClaimAnyKnownAcceptanceBoundary) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.window = 4;
+    options_.mixed_send = true;
+    options_.timeout_ms = 25;
+    OpenPair();
+    // status=SUCCESS 与非空 bad_wr 矛盾，不能把 bad_wr 位置当成可回收的后缀边界。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(1).WillOnce([](auto*, auto* wr, auto** bad) {
+        *bad = wr->next;
+        return URMA_SUCCESS;
+    });
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_FALSE(client_->stats().accepted_known);
+    EXPECT_TRUE(client_->stats().pending);
+    EXPECT_EQ(client_->stats().retired, 0U);
+    ExpectRetained();
+}
+
+TEST_F(RmaHardwareTest, ForeignBadWrIsNotDereferencedOrTreatedAsRejected) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.window = 4;
+    options_.timeout_ms = 25;
+    OpenPair();
+    urma_jfs_wr_t foreign{};
+    EXPECT_CALL(*this, Post(_, _, _)).Times(1).WillOnce([&](auto*, auto*, auto** bad) {
+        *bad = &foreign;
+        return URMA_ENOMEM;
+    });
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_FALSE(client_->stats().accepted_known);
+    EXPECT_TRUE(client_->stats().pending);
+    ExpectRetained();
+}
+
+TEST_F(RmaHardwareTest, ErrorCompletionDoesNotLoseOtherTerminalsInTheSamePollBatch) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.window = 32;
+    options_.timeout_ms = 25;
+    fault_ = Fault::kRnrCompletion;
+    OpenPair();
+    // 第一个 CQE 报错，后面 31 条已被 poll 消费的成功 CQE 仍应退休，整批随后失败且不复用内存。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(1).WillOnce(::testing::DoDefault());
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_EQ(client_->stats().accepted, 32U);
+    EXPECT_EQ(client_->stats().retired, 32U);
+    EXPECT_FALSE(client_->stats().pending);
+    EXPECT_EQ(client_->stats().verified, 0U);
+    ExpectRetained();
+}
+
+TEST_F(RmaHardwareTest, UnknownStatusDoesNotProveDmaCompletion) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.window = 4;
+    options_.timeout_ms = 25;
+    fault_ = Fault::kUnknownStatus;
+    OpenPair();
+    EXPECT_CALL(*this, Post(_, _, _)).Times(1).WillOnce(::testing::DoDefault());
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_EQ(client_->stats().accepted, 4U);
+    EXPECT_EQ(client_->stats().retired, 3U);
+    EXPECT_TRUE(client_->stats().pending);
+    ExpectRetained();
+}
+
+TEST_F(RmaHardwareTest, LaterSlotGuardCorruptionCannotHideBehindTheFirstSuccessfulSlot) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.window = 4;
+    options_.timeout_ms = 25;
+    fault_ = Fault::kCorruptGuard;
+    fault_index_ = 2;
+    OpenPair();
+    EXPECT_CALL(*this, Post(_, _, _)).Times(1).WillOnce(::testing::DoDefault());
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_EQ(client_->stats().retired, 4U);
+    ExpectRetained();
+}
+
+TEST_F(RmaHardwareTest, ConcurrentWindowKeepsLeasesUntilDelayedCompletionAndPeerVerification) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.window = 8;
+    delay_polls_ = 5;
+    OpenPair();
+    RunPair();
+    ASSERT_TRUE(client_result_);
+    ASSERT_TRUE(server_result_);
+    EXPECT_EQ(delay_checks_, options_.rounds * delay_polls_);
+    EXPECT_TRUE(client_->Close());
+    EXPECT_TRUE(server_->Close());
+}
+
+class MixedReceiveFailureTest : public RmaHardwareTest, public ::testing::WithParamInterface<int> {
+public:
+    static constexpr int kWrongRemote = static_cast<int>(Fault::kWrongRemote);
+    static constexpr int kWrongImmediate = static_cast<int>(Fault::kWrongImmediate);
+    static constexpr int kBadPayload = static_cast<int>(Fault::kBadReceivePayload);
+};
+
+TEST_P(MixedReceiveFailureTest, BadPeerOrImmediateOrPayloadPreventsRoundConfirmation) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.window = 4;
+    options_.mixed_send = true;
+    options_.timeout_ms = 25;
+    fault_ = static_cast<Fault>(GetParam());
+    OpenPair();
+    // 正常 TX CQE 不能掩盖远端收到的 SEND 身份/数据损坏，服务端不得确认下一轮。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(1).WillOnce(::testing::DoDefault());
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_FALSE(server_result_);
+    EXPECT_EQ(client_->stats().retired, 8U);
+    ExpectRetained();
+}
+INSTANTIATE_TEST_SUITE_P(ReceiveValidation, MixedReceiveFailureTest,
+                         ::testing::Values(MixedReceiveFailureTest::kWrongRemote,
+                                           MixedReceiveFailureTest::kWrongImmediate,
+                                           MixedReceiveFailureTest::kBadPayload));
+
+TEST_F(RmaHardwareTest, PeerWindowMismatchStopsBeforeImportOrDma) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.window = 2;
+    options_.timeout_ms = 25;
+    ASSERT_TRUE(server_->Open(&nodes_[0].ctx, cap_, options_, true));
+    auto client_options = options_;
+    client_options.window = 3;
+    ASSERT_TRUE(client_->Open(&nodes_[1].ctx, cap_, client_options, false));
+    EXPECT_CALL(*this, ImportSeg(_, _, _, _, _)).Times(0);
+    EXPECT_CALL(*this, ImportJetty(_, _, _)).Times(0);
+    EXPECT_CALL(*this, Post(_, _, _)).Times(0);
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_FALSE(server_result_);
+    ExpectRetained();
 }
 
 TEST_F(RmaHardwareTest, UnsupportedCapabilityCreatesNoQueuesOrMemory) {

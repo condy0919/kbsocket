@@ -128,6 +128,36 @@ TEST(RmaProtocolTest, CapabilityChecksReadWriteLimitsSeparatelyFromSendLimit) {
     EXPECT_FALSE(CheckRmaCapability({}, cap));
 }
 
+TEST(RmaProtocolTest, WindowAndMixedModeRoundTripAndEntireWindowMustFitSegment) {
+    auto hello = ValidHello();
+    hello.options.window = 128;
+    hello.options.mixed_send = true;
+    // 最后一条 READ 的整个 payload 也必须在远端段内，不能只检查第一个槽。
+    const auto length = 64 + 127 * RmaSlotStride(hello.options) + hello.options.bytes;
+    hello.segment.len = length;
+    auto decoded = DecodeRmaHello(EncodeRmaHello(hello));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->options.window, 128U);
+    EXPECT_TRUE(decoded->options.mixed_send);
+    --hello.segment.len;
+    EXPECT_FALSE(ValidateRmaHello(hello));
+    auto wire = EncodeRmaHello(*decoded);
+    wire[7] = std::byte{1};
+    EXPECT_FALSE(DecodeRmaHello(wire));
+    wire = EncodeRmaHello(*decoded);
+    wire[111] = std::byte{2};
+    EXPECT_FALSE(DecodeRmaHello(wire));
+}
+
+TEST(RmaProtocolTest, CapsWindowMemoryAndRejectsMixedWriteBeforeAllocation) {
+    EXPECT_TRUE(ValidateRmaOptions({.bytes = 2U * 1024 * 1024, .window = 128}));
+    EXPECT_FALSE(ValidateRmaOptions({.bytes = 2U * 1024 * 1024 + 1, .window = 128}));
+    EXPECT_FALSE(ValidateRmaOptions({.window = 0}));
+    EXPECT_FALSE(ValidateRmaOptions({.window = 129}));
+    EXPECT_FALSE(ValidateRmaOptions({.operation = RmaOperation::kWrite, .mixed_send = true}));
+    EXPECT_FALSE(ValidateRmaOptions({.operation = RmaOperation::kWrite, .window = 2}));
+}
+
 TEST(RmaProtocolTest, RejectsInvalidOptions) {
     EXPECT_FALSE(ValidateRmaOptions({.bytes = 0}));
     EXPECT_FALSE(ValidateRmaOptions({.bytes = 64U * 1024 * 1024 + 1}));

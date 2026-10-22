@@ -51,6 +51,8 @@ JFR 水线的 depth=128/256 两组已有首次事件通过日志；后续 A6 又
 
 ```bash
 USE_BAZEL_VERSION=9.3.0 bazel build --lockfile_mode=off \
+  //tools/async_error_test:async_error_test \
+  //tools/send_test:send_test \
   //tools/async_event_test:async_event_test \
   //tools/jfr_lifecycle_test:jfr_lifecycle_test \
   //tools/provider_boundary_test:provider_boundary_test \
@@ -60,6 +62,8 @@ USE_BAZEL_VERSION=9.3.0 bazel build --lockfile_mode=off \
   //tools/rma_test:rma_test
 
 USE_BAZEL_VERSION=9.3.0 bazel test --lockfile_mode=off \
+  //tools/async_error_test:all \
+  //tools/send_test:all \
   //tools/async_event_test:all \
   //tools/jfr_lifecycle_test:session_test \
   //tools/provider_boundary_test:provider_boundary_test_test \
@@ -163,7 +167,7 @@ READ/WRITE 按 [rma_test README](../tools/rma_test/README.md) 分别运行 `--op
 
 两组端点均为服务端 `udmac0d1e4:39`、客户端 `udmac0d1e4:42`。首次事件 `last_type=3`，baseline/refill_control/repeat_crossing/cleanup 均未取得事件；最终 `threshold_disabled=true`。首次事件路径与补投恢复已验证，重复跨线的 NOT_OBSERVED 不使整组失败，也不能推定事件永久不会再次触发或 Ack 自动 rearm。后续显式重写的结果见 A6，与这两组不重配记录区分，详见[硬件观测记录](hardware-observations.md)。
 
-新版工具已支持多轮对照，协议升级为 v2，两端需同步更新。以下各组两端共同指定 `--rx_depth=128 --threshold=64 --bytes=4096 --observe_ms=100 --crossings=8`，具体命令见工具 README：
+多轮对照最初使用协议 v2；当前新增并发窗口后升级为 v3，两端需同步更新。默认仍为分阶段的 `--traffic=staged`。以下各组两端共同指定 `--rx_depth=128 --threshold=64 --bytes=4096 --observe_ms=100 --crossings=8`，具体命令见工具 README：
 
 | 组 | rearm | 判定与当前覆盖 |
 | --- | --- | --- |
@@ -177,7 +181,30 @@ A6 的服务端为 `udmac0d1e4:39`（jetty=23442，JFR=9626），客户端为 `u
 
 工具记录请求与查询的水线/深度、各阶段事件和流量计数。原始类型或对象归属异常、首次事件缺失、CQE/payload 错误及关闭失败均不能记为通过。结束时禁用水线，以独立收尾流量消费残留 RX，确认数据与控制面静默后释放资源；Ack async 本身不是 WR 终结或 DMA 静默证明。进程监督覆盖可能阻塞的 provider 调用。
 
-本轮仅实现水线场景，不注入 JFC/JFR 错误。当前本地 UDMA 源码的水线档位为 0/64/512/4096；工具回读配置，不能假设任意小阈值都有效，也不能把本地源码直接视为服务器实际版本。
+此工具只观察水线；JFC/JFR 错误使用下文独立的 async_error_test。当前本地 UDMA 源码的水线档位为 0/64/512/4096；工具回读配置，不能假设任意小阈值都有效，也不能把本地源码直接视为服务器实际版本。
+
+## 新增硬件观测：工具已实现，结果待反馈
+
+以下组与已有通过记录分开登记，当前仅有无硬件 mock 和构建验证。两端运行完整命令见各工具 README；参数须共同修改，不把默认场景的历史 PASS 当作新增路径通过。建议先执行 G1/G2、A8/A9、R9/R10，再进行有独立资源和 watchdog 的 X1–X3 故障观测。
+
+| 组 | 工具与两端共同参数 | 要观察的行为 / 当前结果 |
+| --- | --- | --- |
+| G1 | [send_test](../tools/send_test/README.md) `--bytes=64 --sges=2 --header_bytes=32 --send_imm --batch=64 --messages=1001` | 两个独立注册段的拼接、小包、来源/IMM/guard；待真机 |
+| G2 | 同上，`--bytes=4096 --sges=2 --header_bytes=32 --send_imm --batch=64 --messages=1001` | 总 wire 长度到 4 KiB，header 与 payload 无预拼接；待真机 |
+| G3/G4 | 同上，`--bytes=4096 --sges=3 --header_bytes=33 --batch=128` / `--sges=8 --header_bytes=32 --batch=256`，均 `--messages=1001 --send_imm` | 能力允许时的非整齐分段/更多 SGE；待真机 |
+| A8 | [async_event_test](../tools/async_event_test/README.md) `--rx_depth=128 --threshold=64 --bytes=4096 --observe_ms=100 --crossings=8 --rearm=rewrite --traffic=concurrent --rearm_at=above --send_interval_us=100` | 配置窗口内发 32 条，余量仍高于阈值，再独立跨线；总量 583，待真机 |
+| A9 | 同 A8，改 `--rearm_at=below` | 已确认余量 63 时启动配置窗口，观察低位重写及补满后不再重写的下一次跨线；总量 807，待真机 |
+| R9 | [rma_test](../tools/rma_test/README.md) `--operation=read --bytes=1048576 --window=8 --rounds=8` | 多个独立目的 buffer 的并发 READ，64 条 RMA；待真机 |
+| R10 | 同上，加 `--mixed_send` | 同 SQ 交错 READ 与 64 字节 SEND_WITH_IMM，64 条 READ 和 64 条 SEND；待真机 |
+| R11 | 同上，`--operation=read --bytes=16384 --window=128 --rounds=8 --mixed_send` | 单批 256 条混合 WR、跨完成批次、身份与 buffer 复用；待真机 |
+| X1 | [async_error_test](../tools/async_error_test/README.md) `--fault=jfc_overflow --attempts=512 --cq_depth=64 --healthy_rounds=16 --observe_ms=2000` | 服务端 RX CQ 溢出候选，指定 JFC AE、关联 jetty、独立健康资源及终结证据；待真机 |
+| X2/X3 | 同上，改 `--fault=external_jfc` / `--fault=external_jfr`，`--observe_ms=30000` | 现场可靠注入作用于服务端打印的指定对象；窗口内仍有流量及独立健康对照；待真机 |
+
+SEND 协议 v2、水线协议 v3、RMA 协议 v2 均需双端更新。A8/A9 只保证软件协议不等待配置完成才继续发送，报告 Query、配置前后 CQE 数与时间；始终保留 `hardware_overlap=UNPROVEN`，不能据软件未退休数认定 WR 仍在硬件处理。深度 256 的 A8/A9 总量分别为 1607/1831，可另行补测。
+
+X1 不承诺停止 poll 就必然产生 AE；X2/X3 需要现场已经确认的注入方式，工具不伪造事件或提供未经验证的私有驱动指令。预定错误未出现时退出 77，不能登记 PASS。正常观察通过和资源处置分开：`CLOSED` 才是双方正常关闭；缺 CQE、poll 故障或未知 DMA 时 `RETAINED` 表示依赖保留到进程退出，不证明排空成功。JFC_ERR 区分故障 RX/TX 对象，不能用非预定对象或主动 cleanup 阶段的事件代替注入证据。
+
+R9–R11 仍使用逐 WR signal、独立区间和 guard；READ 完成与 payload 校验后才进入轮间完成确认，源 lease 保持到双方确认。混合 SEND 不作为未经证明的 WRITE 发布屏障。WRITE 继续限制为串行；权限撤销、WRITE 数据面发布和 selective signaling 不属于这些新增场景。
 
 ## 第二批：关闭与 provider 边界
 
@@ -263,7 +290,7 @@ F5/F6 使用 `--fault_delay_ms=10000`，控制 TCP 尽量走不受影响的链�
 
 | 项目 | 当前缺口 / 后续范围 |
 | --- | --- |
-| 受支持 async 类型的工具记录 | JFR 水线首次事件与 A6 的 depth=128、rewrite 8 轮已通过；A2/A4 不重配的重复事件未观察到，A5/A7 及 depth=256 多轮仍待记录。用户确认支持的 JFS/JFR/JFC error 仍待可靠注入方式，当前 JFS/相关 jetty AE 需通过绑定 JFC error 联动 |
+| 受支持 async 类型的工具记录 | JFR 水线首次事件与 A6 的 depth=128、rewrite 8 轮已通过；A8/A9 并发配置窗口、X1–X3 错误事件与关联 jetty 的工具已实现，待真机。外部 JFC/JFR error 仍需现场可靠注入方式；A5/A7 及 depth=256 多轮未自动继承结果 |
 | 四 context D2 首次失败，保留观察 | 第二次已补齐双端四路通知/ack/fd；首次客户端 status 9、服务端 fd 超时仍未定位。工具已增加诊断，用户随后反馈暂未复现；不要求无限追测，不代表根因已修复；四物理设备组暂缓 |
 | 物理故障，低优先级可选 | 按用户要求降低优先级；F5/F6 工具日志尚未取得，用户说明通常 ACK_TIMEOUT，不将无法观察的 PORT_DOWN async 列为通过条件 |
 | 在途中断 | F4 已完成提交后退出流程，但未证实 SIGKILL 命中硬件仍在处理 WR 的窗口；延迟软件 poll 不能补齐这项证据 |
@@ -271,7 +298,7 @@ F5/F6 使用 `--fault_delay_ms=10000`，控制 TCP 尽量走不受影响的链�
 | ACK_TIMEOUT | 历史 mixed、provider 边界及新增 D2 首次失败中的 status 9 原因仍未查明，也未证明同源，不能用其他场景 PASS 宣称已修复 |
 | RNR 时间窗口与 provider EAGAIN | 已有 RNR 和 ENOMEM 容量拒绝；尚无精确重试窗口、rx_delay 原始批次全部恢复成功或同步 EAGAIN 的硬件证据 |
 
-RMA 多 WR 并发、正式 UB 数据面完成通知及其可见性、权限错误后的隔离仍超出当前串行 READ/WRITE 正向验证范围；启用这些路径时再补对应验证。
+多 SGE SEND 与并发 READ/混合 SEND 的工具现已实现，G/R 新组待真机反馈。正式 WRITE 数据面完成通知及其可见性、权限错误后的隔离仍超出已验证范围；启用这些路径时再补对应验证。
 
 ## 结果记录与判定
 

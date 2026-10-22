@@ -22,6 +22,9 @@ DEFINE_string(library, "liburma.so", "URMA shared library path");
 DEFINE_uint32(bytes, 4096, "Bytes per SEND, 8 to 4096 and within device capability");
 DEFINE_uint32(messages, 1024, "Total SEND messages; must match peer");
 DEFINE_uint32(batch, 32, "WRs per round, 1 to 256; must match peer");
+DEFINE_uint32(sges, 1, "Independent registered source segments per WR, 1 to 8; must match peer");
+DEFINE_uint32(header_bytes, 32, "First SGE length when sges > 1; at least 8 bytes; must match peer");
+DEFINE_bool(send_imm, false, "Use SEND_WITH_IMM and validate its 64-bit sequence tag; must match peer");
 DEFINE_uint32(timeout_ms, 10000, "Timeout per control operation or completion batch, 1 to 3600000 ms");
 
 namespace {
@@ -41,10 +44,15 @@ struct Hardware {
 };
 int Run() {
     using kbsocket::raw::UrmaApi;
-    kbsocket::tools::SendTestOptions options{FLAGS_bytes, FLAGS_messages, FLAGS_batch, FLAGS_timeout_ms};
-    if (FLAGS_device.empty() || FLAGS_library.empty() || !FLAGS_port || FLAGS_port > 65535 ||
-        !kbsocket::tools::ValidateOptions(options)) {
-        std::println(stderr, "Invalid options; --device is required. Use --help for limits.");
+    kbsocket::tools::SendTestOptions options{FLAGS_bytes, FLAGS_messages,     FLAGS_batch,   FLAGS_timeout_ms,
+                                             FLAGS_sges,  FLAGS_header_bytes, FLAGS_send_imm};
+    if (FLAGS_device.empty() || FLAGS_library.empty() || !FLAGS_port || FLAGS_port > 65535) {
+        std::println(stderr, "Invalid device/library/port; --device is required and port must be 1 to 65535.");
+        return 2;
+    }
+    auto valid = kbsocket::tools::ValidateOptions(options);
+    if (!valid) {
+        std::println(stderr, "Invalid options: {}. Use --help for limits.", valid.error().operation);
         return 2;
     }
     // 错误路径可能存在挂起的 DMA；只有显式成功 Close 后才释放下层依赖。
@@ -58,16 +66,18 @@ int Run() {
     if (log_status != URMA_SUCCESS) {
         std::println(stderr, "URMA log callback registration failed: {}", static_cast<int>(log_status));
     }
-    if (FLAGS_urma_debug)
+    if (FLAGS_urma_debug) {
         UrmaApi::LogSetLevel(URMA_VLOG_LEVEL_DEBUG);
+    }
     auto initialized = hardware->runtime.Initialize({{FLAGS_device, FLAGS_eid_index}});
     if (!initialized) {
         std::println(stderr, "Runtime failed: code={} provider={}", static_cast<int>(initialized.error().code),
                      initialized.error().provider_error);
         return 1;
     }
-    if (FLAGS_urma_debug)
+    if (FLAGS_urma_debug) {
         UrmaApi::LogSetLevel(URMA_VLOG_LEVEL_DEBUG);
+    }
     auto* ctx = hardware->runtime.context(0);
     urma_device_attr_t attributes{};
     auto queried = UrmaApi::QueryDevice(ctx->dev, &attributes);
@@ -75,21 +85,28 @@ int Run() {
         std::println(stderr, "QueryDevice failed: {}", static_cast<int>(queried));
         return 1;
     }
+    std::println("SEND capability: max_msg_size={} max_jfs_sge={}", attributes.dev_cap.max_msg_size,
+                 attributes.dev_cap.max_jfs_sge);
     auto opened = hardware->session.Open(ctx, attributes.dev_cap, options, FLAGS_server);
     if (!opened) {
         std::println(stderr, "{}: {}", opened.error().operation, opened.error().code);
         return 1;
     }
-    std::println("{} ready: device={} eid_index={} bytes={} messages={} batch={} control={}:{}",
+    std::println("{} ready: device={} eid_index={} bytes={} messages={} batch={} sges={} header_bytes={} "
+                 "send_imm={} control={}:{}",
                  FLAGS_server ? "Receiver" : "Sender", FLAGS_device, FLAGS_eid_index, FLAGS_bytes, FLAGS_messages,
-                 FLAGS_batch, FLAGS_address, FLAGS_port);
+                 FLAGS_batch, FLAGS_sges, FLAGS_header_bytes, FLAGS_send_imm, FLAGS_address, FLAGS_port);
     std::fflush(stdout);
     kbsocket::tools::ControlChannel channel;
     auto connected =
         channel.Open(FLAGS_server, FLAGS_address.c_str(), static_cast<std::uint16_t>(FLAGS_port), FLAGS_timeout_ms);
     auto result = connected ? hardware->session.Run(channel, FLAGS_server) : connected;
-    if (!result)
+    const auto& stats = hardware->session.stats();
+    std::println("SEND verification: accepted={} accepted_known={} retired={} received={} guarded_segments={}",
+                 stats.accepted, stats.accepted_known, stats.retired, stats.received, stats.guarded_segments);
+    if (!result) {
         std::println(stderr, "FAIL: {}: {}", result.error().operation, result.error().code);
+    }
     auto closed = hardware->session.Close();
     if (!closed) {
         std::println(stderr, "{}: {}; hardware resources retained until process exit", closed.error().operation,
@@ -106,8 +123,9 @@ int Run() {
         std::println(stderr, "Unload failed: {}", unloaded.error().message);
         return 1;
     }
-    if (!result)
+    if (!result) {
         return 1;
+    }
     std::println("PASS: {} messages, {} bytes; {}", FLAGS_messages,
                  static_cast<std::uint64_t>(FLAGS_messages) * FLAGS_bytes,
                  FLAGS_server ? "payload validated" : "TX and remote RX confirmed");

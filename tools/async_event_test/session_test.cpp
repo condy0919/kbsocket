@@ -162,7 +162,9 @@ protected:
             auto& node = ByContext(jfr->urma_ctx);
             // 每次重配必须先补满 RX，最后一次清理关水线时才允许保留 63 个 posted 槽位。
             EXPECT_EQ(attr->mask, JFR_RX_THRESHOLD);
-            if (attr->rx_threshold == 0 && node.buffers.size() != node.jfr.jfr_cfg.depth) {
+            if (concurrent_ && attr->rx_threshold == 64 && node.threshold_updates) {
+                EXPECT_LT(node.buffers.size(), node.jfr.jfr_cfg.depth);
+            } else if (attr->rx_threshold == 0 && node.buffers.size() != node.jfr.jfr_cfg.depth) {
                 EXPECT_EQ(node.buffers.size(), 63U);
             } else {
                 EXPECT_EQ(node.buffers.size(), node.jfr.jfr_cfg.depth);
@@ -174,6 +176,10 @@ protected:
                 return URMA_EINVAL;
             }
             node.threshold = attr->rx_threshold;
+            if (emit_below_rearm_event_ && node.threshold == 64 && node.buffers.size() < 64) {
+                EmitLimitEvent(node);
+                node.threshold = 0;
+            }
             if (emit_config_event_ && node.threshold_updates > 1 && node.buffers.size() == node.jfr.jfr_cfg.depth) {
                 EmitLimitEvent(node);
             }
@@ -182,6 +188,7 @@ protected:
         EXPECT_CALL(*this, QueryJfr(_, _, _))
             .Times(AnyNumber())
             .WillRepeatedly([this](auto* jfr, auto* cfg, auto* attr) {
+                std::lock_guard lock(mutex_);
                 auto& node = ByContext(jfr->urma_ctx);
                 ++node.queries;
                 if (fail_query_call_ == node.queries) {
@@ -274,10 +281,19 @@ protected:
             std::lock_guard lock(mutex_);
             auto& node = ByContext(cq->urma_ctx);
             auto& completions = node.completions[cq == &node.cqs[0] ? 0 : 1];
+            // 模拟接收线程调度延迟：第二轮 32 条已经发完才暴露 RX CQE。
+            if (hold_active_rx_ && cq == &nodes_[0].cqs[1] && receiver_->stats().received >= 65 && sent_ < 97) {
+                return 0;
+            }
             int returned = 0;
             while (!completions.empty() && returned < count) {
                 output[returned++] = completions.front();
                 completions.pop_front();
+            }
+            if (corrupt_first_rx_ && cq == &nodes_[0].cqs[1] && returned) {
+                // 保留合法 RX user_ctx，让 RX 池正常交出 lease，只破坏报文长度校验。
+                output[0].completion_len = 1;
+                corrupt_first_rx_ = false;
             }
             return returned;
         });
@@ -332,12 +348,16 @@ protected:
     std::array<Node, 2> nodes_;
     urma_device_cap_t cap_{};
     std::mutex mutex_;
+    bool hold_active_rx_ = false;
+    bool concurrent_ = false;
+    bool emit_below_rearm_event_ = false;
     bool emit_first_ = true;
     bool emit_repeat_ = true;
     bool emit_config_event_ = false;
     bool emit_refill_event_ = false;
     bool clear_threshold_after_crossing_ = false;
     bool duplicate_rx_ = false;
+    bool corrupt_first_rx_ = false;
     bool wrong_tx_ = false;
     urma_cr_status_t first_tx_status_ = URMA_CR_SUCCESS;
     std::size_t sent_ = 0;
@@ -348,6 +368,7 @@ protected:
     NoDestructor<JfrLimitSession> sender_;
 
     void OpenBoth(JfrLimitOptions options = {.bytes = 64, .observe_ms = 1, .timeout_ms = 200}) {
+        concurrent_ = options.traffic == JfrLimitTraffic::kConcurrent;
         ASSERT_TRUE(receiver_->Open(&nodes_[0].ctx, cap_, options, true));
         ASSERT_TRUE(sender_->Open(&nodes_[1].ctx, cap_, options, false));
     }
@@ -536,6 +557,154 @@ TEST_F(AsyncSessionTest, ToggleRecordsDisabledReadbackAndSeparatesConfigurationF
     ASSERT_TRUE(receiver_->Close());
 }
 
+TEST_F(AsyncSessionTest, ConcurrentAboveRewritesDuringBoundedTrafficAndStillCrossesAfterwards) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    clear_threshold_after_crossing_ = true;
+    emit_refill_event_ = true;
+    // 配置窗口总共只发 32 条：即使 CQE 全部排队，硬件 RX 余量仍至少 96，高于 64。
+    OpenBoth({.bytes = 64,
+              .observe_ms = 1,
+              .timeout_ms = 500,
+              .crossings = 3,
+              .rearm = JfrLimitRearm::kRewrite,
+              .traffic = JfrLimitTraffic::kConcurrent,
+              .send_interval_us = 1000});
+    RunBoth();
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_EQ(receiver_->stats().received, 258U);
+    EXPECT_EQ(sender_->stats().retired, 258U);
+    EXPECT_EQ(nodes_[0].configured_thresholds, (std::vector<std::uint32_t>{64, 64, 64, 0}));
+    for (std::size_t i = 1; i < 3; ++i) {
+        const auto& round = receiver_->stats().rounds[i];
+        EXPECT_TRUE(round.active_window_completed);
+        EXPECT_TRUE(round.active_rearm_succeeded);
+        EXPECT_GE(nodes_[0].configured_occupancies[i], 96U);
+        EXPECT_LT(nodes_[0].configured_occupancies[i], 128U);
+        EXPECT_EQ(round.active_received_before_rearm + round.active_received_after_rearm, 32U);
+        EXPECT_GT(round.active_received_before_rearm, 0U);
+        EXPECT_EQ(round.refill_events.limit_events, 1U);
+        EXPECT_EQ(round.active_rearm_events.limit_events, 0U);
+        EXPECT_EQ(round.crossing_events.limit_events, 1U);
+        EXPECT_TRUE(round.observed);
+    }
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncSessionTest, ConcurrentWindowDoesNotInventActivityAfterRearmWhenAllCqesWereAlreadyConsumed) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    hold_active_rx_ = true;
+    clear_threshold_after_crossing_ = true;
+    OpenBoth({.bytes = 64,
+              .observe_ms = 1,
+              .timeout_ms = 500,
+              .crossings = 2,
+              .rearm = JfrLimitRearm::kRewrite,
+              .traffic = JfrLimitTraffic::kConcurrent,
+              .send_interval_us = 0});
+    RunBoth();
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    const auto& round = receiver_->stats().rounds[1];
+    // 名称 concurrent 不能充当重叠证据；整批在配置前消费时保留 after=0，打印为 NOT_OBSERVED。
+    EXPECT_EQ(round.active_received_before_rearm, 32U);
+    EXPECT_EQ(round.active_received_after_rearm, 0U);
+    EXPECT_TRUE(round.active_rearm_succeeded);
+    EXPECT_TRUE(round.active_window_completed);
+    EXPECT_TRUE(round.observed);
+    EXPECT_EQ(nodes_[0].configured_occupancies[1], 96U);
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncSessionTest, ConcurrentBelowSeparatesImmediateEventFromUnarmedRecoveryCrossing) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    clear_threshold_after_crossing_ = true;
+    emit_below_rearm_event_ = true;
+    // 模拟低位写入立即触发并清零；随后补满却不重写，所以再次跨线不应被误标成成功。
+    OpenBoth({.bytes = 64,
+              .observe_ms = 1,
+              .timeout_ms = 500,
+              .crossings = 3,
+              .rearm = JfrLimitRearm::kRewrite,
+              .traffic = JfrLimitTraffic::kConcurrent,
+              .rearm_at = JfrLimitRearmAt::kBelow,
+              .send_interval_us = 1000});
+    RunBoth();
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_EQ(receiver_->stats().received, 322U);
+    EXPECT_EQ(sender_->stats().retired, 322U);
+    EXPECT_EQ(nodes_[0].configured_thresholds, (std::vector<std::uint32_t>{64, 64, 64, 0}));
+    EXPECT_EQ(nodes_[0].acknowledged, 3U);
+    for (std::size_t i = 1; i < 3; ++i) {
+        const auto& round = receiver_->stats().rounds[i];
+        EXPECT_GE(nodes_[0].configured_occupancies[i], 31U);
+        EXPECT_LT(nodes_[0].configured_occupancies[i], 63U);
+        EXPECT_TRUE(round.active_window_completed);
+        EXPECT_EQ(round.after_rearm.threshold, 0U);
+        EXPECT_EQ(round.active_rearm_events.limit_events, 1U);
+        EXPECT_EQ(round.crossing_events.limit_events, 0U);
+        EXPECT_FALSE(round.observed);
+        EXPECT_FALSE(sender_->stats().rounds[i].observed);
+    }
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncSessionTest, ConcurrentBelowMayKeepThresholdUntilRefillAndNewCrossing) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    clear_threshold_after_crossing_ = true;
+    // 另一种 provider 行为：低位重写不立即触发，补到高位再跨线时才产生下一次事件。
+    OpenBoth({.bytes = 64,
+              .observe_ms = 1,
+              .timeout_ms = 500,
+              .crossings = 3,
+              .rearm = JfrLimitRearm::kRewrite,
+              .traffic = JfrLimitTraffic::kConcurrent,
+              .rearm_at = JfrLimitRearmAt::kBelow,
+              .send_interval_us = 0});
+    RunBoth();
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    for (std::size_t i = 1; i < 3; ++i) {
+        const auto& round = receiver_->stats().rounds[i];
+        EXPECT_EQ(round.after_rearm.threshold, 64U);
+        EXPECT_EQ(round.active_rearm_events.limit_events, 0U);
+        EXPECT_EQ(round.crossing_events.limit_events, 1U);
+        EXPECT_TRUE(round.observed);
+    }
+    EXPECT_EQ(sender_->stats().retired, 322U);
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncSessionTest, ConcurrentRearmFailureRetainsTheWholeActiveWindowDependencies) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    fail_modify_call_ = 2;
+    OpenBoth({.bytes = 64,
+              .observe_ms = 1,
+              .timeout_ms = 200,
+              .crossings = 3,
+              .rearm = JfrLimitRearm::kRewrite,
+              .traffic = JfrLimitTraffic::kConcurrent,
+              .send_interval_us = 0});
+    RunBoth();
+    ASSERT_FALSE(receiver_result_);
+    EXPECT_EQ(receiver_result_.error().code, URMA_EINVAL);
+    EXPECT_FALSE(sender_result_);
+    const auto& round = receiver_->stats().rounds[1];
+    EXPECT_TRUE(round.active_rearm_attempted);
+    EXPECT_FALSE(round.active_rearm_succeeded);
+    EXPECT_FALSE(round.active_window_completed);
+    // 即便发送端已取得部分/全部 CQE，也没有双方阶段确认，不能安全释放注册内存或队列。
+    EXPECT_CALL(*this, DeleteJetty(_)).Times(0);
+    EXPECT_CALL(*this, Unregister(_)).Times(0);
+    EXPECT_FALSE(receiver_->Close());
+    EXPECT_FALSE(sender_->Close());
+}
+
 TEST_F(AsyncSessionTest, RewriteFailureAfterRefillStopsBeforeNextCrossingAndRetainsDependencies) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     fail_modify_call_ = 2;
@@ -610,6 +779,26 @@ TEST_F(AsyncSessionTest, MissingFirstEventFailsWithoutRefillOrResourceRelease) {
     EXPECT_CALL(*this, DeleteJfr(_)).Times(0);
     EXPECT_CALL(*this, Unregister(_)).Times(0);
     EXPECT_CALL(*this, DeleteJfc(_)).Times(0);
+    EXPECT_FALSE(receiver_->Close());
+    EXPECT_FALSE(sender_->Close());
+}
+
+TEST_F(AsyncSessionTest, FirstMalformedRxStillReturnsEveryLeaseAndCountsLaterValidCompletions) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    corrupt_first_rx_ = true;
+    OpenBoth();
+    RunBoth();
+    ASSERT_FALSE(receiver_result_);
+    EXPECT_FALSE(sender_result_);
+    // 首批 64 条 CQE 中首条长度异常，其余 63 条有效；全部 64 个 lease 均应归还，不能提前退出。
+    EXPECT_EQ(receiver_->stats().received, 63U);
+    EXPECT_EQ(receiver_->stats().rx_leases_released, 64U);
+    EXPECT_EQ(receiver_->stats().rounds[0].received, 63U);
+    EXPECT_EQ(nodes_[0].posted, 128U);
+    EXPECT_EQ(nodes_[0].completions[1].size(), 1U);
+    // 批尾仍必须失败且不进入下一轮补投；未消费 CQE、剩余 posted RX 和 MR 保留到进程退出。
+    EXPECT_CALL(*this, DeleteJetty(_)).Times(0);
+    EXPECT_CALL(*this, Unregister(_)).Times(0);
     EXPECT_FALSE(receiver_->Close());
     EXPECT_FALSE(sender_->Close());
 }

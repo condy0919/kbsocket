@@ -11,6 +11,7 @@ cc_library(
     deps = [
         "//kbsocket/base:scope_exit",
         "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:rx_buffer_pool",
         "//kbsocket/transport/raw:urma_api",
         "//tools/common:control_channel",
     ],

@@ -11,7 +11,7 @@ USE_BAZEL_VERSION=9.3.0 bazel build //tools/async_event_test:async_event_test
 USE_BAZEL_VERSION=9.3.0 bazel test //tools/async_event_test:async_event_test_test --test_output=errors
 ```
 
-两端使用相同版本的二进制，设备/EID 替换为本机实际配置。当前协议为 v2，握手核验轮数和重配方式，拒绝 v1；必须同时更新两端。以下默认 `--crossings=2 --rearm=none`，先启动服务端：
+两端使用相同版本的二进制，设备/EID 替换为本机实际配置。当前协议为 v3，握手核验轮数、重配方式、流量窗口和发送间隔，拒绝 v1/v2；必须同时更新两端。以下默认 `--crossings=2 --rearm=none`，先启动服务端：
 
 ```bash
 ./bazel-bin/tools/async_event_test/async_event_test \
@@ -29,7 +29,7 @@ USE_BAZEL_VERSION=9.3.0 bazel test //tools/async_event_test:async_event_test_tes
   --rx_depth=128 --threshold=64 --bytes=4096 --observe_ms=100
 ```
 
-可两端改为 `--rx_depth=256` 再跑一组，水线仍为 64。参数限制为 `rx_depth=128..256`、`threshold=64`、`bytes=32..4096`、`observe_ms=1..1000`、`crossings=2..1000`。`timeout_ms` 默认 10000，必须大于 `2*observe_ms`；每个 TCP 操作和流量阶段分别有截止时间。两端需匹配 depth、threshold、bytes、observe_ms、crossings 和 rearm；可使用不同的本地 timeout。
+可两端改为 `--rx_depth=256` 再跑一组，水线仍为 64。参数限制为 `rx_depth=128..256`、`threshold=64`、`bytes=32..4096`、`observe_ms=1..1000`、`crossings=2..1000`。`timeout_ms` 默认 10000，必须大于 `2*observe_ms`；每个 TCP 操作和流量阶段分别有截止时间。两端需匹配 depth、threshold、bytes、observe_ms、crossings、rearm、traffic、rearm_at 和 send_interval_us；可使用不同的本地 timeout。
 
 ## 多轮重新使能对照
 
@@ -61,7 +61,7 @@ USE_BAZEL_VERSION=9.3.0 bazel test //tools/async_event_test:async_event_test_tes
 
 三个模式均不修改 JFR 状态。模式名表示尝试的配置操作，不能仅凭 `rearm=rewrite/toggle` 或回读 64 就认定硬件事件已重新使能。未观察到某个后续轮的事件时继续剩余轮次，不自动切换模式或重试该轮流量。
 
-本地 UDMA 驱动源码将水线映射为 0、64、512、4096 四档，低于 64 的值可能映射为禁用；修改时要求水线严格小于实际 JFR 深度。因此本工具不使用 `threshold=8` 等任意小值。现场驱动可能与本地源码不同，工具通过 `ModifyJfr` 后的 `QueryJfr` 同时记录请求值和查询值；阈值不符或查询深度小于请求深度时直接 FAIL，不修改 provider 缓存，也不假定只要 Modify 成功就已设置正确。
+本地 UDMA 驱动源码将水线映射为 0、64、512、4096 四档，低于 64 的值可能映射为禁用；修改时要求水线严格小于实际 JFR 深度。因此本工具不使用 `threshold=8` 等任意小值。现场驱动可能与本地源码不同，工具通过 `ModifyJfr` 后的 `QueryJfr` 同时记录请求值和查询值；默认 staged 模式在配置后的阈值不符或查询深度小于请求深度时直接 FAIL，不修改 provider 缓存，也不假定只要 Modify 成功就已设置正确。
 
 ## 实验阶段
 
@@ -80,6 +80,8 @@ USE_BAZEL_VERSION=9.3.0 bazel test //tools/async_event_test:async_event_test_tes
 
 每次 Get 都先通过 `poll(ctx->async_fd)` 检查可读，避免在没有事件时调用可能阻塞的 Get。成功 Get 的原事件恰好 Ack 一次，并检查 context、类型 `JFR_LIMIT`、`element.jfr` 的归属。程序不解引用事件中的资源指针；遇到其他类型或错误归属时记录并确认已取得的原事件，然后 FAIL。失败 Get 不 Ack。
 
+`Waterline traffic` 的 `rx_leases_released` 记录归还给 RX 池的可信终结 lease 数；它包含 payload 校验失败但已安全归还的槽位，因此失败时可以大于有效 `received`。RX 首条错误不会丢弃同一批已取出的其他 CQE/lease，处理完整批后才返回失败，不继续补投。
+
 `Async phase=...` 是所有轮次按阶段累积的 `get_calls/retrieved/acked/jfr_limit`，同时记录最后事件类型、Get 状态以及 context/JFR 是否匹配。`Async crossing=N phase=...` 单独展示该轮的补投、满水位与跨线窗口；全局计数和逐轮计数是同一批事件的不同视图，不能相加。无事件时 `last_type=-1`，归属字段为 false，仅表示没有可判断的事件；正常取得事件的阶段应满足 `retrieved=acked=jfr_limit`。
 
 `Query crossing=N point=...` 分别记录 before_rearm、disabled（仅 toggle）、after_rearm、after_crossing 的实际回读。`queried=false` 表示该步骤未执行或未成功取得数据，不能把对应的 0 当成禁用成功。只在主动配置后的回读中要求阈值与请求相等；首次事件后、下一轮重配前的查询允许报告不同阈值，保留硬件实际行为。
@@ -87,6 +89,51 @@ USE_BAZEL_VERSION=9.3.0 bazel test //tools/async_event_test:async_event_test_tes
 每轮还打印本地流量差值；第一轮 posted 包含最初投满 RX，后续轮包含补投及一条恢复流量，最终 cleanup 不计入任何轮。只有已开始的轮次才打印，失败中断而未完成观察的轮标为 INCOMPLETE，不能把未来未执行轮次计为 NOT_OBSERVED。服务端逐轮通过控制面发送带索引的观察结果；客户端打印的是对端确认的结果，不伪造本地 Query/Get/Ack。
 
 首次跨线没有取得事件时，输出 NOT_OBSERVED 并 FAIL；不能把数据流量成功代替事件路径验证。任意后续轮没有事件仍可完成实验并 PASS，但该轮必须保留 NOT_OBSERVED；三个模式均遵循这一观测规则。验收“每轮都观察到通知”需另看汇总 `requested=completed=observed=C`，不能只看 PASS 或 `repeat_any=true`。后者仅表示至少一个后续轮有事件。阶段基于软件采集时间，即使重配后设置了独立满水位窗口，仍不能证明延迟到跨线窗口才取得的事件就是该次跨线产生，也不能推导所有重触发时序。
+
+## 收包期间重新使能
+
+`--traffic=concurrent --rearm=rewrite` 保留第一轮标准跨线，用它确认首次水线通知；从第二轮开始，每轮新增一个有 32 条 SEND 的配置窗口。两端匹配 `--rearm_at=above|below` 和 `--send_interval_us=0..10000`（默认 100）。客户端逐条投递，接收端取得第一批 RX CQE、校验并归还 lease 后直接重写 64；配置窗口中没有等待配置完成的 TCP 消息，客户端继续按本地间隔发送。`send_interval_us=0` 可以更容易暴露“整批 CQE 已排队后才配置”的调度情形。
+
+| 模式 | 配置窗口的 RX 余量约束 | 窗口结束后的验证 |
+| --- | --- | --- |
+| `above` | 先补满 D，仅允许 32 条消息消耗 RX；重写时至少还有 `D-32` 个已投递槽位，因此 D≥128 时始终高于 64 | 不补投、不再重写，发送 `D-64+1-32` 条，将余量降到 63，独立观察跨线事件 |
+| `below` | 保留上一轮跨线后已收齐 TX/RX CQE 的 63 个槽位；再发送 32 条，整个配置窗口均低于 64，结束余量为 31 | 先观察低位重写期间的事件并查询，再补满 D；不再次重写 64，发送 `D-64+1` 条，观察重新跨线是否产生事件 |
+
+两种模式不会补投配置窗口中释放的槽位。窗口前会单独采集迟到事件；第一批 RX CQE 之前取得的事件计入 `active_before_rearm`；重写后至窗口观察截止取得的事件计入 `active_rearm`；补满期间取得的事件计入 `refill_control`；最后跨线取得的事件计入 `repeat_crossing`。这是**软件采集窗口**，不能凭事件到达顺序确定硬件产生时间。尤其 below 的配置事件不能充当补满后再次跨线的事件。
+
+服务端：
+
+```bash
+./bazel-bin/tools/async_event_test/async_event_test \
+  --server --address=0.0.0.0 --port=8889 \
+  --device=udmac0d1e4 --eid_index=39 \
+  --rx_depth=128 --threshold=64 --bytes=4096 --observe_ms=100 \
+  --crossings=8 --rearm=rewrite --traffic=concurrent \
+  --rearm_at=above --send_interval_us=100
+```
+
+客户端：
+
+```bash
+./bazel-bin/tools/async_event_test/async_event_test \
+  --address=141.62.33.25 --port=8889 \
+  --device=udmac0d1e4 --eid_index=51 \
+  --rx_depth=128 --threshold=64 --bytes=4096 --observe_ms=100 \
+  --crossings=8 --rearm=rewrite --traffic=concurrent \
+  --rearm_at=above --send_interval_us=100
+```
+
+再在双端改为 `--rearm_at=below` 跑一组。之后可双端使用 `--rx_depth=256`，或把间隔改为 0 做紧凑投递对照。`none/toggle` 不适用于 concurrent，错误组合在初始化硬件前拒绝。发送节奏预算必须满足 `32*send_interval_us < timeout_ms*1000`。
+
+输出增加如下证据：
+
+- `Active window`：是否完成双方真实 TX/RX CQE 与 payload 校验；客户端的 `last_post_ns` 是相对于本端窗口开始的最后一次投递时间。
+- `RX completion consumption before/after rewrite`：配置前后分别消费多少条 RX CQE，以及 `first_rx_ns/rearm_begin_ns/rearm_end_ns/last_rx_ns`。重写区间包含配置前 Query、Modify64 和配置后 Query。若全部 32 条都在配置前被消费，明确报告 NOT_OBSERVED；不会把参数名 concurrent 当作并发证据。
+- `software_posted_before/after`：RX 池尚未消费 CQE 的 posted 计数；其中可能已经有硬件完成但 CQE 排队的槽位，不能当作硬件瞬时余量。上表的高/低约束由已确认完成的阶段与发送总数界限建立。
+- `after_rearm/after_active/after_crossing`：实际阈值查询。收包与配置并行时，写入 64 可能立即产生事件并清零，因此 concurrent 允许回读 0 或 64，不能要求始终为 64；Modify 失败、其他阈值或不合法深度仍 FAIL。
+- `JFR_LIMIT collected in active rearm window` 与后续 crossing 结果分别报告 OBSERVED/NOT_OBSERVED。即使配置前后都消费了 CQE，也可能只是软件消费了排队记录，所以始终标注 `hardware_overlap=UNPROVEN`。双端相对时间不共享时钟基准，不能直接相减推导网卡重叠。
+
+设 C 为 crossings、D 为 rx_depth、T=64、B=32，总 SEND 为：above 模式 `C*(D-T+1)+(T-1)`；below 模式额外增加 `(C-1)*B`。C=8 时，depth=128 的 above/below 分别为 **583/807**，depth=256 分别为 **1607/1831**。初始 posted 及所有补投、最后 63 条 cleanup 都计入总量；双端应分别满足 posted=received=expected 与 accepted=retired=expected。首轮仍要求事件，后续窗口和跨线允许无事件以记录真实行为；PASS 只代表既定实验及安全关闭完成，验收事件覆盖仍须逐轮查看。没有真实硬件结果前，这些新模式均保持待观测。
 
 ## 已有硬件结果
 
@@ -104,6 +151,6 @@ USE_BAZEL_VERSION=9.3.0 bazel test //tools/async_event_test:async_event_test_tes
 
 关闭前先禁用水线、采集当前事件，再通过独立 cleanup 流量消费剩余 posted RX；双方收齐 TX/RX 完成并确认不再发送后才开始 Close。服务端在关闭前再次采集并 Ack 已可见事件，然后关闭 RX 池、jetty/JFR/JFC。晚到事件的最大延迟没有保证，不能把一次空 fd 视作永久静默；provider 删除若等待未完成 Ack，会受到整个 worker 的 watchdog 约束。
 
-默认 `--watchdog_ms=0` 自动取 `max(60000, 4*timeout_ms+(6*crossings+8)*observe_ms)` 毫秒，并在 ready 行显示有效预算；轮数增多时不再固定 60 秒。预算最多一小时，自动计算超过上限时会拒绝参数，需减少观察预算或显式指定 watchdog；显式值必须大于 timeout_ms 且不超过一小时，可主动设短以限制整次实验。该预算不保证每个操作都能各自耗尽 timeout。工具复用 `peer_failure_test` 的监督进程，在 URMA Load 之前 fork，覆盖初始化、收发、事件采集与同步 provider 关闭调用。超时退出码为 124，不是安全关闭成功。任意协议、查询、post、CQE、payload 或事件错误都 FAIL；未知接受范围不重放，不能证明 DMA/peer 状态时由 `NoDestructor` 保留所有依赖到 worker 退出。最终 PASS 还要求两端互相确认资源关闭。
+默认 `--watchdog_ms=0` 自动取 `max(60000, 4*timeout_ms+(6*crossings+8)*observe_ms+pacing_ms)` 毫秒；staged 的 pacing_ms 为 0，concurrent 为 `ceil(32*send_interval_us*(crossings-1)/1000)`，并在 ready 行显示有效预算；轮数增多时不再固定 60 秒。预算最多一小时，自动计算超过上限时会拒绝参数，需减少观察预算或显式指定 watchdog；显式值必须大于 timeout_ms 且不超过一小时，可主动设短以限制整次实验。该预算不保证每个操作都能各自耗尽 timeout。工具复用 `peer_failure_test` 的监督进程，在 URMA Load 之前 fork，覆盖初始化、收发、事件采集与同步 provider 关闭调用。超时退出码为 124，不是安全关闭成功。任意协议、查询、post、CQE、payload 或事件错误都 FAIL；未知接受范围不重放，不能证明 DMA/peer 状态时由 `NoDestructor` 保留所有依赖到 worker 退出。最终 PASS 还要求两端互相确认资源关闭。
 
 所有数据 buffer、WR 和事件数组在 Open 或对象创建时预分配；正常流量阶段不扩容。本地 gMock 验证 API 边界、协议和资源约束，实际水线行为必须用双端硬件日志确认。保留完整命令、stdout/stderr、退出码及服务器使用的 URMA/provider/驱动版本。

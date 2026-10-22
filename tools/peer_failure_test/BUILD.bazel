@@ -6,6 +6,7 @@ cc_library(
     srcs = ["process.cpp"],
     hdrs = ["process.hpp"],
     visibility = [
+        "//tools/async_error_test:__pkg__",
         "//tools/async_event_test:__pkg__",
         "//tools/sq_multiplex_test:__pkg__",
     ],

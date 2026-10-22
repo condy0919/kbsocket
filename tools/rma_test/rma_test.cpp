@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <thread>
 
 #include "kbsocket/base/scope_exit.hpp"
@@ -14,7 +15,7 @@ namespace kbsocket {
 namespace tools {
 namespace {
 using raw::UrmaApi;
-constexpr std::size_t kGuardBytes = 64;
+constexpr std::size_t kGuardBytes = kRmaGuardBytes;
 constexpr std::byte kGuard{0xa5};
 constexpr std::byte kPoison{0xcc};
 constexpr std::uint32_t kReady = 0x52410000;
@@ -25,8 +26,30 @@ constexpr std::uint32_t kQuiescent = 0x52444444;
 auto Error(const char* operation, int code = EIO) {
     return std::unexpected(ToolError{operation, code ? code : EPROTO});
 }
-std::byte Pattern(std::uint32_t round, std::size_t offset) {
-    return static_cast<std::byte>((round * 37U + offset + offset / 251) % 251);
+std::byte Pattern(std::uint32_t round, std::uint32_t slot, std::size_t offset) {
+    return static_cast<std::byte>((round * 37U + slot * 19U + offset + offset / 251) % 251);
+}
+// 只有正常硬件终结 CQE 可以退休 WR；未知状态或边界标记不能作为 DMA 已结束的依据。
+bool IsTerminal(urma_cr_status_t status) {
+    switch (status) {
+    case URMA_CR_SUCCESS:
+    case URMA_CR_UNSUPPORTED_OPCODE_ERR:
+    case URMA_CR_LOC_LEN_ERR:
+    case URMA_CR_LOC_OPERATION_ERR:
+    case URMA_CR_LOC_ACCESS_ERR:
+    case URMA_CR_REM_RESP_LEN_ERR:
+    case URMA_CR_REM_UNSUPPORTED_REQ_ERR:
+    case URMA_CR_REM_OPERATION_ERR:
+    case URMA_CR_REM_ACCESS_ABORT_ERR:
+    case URMA_CR_ACK_TIMEOUT_ERR:
+    case URMA_CR_RNR_RETRY_CNT_EXC_ERR:
+    case URMA_CR_WR_FLUSH_ERR:
+    case URMA_CR_LOC_DATA_POISON:
+    case URMA_CR_REM_DATA_POISON:
+        return true;
+    default:
+        return false;
+    }
 }
 } // namespace
 
@@ -47,15 +70,16 @@ std::expected<void, ToolError> RmaSession::Open(urma_context_t* ctx, const urma_
     local_.server = server;
     raw::JettyPoolConfig config;
     config.jetty_count = 1;
-    config.tx_depth = 1;
-    config.rx_depth = 1;
-    config.tx_cq_depth = 2;
-    config.rx_cq_depth = 1;
+    const auto wr_count = options.window * (options.mixed_send ? 2U : 1U);
+    config.tx_depth = wr_count;
+    config.rx_depth = options.mixed_send ? options.window : 1;
+    config.tx_cq_depth = wr_count + 1;
+    config.rx_cq_depth = *config.rx_depth;
     auto opened = pool_.Open(ctx, cap, config);
     if (!opened) {
         return Error("create RMA RM_CTP jetty", opened.error().failure.provider_error);
     }
-    // 只读取原始句柄；本工具自己的 pending 状态覆盖唯一 WR 的生存期，不走 SEND 账本。
+    // 工具独占此 SQ，以逐条 identity/退休状态覆盖整批 RMA 与 SEND 的生存期。
     auto ticket = pool_.Reserve();
     if (!ticket) {
         return Error("reserve RMA lane");
@@ -72,11 +96,10 @@ std::expected<void, ToolError> RmaSession::Open(urma_context_t* ctx, const urma_
         return Error("read page size");
     }
     const auto page = static_cast<std::size_t>(page_value);
-    const auto length = (options.bytes + 2 * kGuardBytes + page - 1) / page * page;
+    const auto length = (RmaSlotStride(options) * options.window + page - 1) / page * page;
     storage_.resize(length + page - 1);
     const auto address = reinterpret_cast<std::uintptr_t>(storage_.data());
     registered_ = std::span(storage_).subspan((page - address % page) % page, length);
-    payload_ = registered_.subspan(kGuardBytes, options.bytes);
     urma_seg_cfg_t cfg{};
     cfg.va = reinterpret_cast<std::uintptr_t>(registered_.data());
     cfg.len = registered_.size();
@@ -101,12 +124,26 @@ std::expected<void, ToolError> RmaSession::Open(urma_context_t* ctx, const urma_
         return Error("only raw segment descriptors without provider extensions are supported", EOPNOTSUPP);
     }
     local_.segment = *exported;
-    local_.payload_address = reinterpret_cast<std::uintptr_t>(payload_.data());
+    local_.payload_address = reinterpret_cast<std::uintptr_t>(Payload(0).data());
     auto valid = ValidateRmaHello(local_);
     if (!valid) {
         return valid;
     }
-    local_sge_ = {.addr = local_.payload_address, .len = options.bytes, .tseg = segment_};
+    for (std::uint32_t slot = 0; slot < options.window; ++slot) {
+        local_sges_[slot] = {
+            .addr = reinterpret_cast<std::uintptr_t>(Payload(slot).data()), .len = options.bytes, .tseg = segment_};
+        if (options.mixed_send) {
+            send_sges_[slot] = {.addr = reinterpret_cast<std::uintptr_t>(SendPayload(slot).data()),
+                                .len = kRmaSendBytes,
+                                .tseg = segment_};
+        }
+    }
+    if (server && options.mixed_send) {
+        auto received = rx_.Open(pool_, options.window);
+        if (!received) {
+            return Error("open mixed READ/SEND receive buffers", received.error().provider_error);
+        }
+    }
     ready_ = true;
     return {};
 }
@@ -128,7 +165,8 @@ std::expected<void, ToolError> RmaSession::Exchange(ControlChannel& channel) {
     }
     peer_ = *decoded;
     if (peer_.server == local_.server || peer_.options.operation != local_.options.operation ||
-        peer_.options.bytes != local_.options.bytes || peer_.options.rounds != local_.options.rounds) {
+        peer_.options.bytes != local_.options.bytes || peer_.options.rounds != local_.options.rounds ||
+        peer_.options.window != local_.options.window || peer_.options.mixed_send != local_.options.mixed_send) {
         return Error("peer RMA role/options mismatch", EPROTO);
     }
     if (!local_.server) {
@@ -151,90 +189,243 @@ std::expected<void, ToolError> RmaSession::Exchange(ControlChannel& channel) {
         if (!target_) {
             return Error("import remote RMA jetty", errno ? errno : EIO);
         }
-        remote_sge_ = {.addr = peer_.payload_address, .len = local_.options.bytes, .tseg = remote_segment_};
+        for (std::uint32_t slot = 0; slot < local_.options.window; ++slot) {
+            remote_sges_[slot] = {.addr = peer_.payload_address + slot * RmaSlotStride(local_.options),
+                                  .len = local_.options.bytes,
+                                  .tseg = remote_segment_};
+        }
     }
     return {};
+}
+
+std::span<std::byte> RmaSession::Payload(std::uint32_t slot) {
+    return registered_.subspan(slot * RmaSlotStride(local_.options) + kGuardBytes, local_.options.bytes);
+}
+
+std::span<std::byte> RmaSession::SendPayload(std::uint32_t slot) {
+    return registered_.subspan(slot * RmaSlotStride(local_.options) + 2 * kGuardBytes + local_.options.bytes,
+                               kRmaSendBytes);
 }
 
 void RmaSession::Prepare(std::uint32_t round) {
     std::fill(registered_.begin(), registered_.end(), kGuard);
     const bool source = (local_.options.operation == RmaOperation::kRead) == local_.server;
-    for (std::size_t i = 0; i < payload_.size(); ++i) {
-        payload_[i] = source ? Pattern(round, i) : kPoison;
+    for (std::uint32_t slot = 0; slot < local_.options.window; ++slot) {
+        auto payload = Payload(slot);
+        for (std::size_t i = 0; i < payload.size(); ++i) {
+            payload[i] = source ? Pattern(round, slot, i) : kPoison;
+        }
+        if (local_.options.mixed_send) {
+            auto small = SendPayload(slot);
+            for (std::size_t i = 0; i < small.size(); ++i) {
+                small[i] = Pattern(round, slot, i + local_.options.bytes);
+            }
+        }
     }
 }
 
 std::expected<void, ToolError> RmaSession::Verify(std::uint32_t round) {
-    // READ 的发送源也校验未被改写；WRITE 的发送源同样保持完整，目标两端只在 CQ/屏障后读取。
-    for (std::size_t i = 0; i < payload_.size(); ++i) {
-        if (payload_[i] != Pattern(round, i)) {
-            return Error("RMA payload mismatch after completion", EPROTO);
+    // 每个并发槽独立校验，包含相邻槽之间的 guard；不会只验证一大片末尾保护区。
+    for (std::uint32_t slot = 0; slot < local_.options.window; ++slot) {
+        const auto payload = Payload(slot);
+        for (std::size_t i = 0; i < payload.size(); ++i) {
+            if (payload[i] != Pattern(round, slot, i)) {
+                return Error("RMA payload mismatch after completion", EPROTO);
+            }
         }
+        const auto memory = registered_.subspan(slot * RmaSlotStride(local_.options), RmaSlotStride(local_.options));
+        for (std::size_t i = 0; i < memory.size(); ++i) {
+            if (i >= kGuardBytes && i < kGuardBytes + payload.size()) {
+                continue;
+            }
+            if (local_.options.mixed_send && i >= 2 * kGuardBytes + payload.size() &&
+                i < 2 * kGuardBytes + payload.size() + kRmaSendBytes) {
+                if (memory[i] != Pattern(round, slot, i - 2 * kGuardBytes)) {
+                    return Error("mixed SEND source changed before retirement", EPROTO);
+                }
+            } else if (memory[i] != kGuard) {
+                return Error("RMA guard overwritten", EPROTO);
+            }
+        }
+        ++stats_.verified;
     }
-    for (const auto value : registered_.first(kGuardBytes)) {
+    for (const auto value : registered_.subspan(local_.options.window * RmaSlotStride(local_.options))) {
         if (value != kGuard) {
-            return Error("RMA prefix guard overwritten", EPROTO);
+            return Error("RMA registration padding overwritten", EPROTO);
         }
     }
-    for (const auto value : registered_.subspan(kGuardBytes + payload_.size())) {
-        if (value != kGuard) {
-            return Error("RMA suffix guard overwritten", EPROTO);
-        }
-    }
-    ++stats_.verified;
     return {};
 }
 
 std::expected<void, ToolError> RmaSession::Transfer(std::uint32_t round) {
-    wr_ = {};
-    wr_.opcode = local_.options.operation == RmaOperation::kRead ? URMA_OPC_READ : URMA_OPC_WRITE;
-    wr_.flag.bs.complete_enable = 1;
-    wr_.tjetty = target_;
-    wr_.user_ctx = static_cast<std::uint64_t>(round) + 1;
-    wr_.rw.src = {local_.options.operation == RmaOperation::kRead ? &remote_sge_ : &local_sge_, 1};
-    wr_.rw.dst = {local_.options.operation == RmaOperation::kRead ? &local_sge_ : &remote_sge_, 1};
+    const auto& options = local_.options;
+    const std::uint32_t factor = options.mixed_send ? 2 : 1;
+    const std::uint32_t count = options.window * factor;
+    const std::uint64_t first_id = static_cast<std::uint64_t>(round) * count + 1;
+    retired_.fill(false);
+    for (std::uint32_t slot = 0; slot < options.window; ++slot) {
+        auto& wr = wrs_[slot * factor];
+        wr = {};
+        const bool read = options.operation == RmaOperation::kRead;
+        wr.opcode = read ? URMA_OPC_READ : URMA_OPC_WRITE;
+        wr.rw.src = {read ? &remote_sges_[slot] : &local_sges_[slot], 1};
+        wr.rw.dst = {read ? &local_sges_[slot] : &remote_sges_[slot], 1};
+        if (options.mixed_send) {
+            auto& send = wrs_[slot * factor + 1];
+            send = {};
+            send.opcode = URMA_OPC_SEND_IMM;
+            send.send.src = {&send_sges_[slot], 1};
+            send.send.imm_data = static_cast<std::uint64_t>(round) * options.window + slot + 1;
+        }
+    }
+    for (std::uint32_t i = 0; i < count; ++i) {
+        auto& wr = wrs_[i];
+        wr.flag.bs.complete_enable = 1;
+        wr.tjetty = target_;
+        wr.user_ctx = first_id + i;
+        wr.next = i + 1 < count ? &wrs_[i + 1] : nullptr;
+    }
     urma_jfs_wr_t* bad = nullptr;
     const auto begin = std::chrono::steady_clock::now();
     stats_.pending = true;
-    const auto posted = UrmaApi::PostJettySendWr(jetty_, &wr_, &bad);
+    const auto posted = UrmaApi::PostJettySendWr(jetty_, wrs_.data(), &bad);
     stats_.last_post_status = static_cast<int>(posted);
-    if (posted != URMA_SUCCESS || bad) {
-        if (posted != URMA_SUCCESS && bad == &wr_) {
-            stats_.pending = false;
-        }
-        return Error("post RMA WR rejected or acceptance unresolved", static_cast<int>(posted));
-    }
-    ++stats_.accepted;
-    const auto deadline = begin + std::chrono::milliseconds(local_.options.timeout_ms);
-    std::array<urma_cr_t, 2> completions{};
-    for (;;) {
-        auto count = pool_.PollSend(completions);
-        if (!count) {
-            return Error("poll RMA completion", count.error().provider_error);
-        }
-        if (*count) {
-            const auto& cr = completions[0];
-            stats_.last_completion_status = static_cast<int>(cr.status);
-            // 假 CQE/status 错误先于 user_ctx 检查，错误完成不会触发 buffer 复用。
-            if (*count != 1 || cr.status != URMA_CR_SUCCESS || cr.flag.bs.s_r || !cr.flag.bs.jetty ||
-                cr.local_id != jetty_->jetty_id.id || cr.user_ctx != wr_.user_ctx) {
-                return Error("unexpected RMA completion status/type/id/count", static_cast<int>(cr.status));
+    std::uint32_t accepted = count;
+    const bool post_failed = posted != URMA_SUCCESS || bad;
+    if (post_failed) {
+        accepted = 0;
+        bool known = false;
+        if (posted != URMA_SUCCESS) {
+            for (std::uint32_t i = 0; i < count; ++i) {
+                if (bad == &wrs_[i]) {
+                    accepted = i;
+                    known = true;
+                    break;
+                }
             }
-            stats_.pending = false;
+        }
+        if (!known) {
+            stats_.accepted_known = false;
+            return Error("post RMA batch acceptance unresolved", static_cast<int>(posted));
+        }
+        stats_.partial_batches += accepted != 0;
+    }
+    stats_.accepted += accepted;
+    if (options.mixed_send) {
+        stats_.send_accepted += accepted / 2;
+    }
+    stats_.pending = accepted != 0;
+    const auto deadline = begin + std::chrono::milliseconds(options.timeout_ms);
+    std::uint32_t remaining = accepted;
+    std::array<urma_cr_t, 64> completions{};
+    while (remaining) {
+        auto polled = pool_.PollSend(completions);
+        if (!polled) {
+            return Error("poll RMA completion", polled.error().provider_error);
+        }
+        std::expected<void, ToolError> result;
+        for (int i = 0; i < *polled; ++i) {
+            const auto& cr = completions[i];
+            stats_.last_completion_status = static_cast<int>(cr.status);
+            // 边界假 CQE 的 user_ctx 无效，必须先排除；异常也不能丢弃同批后续可信 CQE。
+            if (!IsTerminal(cr.status) || cr.flag.bs.s_r || !cr.flag.bs.jetty || cr.local_id != jetty_->jetty_id.id ||
+                cr.user_ctx < first_id || cr.user_ctx - first_id >= accepted) {
+                if (result) {
+                    result = Error("unexpected RMA completion type/id", EPROTO);
+                }
+                continue;
+            }
+            const auto index = static_cast<std::size_t>(cr.user_ctx - first_id);
+            if (retired_[index]) {
+                if (result) {
+                    result = Error("duplicate RMA completion", EPROTO);
+                }
+                continue;
+            }
+            retired_[index] = true;
+            --remaining;
             ++stats_.retired;
+            stats_.send_retired += options.mixed_send && index % 2 == 1;
+            if (cr.status != URMA_CR_SUCCESS && result) {
+                result = Error("RMA completion failed", static_cast<int>(cr.status));
+            }
             const auto elapsed = static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
             if (!stats_.min_cqe_ns || elapsed < stats_.min_cqe_ns) {
                 stats_.min_cqe_ns = elapsed;
             }
             stats_.max_cqe_ns = std::max(stats_.max_cqe_ns, elapsed);
-            return {};
         }
-        if (std::chrono::steady_clock::now() >= deadline) {
+        stats_.pending = remaining != 0;
+        if (!result) {
+            return result;
+        }
+        if (remaining && std::chrono::steady_clock::now() >= deadline) {
             return Error("wait RMA completion", ETIMEDOUT);
         }
-        std::this_thread::yield();
+        if (!*polled) {
+            std::this_thread::yield();
+        }
     }
+    if (post_failed) {
+        return Error("RMA batch rejected after accepted prefix retired; no replay", static_cast<int>(posted));
+    }
+    return {};
+}
+
+std::expected<void, ToolError> RmaSession::Receive(std::uint32_t round) {
+    const auto& options = local_.options;
+    received_.fill(false);
+    std::uint32_t remaining = options.window;
+    const std::uint64_t first_id = static_cast<std::uint64_t>(round) * options.window + 1;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(options.timeout_ms);
+    std::array<raw::RxBufferEvent, raw::RxBufferPool::kPollBatch> events{};
+    while (remaining) {
+        auto polled = rx_.Poll(events);
+        if (!polled) {
+            return Error("poll mixed READ/SEND receive", polled.error().provider_error);
+        }
+        std::expected<void, ToolError> result;
+        for (std::size_t i = 0; i < *polled; ++i) {
+            auto& event = events[i];
+            const auto id = event.completion.imm_data;
+            bool valid = !event.error && event.lease && event.completion.opcode == URMA_CR_OPC_SEND_WITH_IMM &&
+                         event.payload.size() == kRmaSendBytes && id >= first_id && id - first_id < options.window &&
+                         event.completion.remote_id.id == peer_.endpoint.id &&
+                         std::memcmp(event.completion.remote_id.eid.raw, peer_.endpoint.eid.raw, URMA_EID_SIZE) == 0;
+            if (valid) {
+                const auto slot = static_cast<std::uint32_t>(id - first_id);
+                valid = !received_[slot];
+                for (std::size_t j = 0; valid && j < event.payload.size(); ++j) {
+                    valid = event.payload[j] == Pattern(round, slot, j + options.bytes);
+                }
+                if (valid) {
+                    received_[slot] = true;
+                    --remaining;
+                    ++stats_.send_received;
+                }
+            }
+            if (!valid && result) {
+                result = Error("mixed READ/SEND receive identity or payload mismatch", EPROTO);
+            }
+            if (event.lease) {
+                auto released = rx_.Release(*event.lease);
+                if (!released && result) {
+                    result = Error("release mixed READ/SEND receive", released.error().provider_error);
+                }
+            }
+        }
+        if (!result) {
+            return result;
+        }
+        if (remaining && std::chrono::steady_clock::now() >= deadline) {
+            return Error("wait mixed READ/SEND receive", ETIMEDOUT);
+        }
+        if (!*polled) {
+            std::this_thread::yield();
+        }
+    }
+    return {};
 }
 
 std::expected<void, ToolError> RmaSession::Barrier(ControlChannel& channel, std::uint32_t marker) {
@@ -257,6 +448,12 @@ std::expected<void, ToolError> RmaSession::Run(ControlChannel& channel) {
     }
     for (std::uint32_t round = 0; round < local_.options.rounds; ++round) {
         Prepare(round);
+        if (local_.server && local_.options.mixed_send) {
+            auto posted = rx_.Refill(local_.options.window);
+            if (!posted || *posted != local_.options.window) {
+                return Error("refill mixed READ/SEND receive", posted ? EPROTO : posted.error().provider_error);
+            }
+        }
         auto ready = Barrier(channel, kReady + round);
         if (!ready) {
             return ready;
@@ -279,7 +476,14 @@ std::expected<void, ToolError> RmaSession::Run(ControlChannel& channel) {
                 return confirmed;
             }
         } else {
-            // 服务端不投递 RX，也不等待 RX CQE。客户端的成功 TX CQE 加此控制消息是读取目标数据的前提。
+            // 混合模式先推进 RX，客户端仍须等整批 READ/SEND CQE 后才能发完成标记。
+            if (local_.options.mixed_send) {
+                auto received = Receive(round);
+                if (!received) {
+                    return received;
+                }
+            }
+            // 成功 TX CQE 加控制消息，才允许服务端读取/复用 RMA 源或目标。
             auto completed = channel.ExpectMarker(kCompleted + round, local_.options.timeout_ms);
             if (!completed) {
                 return completed;
@@ -298,6 +502,13 @@ std::expected<void, ToolError> RmaSession::Run(ControlChannel& channel) {
     auto extra = pool_.PollSend(tail);
     if (!extra || *extra) {
         return Error("unexpected extra RMA completion before close", extra ? EPROTO : extra.error().provider_error);
+    }
+    if (local_.server && local_.options.mixed_send) {
+        std::array<raw::RxBufferEvent, raw::RxBufferPool::kPollBatch> events{};
+        auto received = rx_.Poll(events);
+        if (!received || *received) {
+            return Error("unexpected extra mixed SEND receive before close", EPROTO);
+        }
     }
     auto stopped = Barrier(channel, kQuiescent);
     if (!stopped) {
@@ -330,6 +541,10 @@ std::expected<void, ToolError> RmaSession::Close() {
         }
         remote_segment_ = nullptr;
     }
+    auto rx_closed = rx_.Close();
+    if (!rx_closed) {
+        return failed("close mixed READ/SEND receive buffers", rx_closed.error().provider_error);
+    }
     auto closed = pool_.Close();
     if (!closed) {
         return failed("close RMA queues", closed.error().provider_error);
@@ -342,7 +557,6 @@ std::expected<void, ToolError> RmaSession::Close() {
         }
         segment_ = nullptr;
     }
-    payload_ = {};
     registered_ = {};
     storage_.clear();
     ctx_ = nullptr;

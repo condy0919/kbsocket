@@ -201,6 +201,18 @@ TEST(JfrLimitProtocolTest, BoundsWatermarkExperimentAndWatchdogInputs) {
     EXPECT_FALSE(ValidateJfrLimitOptions({.crossings = 1}));
     EXPECT_FALSE(ValidateJfrLimitOptions({.crossings = 1001}));
     EXPECT_FALSE(ValidateJfrLimitOptions({.rearm = static_cast<JfrLimitRearm>(3)}));
+    EXPECT_FALSE(ValidateJfrLimitOptions({.traffic = JfrLimitTraffic::kConcurrent}));
+    EXPECT_FALSE(ValidateJfrLimitOptions({.traffic = static_cast<JfrLimitTraffic>(2)}));
+    EXPECT_FALSE(ValidateJfrLimitOptions({.rearm_at = static_cast<JfrLimitRearmAt>(2)}));
+    EXPECT_FALSE(ValidateJfrLimitOptions({.send_interval_us = 10001}));
+    EXPECT_FALSE(ValidateJfrLimitOptions({.observe_ms = 1,
+                                          .timeout_ms = 100,
+                                          .rearm = JfrLimitRearm::kRewrite,
+                                          .traffic = JfrLimitTraffic::kConcurrent,
+                                          .send_interval_us = 10000}));
+    EXPECT_TRUE(ValidateJfrLimitOptions({.rearm = JfrLimitRearm::kRewrite,
+                                         .traffic = JfrLimitTraffic::kConcurrent,
+                                         .rearm_at = JfrLimitRearmAt::kBelow}));
 }
 
 TEST(JfrLimitProtocolTest, HelloRoundTripUsesNetworkOrderAndKeepsTimeoutLocal) {
@@ -209,8 +221,8 @@ TEST(JfrLimitProtocolTest, HelloRoundTripUsesNetworkOrderAndKeepsTimeoutLocal) {
     hello.endpoint.id = 0x01020304;
     hello.endpoint.eid.raw[15] = 42;
     const auto wire = EncodeJfrLimitHello(hello);
-    EXPECT_EQ(wire.size(), 56U);
-    EXPECT_EQ(wire[7], std::byte{2});
+    EXPECT_EQ(wire.size(), 68U);
+    EXPECT_EQ(wire[7], std::byte{3});
     EXPECT_EQ(wire[11], std::byte{1});
     EXPECT_EQ(wire[15], std::byte{128});
     EXPECT_EQ(wire[19], std::byte{64});
@@ -239,7 +251,7 @@ TEST(JfrLimitProtocolTest, HelloRejectsForeignProtocolRoleAndMalformedOptions) {
     const auto valid = EncodeJfrLimitHello(hello);
     ASSERT_TRUE(DecodeJfrLimitHello(valid));
     // 错工具、错版本、非法角色都应在远端导入与 WR 投递之前失败。
-    for (const auto offset : {0U, 7U, 11U, 12U, 16U, 20U, 24U, 48U, 55U}) {
+    for (const auto offset : {0U, 7U, 11U, 12U, 16U, 20U, 24U, 48U, 55U, 59U, 63U, 64U}) {
         auto corrupted = valid;
         corrupted[offset] = std::byte{0xff};
         EXPECT_FALSE(DecodeJfrLimitHello(corrupted)) << "offset=" << offset;
@@ -277,6 +289,44 @@ TEST(JfrLimitProtocolTest, PeerMustMatchOppositeRoleAndAllTrafficParameters) {
     peer = {.server = true};
     peer.options.rearm = JfrLimitRearm::kRewrite;
     EXPECT_FALSE(ValidateJfrLimitPeer(local, peer));
+    peer = {.server = true};
+    peer.options.traffic = JfrLimitTraffic::kConcurrent;
+    EXPECT_FALSE(ValidateJfrLimitPeer(local, peer));
+    peer = {.server = true};
+    peer.options.rearm_at = JfrLimitRearmAt::kBelow;
+    EXPECT_FALSE(ValidateJfrLimitPeer(local, peer));
+    peer = {.server = true};
+    ++peer.options.send_interval_us;
+    EXPECT_FALSE(ValidateJfrLimitPeer(local, peer));
+}
+TEST(JfrLimitProtocolTest, ConcurrentProtocolPreservesModeAndPacingAndAccountsForDistinctTraffic) {
+    // above 的 32 条窗口流量属于同一次跨线；below 先消耗 32 再补满，需要额外计数。
+    JfrLimitHello hello{.options = {.crossings = 8,
+                                    .rearm = JfrLimitRearm::kRewrite,
+                                    .traffic = JfrLimitTraffic::kConcurrent,
+                                    .rearm_at = JfrLimitRearmAt::kBelow,
+                                    .send_interval_us = 1234},
+                        .server = true};
+    hello.endpoint.id = 1;
+    const auto wire = EncodeJfrLimitHello(hello);
+    EXPECT_EQ(wire[59], std::byte{1});
+    EXPECT_EQ(wire[63], std::byte{1});
+    EXPECT_EQ(wire[66], std::byte{4});
+    EXPECT_EQ(wire[67], std::byte{0xd2});
+    auto decoded = DecodeJfrLimitHello(wire);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->options.traffic, JfrLimitTraffic::kConcurrent);
+    EXPECT_EQ(decoded->options.rearm_at, JfrLimitRearmAt::kBelow);
+    EXPECT_EQ(decoded->options.send_interval_us, 1234U);
+    EXPECT_EQ(ExpectedJfrLimitTraffic(hello.options), 807U);
+    hello.options.rearm_at = JfrLimitRearmAt::kAbove;
+    EXPECT_EQ(ExpectedJfrLimitTraffic(hello.options), 583U);
+    hello.options.traffic = JfrLimitTraffic::kStaged;
+    EXPECT_EQ(ExpectedJfrLimitTraffic(hello.options), 590U);
+    // v2 不带实验窗口与 pacing 参数，不能误认为握手成功。
+    auto previous = wire;
+    previous[7] = std::byte{2};
+    EXPECT_FALSE(DecodeJfrLimitHello(previous));
 }
 } // namespace
 } // namespace tools
