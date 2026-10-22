@@ -92,7 +92,11 @@ USE_BAZEL_VERSION=9.3.0 bazel test //tools/async_event_test:async_event_test_tes
 
 用户提供的 depth=128/256 两组双端日志均通过，端点为服务端 `udmac0d1e4:39`、客户端 `udmac0d1e4:42`，共同参数 `threshold=64、bytes=4096、observe_ms=100`。查询的深度/水线均与请求一致；首次各取得并 Ack 一个 context/JFR 匹配的 JFR_LIMIT（type=3），其他阶段均未取得事件。服务端 posted=received、客户端 accepted=retired 分别为 194/450，水线已禁用，双方正常关闭。
 
-这些历史日志来自两次跨线、没有阈值重写的实验；首次事件与补投恢复已验证，第二次均为 NOT_OBSERVED。新增的多轮 none/rewrite/toggle 模式尚待真机反馈，不能继承历史通过结论。详细计数与解释见[硬件观测记录](../../docs/hardware-observations.md)。
+这些历史日志来自两次跨线、没有阈值重写的实验；首次事件与补投恢复已验证，第二次均为 NOT_OBSERVED。
+
+随后 `depth=128、threshold=64、crossings=8、rearm=rewrite、observe_ms=100、bytes=4096` 的 A6 双端通过，服务端 `udmac0d1e4:39`，客户端 `udmac0d1e4:51`。每轮 before_rearm/after_rearm/after_crossing 的 threshold 均为 `0/64/0`，各取得并 Ack 一个匹配的 JFR_LIMIT；其他阶段事件为 0。双端 `requested=completed=observed=8`，服务端 posted=received=590，客户端 accepted=retired=590，最终禁用水线并正常关闭。
+
+这验证了本组补满后直接重写 64 可恢复通知，无需在轮间先显式写 0。重写的是相同请求值，但操作前实际查询值已经是 0；日志不能分辨清零由硬件、驱动还是 provider 内部执行。新版 none/toggle 的 8 轮及 depth=256 多轮仍待反馈，不能继承 A6 的结果。详细计数与解释见[硬件观测记录](../../docs/hardware-observations.md)。
 
 ## 完成、Ack 与资源生命周期
 

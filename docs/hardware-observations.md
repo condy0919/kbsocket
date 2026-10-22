@@ -44,7 +44,7 @@
 | status 8 的生产完成层集成 | peer_exit 的 Q3/Q4（`batch=32/128、rounds=8`）双端 PASS；completion_path=processor，processor_events=processor_retired=1025/4097 | 真实完成经 TxCompletionProcessor 逐 WR 退休并归还额度，软件 lane 与硬件 SQ 保持 READY；健康三阶段均成功，跨完成批次及后续轮次继续可用 |
 | [Provider 提交边界](../tools/provider_boundary_test/README.md) | `tx_depth=64/128/256` 分别接受并退休 `128/256/512` 条，三组均容量拒绝和部分接受；额外 ERROR post 组也通过 | 真实容量拒绝为 `ENOMEM`；ERROR SQ 仍可能接受 post；已观察到非零 `WR_UNHANDLED` |
 | [残留 RX 的 JFR 关闭](../tools/jfr_lifecycle_test/README.md) | `rx_depth/consumed` 为 `1/0、32/0、256/0、32/7、256/255` 五组通过 | 对端静默、依赖 jetty 已删除后，残留 posted RX 不妨碍本次 DeleteJfr；之后释放 MR |
-| [JFR 水线 async 事件](../tools/async_event_test/README.md) | depth=128/256、threshold=64，两组首次各取得并 Ack 1 个匹配的 JFR_LIMIT；全部 194/450 条流量及双端关闭通过；重复跨线均 NOT_OBSERVED | 首次事件路径、归属与 Get/Ack、补投恢复可工作；仅 Ack 和补投未使本轮再次跨线产生可见事件，显式重新使能尚未测试 |
+| [JFR 水线 async 事件](../tools/async_event_test/README.md) | depth=128/256 的首次事件通过，不重配的第二次未观察到；A6 的 depth=128、rewrite 8 轮各 Get/Ack 1 个匹配事件，590 条流量及关闭通过 | 当前配置下跨线后阈值回读为 0，补满后直接重写 64 可恢复下一次通知；仅 Ack/补投不应当作重新使能 |
 | [持续收发与 JFC 通知](../tools/streaming_test/README.md) | 同设备双 context 已通过；两设备各双 EID 的四 context 在 D1、D3 及额外的 `window=32、events/延迟 0` 组均双端 PASS；D2 首次 status 9/事件等待超时，第二次双端 PASS、各十行 OBSERVED | 四路持续收发、补投、通知、recheck 与双端各路 fd readiness 均有通过证据；D2 首次失败仍未定位，不能据复测通过宣称问题已修复 |
 | [单 WR READ/WRITE](../tools/rma_test/README.md) | READ/WRITE 各 `4 KiB、16 KiB、1 MiB、8 MiB`，每组 8 轮 PASS，未投递 RX | 单 WR 可传输大于 4 KiB 的 RMA 数据；本地/远端 payload 与 guards 校验及关闭通过 |
 | [对端退出后提交](../tools/peer_failure_test/README.md) | `process_exit` 的 batch 32、256 均 post 成功，全部以 status 8 退休；本地查询前后 READY，无 async | 已确认对端退出后，本地仍可接受 SEND；故障通过逐 WR CQE 报告，不必伴随本地 SQ ERROR/async |
@@ -428,11 +428,34 @@ Q3 的 healthy/sink mixed 软件 CQE 耗时分别为 `20.610～41.130 / 20.420�
 
 首次事件通过 context 的 `async_fd`、`GetAsyncEvent` 和 `AckAsyncEvent` 取得并确认，类型 3 对应 JFR_LIMIT，且原事件的 context/JFR 归属正确。补投后的一条正常恢复流量、第二次跨线流量和关闭前的独立 cleanup 流量均通过 payload 与完成检查。最后禁用水线并消费剩余 63 个 RX，双方完成资源关闭。因此首次水线事件、事件确认及补投恢复可登记通过。
 
-两次跨线之间没有重新配置水线，只有 Ack 与 RX 补投；第二次窗口及后续 cleanup 均未取得更多事件。**本轮未验证水线通知会自动重复触发，不能依赖仅 Ack/补投就必有下一次通知。** 该现象与需要显式重新使能的行为相容，但尚不能据此认定硬件永久只触发一次，或某种重新配置方式必然有效；硬件版本和事件延迟上界未确认。需要继续研究时，应单独在补满后验证重写 64 或 `0→64`，并区分修改配置期间与随后再次跨线时取得的事件，不覆盖本轮“不重写阈值”的结果。
+两次跨线之间没有重新配置水线，只有 Ack 与 RX 补投；第二次窗口及后续 cleanup 均未取得更多事件。**这两组未验证水线通知会自动重复触发，不能依赖仅 Ack/补投就必有下一次通知。** 当时的证据仅与需要显式重新使能的行为相容，没有证明哪种重新配置方式有效。后续 A6 单独验证补满后重写 64 的行为，并区分配置期间与跨线窗口取得的事件，不覆盖原始“不重写阈值”的结果。
 
-源码对照：本地 [urma_cmd.c](../../umdk/src/urma/lib/urma/core/urma_cmd.c) 对 JFR_LIMIT 的 Ack 仅累计已确认事件数并唤醒资源销毁等待者，没有重新配置硬件；[udma_jfr.c](../../kernel/drivers/ub/urma/hw/udma/udma_jfr.c) 对显式设置 `JFR_RX_THRESHOLD` 会下发修改命令，即使仍写相同阈值，也未见跳过逻辑。但这不足以证明重新写 64 就会恢复通知。查询返回的 threshold 是配置值，不是下一次事件已使能的证明；上述实测版本在首次配置与关闭时查询，没有在首次事件后再次查询。上述是本地源码行为，尚未核对现场版本。
+源码对照：本地 [urma_cmd.c](../../umdk/src/urma/lib/urma/core/urma_cmd.c) 对 JFR_LIMIT 的 Ack 仅累计已确认事件数并唤醒资源销毁等待者，没有重新配置硬件；[udma_jfr.c](../../kernel/drivers/ub/urma/hw/udma/udma_jfr.c) 对显式设置 `JFR_RX_THRESHOLD` 会下发修改命令，即使仍写相同阈值，也未见跳过逻辑。仅凭源码不足以证明重新写 64 就会恢复通知，后续 A6 提供了独立实测证据。查询返回的 threshold 是配置值，不单独作为下一次事件已使能的证明；前述两轮实测版本在首次配置与关闭时查询，没有在首次事件后再次查询。上述是本地源码行为，尚未核对现场版本。
 
-后续工具已增加 `--crossings` 和 `--rearm=none|rewrite|toggle`，每轮记录配置前后及跨线后的实际 Query，单独统计补投、满水位与跨线窗口取得的事件；协议为 v2。三个模式的多轮实测结果仍待反馈，已有两次不重配日志不能替代新增路径验证。运行方法与计数见 [async_event_test README](../tools/async_event_test/README.md)，验证矩阵按 A5–A7 单独登记。
+后续工具已增加 `--crossings` 和 `--rearm=none|rewrite|toggle`，每轮记录配置前后及跨线后的实际 Query，单独统计补投、满水位与跨线窗口取得的事件；协议为 v2。运行方法与计数见 [async_event_test README](../tools/async_event_test/README.md)，验证矩阵按 A5–A7 单独登记。
+
+### 重写 64 的 8 轮结果
+
+用户提供 A6 的完整双端日志：`rx_depth=128、threshold=64、bytes=4096、observe_ms=100、crossings=8、rearm=rewrite`，watchdog 为 60000 ms。服务端 `udmac0d1e4:39`，jetty=23442、JFR=9626；客户端 `udmac0d1e4:51`，jetty=49500、JFR=21086。
+
+| 指标 | 实测结果 |
+| --- | --- |
+| requested / completed / observed | 双端均为 8 / 8 / 8 |
+| 每轮 before_rearm 查询 | depth=128、threshold=0 |
+| 每轮 after_rearm 查询 | depth=128、threshold=64 |
+| 每轮 after_crossing 查询 | depth=128、threshold=0 |
+| 每轮跨线事件 | Get/retrieved/Ack/JFR_LIMIT 均为 1，type=3，context/JFR 匹配 |
+| 首次 / 后续跨线累计事件 | 1 / 7 |
+| baseline / refill_control / above_water / cleanup 事件 | 均为 0 |
+| 服务端 posted / received | 590 / 590 |
+| 客户端 accepted / retired / accepted_known | 590 / 590 / true |
+| 最终 threshold_disabled / 双端结果 | true / PASS |
+
+客户端第一轮接受并退休 65 条，随后 7 轮各 66 条（1 条恢复流量加 65 条跨线流量），最后另有 63 条 cleanup，所以总量为 `65+7*66+63=590`。服务端最初投递 128 个 RX，后续每轮补投 66 个，总量为 `128+7*66=590`；每轮日志不包含最终 cleanup，不能把各轮 received/retired 直接相加当作总量。
+
+这组观察到稳定的 `配置64 → 跨线取得并Ack事件 → 查询0 → 补满 → 再配置64` 循环，8 次都取得匹配事件；没有把满水位/配置期间取得的事件充当跨线事件。**当前设备与软件组合下，补满后直接重写 64 足以恢复后续水线通知，对外表现与一次性触发后禁用、显式重新使能一致。** 本实验没有在轮间主动写入 0，`disabled` 的 queried=false 表示未执行该步骤；最终 cleanup 才主动禁用水线。
+
+`rewrite` 重写的是同一个请求值 64，但每轮操作前实际回读已经为 0，因此这不是验证“当前值仍为 64 时再写 64”的效果。日志不能进一步定位清零发生于硬件、驱动还是 provider 内部，也不能给出精确清零时刻或任意时序下的事件数量保证。新版 none 的 8 轮对照、toggle 模式及 depth=256 的多轮结果仍未登记；不能因本组通过推定这些场景也通过。
 
 水线事件也不代替 RX CQE、buffer 所有权归还或 DMA 静默证明。正常 RX 补投应由完成与可用槽位驱动，不能等到水线事件才推进。
 
@@ -471,7 +494,7 @@ status 9 是 ACK_TIMEOUT，status 10 才是 RNR 重试耗尽：[urma_opcode.h](.
 - 两设备各双 EID 的四 context 已有 D1、D3 和 D2 第二次运行的通过证据，双端各路 fd readiness 已覆盖；后续重点是 D2 首次失败的逐 context CQE/事件时序诊断，而非把原覆盖缺口继续列作未测。四个物理裸设备并行按用户部署范围暂缓。
 - 真正中断硬件在途 WR 的对端退出；`inflight_exit` 已验证提交后退出的控制时序，但本次全部 SUCCESS，硬件在途未确认。
 - 链路/端口真实故障的工具日志：用户说明通常为 ACK_TIMEOUT，现有 external 场景尚无日志，不把当前无法观察的 PORT_DOWN async 列作通过条件。
-- JFR 水线首次事件及 Get/Ack 已有 depth=128/256 两组实测；不重写阈值的重复跨线未观察到事件，显式重新使能仍待独立实验。用户确认支持的 JFS/JFR/JFC error 还需遵循相应注入条件补记录；当前 JFS/相关 jetty AE 需通过绑定 JFC error 联动。既有进程退出测试未观测到 async，不要求为该故障强行触发事件。
+- JFR 水线首次事件及 Get/Ack 已有 depth=128/256 两组实测，A6 已验证 depth=128 下重写 64 可恢复通知，8 轮全部观察到；不重写阈值的历史第二次跨线未观察到事件，新版 none/toggle 的 8 轮及 depth=256 多轮仍待记录。用户确认支持的 JFS/JFR/JFC error 还需遵循相应注入条件补记录；当前 JFS/相关 jetty AE 需通过绑定 JFC error 联动。既有进程退出测试未观测到 async，不要求为该故障强行触发事件。
 - 多 WR 并发 RMA、RMA 故障、WRITE 加数据面通知的可见性/lease 协议，以及大于 8 MiB 的传输。
 - 对端仍活跃时的共享 JFR 删除，以及 brpc worker 仍访问资源时的进程退出；已通过的是受控静默后的残留 RX 删除。
 
