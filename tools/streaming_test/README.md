@@ -39,7 +39,7 @@ bazel-bin/tools/streaming_test/streaming_test \
 | 32 | 100001 | 0 | 连续负载与通知合并 |
 | 32 | 10001 | 100 | 放大 arm 到 recheck 的软件间隔 |
 
-每轮先通过 `WaitJfc(timeout=0) → AckJfc` 消费已有通知，再 poll CQ 并推进流量。无进展时执行 `rearm → recheck`；recheck 仍无进展才调用 `poll(JFCE fd)`，fd 就绪后再次消费通知。等待超时直接失败，不靠定时重新 poll 掩盖丢通知。`WaitJfc` 每个返回项 ack 一次，ack 的单位是通知而非 CQE。[URMA API 文档](https://docs.openeuler.org/zh/docs/24.03_LTS_SP3/unifiedbus/unifiedbus/urma/URMA%20API%20Guide.ch.html)
+每轮先通过 `WaitJfc(timeout=0) → AckJfc` 消费已有通知，再 poll CQ 并推进流量。无进展时执行 `rearm → recheck`；recheck 仍无进展才调用 `poll(JFCE fd)`，fd 就绪后再次消费通知。等待超时仍然失败，只额外执行下文的诊断采样，不恢复轮询推进。`WaitJfc` 每个返回项 ack 一次，ack 的单位是通知而非 CQE。[URMA API 文档](https://docs.openeuler.org/zh/docs/24.03_LTS_SP3/unifiedbus/unifiedbus/urma/URMA%20API%20Guide.ch.html)
 
 `--arm_delay_us` 主动延迟 rearm 到 recheck 之间的时间，供 CQE 在这个窗口到达。延迟较大时，recheck 常常已经消费 CQE，循环直接继续推进，无须进入 fd 等待分支；已有通知仍会在下一轮由 `WaitJfc(timeout=0)` 消费并 ack。这种情况下，`recheck_progress` 非零、通知存在而 `fd_wakes=0` 是有效结果，不表示丢通知。
 
@@ -149,6 +149,51 @@ bazel-bin/tools/streaming_test/streaming_test \
 先保证每个端点独立可通信，再跑这三组。两设备四 context 验证的是单 owner 下四路共存、独立身份与持续复用，不验证四个 CPU owner 并行性能，也不验证跨设备故障隔离。当前本地 gMock 已覆盖八个独立 `StreamSession`（两端各四个 context），一条延迟不阻塞其他三条，以及四个独立 eventfd 的归属、通知 ack 和 RX 补投；这些单测通过不等于物理硬件已经通过。
 
 不加 `--two_devices_two_eids` 时，保留原有任意 1–4 context 用法，包括同设备多个 EID。四个物理设备测试目前暂缓，同设备四 EID 也不能替代这里的两设备各两 EID。
+
+## 失败诊断与 window=1 对照
+
+运行失败时，工具保留原有流量计数，并在 `FAIL` 之前向 stderr 输出诊断；成功路径的输出保持不变。保留两端完整 stdout/stderr，避免遗漏失败定位信息。
+
+- `Stream failure`：失败阶段、可定位时的 context 索引、运行开始与失败时间。`context=none` 表示等待或全局超时没有唯一来源，不等于所有 context 都失败。
+- `Stream last wait` 和 `Stream context`：最近一次 fd 等待的开始、结束、返回值、errno、各 fd 的 `revents`，以及等待次数。尚未进入等待时，这些时间和次数为 0。每个 context 同时记录设备组、设备/EID、jetty、最近一次流量推进时间和截至失败的 `idle_ns`；未取得进展时使用 `started_ns` 计算，并标记 `idle_from=start`。通知的领取或 ack 不算流量推进。超时仍沿用四路共用的无进展期限，这些独立时间用于识别被其他路进展掩盖的停滞。
+- `Stream failure CQE`：首次失败 CQE 的 TX/RX 方向、status、local_id、user_ctx、flags、opcode、长度和批内位置。只有完成通过对应身份校验时才有 `sequence_valid=true`；RX 的原始 user_ctx 是接收槽位，不直接等于消息序号。`FLUSH_ERR_DONE/SUSPEND_DONE` 等边界伪 CQE 的 user_ctx 记为 `0/suppressed`，不能据此查找 WR。
+- `Stream timeout probe`：超时后对每个 context 做一次分时采样，记录通知领取结果、errno、TX/RX/未知归属通知数、ack 数，以及各 TX/RX CQ 的一次 poll 结果和 errno。每只 CQ 最多保存 64 个完成，逐项以 `sampling=diagnostic-only` 输出；满 64 时 `may_have_more=true`，不能认为已读取全部完成。探查只打印原始身份，`sequence_valid=false`，不复用正常身份校验或退休路径。
+
+`failure_unix_ns` 是系统时钟时间，其他时间戳为本机 steady clock 纳秒。不同机器的 steady clock 时间戳不能直接比较；跨端对照 `failure_unix_ns` 也需要现场时钟同步及对同步误差的了解。`idle_ns` 是截至首次失败记录时的间隔，不包含后续诊断采样耗时。
+
+超时探查的通知、TX CQ、RX CQ 分别在调用时采样，且各 context 依次执行，**不是超时瞬间的原子快照**。失败后看到 CQE，只说明采样时存在完成，不能单凭它确认此前丢通知；失败后没有 CQE，也不能证明此前没有完成。已被失败批次取出的 CQE 不会重新出现在探查里，`batch_count/batch_index` 用于区分已读取但尚未按正常路径处理的后缀。普通 CQE 错误仅记录故障完成，不额外执行超时探查。
+
+探查不发送、不补投、不退休 WR，也不会将读到的 SUCCESS 计入原有流量计数。即使读到了完成，测试仍为 FAIL，资源保留到进程退出，不切回轮询继续运行。这些诊断用于区分故障现场，**没有修复或解释 ACK_TIMEOUT 的根因**。
+
+针对四 context 偶发 ACK_TIMEOUT/等待超时，先使用相同 `window=1` 对比事件模式与纯轮询；沿用前文已设置的端点变量，两端分别逐组启动：
+
+```bash
+# 第 1 组：服务端；客户端使用下面对应的 --events 命令。
+bazel-bin/tools/streaming_test/streaming_test \
+  --server --address=0.0.0.0 --port=8894 \
+  --devices="${SERVER_ENDPOINTS}" --two_devices_two_eids \
+  --window=1 --messages=100001 --bytes=4096 --events --arm_delay_us=0
+
+# 第 1 组：客户端。
+bazel-bin/tools/streaming_test/streaming_test \
+  --address="${SERVER_ADDRESS}" --port=8894 \
+  --devices="${CLIENT_ENDPOINTS}" --two_devices_two_eids \
+  --window=1 --messages=100001 --bytes=4096 --events --arm_delay_us=0
+
+# 第 2 组：服务端；客户端使用下面对应的 --noevents 命令。
+bazel-bin/tools/streaming_test/streaming_test \
+  --server --address=0.0.0.0 --port=8894 \
+  --devices="${SERVER_ENDPOINTS}" --two_devices_two_eids \
+  --window=1 --messages=100001 --bytes=4096 --noevents
+
+# 第 2 组：客户端。
+bazel-bin/tools/streaming_test/streaming_test \
+  --address="${SERVER_ADDRESS}" --port=8894 \
+  --devices="${CLIENT_ENDPOINTS}" --two_devices_two_eids \
+  --window=1 --messages=100001 --bytes=4096 --noevents
+```
+
+每组重复运行并保留首次失败与成功日志。对比时保持设备/EID、窗口、消息数、payload 和超时设置相同，先观察错误是否始终集中在相同设备组、失败 CQE 的身份及各路停滞时间。单次复测 PASS 不能关闭此前失败，也不能仅凭两种模式的差异认定事件通知为根因。
 
 ## 生命周期与退出
 

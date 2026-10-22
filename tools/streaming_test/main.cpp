@@ -2,9 +2,12 @@
 #include <unistd.h>
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <print>
+#include <span>
 #include <string>
 
 #include "tools/common/control_channel.hpp"
@@ -43,6 +46,91 @@ int Fail(const kbsocket::tools::ToolError& error) {
     std::println(stderr, "FAIL: {}: {}; unresolved resources retained until process exit", error.operation, error.code);
     return 1;
 }
+
+void PrintCompletionFields(const urma_cr_t& cr, bool suppress_user_ctx) {
+    // 边界伪 CQE 没有 WR 身份，不能把硬件填充的 user_ctx 当作可定位消息的线索。
+    const bool suppressed =
+        suppress_user_ctx || cr.status == URMA_CR_WR_FLUSH_ERR_DONE || cr.status == URMA_CR_WR_SUSPEND_DONE;
+    std::print(stderr, "status={} local_id={} user_ctx={} user_ctx_source={} flags={:#x} opcode={} completion_len={}",
+               static_cast<int>(cr.status), cr.local_id, suppressed ? 0 : cr.user_ctx,
+               suppressed ? "suppressed" : "raw", static_cast<unsigned>(cr.flag.value), static_cast<int>(cr.opcode),
+               cr.completion_len);
+}
+
+void PrintTimeoutProbe(std::size_t context, const kbsocket::tools::StreamTimeoutProbe& probe) {
+    std::println(stderr, "Stream timeout probe: context={} attempted={} begin_ns={} end_ns={} sampling=diagnostic-only",
+                 context, probe.attempted, probe.begin_ns, probe.end_ns);
+    if (!probe.attempted) {
+        return;
+    }
+    std::println(stderr,
+                 "Stream probe notifications: context={} checked={} result={} errno={} tx={} rx={} foreign={} acked={}",
+                 context, probe.notifications_checked, probe.notification_result, probe.notification_errno,
+                 probe.tx_notifications, probe.rx_notifications, probe.foreign_notifications, probe.acknowledged);
+    const auto print_completions = [&](const char* direction, int result, int saved_errno,
+                                       std::span<const urma_cr_t> completions) {
+        const bool count_valid = result >= 0 && result <= static_cast<int>(completions.size());
+        const auto count = count_valid ? result : 0;
+        std::println(stderr,
+                     "Stream probe CQ: context={} direction={} result={} errno={} count_valid={} captured={} "
+                     "batch_limit={} may_have_more={} sampling=diagnostic-only",
+                     context, direction, result, saved_errno, count_valid, count, completions.size(),
+                     result == static_cast<int>(completions.size()));
+        for (int i = 0; i < count; ++i) {
+            std::print(stderr, "Stream probe CQE: context={} direction={} batch_index={} ", context, direction, i);
+            PrintCompletionFields(completions[i], false);
+            // 探查不走正常身份校验与退休，RX 的 user_ctx 是槽位，TX 的原始值也不声明可信。
+            std::println(stderr, " sequence_valid=false sampling=diagnostic-only");
+        }
+    };
+    print_completions("tx", probe.tx_result, probe.tx_errno, probe.tx_completions);
+    print_completions("rx", probe.rx_result, probe.rx_errno, probe.rx_completions);
+}
+
+void PrintRunDiagnostics(const kbsocket::tools::StreamRunDiagnostics& run,
+                         std::span<kbsocket::tools::StreamSession* const> sessions,
+                         std::span<const kbsocket::raw::DeviceConfig> devices,
+                         const kbsocket::tools::StreamDeviceGroups& groups) {
+    std::print(stderr, "Stream failure: phase={} context=", run.phase);
+    if (run.context_valid) {
+        std::print(stderr, "{}", run.context);
+    } else {
+        std::print(stderr, "none");
+    }
+    std::println(stderr, " started_ns={} failure_ns={} failure_unix_ns={}", run.started_ns, run.failure_ns,
+                 run.failure_unix_ns);
+    std::println(stderr, "Stream clocks: *_ns uses local steady clock except failure_unix_ns; cross-host wall-clock "
+                         "comparison requires synchronized clocks");
+    std::println(stderr, "Stream last wait: begin_ns={} end_ns={} result={} errno={} waits={} empty_wakes={}",
+                 run.last_wait_begin_ns, run.last_wait_end_ns, run.wait_result, run.wait_errno, run.stats.waits,
+                 run.stats.empty_wakes);
+    for (std::size_t i = 0; i < sessions.size(); ++i) {
+        const auto& diagnostics = sessions[i]->diagnostics();
+        const auto progress_base = diagnostics.last_progress_ns ? diagnostics.last_progress_ns : diagnostics.started_ns;
+        const bool idle_valid = progress_base != 0 && run.failure_ns >= progress_base;
+        const char* idle_from = diagnostics.last_progress_ns ? "last_progress" : "start";
+        std::println(stderr,
+                     "Stream context: context={} device_group={} device={} eid_index={} jetty_id={} jfce_fd={} "
+                     "wait_revents={:#x} started_ns={} last_progress_ns={} has_progress={} idle_ns={} idle_ns_valid={} "
+                     "idle_from={}",
+                     i, groups[i], devices[i].device_name, devices[i].eid_index, sessions[i]->endpoint().id,
+                     sessions[i]->event_fd(), static_cast<unsigned short>(run.wait_revents[i]), diagnostics.started_ns,
+                     diagnostics.last_progress_ns, diagnostics.last_progress_ns != 0,
+                     idle_valid ? run.failure_ns - progress_base : 0, idle_valid,
+                     progress_base ? idle_from : "not_started");
+        const auto& failure = diagnostics.failure_cqe;
+        if (failure.present) {
+            std::print(stderr,
+                       "Stream failure CQE: context={} direction={} observed_ns={} batch_count={} batch_index={} ", i,
+                       failure.receive ? "rx" : "tx", failure.observed_ns, failure.batch_count, failure.batch_index);
+            PrintCompletionFields(failure.completion, failure.user_ctx_suppressed);
+            std::println(stderr, " sequence_valid={} sequence={}", failure.sequence_valid,
+                         failure.sequence_valid ? failure.sequence : 0);
+        }
+        PrintTimeoutProbe(i, diagnostics.timeout_probe);
+    }
+}
+
 int Run() {
     kbsocket::tools::StreamOptions options{FLAGS_bytes,
                                            FLAGS_messages,
@@ -152,7 +240,8 @@ int Run() {
     if (!ready) {
         return Fail(ready.error());
     }
-    auto result = kbsocket::tools::RunStreams(std::span(sessions).first(devices->size()), options);
+    kbsocket::tools::StreamRunDiagnostics diagnostics;
+    auto result = kbsocket::tools::RunStreams(std::span(sessions).first(devices->size()), options, &diagnostics);
     for (std::size_t i = 0; i < devices->size(); ++i) {
         const auto& s = sessions[i]->stats();
         std::println(
@@ -163,6 +252,8 @@ int Run() {
             s.rx_posted >= options.window ? s.rx_posted - options.window : 0, (*device_groups)[i]);
     }
     if (!result) {
+        std::fflush(stdout);
+        PrintRunDiagnostics(diagnostics, std::span(sessions).first(devices->size()), *devices, *device_groups);
         return Fail(result.error());
     }
     auto stopped = barrier(0x53545354);

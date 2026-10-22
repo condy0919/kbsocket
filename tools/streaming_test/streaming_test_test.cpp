@@ -391,9 +391,9 @@ protected:
         EXPECT_CALL(*this, DeleteCq(_)).Times(AnyNumber()).WillRepeatedly(::testing::Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteEvent(_)).Times(AnyNumber()).WillRepeatedly(::testing::Return(URMA_SUCCESS));
     }
-    void OpenPair(StreamSession& client, StreamSession& server, const StreamOptions& options) {
-        ASSERT_TRUE(client.Open(&nodes_[0].ctx, cap_, options, false, 0));
-        ASSERT_TRUE(server.Open(&nodes_[1].ctx, cap_, options, true, 0));
+    void OpenPair(StreamSession& client, StreamSession& server, const StreamOptions& options, std::size_t pair = 0) {
+        ASSERT_TRUE(client.Open(&nodes_[2 * pair].ctx, cap_, options, false, pair));
+        ASSERT_TRUE(server.Open(&nodes_[2 * pair + 1].ctx, cap_, options, true, pair));
         ASSERT_TRUE(client.Connect(server.endpoint()));
         ASSERT_TRUE(server.Connect(client.endpoint()));
         ASSERT_TRUE(client.Start());
@@ -412,6 +412,11 @@ protected:
         server.ConfirmPeerQuiescent();
         EXPECT_TRUE(client.Close());
         EXPECT_TRUE(server.Close());
+    }
+    void ExitRetainingSessions() {
+        // 失败测试必须先验证 mock，再直接结束子进程，保留未证明 DMA 已终结的依赖。
+        const bool verified = ::testing::Mock::VerifyAndClearExpectations(this);
+        std::_Exit(verified && !HasFailure() ? 0 : 1);
     }
     inline static StreamHardwareTest* active_;
     std::unique_ptr<raw::test_support::ScopedUrmaOverride> override_;
@@ -627,7 +632,112 @@ TEST_F(StreamHardwareTest, DuplicateOrPseudoTxNeverPermitsMemoryRelease) {
                     if (client->Advance() || client->Close() || !nodes_[0].mr_live) {
                         std::_Exit(3);
                     }
-                    std::_Exit(0);
+                    // FLUSH_DONE 的 user_ctx 不是 WR 身份，诊断必须屏蔽它且不得猜测序号。
+                    const auto& failure = client->diagnostics().failure_cqe;
+                    EXPECT_TRUE(failure.present);
+                    EXPECT_TRUE(failure.user_ctx_suppressed);
+                    EXPECT_FALSE(failure.sequence_valid);
+                    EXPECT_EQ(failure.completion.user_ctx, 0u);
+                    EXPECT_EQ(failure.completion.status, URMA_CR_WR_FLUSH_ERR_DONE);
+                    ExitRetainingSessions();
+                }()),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(StreamHardwareTest, TxFailureIdentifiesContextAndSequenceWithoutBeingOverwrittenByLateCompletions) {
+    EXPECT_EXIT(([&] {
+                    NoDestructor<std::array<StreamSession, 4>> owners;
+                    StreamOptions options{.bytes = 32, .messages = 4, .window = 3};
+                    OpenPair((*owners)[0], (*owners)[1], options);
+                    OpenPair((*owners)[2], (*owners)[3], options, 1);
+                    ASSERT_TRUE((*owners)[0].Advance());
+                    ASSERT_TRUE((*owners)[2].Advance());
+                    // 第二路批内先退休一条成功 WR，随后遇到 ACK_TIMEOUT；失败位置和批长不能丢失。
+                    auto& failing = (*owners)[2];
+                    nodes_[2].completions[0][1].status = URMA_CR_ACK_TIMEOUT_ERR;
+                    const auto failed_cr = nodes_[2].completions[0][1];
+                    const auto progress_before = failing.diagnostics().last_progress_ns;
+                    EXPECT_CALL(*this, PostSend(_, _, _)).Times(0);
+                    EXPECT_CALL(*this, PostRecv(_, _, _)).Times(0);
+                    std::array<StreamSession*, 2> sessions{&(*owners)[0], &failing};
+                    StreamRunDiagnostics run;
+                    const auto result = RunStreams(sessions, options, &run);
+                    ASSERT_FALSE(result);
+                    EXPECT_EQ(result.error().code, URMA_CR_ACK_TIMEOUT_ERR);
+                    EXPECT_TRUE(run.failed);
+                    EXPECT_TRUE(run.context_valid);
+                    EXPECT_EQ(run.context, 1u);
+                    EXPECT_STREQ(run.phase, "advance");
+                    EXPECT_GT(run.failure_ns, run.started_ns);
+                    EXPECT_GT(run.failure_unix_ns, 0);
+                    EXPECT_EQ((*owners)[0].stats().retired, 3u);
+                    EXPECT_FALSE((*owners)[0].diagnostics().failure_cqe.present);
+                    const auto failure = failing.diagnostics().failure_cqe;
+                    EXPECT_TRUE(failure.present);
+                    EXPECT_FALSE(failure.receive);
+                    EXPECT_FALSE(failure.user_ctx_suppressed);
+                    EXPECT_TRUE(failure.sequence_valid);
+                    EXPECT_EQ(failure.sequence, 1u);
+                    EXPECT_EQ(failure.batch_count, 3);
+                    EXPECT_EQ(failure.batch_index, 1);
+                    EXPECT_EQ(failure.completion.status, failed_cr.status);
+                    EXPECT_EQ(failure.completion.local_id, nodes_[2].jetty.jetty_id.id);
+                    EXPECT_EQ(failure.completion.user_ctx, failed_cr.user_ctx);
+                    EXPECT_LE(failure.observed_ns, run.failure_ns);
+                    EXPECT_EQ(failing.stats().retired, 1u);
+                    EXPECT_GT(failing.diagnostics().last_progress_ns, progress_before);
+
+                    // 失败后晚到的 CQE 只能进入诊断快照，不能覆盖第一次失败身份或恢复发送。
+                    auto late = failed_cr;
+                    late.status = URMA_CR_SUCCESS;
+                    late.user_ctx = 1;
+                    nodes_[2].completions[0].push_back(late);
+                    failing.CaptureTimeoutProbe();
+                    EXPECT_EQ(failing.diagnostics().timeout_probe.tx_result, 1);
+                    EXPECT_EQ(failing.diagnostics().failure_cqe.observed_ns, failure.observed_ns);
+                    EXPECT_EQ(failing.diagnostics().failure_cqe.completion.status, URMA_CR_ACK_TIMEOUT_ERR);
+                    EXPECT_EQ(failing.diagnostics().failure_cqe.sequence, 1u);
+                    EXPECT_FALSE(failing.Advance());
+                    EXPECT_FALSE(failing.Close());
+                    EXPECT_EQ(failing.stats().retired, 1u);
+                    EXPECT_TRUE(nodes_[2].mr_live);
+                    ExitRetainingSessions();
+                }()),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(StreamHardwareTest, RxFailureRecordsRawCompletionWithoutTreatingBufferSlotAsSequence) {
+    EXPECT_EXIT(([&] {
+                    NoDestructor<StreamSession> client, server;
+                    StreamOptions options{.bytes = 32, .messages = 3, .window = 2};
+                    OpenPair(*client, *server, options);
+                    ASSERT_TRUE(client->Advance());
+                    // 错误 RX 的 user_ctx 仅标识接收槽，不能据此推导消息序号或读取未可信的 payload。
+                    nodes_[1].completions[1].back().status = URMA_CR_LOC_ACCESS_ERR;
+                    const auto failed_cr = nodes_[1].completions[1].back();
+                    EXPECT_CALL(*this, PostSend(_, _, _)).Times(0);
+                    EXPECT_CALL(*this, PostRecv(_, _, _)).Times(0);
+                    std::array<StreamSession*, 1> sessions{&*server};
+                    StreamRunDiagnostics run;
+                    const auto result = RunStreams(sessions, options, &run);
+                    ASSERT_FALSE(result);
+                    EXPECT_EQ(result.error().code, URMA_CR_LOC_ACCESS_ERR);
+                    EXPECT_TRUE(run.context_valid);
+                    EXPECT_EQ(run.context, 0u);
+                    const auto& failure = server->diagnostics().failure_cqe;
+                    EXPECT_TRUE(failure.present);
+                    EXPECT_TRUE(failure.receive);
+                    EXPECT_FALSE(failure.sequence_valid);
+                    EXPECT_FALSE(failure.user_ctx_suppressed);
+                    EXPECT_EQ(failure.completion.user_ctx, failed_cr.user_ctx);
+                    EXPECT_EQ(failure.completion.local_id, failed_cr.local_id);
+                    EXPECT_EQ(failure.completion.remote_id.id, failed_cr.remote_id.id);
+                    EXPECT_EQ(failure.completion.status, URMA_CR_LOC_ACCESS_ERR);
+                    EXPECT_EQ(failure.batch_count, 2);
+                    EXPECT_EQ(failure.batch_index, 0);
+                    EXPECT_EQ(server->stats().received, 0u);
+                    EXPECT_FALSE(server->Close());
+                    ExitRetainingSessions();
                 }()),
                 ::testing::ExitedWithCode(0), "");
 }
@@ -802,6 +912,198 @@ TEST_F(StreamHardwareTest, SuccessWithBadWrRetainsUnknownOwnership) {
                 ::testing::ExitedWithCode(0), "");
 }
 
+TEST_F(StreamHardwareTest, TimeoutProbesEveryContextWithoutRetiringLateTrafficOrMaskingOriginalFailure) {
+    EXPECT_EXIT(
+        ([&] {
+            NoDestructor<std::array<StreamSession, 4>> owners;
+            StreamOptions options{.bytes = 32, .messages = 1, .window = 1, .timeout_ms = 5, .events = true};
+            OpenPair((*owners)[0], (*owners)[1], options);
+            OpenPair((*owners)[2], (*owners)[3], options, 1);
+            std::array<StreamSession*, 2> sessions{&(*owners)[1], &(*owners)[3]};
+            std::array<int, 2> notification_probes{};
+            std::array<std::array<int, 2>, 2> cq_probes{};
+            std::array<std::uint64_t, 2> progress_ns{};
+            for (std::size_t i = 0; i < sessions.size(); ++i) {
+                auto& node = nodes_[2 * i + 1];
+                node.event.fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+                ASSERT_GE(node.event.fd, 0);
+                progress_ns[i] = sessions[i]->diagnostics().last_progress_ns;
+                EXPECT_CALL(*this, Wait(&node.event, 16, 0, _)).WillRepeatedly([&, i](auto*, auto, int, auto** out) {
+                    if (!sessions[i]->diagnostics().timeout_probe.attempted) {
+                        return 0;
+                    }
+                    ++notification_probes[i];
+                    if (i == 0) {
+                        errno = EACCES;
+                        return -1;
+                    }
+                    // 一路 provider 查询失败不能阻止其他 context；只 ack 已知 CQ 的通知。
+                    out[0] = &nodes_[3].cq[0];
+                    out[1] = &nodes_[0].cq[0];
+                    out[2] = &nodes_[3].cq[1];
+                    return 3;
+                });
+                for (std::size_t cq = 0; cq < 2; ++cq) {
+                    EXPECT_CALL(*this, Poll(&node.cq[cq], 64, _)).WillRepeatedly([&, i, cq](auto*, int, auto* out) {
+                        if (!sessions[i]->diagnostics().timeout_probe.attempted) {
+                            return 0;
+                        }
+                        ++cq_probes[i][cq];
+                        if (i == 0) {
+                            errno = cq == 0 ? EIO : 0;
+                            return cq == 0 ? -1 : 0;
+                        }
+                        out[0] = {};
+                        out[0].status = URMA_CR_SUCCESS;
+                        out[0].flag.bs.s_r = cq;
+                        out[0].flag.bs.jetty = 1;
+                        out[0].local_id = nodes_[3].jetty.jetty_id.id;
+                        out[0].user_ctx = 1;
+                        return 1;
+                    });
+                }
+            }
+            EXPECT_CALL(*this, Ack(_, _, 2)).WillOnce([&](auto** cq, auto* counts, auto) {
+                EXPECT_EQ(cq[0], &nodes_[3].cq[0]);
+                EXPECT_EQ(cq[1], &nodes_[3].cq[1]);
+                EXPECT_EQ(counts[0], 1u);
+                EXPECT_EQ(counts[1], 1u);
+            });
+            // 晚到 SUCCESS 只供诊断，不能触发 echo、补投或“继续 poll 最终成功”。
+            EXPECT_CALL(*this, PostSend(_, _, _)).Times(0);
+            EXPECT_CALL(*this, PostRecv(_, _, _)).Times(0);
+            StreamRunDiagnostics run;
+            const auto result = RunStreams(sessions, options, &run);
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error().code, ETIMEDOUT);
+            EXPECT_TRUE(run.failed);
+            EXPECT_FALSE(run.context_valid);
+            EXPECT_EQ(run.wait_result, 0);
+            EXPECT_EQ(run.stats.waits, 1u);
+            EXPECT_GT(run.last_wait_end_ns, run.last_wait_begin_ns);
+            EXPECT_LE(run.failure_ns, sessions[0]->diagnostics().timeout_probe.begin_ns);
+            const auto& failed_probe = sessions[0]->diagnostics().timeout_probe;
+            EXPECT_EQ(failed_probe.notification_result, -1);
+            EXPECT_EQ(failed_probe.notification_errno, EACCES);
+            EXPECT_EQ(failed_probe.tx_result, -1);
+            EXPECT_EQ(failed_probe.tx_errno, EIO);
+            EXPECT_EQ(failed_probe.rx_result, 0);
+            const auto& observed_probe = sessions[1]->diagnostics().timeout_probe;
+            EXPECT_EQ(observed_probe.tx_result, 1);
+            EXPECT_EQ(observed_probe.rx_result, 1);
+            EXPECT_EQ(observed_probe.tx_completions[0].local_id, nodes_[3].jetty.jetty_id.id);
+            EXPECT_EQ(observed_probe.rx_completions[0].status, URMA_CR_SUCCESS);
+            EXPECT_EQ(observed_probe.tx_notifications, 1u);
+            EXPECT_EQ(observed_probe.rx_notifications, 1u);
+            EXPECT_EQ(observed_probe.foreign_notifications, 1u);
+            EXPECT_EQ(observed_probe.acknowledged, 2u);
+            for (std::size_t i = 0; i < sessions.size(); ++i) {
+                const auto* session = sessions[i];
+                EXPECT_TRUE(session->diagnostics().timeout_probe.attempted);
+                EXPECT_EQ(session->diagnostics().last_progress_ns, progress_ns[i]);
+                EXPECT_FALSE(session->diagnostics().failure_cqe.present);
+                EXPECT_EQ(session->stats().accepted, 0u);
+                EXPECT_EQ(session->stats().retired, 0u);
+                EXPECT_EQ(session->stats().received, 0u);
+                EXPECT_EQ(session->stats().rx_posted, 1u);
+                EXPECT_EQ(session->stats().event_acks, 0u);
+                EXPECT_EQ(session->stats().tx_notifications, 0u);
+                EXPECT_EQ(session->stats().rx_notifications, 0u);
+                // 重复要求快照或重新推进都不能消费另一批 CQE，更不能释放资源。
+                sessions[i]->CaptureTimeoutProbe();
+                EXPECT_FALSE(sessions[i]->Advance());
+                EXPECT_FALSE(sessions[i]->Close());
+                EXPECT_EQ(notification_probes[i], 1);
+                EXPECT_EQ(cq_probes[i][0], 1);
+                EXPECT_EQ(cq_probes[i][1], 1);
+                EXPECT_TRUE(nodes_[2 * i + 1].mr_live);
+                ::close(nodes_[2 * i + 1].event.fd);
+            }
+            ExitRetainingSessions();
+        }()),
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(StreamHardwareTest, DiagnosticProbeCapsEachQueueAtOneBatchAndSuppressesPseudoIdentity) {
+    EXPECT_EXIT(([&] {
+                    NoDestructor<StreamSession> client, server;
+                    StreamOptions options{.bytes = 32, .messages = 1, .window = 1, .events = true};
+                    OpenPair(*client, *server, options);
+                    EXPECT_CALL(*this, Wait(&nodes_[1].event, 16, 0, _)).WillOnce(::testing::Return(0));
+                    // 即使 TX 返回满批也不能继续读取；这是有界取证而不是尝试排空故障队列。
+                    EXPECT_CALL(*this, Poll(&nodes_[1].cq[0], 64, _)).WillOnce([](auto*, int count, auto* out) {
+                        for (int i = 0; i < count; ++i) {
+                            out[i] = {};
+                            out[i].status = URMA_CR_SUCCESS;
+                            out[i].user_ctx = i + 1;
+                        }
+                        out[0].status = URMA_CR_WR_FLUSH_ERR_DONE;
+                        out[0].user_ctx = ~std::uint64_t{0};
+                        return count;
+                    });
+                    EXPECT_CALL(*this, Poll(&nodes_[1].cq[1], 64, _)).WillOnce(::testing::Return(0));
+                    EXPECT_CALL(*this, Ack(_, _, _)).Times(0);
+                    EXPECT_CALL(*this, PostSend(_, _, _)).Times(0);
+                    EXPECT_CALL(*this, PostRecv(_, _, _)).Times(0);
+                    server->CaptureTimeoutProbe();
+                    server->CaptureTimeoutProbe();
+                    const auto& probe = server->diagnostics().timeout_probe;
+                    EXPECT_EQ(probe.tx_result, 64);
+                    EXPECT_EQ(probe.rx_result, 0);
+                    EXPECT_EQ(probe.tx_completions[0].status, URMA_CR_WR_FLUSH_ERR_DONE);
+                    EXPECT_EQ(probe.tx_completions[0].user_ctx, 0u);
+                    EXPECT_EQ(probe.tx_completions[63].user_ctx, 64u);
+                    EXPECT_EQ(probe.acknowledged, 0u);
+                    EXPECT_FALSE(server->Advance());
+                    EXPECT_FALSE(server->Close());
+                    EXPECT_EQ(server->stats().retired, 0u);
+                    EXPECT_EQ(server->stats().received, 0u);
+                    EXPECT_EQ(server->stats().rx_posted, 1u);
+                    ExitRetainingSessions();
+                }()),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(StreamHardwareTest, ProgressTimestampsTrackOnlyOwnTrafficInsteadOfNotificationActivity) {
+    std::array<StreamSession, 4> owners;
+    StreamOptions options{.bytes = 32, .messages = 3, .window = 1, .events = true};
+    OpenPair(owners[0], owners[1], options);
+    OpenPair(owners[2], owners[3], options, 1);
+    std::array<std::uint64_t, 4> initial{};
+    for (std::size_t i = 0; i < owners.size(); ++i) {
+        initial[i] = owners[i].diagnostics().last_progress_ns;
+        EXPECT_GT(owners[i].diagnostics().started_ns, 0u);
+        EXPECT_GE(initial[i], owners[i].diagnostics().started_ns);
+    }
+    // 第一条流停滞时，其他 context 的收发或本 context 的通知/rearm 都不能刷新其推进时间。
+    ASSERT_TRUE(owners[2].Advance());
+    EXPECT_GT(owners[2].diagnostics().last_progress_ns, initial[2]);
+    EXPECT_EQ(owners[0].diagnostics().last_progress_ns, initial[0]);
+    EXPECT_EQ(owners[1].diagnostics().last_progress_ns, initial[1]);
+    EXPECT_EQ(owners[3].diagnostics().last_progress_ns, initial[3]);
+    ASSERT_TRUE(owners[0].Arm());
+    owners[0].RecordFdWake();
+    owners[0].RecordRecheckProgress();
+    EXPECT_CALL(*this, Wait(&nodes_[0].event, 16, 0, _))
+        .WillOnce([&](auto*, auto, int, auto** out) {
+            out[0] = &nodes_[0].cq[1];
+            return 1;
+        })
+        .RetiresOnSaturation();
+    EXPECT_CALL(*this, Ack(_, _, 1)).WillOnce([](auto**, auto* counts, auto) { EXPECT_EQ(counts[0], 1u); });
+    ASSERT_TRUE(owners[0].CollectNotifications());
+    EXPECT_EQ(owners[0].diagnostics().last_progress_ns, initial[0]);
+    // 消费 TX CQE 与补投/echo 都是真实推进，应更新各自的时间而非共享全局时间。
+    const auto before_tx = owners[2].diagnostics().last_progress_ns;
+    ASSERT_TRUE(owners[2].Advance());
+    EXPECT_GT(owners[2].diagnostics().last_progress_ns, before_tx);
+    ASSERT_TRUE(owners[3].Advance());
+    EXPECT_GT(owners[3].diagnostics().last_progress_ns, initial[3]);
+    EXPECT_EQ(owners[0].diagnostics().last_progress_ns, initial[0]);
+    FinishPair(owners[0], owners[1], options.messages);
+    FinishPair(owners[2], owners[3], options.messages);
+}
+
 TEST_F(StreamHardwareTest, MissingNotificationFailsWithoutPeriodicPollingFallback) {
     EXPECT_EXIT(([&] {
                     NoDestructor<StreamSession> client, server;
@@ -811,14 +1113,35 @@ TEST_F(StreamHardwareTest, MissingNotificationFailsWithoutPeriodicPollingFallbac
                     if (nodes_[1].event.fd < 0) {
                         std::_Exit(2);
                     }
+                    int notification_probes = 0;
+                    std::array<int, 2> cq_probes{};
+                    EXPECT_CALL(*this, Wait(&nodes_[1].event, 16, 0, _)).WillRepeatedly([&](auto*, auto, int, auto**) {
+                        notification_probes += server->diagnostics().timeout_probe.attempted;
+                        return 0;
+                    });
+                    for (std::size_t cq = 0; cq < cq_probes.size(); ++cq) {
+                        EXPECT_CALL(*this, Poll(&nodes_[1].cq[cq], 64, _)).WillRepeatedly([&, cq](auto*, int, auto*) {
+                            cq_probes[cq] += server->diagnostics().timeout_probe.attempted;
+                            return 0;
+                        });
+                    }
                     // 空 fd 永不通知；必须有界失败，不能用超时后的忙 poll 冒充事件唤醒通过。
                     std::array<StreamSession*, 1> sessions{&*server};
                     auto result = RunStreams(sessions, options);
                     if (result || result.error().code != ETIMEDOUT || server->Close() || !nodes_[1].mr_live) {
                         std::_Exit(3);
                     }
+                    // 空快照同样只取一次，防止为“观察到结果”无限重复等待/轮询。
+                    server->CaptureTimeoutProbe();
+                    EXPECT_TRUE(server->diagnostics().timeout_probe.attempted);
+                    EXPECT_EQ(server->diagnostics().timeout_probe.notification_result, 0);
+                    EXPECT_EQ(server->diagnostics().timeout_probe.tx_result, 0);
+                    EXPECT_EQ(server->diagnostics().timeout_probe.rx_result, 0);
+                    EXPECT_EQ(notification_probes, 1);
+                    EXPECT_EQ(cq_probes[0], 1);
+                    EXPECT_EQ(cq_probes[1], 1);
                     ::close(nodes_[1].event.fd);
-                    std::_Exit(0);
+                    ExitRetainingSessions();
                 }()),
                 ::testing::ExitedWithCode(0), "");
 }

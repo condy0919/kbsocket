@@ -6,13 +6,13 @@
 
 当前已记录正常 SEND/READ/WRITE、共享队列、RNR 后续发、单 SQ 故障排空、provider 提交边界、残留 RX 的 JFR 关闭、持续多 EID 收发/JFC 通知和对端进程退出。**WR 失败、逻辑连接失败、SQ 进入 ERROR 和物理端口故障必须分别判断。** 在本次裸设备 RM_CTP、`error_suspend=0` 配置下，RNR 后同一 SQ 可继续发送；对端退出后的 SEND 可以异步报错而本地 SQ 仍为 READY；新增两组 peer_exit 实测还确认，同 SQ 上失效目标的 status 8 没有使健康目标的 before/mixed/after 流量失败。已主动置 ERROR 的 SQ 也可能接受 post，必须保留软件发送门禁。
 
-同 SQ 多目标实验先出现过 ACK_TIMEOUT；修正完成收集后，用户再次运行 `batch=32、rounds=8`，健康目标的 before/mixed/after 全部成功，空 JFR 目标的 256 条 WR 全部 RNR，同一 SQ 在 25 次查询中保持 READY。**这支持本次配置下同 SQ 多目标 RNR 隔离；旧 ACK_TIMEOUT 的原因仍未查明，不能由复测成功宣称已修复。**
+同 SQ 多目标实验先出现过 ACK_TIMEOUT；修正完成收集后，用户再次运行 `batch=32、rounds=8`，健康目标的 before/mixed/after 全部成功，空 JFR 目标的 256 条 WR 全部 RNR，同一 SQ 在 25 次查询中保持 READY。**这支持本次配置下同 SQ 多目标 RNR 隔离；旧 ACK_TIMEOUT 的原因仍未查明，不能由复测成功宣称已修复。** 后续四 context 的 D2 首次运行也出现 status 9 和另一端事件等待超时；第二次完整通过并补齐 fd readiness，但首次失败仍需独立定位。
 
 ## 证据与环境范围
 
 - 硬件结果来自用户运行反馈和贴出的日志；本地 gMock 测试不计作硬件证据。
-- 已贴出的日志使用裸设备 `udmac0d1e4`；各轮 EID 不同，具体选择在相应记录中列出。这些值是该环境的选择，不是设备型号或通用配置要求。
-- 工具使用 RM_CTP；每个 JettyPool 内的多个 jetty 共用 JFR，TX/RX 各有一个 JFC。同池隔离工具另有独立的 sink pool。持续收发已测试每端同一裸设备的两个 EID/context；目标部署的两个裸设备、每设备两个 EID，共四个 context 尚未测试。四个物理裸设备并行由用户暂缓，不作为当前部署的必测项。
+- 已贴出的日志使用裸设备 `udmac0d1e4`，后续四 context 测试还使用 `udmac1d1e4`；各轮 EID 不同，具体选择在相应记录中列出。这些值是该环境的选择，不是设备型号或通用配置要求。
+- 工具使用 RM_CTP；每个 JettyPool 内的多个 jetty 共用 JFR，TX/RX 各有一个 JFC。同池隔离工具另有独立的 sink pool。持续收发已测试同设备双 EID/context，以及目标部署的两个裸设备、每设备两个 EID，共四个 context；后者已覆盖收发、补投、通知、recheck 和双端各路 fd readiness，D2 首次失败的根因仍未查明。四个物理裸设备并行由用户暂缓，不作为当前部署的必测项。
 - 未完整记录网卡型号、固件、内核、UDMA、liburma 版本、每轮实际命令及运行二进制的提交号。以下结论仅覆盖已反馈的环境和场景。
 - `rnr_continue` 实现在提交 `aacb1c0` 中；用户反馈了 `rnr_continue_success`，但尚未贴出该次完整双端日志和参数。不能把当时 README 中建议的 `tx_depth=1/32/256` 三组都记作已通过，也不能补写实际查询值；后续推荐参数调整为 64/128/256，不改变历史记录。
 
@@ -43,14 +43,14 @@
 | 同 SQ 的 status 8 隔离 | peer_exit 的 Q1/Q2（`batch=32/128、rounds=8`）双端 PASS；每个健康阶段分别 256/1024 条 SUCCESS，失效目标分别 256/1024 条 status 8 | 本次已退出 endpoint 与健康 endpoint 共用客户端 SQ，健康收发在 mixed 前、期间及之后均成功；各 26 次状态检查为 READY，无主动 ERROR/flush/重建/重放 |
 | [Provider 提交边界](../tools/provider_boundary_test/README.md) | `tx_depth=64/128/256` 分别接受并退休 `128/256/512` 条，三组均容量拒绝和部分接受；额外 ERROR post 组也通过 | 真实容量拒绝为 `ENOMEM`；ERROR SQ 仍可能接受 post；已观察到非零 `WR_UNHANDLED` |
 | [残留 RX 的 JFR 关闭](../tools/jfr_lifecycle_test/README.md) | `rx_depth/consumed` 为 `1/0、32/0、256/0、32/7、256/255` 五组通过 | 对端静默、依赖 jetty 已删除后，残留 posted RX 不妨碍本次 DeleteJfr；之后释放 MR |
-| [持续收发与 JFC 通知](../tools/streaming_test/README.md) | 同设备两个 EID/context，每 context 100001 条、4096 字节的持续 request/echo 通过；后续 `window=1、arm_delay_us=0` 两端六行 OBSERVED | 持续 buffer 复用、各 context JFC 通知和 JFCE fd readiness 已覆盖；四 context 部署尚未覆盖 |
+| [持续收发与 JFC 通知](../tools/streaming_test/README.md) | 同设备双 context 已通过；两设备各双 EID 的四 context 在 D1、D3 及额外的 `window=32、events/延迟 0` 组均双端 PASS；D2 首次 status 9/事件等待超时，第二次双端 PASS、各十行 OBSERVED | 四路持续收发、补投、通知、recheck 与双端各路 fd readiness 均有通过证据；D2 首次失败仍未定位，不能据复测通过宣称问题已修复 |
 | [单 WR READ/WRITE](../tools/rma_test/README.md) | READ/WRITE 各 `4 KiB、16 KiB、1 MiB、8 MiB`，每组 8 轮 PASS，未投递 RX | 单 WR 可传输大于 4 KiB 的 RMA 数据；本地/远端 payload 与 guards 校验及关闭通过 |
 | [对端退出后提交](../tools/peer_failure_test/README.md) | `process_exit` 的 batch 32、256 均 post 成功，全部以 status 8 退休；本地查询前后 READY，无 async | 已确认对端退出后，本地仍可接受 SEND；故障通过逐 WR CQE 报告，不必伴随本地 SQ ERROR/async |
 | 提交后对端退出 | `inflight_exit、batch=256` 全部 SUCCESS，退出确认时软件尚有 224 条未退休 | 提交、退出协调和完成收集通过；未证明硬件在途 WR 被退出中断 |
 
 共享队列双 SQ 日志中，每端 `messages_per_jetty=1001`；源 jetty 到目标 jetty 的 TX/RX 计数均为 `0→0:501`、`0→1:500`、`1→0:500`、`1→1:501`。这证明不同源/目标组合被实际使用，不是仅创建了多个空闲 jetty。
 
-`accepted` 表示 provider 接受；`retired` 表示已获得逐 WR 终结证据并回收账本，可以包含成功和错误。两者相等不能单独证明发送成功，成功还需检查 `success` 和远端接收校验。
+`accepted` 表示 provider 接受；账本工具的 `retired` 表示已获得逐 WR 终结证据并回收账本，可以包含成功和错误。两者相等不能单独证明发送成功，成功还需检查 `success` 和远端接收校验。`streaming_test` 是正常流量工具，其 `retired` 只累计通过校验的 SUCCESS 完成；错误 CQE 触发退出且不加入该计数，详见下文 D2 失败记录。
 
 ## ERROR 排空与同池隔离
 
@@ -237,9 +237,74 @@ READ 在本地成功 CQE 后立即校验目的内存；WRITE 则在发送端成�
 
 用户后续用 `arm_delay_us=0、window=1` 运行，确认客户端、服务端均出现六行 OBSERVED，即每个 context 的 JFC 通知、JFCE fd readiness 及两项汇总全部观测到；该次未提供完整计数，不补写消息数。fd readiness 证明观察到 `POLLIN`，不证明线程实际睡眠过，也不证明所有通知竞态都已覆盖。
 
-当前已覆盖持续 buffer 复用、同设备多 EID/context、通知获取与 ack、rearm 后复查，以及 fd readiness。目标部署的两个物理裸设备、每设备两个 EID 的四 context 同时运行仍待测试；不能从同设备双 context 的结果推导跨设备并行已通过。
+本节保留同设备双 context 的历史证据；随后两个裸设备、每设备两个 EID 的实测见下一节，不能把本节六行 OBSERVED 直接计作四 context 的事件覆盖。
 
-本轮优先实现严格的 `--two_devices_two_eids` 拓扑检查，现场按照[矩阵 D1–D3](hardware-validation-matrix.md)分别运行无 events、`window=1` 的事件观察和 `window=32、arm_delay_us=1000` 的 recheck 观察。三组均为每 context 100001 条、4096 字节，具体两端命令见 [streaming_test README](../tools/streaming_test/README.md)。新增模式与本地单测不构成四 context 的硬件通过证据，后续日志另行追加。
+## 两个裸设备、每设备两个 EID：四 context 持续收发
+
+用户补充三组完整双端日志，均启用严格拓扑检查 `--two_devices_two_eids`，使用 `window=32、messages=100001、bytes=4096`。context 按以下顺序逐路配对：
+
+| context | device_group | 裸设备 | 服务端 eid_index | 客户端 eid_index |
+| ---: | ---: | --- | ---: | ---: |
+| 0 | 0 | udmac0d1e4 | 39 | 42 |
+| 1 | 0 | udmac0d1e4 | 72 | 75 |
+| 2 | 1 | udmac1d1e4 | 39 | 42 |
+| 3 | 1 | udmac1d1e4 | 72 | 75 |
+
+第一组没有启用 events，对应[矩阵 D1](hardware-validation-matrix.md)；第二组启用 events、`arm_delay_us=0`，是额外的 `window=32` 观测，**不等同于计划中的 D2（`window=1`）**；第三组启用 events、`arm_delay_us=1000`，对应 D3。三组中每端每个 context 都满足：
+
+```text
+accepted = retired = received = rx_posted = 100001
+rx_reposts = 99969 = 100001 - 32
+```
+
+两端每组最终均 PASS，全部 payload 校验成功并关闭资源。每路初始 32 个 RX 后继续补投 99969 个，确认四路实际持续收发并复用 buffer，而非仅创建四组空闲资源；无 events 组所有事件计数为 0 符合配置。
+
+两组 events 结果如下。方括号按 context 0、1、2、3 排列；`rearms` 是每个 context 的计数，TX/RX 两个 JFC 分别计一次。
+
+| arm_delay_us / 端 | 每 context rearms | 各 context acks | 各 context recheck_progress | 各 context fd_wakes | 汇总 waits / events |
+| --- | ---: | --- | --- | --- | --- |
+| 0 / 服务端 | 2 | [2, 2, 2, 2] | [0, 0, 0, 0] | [1, 0, 0, 0] | 1 / 8 |
+| 0 / 客户端 | 31670 | [7393, 7310, 7130, 7172] | [573, 515, 271, 174] | [3529, 3568, 3573, 3632] | 14302 / 29005 |
+| 1000 / 服务端 | 2 | [2, 2, 2, 2] | [1, 1, 1, 1] | [0, 0, 0, 0] | 0 / 8 |
+| 1000 / 客户端 | 16334 | [6265, 6261, 6261, 6257] | [2065, 2004, 2001, 2154] | [0, 3, 1, 0] | 4 / 25044 |
+
+各 context 均观察到 TX 和 RX 通知，且 `acks=tx_events+rx_events`；服务端两组每路均是 TX/RX 各 1 个通知、ack 2 个。通知对应 JFC 的唤醒机制，不是一条消息对应一个通知，计数远小于消息数不是丢完成的证据。
+
+源码中每轮先收通知并推进所有 context，只要任一路有进展就继续轮询；所有路都无进展时才 arm 各路 TX/RX JFC，复查后仍无进展才等待 fd。服务端 `rearms=2` 表示每路仅执行一轮 TX/RX arm，后续流量持续由轮询推进。延迟 0 组唯一一次 fd 等待只观察到 context 0，不妨碍另外三路后续直接取得通知并 ack；延迟 1000 组每路 recheck 均取得进展，整轮没有进入 fd 等待。因此这些服务端 `NOT_OBSERVED: ... fd readiness` 不表示通知失败，但不能仅凭这三组日志将相应 fd 路径记作已验证。
+
+本次 D1 通过，D3 覆盖了所测 arm/延迟/recheck 时序，且四路在两端都有通知及 ack；客户端延迟 0 组四路 fd readiness 全部观察到。后续 D2 的首次失败和第二次通过见下一节，第二次补齐了服务端其余三路 fd readiness。具体命令见 [streaming_test README](../tools/streaming_test/README.md)。这些结果证明四 context 的共同推进与 buffer 复用，不证明多线程同时调用安全、跨设备故障隔离或所有通知竞态均已覆盖。
+
+## 四 context D2：首次失败与复测通过
+
+用户随后提供两次 `window=1、events=true、arm_delay_us=0` 的 D2 双端日志。第一次客户端报告 `invalid streaming TX completion: 9`，即取得 status 9（ACK_TIMEOUT）CQE；服务端报告事件等待超时，错误码 110。停止时计数如下：
+
+| 端 / context | device_group | accepted | retired | received | rx_posted |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 服务端 0 | 0 | 44723 | 44723 | 44723 | 44724 |
+| 服务端 1 | 0 | 43729 | 43729 | 43729 | 43730 |
+| 服务端 2 / 3（各） | 1 | 100001 | 100001 | 100001 | 100001 |
+| 客户端 0 | 0 | 44723 | 44722 | 44722 | 44723 |
+| 客户端 1 | 0 | 43729 | 43728 | 43728 | 43729 |
+| 客户端 2 / 3（各） | 1 | 100001 | 100001 | 100001 | 100001 |
+
+这次确实发生了运行失败，现有证据的解释范围为：
+
+- 未完成的 context 0/1 同属 `device_group=0`、裸设备 `udmac0d1e4`；另一设备的两路均完成全部流量。这是值得继续追踪的相关性，不能据此认定设备故障，也不能将一条汇总错误消息解释为两路均收到 ACK_TIMEOUT。
+- 服务端已接收并校验两路累计 44723/43729 条请求，并观察到相同数量 echo TX 的 SUCCESS；客户端两路的请求 TX 成功退休与 echo 接收计数都少 1。`Advance` 先处理 TX，再处理 RX，遇到 TX 错误即退出；由错误 CQE 不能断言对应 payload 未送达，也不能由客户端 `received` 少 1 断言回包未到硬件或未在 RX CQ 中排队。
+- [StreamSession::PollTx](../tools/streaming_test/streaming_test.cpp) 先检查 CQE 状态和身份，再增加 `retired`。status 9 CQE 已由 poll 取出，但未计入成功退休数；因此 `accepted-retired=1` 是软件计数差，不能直接当作仍在 DMA 的 WR 数。异常后的保守资源保留也不构成硬件仍在执行的证明。
+- 日志没有记录该错误 CQE 的 context、local_id/user_ctx 或双端关键事件时间戳，无法确定哪一路首先出错、ACK_TIMEOUT 与服务端超时的先后关系，也不能定位为通知丢失。缺少事件等待末尾的 CQ 状态等证据时，不能仅根据超时把问题归因于通知路径。
+- `RunStreams` 的停滞 deadline 由任一路进展重置；context 2/3 继续收发时，context 0/1 即使已停滞也不会立即触发全局超时。因此最终汇总不能还原各路停止推进或首次故障的时间。
+
+第二次运行两端都 PASS，并各输出十行 OBSERVED。每端四个 context 均 `accepted=retired=received=rx_posted=100001、rx_reposts=100000`，payload 全部校验成功并正常关闭资源。事件计数如下，数组仍按 context 0～3 排列：
+
+| 端 | 各 context acks | 各 context fd_wakes | 汇总 events | 汇总 waits | 汇总 fd_wakes |
+| --- | --- | --- | ---: | ---: | ---: |
+| 服务端 | [515, 530, 820, 1949] | [97, 62, 109, 1264] | 3814 | 1458 | 1532 |
+| 客户端 | [196705, 197239, 195401, 197075] | [126226, 145042, 99483, 129905] | 786420 | 388673 | 500656 |
+
+一次 `poll` 可以同时返回多个 context 的 fd 就绪，工具逐 fd 增加 `fd_wakes`，所以汇总 `fd_wakes > waits` 是正常计数关系。这里的 acks 是通过 `AckJfc` 确认的 JFC 通知事件数，不能当作传输协议 ACK 的数量。这次已补齐双端四路正常通知、ack 和 fd readiness 的通过证据；**D2 首次失败的原因仍未查明，第二次通过不代表已修复或排除了偶发 ACK_TIMEOUT/停滞。** 它与此前同 SQ 多目标实验的 status 9 也不能仅凭相同状态码合并为同一根因。
+
+后续工具已补充[失败诊断](../tools/streaming_test/README.md)：错误 CQE 的 context/身份、各路最近推进时间、失败和最近等待时间，以及超时后每个 context 的一次通知与 TX/RX CQ 探查。探查只记录，不退休、补投或恢复运行；结果是失败后的分时采样，不能单凭晚到 CQE 认定原等待丢通知。上述旧日志尚不含这些字段，需要新版真机日志继续定位；本地诊断实现与单测不构成 ACK_TIMEOUT 已修复的证据。
 
 ## 带残留 RX 的共享 JFR 关闭
 
@@ -339,12 +404,12 @@ status 9 是 ACK_TIMEOUT，status 10 才是 RNR 重试耗尽：[urma_opcode.h](.
 
 已完成的范围见上文；剩余问题不能以工具最终 PASS 自动勾选：
 
-- ACK_TIMEOUT 的根因仍未查明；同 SQ 多目标复测成功不抹去首次失败，provider 边界实验也继续出现该状态。
+- ACK_TIMEOUT 的根因仍未查明；同 SQ 多目标复测成功不抹去首次失败，provider 边界实验也继续出现该状态。四 context D2 首次运行的客户端 status 9 与服务端事件等待超时同样待定位，不能仅凭状态码认定这些实验的根因相同。
 - 延迟 RX 后原始批次全部成功，以及 RNR 的实际重试次数和时间窗口。
 - provider 同步 `URMA_EAGAIN`；已观察到的是 `ENOMEM` 容量拒绝及部分接受，尚不能证明 socket 的 EAGAIN 到 EPOLLOUT/NotifyWritable 闭环。
 - ERROR probe 的逐 WR 终结状态及来源；整轮已取得非零 `WR_UNHANDLED`，但汇总日志未将它与 probe 绑定。
 - 同一共享 SQ 的跨远端主机/链路及其他错误类型隔离；同一远端主机上已退出 endpoint 的 status 8 与健康流量共存已由 Q1/Q2 验证，不再列为未测，但不能外推到 ACK_TIMEOUT 等故障。
-- 优先补两个物理裸设备、每设备两个 EID 的四 context 持续收发、补投与通知，使用严格拓扑模式分别执行矩阵 D1–D3；四个物理裸设备并行按用户部署范围暂缓。
+- 两设备各双 EID 的四 context 已有 D1、D3 和 D2 第二次运行的通过证据，双端各路 fd readiness 已覆盖；后续重点是 D2 首次失败的逐 context CQE/事件时序诊断，而非把原覆盖缺口继续列作未测。四个物理裸设备并行按用户部署范围暂缓。
 - 真正中断硬件在途 WR 的对端退出；`inflight_exit` 已验证提交后退出的控制时序，但本次全部 SUCCESS，硬件在途未确认。
 - 链路/端口真实故障的工具日志：用户说明通常为 ACK_TIMEOUT，现有 external 场景尚无日志，不把当前无法观察的 PORT_DOWN async 列作通过条件。
 - 对用户确认支持的 JFS/JFR/JFC error 和 JFR 水线事件，补独立 Get/Ack 工具记录时应遵循其注入条件；当前 JFS/相关 jetty AE 需通过绑定 JFC error 联动。既有进程退出测试未观测到 async，不要求为该故障强行触发事件。

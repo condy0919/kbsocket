@@ -2,7 +2,7 @@
 
 [文档入口](README.md) · [已有实测记录](hardware-observations.md)
 
-更新日期：2026-10-22。本矩阵区分已反馈的硬件结果、尚未观察到的行为和可选复测参数；详细计数、历史失败及源码对照放在[硬件观测记录](hardware-observations.md)中。结论仅覆盖现场使用的裸设备 `udmac0d1e4`、RM_CTP 和对应 WR 配置，网卡/固件/provider 完整版本尚未登记。
+更新日期：2026-10-22。本矩阵区分已反馈的硬件结果、尚未观察到的行为和可选复测参数；详细计数、历史失败及源码对照放在[硬件观测记录](hardware-observations.md)中。结论仅覆盖现场使用的裸设备、RM_CTP 和对应 WR 配置：此前主要为 `udmac0d1e4`，四 context 组还使用 `udmac1d1e4`；网卡/固件/provider 完整版本尚未登记。
 
 “已通过”表示该场景的工具判据成立，不要求故障实验中的 WR 成功发送；“部分覆盖”表示流程通过但目标硬件时序未得到证明；“未观察到”不等于硬件不支持或永远不会发生。本地 gMock 通过不计作硬件证据，计划参数也不自动继承其他参数的通过结论。
 
@@ -18,14 +18,14 @@
 | 软件 TX 配额耗尽与恢复 | 已通过反馈 | tx_quota 通过；这是 kbsocket 软件额度，不能替代真实 provider 容量拒绝 |
 | 单 WR READ/WRITE 大于 4 KiB | 已通过 | 两种操作各覆盖 4 KiB、16 KiB、1 MiB、8 MiB，每组 8 轮，无 RX 投递；串行单 WR，未验证多 WR 并发 |
 | 持续发送、同设备双 EID/context | 已通过 | 每端两个 context 各完成 100001 条 4096 字节 request/echo，payload 与收发/补投计数通过 |
-| JFC 通知、ack、JFCE fd 就绪及 arm/recheck | 已覆盖所测时序 | 双 context 延迟 recheck 有进展且通知被 ack；改用 window=1、arm_delay_us=0 后，用户确认两端各 6 行 OBSERVED；不证明所有竞态或实际睡眠 |
+| JFC 通知、ack、JFCE fd 就绪及 arm/recheck | 已覆盖所测时序，存在失败记录 | 四 context 的 D2 第二次双端十行 OBSERVED，补齐各路通知/ack 与 fd 就绪；D3 有各路 recheck 进展。D2 首次客户端 status 9、服务端等待超时，原因未明，不能因复测通过认定问题已消失 |
 | 共享 JFR 带残留 posted RX 删除 | 已通过 | J1–J5 均成功；先停止对端发送并删除依赖 jetty，再 DeleteJfr，成功后释放 MR |
 | provider 容量拒绝与批次部分接受 | 已观察到 | P1–P3 请求深度 64/128/256，实际接受 128/256/512；均 ENOMEM、合法 bad_wr 前缀、完整退休及关闭 |
 | ERROR SQ 直接 post 与非零 WR_UNHANDLED | 已观察到 | P4 查询 ERROR 后 post 返回 SUCCESS，额外 WR 最终终结；整轮软件 flush 回收 1 条 WR_UNHANDLED，未单独打印该条 WR 的阶段归属 |
 | 目标进程退出后新投递 | 已通过 | process_exit 的 batch=32/256，SIGKILL/waitpid 确认后 post 仍成功，全部 CQE 为 status 8；前后查询均 READY，客户端资源关闭 |
 | 进程退出相关 async 事件 | 未观察到 | 上述故障 TX 轮询期间及其后默认 1 秒无事件；async fd 可用不代表必定产生通知 |
 | 提交后退出、硬件在途窗口 | 部分覆盖 | inflight_exit 的 256 条全部 SUCCESS；退出请求前已退休 32，确认时软件未退休 224，不能证明这 224 条仍由硬件处理 |
-| 两个裸设备、每设备两个 EID，共四个 context | 优先待硬件验证 | streaming_test 新增严格拓扑检查；D1/D2/D3 分别观察持续收发、fd 通知和延迟 recheck，现有双 context 结果不自动继承 |
+| 两个裸设备、每设备两个 EID，共四个 context | 各路径已有通过证据，首次 D2 失败待查 | window=32 的 D1/D2a/D3 均通过；window=1 的 D2 第二次双端通过，各 context 四项流量计数 100001、补投 100000，通知与 fd 全覆盖；首次 D2 在设备组 0 停滞并失败 |
 | 四个物理裸设备同时工作 | 暂缓 | 用户明确暂不测试；与四个 context 区分，不作为当前部署验证要求 |
 | 真实链路/端口故障及 external 对照 | 工具场景未测试 | 用户说明此类故障 WR 通常以 ACK_TIMEOUT 终结；尚无 F5/F6 工具日志，不要求出现 PORT_DOWN async |
 
@@ -39,7 +39,7 @@
 - URMA async event 目前仅部分支持；当前环境明确无法观察到 PORT_DOWN async，不再将其列为故障测试的待补通过条件。
 - 已确认支持 JFS error、JFR error、JFC error 及 JFR 水线相关事件。其中当前 JFS/相关 jetty 的错误 AE 需先触发其绑定的 JFC error，再联动产生，不能按独立 JFS 故障注入理解。
 
-同 SQ `peer_exit` 的 Q1/Q2 已取得双端通过日志；当前优先补 D1–D3 的两设备四 context 部署验证。物理故障和受支持 async 类型的工具 Get/Ack 记录可后续补充；不要求任意故障都产生 async，也不以没有 PORT_DOWN 否定错误 CQE。现有进程退出实验的 async=0 记录保持不变，sq_multiplex 本身不采集 async。
+同 SQ `peer_exit` 的 Q1/Q2，以及两设备四 context 的 D1–D3 都已有双端通过记录；D2 在首次失败后第二次通过，补齐各路 fd 就绪。当前优先定位首次 D2 的客户端 ACK_TIMEOUT 与服务端等待超时，保留失败现场及成功复测，不把它降为单纯的 NOT_OBSERVED。物理故障和受支持 async 类型的工具 Get/Ack 记录可后续补充；不要求任意故障都产生 async，也不以没有 PORT_DOWN 否定错误 CQE。现有进程退出实验的 async=0 记录保持不变，sq_multiplex 本身不采集 async。
 
 ## 统一准备
 
@@ -66,7 +66,7 @@ USE_BAZEL_VERSION=9.2.0 bazel test --lockfile_mode=off \
   //tools/rma_test:session_test --test_output=errors
 ```
 
-已有正常收发、JFR 关闭、provider 边界、进程退出和同 SQ status 8 隔离记录；当前优先补两设备四 context，不要求先重跑已通过的全部组。物理故障可能影响后续所有实验，应最后做。测试期间记录完整 stdout/stderr 和退出码，不只摘录 PASS。
+已有正常收发、JFR 关闭、provider 边界、进程退出、同 SQ status 8 隔离和两设备四 context 持续收发记录；当前针对 D2 的失败做定位，不要求先重跑已通过的全部组。物理故障可能影响后续所有实验，应最后做。测试期间记录完整 stdout/stderr 和退出码，不只摘录 PASS。
 
 ## 第一批：正常数据路径与事件
 
@@ -84,7 +84,7 @@ bazel-bin/tools/streaming_test/streaming_test \
   --window=32 --messages=100001 --bytes=4096
 ```
 
-两端同步替换参数。S/E 单 context 基线保留为可选复测；已有通过证据主要来自 C2–C4，不要求为了补齐表格而重跑所有基线。
+两端同步替换参数。S/E 单 context 基线保留为可选复测；已有通过证据包括 C2–C4 和下述四 context 组，不要求为了补齐表格而重跑所有基线。
 
 | 组 | window | messages | 附加参数 / 拓扑 | 当前结果 |
 | --- | ---: | ---: | --- | --- |
@@ -95,9 +95,10 @@ bazel-bin/tools/streaming_test/streaming_test \
 | C2 | 32 | 100001 | 同设备双 EID，`--events --arm_delay_us=0` | 已贴客户端 PASS，两个 context 均有通知/ack 与 fd 就绪；该次服务端完整计数未登记 |
 | C3 | 32 | 100001 | 同设备双 EID，`--events --arm_delay_us=1000` | 双端 PASS；每个 context 均有 recheck 进展及通知/ack，服务端有 fd 就绪、客户端未进入 fd 等待 |
 | C4 | 1 | 未完整记录 | 同设备双 EID，`--events --arm_delay_us=0` | 用户确认两端各 6 行 OBSERVED，补齐双方逐 context 的通知与 fd 就绪观测；不补写计数 |
-| D1 | 32 | 100001 | 两个物理裸设备，每设备两个 EID；`--two_devices_two_eids`，无 events | 优先待硬件验证：四 context 持续收发和补投 |
-| D2 | 1 | 100001 | D1 拓扑，`--events --arm_delay_us=0` | 优先待硬件验证：每端四 context 的通知、ack 和 fd 就绪 |
-| D3 | 32 | 100001 | D1 拓扑，`--events --arm_delay_us=1000` | 优先待硬件验证：每端四 context 的 arm/recheck 进展与通知 ack |
+| D1 | 32 | 100001 | 两个物理裸设备，每设备两个 EID；`--two_devices_two_eids`，无 events | 双端通过；各 context 四项流量计数均 100001，RX 补投 99969 次，payload 与关闭通过 |
+| D2 | 1 | 100001 | D1 拓扑，`--events --arm_delay_us=0` | 首次失败：客户端 status 9，服务端 fd 等待超时；第二次双端通过，各 context 四项流量计数 100001、补投 100000，每端十行 OBSERVED；首次原因未明 |
+| D2a | 32 | 100001 | D1 拓扑，`--events --arm_delay_us=0`，本次额外观测 | 双端流量通过，四 context 均取得通知并 ack；客户端全部 fd 可见，服务端仅 context 0 的 fd 可见 |
+| D3 | 32 | 100001 | D1 拓扑，`--events --arm_delay_us=1000` | 双端通过，四 context 均取得通知/ack 与 recheck 进展；服务端每路 recheck=1，不要求 fd 就绪 |
 | M1/M2 | 32 | 100001 | 四个物理裸设备；M2 加 `--events` | 暂缓 |
 
 `--devices` 接受 1–4 个逗号分隔的 `device:eid_index` 端点，同一设备名可重复，但设备名与 EID 索引的组合不能重复。两端列表长度必须一致，并按位置配对；各端的实际设备名和 EID 索引可以不同。例如 C1 可使用：
@@ -116,7 +117,13 @@ bazel-bin/tools/streaming_test/streaming_test \
   --window=32 --messages=100001 --bytes=4096
 ```
 
-补测 D1–D3 时，使用 [streaming_test 的两设备四 context 命令](../tools/streaming_test/README.md)，两端都指定 `--two_devices_two_eids` 和 `--bytes=4096`。每端应列出两个不同物理裸设备名，并为每个设备选择两个不同 EID，按位置与对端配对；工具检查恰好两个设备名、每个各两个不同 EID，现场仍须确认所选名称确实对应两个物理裸设备。可先逐个端点运行 S2。日志以 `Context N device:eid_index` 标明原始配置顺序，每端、每 context 应有 `accepted=retired=received=rx_posted=100001`，四 context 合计为每端 400004 条 request/echo 记录；不能用汇总计数替代每 context 检查。
+复测或补测 D 组时，使用 [streaming_test 的两设备四 context 命令](../tools/streaming_test/README.md)，两端都指定 `--two_devices_two_eids` 和 `--bytes=4096`。每端应列出两个不同物理裸设备名，并为每个设备选择两个不同 EID，按位置与对端配对；工具检查恰好两个设备名、每个各两个不同 EID，现场仍须确认所选名称确实对应两个物理裸设备。日志以 `Context N device:eid_index` 标明原始配置顺序，每端、每 context 应有 `accepted=retired=received=rx_posted=100001`，四 context 合计为每端 400004 条 request/echo 记录；不能用汇总计数替代每 context 检查。
+
+本次 D1/D2a/D3 的端点为服务端 `udmac0d1e4:39,udmac0d1e4:72,udmac1d1e4:39,udmac1d1e4:72`，客户端 `udmac0d1e4:42,udmac0d1e4:75,udmac1d1e4:42,udmac1d1e4:75`，按 `A0,A1,B0,B1` 配对。三组均为 window=32，每端各路 `rx_reposts=99969=100001-32`；payload 全部校验通过，双方正常关闭。D2a 服务端的 `fd_wakes=[1,0,0,0]`，客户端为 `[3529,3568,3573,3632]`。D3 服务端各路 `recheck_progress=1`，客户端为 `[2065,2004,2001,2154]`；服务端 waits=0，客户端 waits=4。全部 context 均满足 `acks=tx_events+rx_events`。详细事件计数及其含义见[硬件观测记录](hardware-observations.md)。
+
+随后相同设备/EID 的 D2 连跑两次：首次 context 0/1（均属 `udmac0d1e4`）未完成，context 2/3 在两端都已完成 100001 条。客户端前两路 `accepted/retired/received` 分别为 `44723/44722/44722`、`43729/43728/43728`；服务端这两路的接收及 echo 接受/成功退休均为 `44723`、`43729`，且各保留一个 posted RX。客户端报 `invalid streaming TX completion: 9`（ACK_TIMEOUT），服务端报 fd 等待超时 110；两端均保留未决资源到退出。工具只对通过验证的 SUCCESS CQE 增加 retired，错误 CQE 可能已被取出而未计数；日志未记录错误 CQE 所属 context、WR 身份及两端时间线，不能将差额直接解释为硬件在途，也不能据此判定两个 context 都发生 ACK_TIMEOUT、设备整体损坏或通知丢失。
+
+D2 第二次双端 PASS，每路 `accepted=retired=received=rx_posted=100001、rx_reposts=100000`。服务端 `fd_wakes=[97,62,109,1264]、events=3814、waits=1458`，客户端 `fd_wakes=[126226,145042,99483,129905]、events=786420、waits=388673`；双方每路都有 TX/RX 通知及对应 ack。一次 poll 可以同时报告多个 fd，因此 fd_wakes 总和分别为 1532、500656，大于 waits 合理。这轮补齐四路 fd 观测，但不解释或修复首次失败；成功运行中的 `empty_wakes=0` 也不能证明首次没有通知问题。
 
 事件覆盖分开记录：`OBSERVED: context N JFC notifications` 表示取得并 ack 通知（`acks>0`）；`OBSERVED: context N JFCE fd readiness` 表示 fd 在 `poll` 中返回过 `POLLIN`（`fd_wakes>0`），不证明线程实际睡眠过。总计也分别报告这两项；`waits>0` 不能代替 fd 就绪证据，总计 OBSERVED 不能代替逐 context 的结果。
 
@@ -124,7 +131,7 @@ E1/E2/C2/C4/D2/M2 若要登记完整 fd 通知路径，应在每端、每 contex
 
 E3/C3/D3 重点覆盖 arm/recheck：检查每个 context 的 `recheck_progress>0`。`arm_delay_us` 延迟 rearm 到 recheck，可能使 CQE 已被 recheck 消费，无须等待 fd；已有通知仍由循环中的 `WaitJfc(timeout=0)` 消费并 ack。因此不要求 `fd_wakes>0`。C3 的双端日志已观察到这一路径，客户端 `waits=0、fd_wakes=0` 与流量通过并不矛盾；单次运行不证明所有竞态均已验证。
 
-同设备双 EID 已有真机通过记录，但不能替代 D1–D3 的跨物理设备四 context 验证。D2 两端完整观察时，每端应有四 context 各两项，加两项汇总，共十行 OBSERVED；D3 不要求 fd 就绪，也不把 D2 的 fd 结果代替 D3 的 recheck 结果。M1/M2 的四物理设备验证按用户要求暂缓。
+两设备四 context 的 D1/D3 已有独立真机证据，D2 第二次也取得每端十行 OBSERVED，完成四路 fd 观测；当前保留首次失败待查。D3 不要求 fd 就绪，也不把 D2 的 fd 结果代替 D3 的 recheck 结果。当前四路实验验证单 owner 推进、各路身份和 buffer 复用，不验证多 owner 并行性能或跨设备故障隔离。M1/M2 的四物理设备验证按用户要求暂缓。
 
 READ/WRITE 按 [rma_test README](../tools/rma_test/README.md) 分别运行 `--operation=read` 和 `--operation=write`，每种操作 `--bytes=4096/16384/1048576/8388608 --rounds=8`。这里是**一条 WR 的实际长度**，不是 SEND 拆成若干 4 KiB。能力不足的组记录 SKIP；实际 post、CQE 或数据错误仍为 FAIL。READ 源 MR 在远端确认完成前不复用，WRITE 在发送端完成后由远端校验可见数据。
 
@@ -212,12 +219,12 @@ F5/F6 使用 `--fault_delay_ms=10000`，控制 TCP 尽量走不受影响的链�
 
 | 项目 | 当前缺口 / 后续范围 |
 | --- | --- |
-| 部署拓扑，优先 | D1–D3：两个物理裸设备、每设备两个 EID 的四 context 持续收发、补投、通知和 recheck；四物理设备组暂缓 |
+| 四 context D2 首次失败，优先 | 第二次已补齐双端四路通知/ack/fd；首次设备组 0 两路未完成，客户端 status 9、服务端 fd 超时。工具已增加错误 context/CQE 身份、各路推进时间及失败后一次 CQ/通知探查，待取得新版现场日志；诊断仍保留 FAIL，不代表根因已修复；四物理设备组暂缓 |
 | 物理故障 | F5/F6 工具日志尚未取得；用户说明通常 ACK_TIMEOUT，不将无法观察的 PORT_DOWN async 列为通过条件 |
 | 受支持 async 类型的工具记录 | 用户确认支持 JFS/JFR/JFC error 与 JFR 水线事件，Get/Ack 工具日志仍待专门注入；JFS/相关 jetty AE 当前需通过绑定 JFC error 联动，不与链路故障绑定验收 |
 | 在途中断 | F4 已完成提交后退出流程，但未证实 SIGKILL 命中硬件仍在处理 WR 的窗口；延迟软件 poll 不能补齐这项证据 |
 | ERROR probe 的终结归属 | P4 已有非零 WR_UNHANDLED 和 ERROR post SUCCESS；需逐 probe 状态/来源才能把两者严格对应，无须再把非零 flush 本身列为未测 |
-| ACK_TIMEOUT | 历史 mixed 和 provider 边界实验中的 status 9 原因仍未查明，不能用其他场景 PASS 宣称已修复 |
+| ACK_TIMEOUT | 历史 mixed、provider 边界及新增 D2 首次失败中的 status 9 原因仍未查明，也未证明同源，不能用其他场景 PASS 宣称已修复 |
 | RNR 时间窗口与 provider EAGAIN | 已有 RNR 和 ENOMEM 容量拒绝；尚无精确重试窗口、rx_delay 原始批次全部恢复成功或同步 EAGAIN 的硬件证据 |
 
 RMA 多 WR 并发、正式 UB 数据面完成通知及其可见性、权限错误后的隔离仍超出当前串行 READ/WRITE 正向验证范围；启用这些路径时再补对应验证。
