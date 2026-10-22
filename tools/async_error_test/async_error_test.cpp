@@ -22,7 +22,7 @@ using Clock = std::chrono::steady_clock;
 constexpr std::size_t kBytes = 64;
 constexpr std::size_t kStride = 128;
 constexpr std::size_t kGuard = 32;
-constexpr std::uint32_t kHello = 0x41454531;
+constexpr std::uint32_t kHello = 0x41454532;
 auto Error(const char* text, int code) {
     return std::unexpected(ToolError{text, code});
 }
@@ -46,13 +46,15 @@ const char* AsyncFaultName(AsyncFault fault) noexcept {
         return "external_jfc";
     case AsyncFault::kExternalJfr:
         return "external_jfr";
+    case AsyncFault::kTxJfcOverflow:
+        return "tx_jfc_overflow";
     }
     return "unknown";
 }
 
 std::expected<void, ToolError> ValidateAsyncErrorOptions(const AsyncErrorOptions& o) noexcept {
     if (o.fault != AsyncFault::kJfcOverflow && o.fault != AsyncFault::kExternalJfc &&
-        o.fault != AsyncFault::kExternalJfr) {
+        o.fault != AsyncFault::kExternalJfr && o.fault != AsyncFault::kTxJfcOverflow) {
         return Error("unknown async fault mode", EINVAL);
     }
     if (o.attempts < 128 || o.attempts > 4096 || o.attempts % 2 || o.cq_depth < 1 || o.cq_depth >= o.attempts ||
@@ -116,10 +118,11 @@ std::expected<void, ToolError> RecordAsyncErrorEvent(urma_async_event_t& event, 
 
 std::expected<void, ToolError> AsyncErrorQueue::Open(urma_context_t* ctx, const urma_device_cap_t& cap,
                                                      std::uint32_t count, std::uint32_t rx_cq_depth, bool server,
-                                                     std::uint32_t jets) {
+                                                     std::uint32_t jets, std::uint32_t tx_cq_depth) {
+    const auto tx_depth = tx_cq_depth ? tx_cq_depth : count + 2;
     if (ctx_ || !ctx || !(cap.trans_mode & URMA_TM_RM) || !cap.rm_tp_cap.bs.ctp || (jets != 1 && jets != 2) ||
-        count < 1 || count > 8192 || cap.max_jfs_depth < count || cap.max_jfr_depth < count ||
-        cap.max_jfc_depth < count + 2 || cap.max_jfc_depth < rx_cq_depth || cap.max_msg_size < kBytes ||
+        count < 1 || count > 8192 || cap.max_jfs_depth < count || cap.max_jfr_depth < count || !rx_cq_depth ||
+        cap.max_jfc_depth < tx_depth || cap.max_jfc_depth < rx_cq_depth || cap.max_msg_size < kBytes ||
         !cap.max_jfs_sge || !cap.max_jfr_sge) {
         return Error("async queue capability/limits", EINVAL);
     }
@@ -127,7 +130,7 @@ std::expected<void, ToolError> AsyncErrorQueue::Open(urma_context_t* ctx, const 
     jets_ = jets;
     server_ = server;
     urma_jfc_cfg_t cq{};
-    cq.depth = count + 2;
+    cq.depth = tx_depth;
     cq.flag.bs.lock_free = 1;
     tx = UrmaApi::CreateJfc(ctx, &cq);
     if (!tx) {
@@ -343,6 +346,7 @@ std::expected<void, ToolError> AsyncErrorQueue::Poll(bool require_success) {
                                : std::expected<void, ToolError>{};
     }
     std::array<urma_cr_t, 64> completions{};
+    ++stats.poll_calls;
     const int count = UrmaApi::PollJfc(server_ ? rx : tx, completions.size(), completions.data());
     if (count < 0 || count > static_cast<int>(completions.size())) {
         stats.poll_status = count;
@@ -508,7 +512,8 @@ std::expected<void, ToolError> AsyncErrorSession::Open(urma_context_t* ctx, cons
     server_ = server;
     const auto fault_count = options.attempts + 2;
     const auto rx_depth = server && options.fault == AsyncFault::kJfcOverflow ? options.cq_depth : fault_count;
-    if (auto opened = fault.Open(ctx, cap, fault_count, rx_depth, server, 2); !opened) {
+    const auto tx_depth = !server && options.fault == AsyncFault::kTxJfcOverflow ? options.cq_depth : fault_count + 2;
+    if (auto opened = fault.Open(ctx, cap, fault_count, rx_depth, server, 2, tx_depth); !opened) {
         return opened;
     }
     const auto healthy_count = options.healthy_rounds + 2;
@@ -622,8 +627,10 @@ std::expected<void, ToolError> AsyncErrorSession::HealthyRound(ControlChannel& c
         if (auto poll = healthy.Poll(true); !poll) {
             return poll;
         }
-        // 自动溢出阶段有意不 poll 服务端故障 RX JFC；健康队列使用独立 JFC/JFR。
-        if (!server_) {
+        // 只暂停被测方向的故障 CQ；TX 溢出时接收端持续消费足容量 RX CQ，避免叠加 RX 故障。
+        // 两端基线已在 Baseline 中读完。故障 TX 的积压留到 after 探针及状态查询之后才收集。
+        const bool poll_fault = options_.fault == AsyncFault::kTxJfcOverflow ? server_ : !server_;
+        if (poll_fault) {
             if (auto poll = fault.Poll(false); !poll) {
                 return poll;
             }
@@ -662,14 +669,23 @@ std::expected<void, ToolError> AsyncErrorSession::Run(ControlChannel& channel) {
     if (stats.baseline.retrieved) {
         return Error("async error observed before injection window", EPROTO);
     }
-    std::println("INJECTION_WINDOW: mode={} role={} fault_rx_jfc={} fault_jfr={} fault_jetty0={} "
-                 "fault_jetty1={} healthy_rx_jfc={} healthy_jetty={} observe_ms={}",
-                 AsyncFaultName(options_.fault), server_ ? "receiver" : "sender", fault.rx->jfc_id.id,
-                 fault.jfr->jfr_id.id, fault.jetties[0]->jetty_id.id, fault.jetties[1]->jetty_id.id,
-                 healthy.rx->jfc_id.id, healthy.jetties[0]->jetty_id.id, options_.observe_ms);
+    const bool tx_fault = options_.fault == AsyncFault::kTxJfcOverflow;
+    const bool automatic = options_.fault == AsyncFault::kJfcOverflow || tx_fault;
+    const bool target_owner = tx_fault ? !server_ : server_;
+    const auto window_poll_begin = fault.stats.poll_calls;
+    std::println("INJECTION_WINDOW: mode={} role={} target_role={} target_object={} fault_tx_jfc={} "
+                 "fault_rx_jfc={} fault_jfr={} fault_jetty0={} fault_jetty1={} healthy_tx_jfc={} "
+                 "healthy_rx_jfc={} healthy_jetty={} observe_ms={}",
+                 AsyncFaultName(options_.fault), server_ ? "receiver" : "sender", tx_fault ? "sender" : "receiver",
+                 tx_fault                                     ? "TX_JFC"
+                 : options_.fault == AsyncFault::kExternalJfr ? "JFR"
+                                                              : "RX_JFC",
+                 fault.tx->jfc_id.id, fault.rx->jfc_id.id, fault.jfr->jfr_id.id, fault.jetties[0]->jetty_id.id,
+                 fault.jetties[1]->jetty_id.id, healthy.tx->jfc_id.id, healthy.rx->jfc_id.id,
+                 healthy.jetties[0]->jetty_id.id, options_.observe_ms);
     std::fflush(stdout);
     // 外部模式不执行任意 shell 命令；操作者使用现场确认过的注入工具，目标仅为服务端打印的对象。
-    if (!server_ && options_.fault == AsyncFault::kJfcOverflow) {
+    if (!server_ && automatic) {
         auto posted = fault.Post(2, options_.attempts);
         if (!posted && !fault.stats.accepted_known) {
             return posted;
@@ -679,7 +695,7 @@ std::expected<void, ToolError> AsyncErrorSession::Run(ControlChannel& channel) {
     for (std::uint32_t round = 1; round <= options_.healthy_rounds; ++round) {
         // 外部注入窗口持续提供故障目标流量，便于观察 JFC 错误与关联 jetty AE 的联动。
         // 一旦 provider 明确拒绝则停止该批次；未接受后缀绝不自动重发。
-        if (!server_ && options_.fault != AsyncFault::kJfcOverflow) {
+        if (!server_ && !automatic) {
             const auto first = (round - 1) * options_.attempts / options_.healthy_rounds;
             const auto end = round * options_.attempts / options_.healthy_rounds;
             auto posted = fault.Post(2 + first, end - first);
@@ -696,13 +712,15 @@ std::expected<void, ToolError> AsyncErrorSession::Run(ControlChannel& channel) {
     if (auto events = Collect(stats.observation); !events) {
         return events;
     }
+    stats.fault_poll_calls_in_window = fault.stats.poll_calls - window_poll_begin;
     // 先锁定窗口内故障证据，再发送 after 探针；迟到到 after/cleanup 的事件不追认先前隔离成立。
-    stats.target_observed =
-        server_ && (options_.fault == AsyncFault::kExternalJfr ? stats.observation.fault_jfr != 0
-                                                               : stats.observation.fault_rx_jfc != 0);
-    // 接收端锁定观察结果后才允许客户端提交 after WR，不能仅靠各自结束上一轮的时间推断顺序。
-    auto after_ready = server_ ? channel.SendMarker(0x41465452, options_.timeout_ms)
-                               : channel.ExpectMarker(0x41465452, options_.timeout_ms);
+    const auto target_events = tx_fault                                     ? stats.observation.fault_tx_jfc
+                               : options_.fault == AsyncFault::kExternalJfr ? stats.observation.fault_jfr
+                                                                            : stats.observation.fault_rx_jfc;
+    stats.target_observed = target_owner && target_events != 0;
+    // 被测对象所属端锁定观察结果后才开始 after 探针；TX 模式由客户端锁定，RX/JFR 模式由服务端锁定。
+    auto after_ready = target_owner ? channel.SendMarker(0x41465452, options_.timeout_ms)
+                                    : channel.ExpectMarker(0x41465452, options_.timeout_ms);
     if (!after_ready) {
         return after_ready;
     }
@@ -713,6 +731,22 @@ std::expected<void, ToolError> AsyncErrorSession::Run(ControlChannel& channel) {
     healthy.Query(true);
     if (stats.observation.healthy || stats.after.healthy) {
         return Error("async fault affected independent healthy queues", EIO);
+    }
+    if (tx_fault && !server_) {
+        // 暂停 poll 不等于 WR 尚未完成。先收集现有 CQE，不能仅因软件账本积压就把正常 SQ 置 ERROR。
+        // 丢失 CQE 或 poll 失败仍不构成 DMA 终结，后续按原有有界排空/保留规则处理。
+        for (;;) {
+            const auto before = fault.stats.retired + fault.stats.flush_done[0] + fault.stats.flush_done[1];
+            if (auto polled = fault.Poll(false); !polled) {
+                return polled;
+            }
+            if (auto events = Collect(stats.cleanup); !events) {
+                return events;
+            }
+            if (before == fault.stats.retired + fault.stats.flush_done[0] + fault.stats.flush_done[1]) {
+                break;
+            }
+        }
     }
     // 观察完成后才开始主动 ERROR/flush，cleanup 事件不得作为注入成功证据。
     if (!server_ && fault.stats.accepted != fault.stats.retired) {
@@ -750,7 +784,7 @@ std::expected<void, ToolError> AsyncErrorSession::Run(ControlChannel& channel) {
     if (auto read = channel.Read(std::as_writable_bytes(std::span(peer)), result_timeout); !read) {
         return read;
     }
-    if (peer[0] != local[0] || ntohl(peer[1]) > 1 || ntohl(peer[2]) > 1 || (server_ && peer[1])) {
+    if (peer[0] != local[0] || ntohl(peer[1]) > 1 || ntohl(peer[2]) > 1 || (target_owner && peer[1])) {
         return Error("async result mismatch", EPROTO);
     }
     stats.peer_target_observed = ntohl(peer[1]);

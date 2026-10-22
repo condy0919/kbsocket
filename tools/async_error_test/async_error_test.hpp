@@ -15,7 +15,7 @@
 
 namespace kbsocket {
 namespace tools {
-enum class AsyncFault : std::uint32_t { kJfcOverflow, kExternalJfc, kExternalJfr };
+enum class AsyncFault : std::uint32_t { kJfcOverflow, kExternalJfc, kExternalJfr, kTxJfcOverflow };
 const char* AsyncFaultName(AsyncFault fault) noexcept;
 struct AsyncErrorOptions {
     AsyncFault fault = AsyncFault::kJfcOverflow;
@@ -61,6 +61,7 @@ struct AsyncQueueStats {
     std::uint64_t posted = 0;
     std::uint64_t received = 0;
     std::uint64_t rx_retired = 0;
+    std::uint64_t poll_calls = 0;
     std::array<std::uint64_t, 17> statuses{};
     std::array<std::uint64_t, 2> flush_done{};
     std::array<int, 2> state_before{-1, -1};
@@ -83,7 +84,8 @@ struct AsyncQueueStats {
 class AsyncErrorQueue {
 public:
     std::expected<void, ToolError> Open(urma_context_t* ctx, const urma_device_cap_t& cap, std::uint32_t count,
-                                        std::uint32_t rx_cq_depth, bool server, std::uint32_t jets);
+                                        std::uint32_t rx_cq_depth, bool server, std::uint32_t jets,
+                                        std::uint32_t tx_cq_depth = 0);
     std::expected<void, ToolError> Import(std::span<const urma_jetty_id_t> peers);
     std::expected<void, ToolError> Post(std::uint32_t first, std::uint32_t count);
     std::expected<void, ToolError> Poll(bool require_success);
@@ -122,6 +124,7 @@ struct AsyncErrorStats {
     AsyncErrorEvents observation;
     AsyncErrorEvents after;
     AsyncErrorEvents cleanup;
+    std::uint64_t fault_poll_calls_in_window = 0;
     bool target_observed = false;
     bool peer_target_observed = false;
     bool can_close = false;

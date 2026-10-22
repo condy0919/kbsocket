@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MulanPSL-2.0
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -74,6 +75,9 @@ protected:
         std::size_t imported = 0;
         std::size_t acked = 0;
         std::size_t fault_posts = 0;
+        std::size_t fault_tx_window_polls = 0;
+        std::size_t fault_rx_window_polls = 0;
+        bool after_probe_posted = false;
     };
 
     raw::UrmaFunctions MockedFunctions() {
@@ -192,10 +196,14 @@ protected:
                 return URMA_SUCCESS;
             });
         EXPECT_CALL(*this, ModifyJetty(_, _)).Times(AnyNumber()).WillRepeatedly([this](auto* jetty, auto* attr) {
+            std::lock_guard lock(mutex_);
             EXPECT_EQ(attr->mask, JETTY_STATE);
             EXPECT_EQ(attr->state, URMA_JETTY_STATE_ERROR);
             auto& node = ByContext(jetty->urma_ctx);
             node.states[jetty - node.jetties.data()] = attr->state;
+            if (cleanup_event_ && jetty == &nodes_[1].jetties[0]) {
+                Emit(node, URMA_EVENT_JFC_ERR);
+            }
             return URMA_SUCCESS;
         });
         EXPECT_CALL(*this, PostRecv(_, _, _))
@@ -255,15 +263,31 @@ protected:
                 tx.local_id = jetty->jetty_id.id;
                 tx.user_ctx = wr->user_ctx;
                 tx.status = URMA_CR_SUCCESS;
-                sender.completions[jetty->jetty_cfg.jfs_cfg.jfc - sender.cqs.data()].push_back(tx);
-                // fixture 的 healthy_rounds=2，最后探针使用独立 IMM=4；只在该 WR 投递时产生迟到事件。
-                if (after_event_ && jfr == &receiver.jfrs[1] && wr->send.imm_data == 4) {
-                    Emit(receiver, URMA_EVENT_JFC_ERR);
+                auto& tx_completions = sender.completions[jetty->jetty_cfg.jfs_cfg.jfc - sender.cqs.data()];
+                const bool fault_target = jfr == &receiver.jfrs[0];
+                const bool overflowing = tx_overflow_ && fault_target && !overflow_triggered_ &&
+                                         tx_completions.size() >= jetty->jetty_cfg.jfs_cfg.jfc->jfc_cfg.depth;
+                // 即使远端已经收齐，也模拟溢出导致一条本地 CQE 永远缺失；这不能靠 RX 或 Ack 补退休。
+                if (!overflowing || !drop_overflow_completion_) {
+                    tx_completions.push_back(tx);
                 }
-                if (jfr == &receiver.jfrs[0]) {
+                if (overflowing) {
+                    overflow_triggered_ = true;
+                    if (inject_event_) {
+                        Emit(event_on_sender_ ? sender : receiver, injected_type_, affect_healthy_);
+                    }
+                }
+                // fixture 的 healthy_rounds=2，最后探针使用独立 IMM=4；只在该 WR 投递时产生迟到事件。
+                if (jfr == &receiver.jfrs[1] && wr->send.imm_data == 4) {
+                    sender.after_probe_posted = true;
+                    if (after_event_) {
+                        Emit(event_on_sender_ ? sender : receiver, URMA_EVENT_JFC_ERR);
+                    }
+                }
+                if (fault_target) {
                     ++sender.fault_posts;
                     // 两条 baseline 已完成后才允许注入，避免把基线事件混成被测故障。
-                    if (inject_event_ && sender.fault_posts == 3) {
+                    if (inject_event_ && !tx_overflow_ && sender.fault_posts == 3) {
                         Emit(receiver, injected_type_, affect_healthy_);
                     }
                 }
@@ -272,6 +296,10 @@ protected:
         EXPECT_CALL(*this, Poll(_, _, _)).Times(AnyNumber()).WillRepeatedly([this](auto* cq, int count, auto* out) {
             std::lock_guard lock(mutex_);
             auto& node = ByContext(cq->urma_ctx);
+            if (nodes_[1].fault_posts > 2 && !nodes_[1].after_probe_posted) {
+                node.fault_tx_window_polls += cq == &node.cqs[0];
+                node.fault_rx_window_polls += cq == &node.cqs[1];
+            }
             auto& completions = node.completions[cq - node.cqs.data()];
             int copied = 0;
             while (copied < count && !completions.empty()) {
@@ -351,8 +379,13 @@ protected:
     urma_device_cap_t cap_{};
     std::mutex mutex_;
     bool automatic_traffic_ = false;
+    bool tx_overflow_ = false;
+    bool overflow_triggered_ = false;
+    bool drop_overflow_completion_ = false;
+    bool event_on_sender_ = false;
     bool fault_tx_event_ = false;
     bool after_event_ = false;
+    bool cleanup_event_ = false;
     bool inject_event_ = false;
     bool affect_healthy_ = false;
     urma_async_event_type_t injected_type_ = URMA_EVENT_JFC_ERR;
@@ -366,7 +399,9 @@ protected:
 
 TEST(AsyncErrorOptionsTest, RejectsInvalidInjectionBudgetsBeforeHardwareInitialization) {
     EXPECT_TRUE(ValidateAsyncErrorOptions({}));
-    EXPECT_FALSE(ValidateAsyncErrorOptions({.fault = static_cast<AsyncFault>(3)}));
+    EXPECT_TRUE(ValidateAsyncErrorOptions({.fault = AsyncFault::kTxJfcOverflow}));
+    EXPECT_STREQ(AsyncFaultName(AsyncFault::kTxJfcOverflow), "tx_jfc_overflow");
+    EXPECT_FALSE(ValidateAsyncErrorOptions({.fault = static_cast<AsyncFault>(4)}));
     EXPECT_FALSE(ValidateAsyncErrorOptions({.attempts = 127}));
     EXPECT_FALSE(ValidateAsyncErrorOptions({.attempts = 4098}));
     EXPECT_FALSE(ValidateAsyncErrorOptions({.attempts = 129}));
@@ -441,6 +476,37 @@ TEST_F(AsyncErrorTest, RejectsUnsupportedQueueBeforeCreatingResources) {
     cap_.max_jfs_sge = 0;
     EXPECT_CALL(*this, CreateJfc(_, _)).Times(0);
     EXPECT_FALSE(queue_->Open(&nodes_[0].ctx, cap_, 128, 64, true, 2));
+}
+
+TEST_F(AsyncErrorTest, RejectsExplicitTxCqDepthBeyondCapabilityBeforeCreatingResources) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    EXPECT_CALL(*this, CreateJfc(_, _)).Times(0);
+    EXPECT_FALSE(queue_->Open(&nodes_[1].ctx, cap_, 128, 128, false, 2, cap_.max_jfc_depth + 1));
+}
+
+TEST_F(AsyncErrorTest, RejectsPreviousProtocolBeforeImportingOrPostingFaultTraffic) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    AsyncErrorOptions options{.fault = AsyncFault::kTxJfcOverflow, .timeout_ms = 200};
+    ASSERT_TRUE(sender_->Open(&nodes_[1].ctx, cap_, options, false));
+    std::array<int, 2> sockets;
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets.data()), 0);
+    ControlChannel left(sockets[0]), right(sockets[1]);
+    EXPECT_CALL(*this, Import(_, _, _)).Times(0);
+    EXPECT_CALL(*this, PostSend(_, _, _)).Times(0);
+    // 新旧观察方向和结果握手不兼容；只改 magic 的旧端必须在任何远端导入/发送前被拒绝。
+    std::jthread peer([&] {
+        std::array<std::uint32_t, 24> hello{};
+        ASSERT_TRUE(right.Read(std::as_writable_bytes(std::span(hello)), options.timeout_ms));
+        EXPECT_EQ(ntohl(hello[0]), 0x41454532U);
+        hello[0] = htonl(0x41454531U);
+        hello[1] = htonl(1U);
+        EXPECT_TRUE(right.Write(std::as_bytes(std::span(hello)), options.timeout_ms));
+    });
+    const auto result = sender_->Run(left);
+    peer.join();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, EPROTO);
+    EXPECT_EQ(sender_->fault.stats.accepted, 0U);
 }
 
 TEST_F(AsyncErrorTest, UnknownSendAcceptancePreventsQueueClose) {
@@ -652,6 +718,185 @@ TEST_F(AsyncErrorTest, FaultTxJfcEventDoesNotEstablishTheRequestedRxJfcFault) {
     EXPECT_FALSE(sender_->stats.peer_target_observed);
     ASSERT_TRUE(sender_->Close());
     ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncErrorTest, TxOverflowObservesSenderTxJfcWithoutPollingItDuringInjection) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    tx_overflow_ = inject_event_ = event_on_sender_ = fault_tx_event_ = true;
+    // 故障 TX CQ 的积压触发 AE；两个共享它的 jetty 与独立健康队列都必须保留正确归属。
+    // mock 仍给出全部终结 CQE，此时 cleanup 只需收割，不能主动 ERROR 制造额外故障。
+    EXPECT_CALL(*this, ModifyJetty(_, _)).Times(0);
+    RunSessions(AsyncFault::kTxJfcOverflow);
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_TRUE(overflow_triggered_);
+    EXPECT_EQ(sender_->fault.tx->jfc_cfg.depth, 64U);
+    EXPECT_GE(sender_->fault.rx->jfc_cfg.depth, 130U);
+    EXPECT_GE(receiver_->fault.rx->jfc_cfg.depth, 130U);
+    EXPECT_EQ(sender_->fault.jetties[0]->jetty_cfg.jfs_cfg.jfc, sender_->fault.tx);
+    EXPECT_EQ(sender_->fault.jetties[1]->jetty_cfg.jfs_cfg.jfc, sender_->fault.tx);
+    EXPECT_NE(sender_->healthy.tx, sender_->fault.tx);
+    EXPECT_EQ(nodes_[1].fault_tx_window_polls, 0U);
+    EXPECT_GT(nodes_[0].fault_rx_window_polls, 0U);
+    EXPECT_EQ(sender_->stats.fault_poll_calls_in_window, 0U);
+    EXPECT_GT(receiver_->stats.fault_poll_calls_in_window, 0U);
+    EXPECT_TRUE(sender_->stats.target_observed);
+    EXPECT_FALSE(receiver_->stats.target_observed);
+    EXPECT_TRUE(receiver_->stats.peer_target_observed);
+    EXPECT_FALSE(sender_->stats.peer_target_observed);
+    EXPECT_EQ(sender_->stats.baseline.retrieved, 0U);
+    EXPECT_EQ(sender_->stats.observation.fault_tx_jfc, 1U);
+    EXPECT_EQ(sender_->stats.observation.fault_rx_jfc, 0U);
+    EXPECT_EQ(sender_->stats.observation.acknowledged, 1U);
+    EXPECT_EQ(receiver_->stats.observation.retrieved, 0U);
+    EXPECT_EQ(receiver_->fault.stats.received, 130U);
+    EXPECT_EQ(sender_->fault.stats.retired, 130U);
+    EXPECT_EQ(receiver_->healthy.stats.received, 4U);
+    EXPECT_EQ(sender_->healthy.stats.retired, 4U);
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncErrorTest, RoundedUpTxCqCapacityCompletesTrafficWithoutClaimingOverflow) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    tx_overflow_ = inject_event_ = event_on_sender_ = fault_tx_event_ = true;
+    // provider 把实际 TX CQ 扩到 256，128 条积压不足以触发溢出；请求容量不能当作事件证据。
+    EXPECT_CALL(*this, CreateJfc(&nodes_[1].ctx, _)).Times(4).WillRepeatedly([this](auto* ctx, auto* cfg) {
+        auto& node = nodes_[1];
+        auto& cq = node.cqs.at(node.created_cqs++);
+        cq.urma_ctx = ctx;
+        cq.jfc_cfg = *cfg;
+        cq.jfc_id.id = node.created_cqs;
+        if (node.created_cqs == 1) {
+            EXPECT_EQ(cfg->depth, 64U);
+            cq.jfc_cfg.depth = 256;
+        }
+        return &cq;
+    });
+    EXPECT_CALL(*this, ModifyJetty(_, _)).Times(0);
+    RunSessions(AsyncFault::kTxJfcOverflow);
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_FALSE(overflow_triggered_);
+    EXPECT_FALSE(sender_->stats.target_observed);
+    EXPECT_FALSE(receiver_->stats.peer_target_observed);
+    EXPECT_EQ(sender_->stats.observation.retrieved, 0U);
+    EXPECT_EQ(sender_->fault.stats.retired, 130U);
+    EXPECT_TRUE(sender_->stats.can_close);
+    EXPECT_TRUE(receiver_->stats.can_close);
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncErrorTest, SenderRxJfcEventCannotEstablishTxOverflow) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    tx_overflow_ = inject_event_ = event_on_sender_ = true;
+    RunSessions(AsyncFault::kTxJfcOverflow);
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_EQ(sender_->stats.observation.fault_rx_jfc, 1U);
+    EXPECT_EQ(sender_->stats.observation.fault_tx_jfc, 0U);
+    EXPECT_EQ(sender_->stats.observation.acknowledged, 1U);
+    EXPECT_FALSE(sender_->stats.target_observed);
+    EXPECT_FALSE(receiver_->stats.peer_target_observed);
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncErrorTest, ReceiverTxJfcEventCannotEstablishSenderTxOverflow) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    tx_overflow_ = inject_event_ = fault_tx_event_ = true;
+    // 对端存在同名 fault TX CQ，其事件也不能代替正在受测的发送端 TX CQ。
+    RunSessions(AsyncFault::kTxJfcOverflow);
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_EQ(receiver_->stats.observation.fault_tx_jfc, 1U);
+    EXPECT_EQ(receiver_->stats.observation.acknowledged, 1U);
+    EXPECT_FALSE(receiver_->stats.target_observed);
+    EXPECT_FALSE(sender_->stats.target_observed);
+    EXPECT_FALSE(receiver_->stats.peer_target_observed);
+    EXPECT_FALSE(sender_->stats.peer_target_observed);
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncErrorTest, TxJfcEventFirstCollectedAfterWindowCannotEstablishIsolation) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    tx_overflow_ = event_on_sender_ = fault_tx_event_ = after_event_ = true;
+    RunSessions(AsyncFault::kTxJfcOverflow);
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_EQ(sender_->stats.observation.retrieved, 0U);
+    EXPECT_EQ(sender_->stats.after.fault_tx_jfc, 1U);
+    EXPECT_EQ(sender_->stats.after.acknowledged, 1U);
+    EXPECT_FALSE(sender_->stats.target_observed);
+    EXPECT_FALSE(receiver_->stats.peer_target_observed);
+    EXPECT_EQ(receiver_->healthy.stats.received, 4U);
+    EXPECT_EQ(sender_->healthy.stats.retired, 4U);
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncErrorTest, TxOverflowWithMissingCompletionRetainsBothEndpointsDespiteAllRemoteReceives) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    tx_overflow_ = inject_event_ = event_on_sender_ = fault_tx_event_ = drop_overflow_completion_ = true;
+    RunSessions(AsyncFault::kTxJfcOverflow);
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_TRUE(sender_->stats.target_observed);
+    EXPECT_TRUE(receiver_->stats.peer_target_observed);
+    EXPECT_EQ(sender_->stats.observation.acknowledged, 1U);
+    EXPECT_EQ(receiver_->fault.stats.received, 130U);
+    EXPECT_EQ(sender_->fault.stats.accepted, 130U);
+    EXPECT_EQ(sender_->fault.stats.retired, 129U);
+    EXPECT_EQ(receiver_->healthy.stats.received, 4U);
+    EXPECT_EQ(sender_->healthy.stats.retired, 4U);
+    // 完整远端数据和 AE Ack 都不是本地 WR 的 DMA 终结证明；双端必须协商保留所有依赖。
+    EXPECT_FALSE(sender_->stats.can_close);
+    EXPECT_FALSE(receiver_->stats.can_close);
+    EXPECT_CALL(*this, DeleteJetty(_)).Times(0);
+    EXPECT_CALL(*this, DeleteJfr(_)).Times(0);
+    EXPECT_CALL(*this, DeleteJfc(_)).Times(0);
+    EXPECT_CALL(*this, Unregister(_)).Times(0);
+    EXPECT_CALL(*this, Unimport(_)).Times(0);
+    EXPECT_FALSE(sender_->Close());
+    EXPECT_FALSE(receiver_->Close());
+}
+
+TEST_F(AsyncErrorTest, CleanupTxJfcEventCannotRetroactivelyEstablishObservation) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    tx_overflow_ = event_on_sender_ = fault_tx_event_ = drop_overflow_completion_ = cleanup_event_ = true;
+    // 仅在因缺少 CQE 主动 BeginDrain 时产生 JFC_ERR，它不能追认为窗口内溢出证据。
+    RunSessions(AsyncFault::kTxJfcOverflow);
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_EQ(sender_->stats.observation.retrieved, 0U);
+    EXPECT_EQ(sender_->stats.after.retrieved, 0U);
+    EXPECT_EQ(sender_->stats.cleanup.fault_tx_jfc, 1U);
+    EXPECT_EQ(sender_->stats.cleanup.acknowledged, 1U);
+    EXPECT_FALSE(sender_->stats.target_observed);
+    EXPECT_FALSE(receiver_->stats.peer_target_observed);
+    EXPECT_FALSE(sender_->stats.can_close);
+    EXPECT_FALSE(receiver_->stats.can_close);
+    EXPECT_FALSE(sender_->Close());
+    EXPECT_FALSE(receiver_->Close());
+}
+
+TEST_F(AsyncErrorTest, SenderHealthyJfcEventFailsTxFaultIsolation) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    tx_overflow_ = inject_event_ = event_on_sender_ = fault_tx_event_ = affect_healthy_ = true;
+    RunSessions(AsyncFault::kTxJfcOverflow);
+    EXPECT_FALSE(receiver_result_);
+    EXPECT_FALSE(sender_result_);
+    EXPECT_EQ(sender_->stats.observation.healthy, 1U);
+    EXPECT_EQ(sender_->stats.observation.acknowledged, 1U);
+    EXPECT_FALSE(sender_->stats.target_observed);
+    EXPECT_FALSE(sender_->stats.can_close);
+    EXPECT_FALSE(receiver_->stats.can_close);
+    EXPECT_CALL(*this, DeleteJetty(_)).Times(0);
+    EXPECT_CALL(*this, Unregister(_)).Times(0);
+    EXPECT_FALSE(sender_->Close());
+    EXPECT_FALSE(receiver_->Close());
 }
 
 TEST_F(AsyncErrorTest, EventFirstRetrievedDuringAfterProbeDoesNotRetroactivelyEstablishIsolation) {

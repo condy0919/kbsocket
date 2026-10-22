@@ -8,7 +8,7 @@
 
 这是直接调用 URMA 的硬件观测工具；生产 `TxSender` 尚未因此增加 WRITE 支持。所有端点都不投递 RX buffer，TCP 只传递描述符、阶段同步和远端校验确认，不传测试 payload。WRITE 的数据通过注册段直接写入远端内存；本地 SUCCESS 后仍须取得远端校验确认，才能把该轮记为数据验证成功并复用槽位。
 
-用户已说明当前芯片存在已知缺陷：jetty 一旦出现 status 9（ACK_TIMEOUT），后续不可继续使用，即使查询仍为 READY；大并发 READ 容易触发，用户说明大并发 WRITE 不出现这一现象。因此本工具由 READ 改为 WRITE，任何目标出现 status 9 都停止后续提交，在收集当前已接受批次的终结证据后报告失败，不能把它当作允许继续测试的普通旧目标错误。新的 WRITE 版本尚待真机执行；旧 READ 失败记录保留在[硬件观测记录](../../docs/hardware-observations.md)。
+用户已说明当前芯片存在已知缺陷：jetty 一旦出现 status 9（ACK_TIMEOUT），后续不可继续使用，即使查询仍为 READY；大并发 READ 容易触发，用户说明大并发 WRITE 不出现这一现象。因此本工具由 READ 改为 WRITE，任何目标出现 status 9 都停止后续提交，在收集当前已接受批次的终结证据后报告失败，不能把它当作允许继续测试的普通旧目标错误。新版 WRITE 的 WF0/WF3 及 WF2 同命令复测已双端通过，旧目标分别返回 1/256/1024 条 status 8，同 SQ 健康写入和远端校验全部成功；WF2 首次运行的健康基线 status 9 仍保留为未定位失败，复测使用新 jetty；WF1 待执行。完整 WRITE 结果及旧 READ 失败记录见[硬件观测记录](../../docs/hardware-observations.md)。
 
 ## 构建与无硬件测试
 
@@ -39,18 +39,20 @@ bazel test //tools/rma_failure_test:all --test_output=errors
   --bytes=16384 --batch=1 --rounds=1 --timeout_ms=10000
 ```
 
-随后在两端同步替换以下参数，每组重新启动进程。以下各组均为待执行的 WRITE 实验，不继承旧 READ 或 SEND 的结果：
+随后在两端同步替换以下参数，每组重新启动进程。各组按实际 WRITE 日志记录结果，不继承旧 READ 或 SEND 的结果：
 
-| 组合 | 双端参数 | 每轮混合链 | 主要覆盖 |
+| 组合 | 双端参数 | 每轮混合链 | 主要覆盖与实测状态 |
 |---|---|---:|---|
-| WF0 | `--bytes=16384 --batch=1 --rounds=1` | 2 条 WRITE | 最小故障场景及后续健康访问 |
-| WF1 | `--bytes=16384 --batch=32 --rounds=8` | 64 条 WRITE | 基本故障隔离、逐 WR 退休 |
-| WF2 | `--bytes=16384 --batch=128 --rounds=8` | 256 条 WRITE | 最大混合提交批次 |
-| WF3 | `--bytes=1048576 --batch=32 --rounds=8` | 64 条 WRITE | 大目的区、健康数据校验 |
+| WF0 | `--bytes=16384 --batch=1 --rounds=1` | 2 条 WRITE | 已通过；旧目标 1 条 status 8，健康三阶段各 1 条成功并经远端校验 |
+| WF1 | `--bytes=16384 --batch=32 --rounds=8` | 64 条 WRITE | 待执行；基本故障隔离、逐 WR 退休 |
+| WF2 | `--bytes=16384 --batch=128 --rounds=8` | 256 条 WRITE | 同命令复测通过；旧目标 1024 条 status 8，健康三阶段各 1024 条成功并经远端校验；首次健康基线 status 9 原因仍未明 |
+| WF3 | `--bytes=1048576 --batch=32 --rounds=8` | 64 条 WRITE | 已通过；旧目标 256 条 status 8，健康三阶段各 256 条成功并经远端校验 |
 
 `batch=1..128` 表示每个目标的 WRITE 数；混合阶段每轮提交 `2 * batch` 条 WR，按 `健康0 → 失效0 → 健康1 → 失效1 …` 交错。这里的 batch 不是 SQ 的请求深度，最小实验无需把 batch 提高到 64。`bytes=1..8MiB`、`rounds=1..256`，并要求 `2 * batch * bytes` 不超过 256 MiB，保护区和对齐空间另计；实际长度还必须满足设备 WRITE 能力。`bytes`、`batch`、`rounds` 必须两端一致。
 
 `--timeout_ms=100..120000` 限制完成等待和控制步骤；基线及退出确认包含远端校验、SIGKILL/waitpid 等复合工作，使用扩展控制等待预算。外层监督进程在任何 URMA 初始化之前创建，覆盖同步 provider 调用。`--watchdog_ms=0` 自动计算总期限；手工设置必须大于 `timeout_ms` 且不超过一小时。超时终止 worker 进程组，故障子进程还受父进程退出信号约束，不能把 watchdog 终止当作通过。
+
+WF2 首次运行的 status 9 来自实际 CQE，不是工具等待超时；增大 `--timeout_ms` 不会修改硬件 ACK 超时配置。baseline 始终只发一条 WRITE，batch 影响初始化时的队列深度和 MR 大小，以及后续阶段的 WR 数量；首次基线失败未进入混合阶段。后续同命令复测已完成最大混合批次，客户端使用新 SQ 25228，首次失败的是 SQ 22394，因此通过结果不表示故障 jetty 恢复或芯片缺陷已修复。保留两次记录，不复用已返回 status 9 的 jetty。
 
 ## 流程和判定
 

@@ -10,15 +10,15 @@
 #include "kbsocket/base/no_destructor.hpp"
 #include "kbsocket/transport/raw/raw_runtime.hpp"
 
-DEFINE_bool(server, false, "Receiver owning the fault injection target");
+DEFINE_bool(server, false, "Receiver role; tx_jfc_overflow targets the client");
 DEFINE_string(address, "127.0.0.1", "Numeric IPv4 control bind/peer address");
 DEFINE_uint32(port, 18527, "TCP control port");
 DEFINE_string(device, "", "Raw UB device name");
 DEFINE_uint32(eid_index, 0, "Local EID index");
 DEFINE_string(library, "liburma.so", "URMA library path");
-DEFINE_string(fault, "jfc_overflow", "jfc_overflow, external_jfc, external_jfr");
+DEFINE_string(fault, "jfc_overflow", "jfc_overflow, tx_jfc_overflow, external_jfc, external_jfr");
 DEFINE_uint32(attempts, 512, "Fault SENDs after baseline, even value 128..4096");
-DEFINE_uint32(cq_depth, 64, "Requested fault RX JFC depth for overflow candidate");
+DEFINE_uint32(cq_depth, 64, "Requested target JFC depth for RX/TX overflow candidate");
 DEFINE_uint32(healthy_rounds, 16, "Independent healthy SEND checkpoints, 2..256");
 DEFINE_uint32(observe_ms, 2000, "Injection observation window, up to 60000 ms");
 DEFINE_uint32(timeout_ms, 10000, "Per control/traffic/cleanup deadline");
@@ -89,11 +89,19 @@ int RunWorker(void* argument) {
     if (auto opened = session.Open(ctx, attributes.dev_cap, options, FLAGS_server); !opened) {
         return Fail(opened.error());
     }
-    std::println("{} ready for async errors: fault={} device={} eid_index={} attempts={} requested_rx_cq={} "
+    const bool tx_fault = options.fault == kbsocket::tools::AsyncFault::kTxJfcOverflow;
+    const auto fault_count = options.attempts + 2;
+    const auto requested_tx = !FLAGS_server && tx_fault ? options.cq_depth : fault_count + 2;
+    const auto requested_rx =
+        FLAGS_server && options.fault == kbsocket::tools::AsyncFault::kJfcOverflow ? options.cq_depth : fault_count;
+    std::println("{} ready for async errors: fault={} device={} eid_index={} attempts={} "
+                 "target_role={} target_object={} requested_tx_cq={} reported_tx_cq={} requested_rx_cq={} "
                  "reported_rx_cq={} async_fd={} control={}:{}",
                  FLAGS_server ? "Server" : "Client", kbsocket::tools::AsyncFaultName(options.fault), FLAGS_device,
-                 FLAGS_eid_index, options.attempts, options.cq_depth, session.fault.rx->jfc_cfg.depth, ctx->async_fd,
-                 FLAGS_address, FLAGS_port);
+                 FLAGS_eid_index, options.attempts, tx_fault ? "sender" : "receiver",
+                 options.fault == kbsocket::tools::AsyncFault::kExternalJfr ? "JFR" : (tx_fault ? "TX_JFC" : "RX_JFC"),
+                 requested_tx, session.fault.tx->jfc_cfg.depth, requested_rx, session.fault.rx->jfc_cfg.depth,
+                 ctx->async_fd, FLAGS_address, FLAGS_port);
     std::fflush(stdout);
     kbsocket::tools::ControlChannel channel;
     auto result =
@@ -103,6 +111,7 @@ int RunWorker(void* argument) {
     }
     PrintQueue("fault", session.fault.stats);
     PrintQueue("healthy", session.healthy.stats);
+    std::println("Observation traffic: fault_poll_calls_in_window={}", session.stats.fault_poll_calls_in_window);
     PrintEvents("baseline", session.stats.baseline);
     PrintEvents("observation", session.stats.observation);
     PrintEvents("after", session.stats.after);
@@ -159,12 +168,14 @@ int main(int argc, char** argv) {
                               .timeout_ms = FLAGS_timeout_ms};
     if (FLAGS_fault == "jfc_overflow") {
         options.fault = kbsocket::tools::AsyncFault::kJfcOverflow;
+    } else if (FLAGS_fault == "tx_jfc_overflow") {
+        options.fault = kbsocket::tools::AsyncFault::kTxJfcOverflow;
     } else if (FLAGS_fault == "external_jfc") {
         options.fault = kbsocket::tools::AsyncFault::kExternalJfc;
     } else if (FLAGS_fault == "external_jfr") {
         options.fault = kbsocket::tools::AsyncFault::kExternalJfr;
     } else {
-        std::println(stderr, "fault must be jfc_overflow, external_jfc or external_jfr");
+        std::println(stderr, "fault must be jfc_overflow, tx_jfc_overflow, external_jfc or external_jfr");
         return 2;
     }
     const auto watchdog =
