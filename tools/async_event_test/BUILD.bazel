@@ -6,6 +6,7 @@ cc_library(
     srcs = ["async_event_test.cpp"],
     hdrs = ["async_event_test.hpp"],
     deps = [
+        "//kbsocket/base:scope_exit",
         "//kbsocket/transport/raw:attempt_ledger",
         "//kbsocket/transport/raw:jetty_pool",
         "//kbsocket/transport/raw:rx_buffer_pool",

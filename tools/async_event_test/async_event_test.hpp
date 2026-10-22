@@ -20,12 +20,16 @@
 
 namespace kbsocket {
 namespace tools {
+enum class JfrLimitRearm : std::uint32_t { kNone, kRewrite, kToggle };
+const char* JfrLimitRearmName(JfrLimitRearm rearm) noexcept;
 struct JfrLimitOptions {
     std::uint32_t rx_depth = 128;
     std::uint32_t threshold = 64;
     std::uint32_t bytes = 4096;
     std::uint32_t observe_ms = 100;
     std::uint32_t timeout_ms = 10000;
+    std::uint32_t crossings = 2;
+    JfrLimitRearm rearm = JfrLimitRearm::kNone;
 };
 std::expected<void, ToolError> ValidateJfrLimitOptions(const JfrLimitOptions& options) noexcept;
 
@@ -34,6 +38,7 @@ enum class JfrLimitPhase : std::uint8_t {
     kFirstCrossing,
     kRefillControl,
     kRepeatCrossing,
+    kAboveWater,
     kCleanup,
     kCount
 };
@@ -58,10 +63,33 @@ struct JfrLimitHello {
     bool server = false;
     urma_jetty_id_t endpoint{};
 };
-using JfrLimitHelloBytes = std::array<std::byte, 48>;
+using JfrLimitHelloBytes = std::array<std::byte, 56>;
 JfrLimitHelloBytes EncodeJfrLimitHello(const JfrLimitHello& hello) noexcept;
 std::expected<JfrLimitHello, ToolError> DecodeJfrLimitHello(const JfrLimitHelloBytes& wire) noexcept;
 std::expected<void, ToolError> ValidateJfrLimitPeer(const JfrLimitHello& local, const JfrLimitHello& peer) noexcept;
+
+struct JfrThresholdSnapshot {
+    bool queried = false;
+    std::uint32_t depth = 0;
+    std::uint32_t threshold = 0;
+};
+struct JfrLimitRoundStats {
+    JfrThresholdSnapshot before_rearm;
+    JfrThresholdSnapshot disabled;
+    JfrThresholdSnapshot after_rearm;
+    JfrThresholdSnapshot after_crossing;
+    JfrLimitEventStats refill_events;
+    JfrLimitEventStats above_water_events;
+    JfrLimitEventStats crossing_events;
+    // 后续轮包含跨线前的一条恢复流量；cleanup 不计入任何轮。
+    std::uint64_t posted = 0;
+    std::uint64_t received = 0;
+    std::uint64_t accepted = 0;
+    std::uint64_t retired = 0;
+    bool started = false;
+    bool crossing_completed = false;
+    bool observed = false;
+};
 
 struct JfrLimitStats {
     std::uint64_t posted = 0;
@@ -75,6 +103,7 @@ struct JfrLimitStats {
     bool repeat_observed = false;
     bool threshold_disabled = false;
     std::array<JfrLimitEventStats, static_cast<std::size_t>(JfrLimitPhase::kCount)> events{};
+    std::vector<JfrLimitRoundStats> rounds;
 };
 
 /// 专用 JFR 水线实验；使用真实共享 JFR、生产 RX 池及发送完成层，不注入队列故障。
@@ -96,11 +125,16 @@ public:
     }
 
 private:
-    std::expected<void, ToolError> ConfigureThreshold(std::uint32_t threshold);
+    std::expected<void, ToolError> QueryThreshold(JfrThresholdSnapshot& snapshot);
+    std::expected<void, ToolError> ConfigureThreshold(std::uint32_t threshold,
+                                                      JfrThresholdSnapshot* snapshot = nullptr);
+    std::expected<void, ToolError> PrepareCrossing(JfrLimitRoundStats& round, bool first);
     std::expected<void, ToolError> Refill();
-    std::expected<void, ToolError> Observe(JfrLimitPhase phase);
+    std::expected<void, ToolError> CollectEvents(JfrLimitPhase phase, JfrLimitEventStats* round_events = nullptr);
+    std::expected<void, ToolError> Observe(JfrLimitPhase phase, JfrLimitEventStats* round_events = nullptr);
     std::expected<void, ToolError> Transfer(ControlChannel& channel, std::uint32_t sequence, std::uint32_t count,
-                                            JfrLimitPhase phase);
+                                            JfrLimitPhase phase, JfrLimitEventStats* round_events = nullptr);
+    std::expected<void, ToolError> ReportCrossing(ControlChannel& channel, std::uint32_t index);
     std::expected<void, ToolError> Exchange(ControlChannel& channel);
 
     JfrLimitOptions options_;

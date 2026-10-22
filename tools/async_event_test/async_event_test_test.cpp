@@ -197,13 +197,20 @@ TEST(JfrLimitProtocolTest, BoundsWatermarkExperimentAndWatchdogInputs) {
     EXPECT_FALSE(ValidateJfrLimitOptions({.observe_ms = 1001}));
     EXPECT_FALSE(ValidateJfrLimitOptions({.timeout_ms = 0}));
     EXPECT_FALSE(ValidateJfrLimitOptions({.observe_ms = 100, .timeout_ms = 100}));
+    EXPECT_TRUE(ValidateJfrLimitOptions({.crossings = 1000, .rearm = JfrLimitRearm::kToggle}));
+    EXPECT_FALSE(ValidateJfrLimitOptions({.crossings = 1}));
+    EXPECT_FALSE(ValidateJfrLimitOptions({.crossings = 1001}));
+    EXPECT_FALSE(ValidateJfrLimitOptions({.rearm = static_cast<JfrLimitRearm>(3)}));
 }
 
 TEST(JfrLimitProtocolTest, HelloRoundTripUsesNetworkOrderAndKeepsTimeoutLocal) {
-    JfrLimitHello hello{.options = {.bytes = 64, .observe_ms = 23}, .server = true};
+    JfrLimitHello hello{.options = {.bytes = 64, .observe_ms = 23, .crossings = 5, .rearm = JfrLimitRearm::kToggle},
+                        .server = true};
     hello.endpoint.id = 0x01020304;
     hello.endpoint.eid.raw[15] = 42;
     const auto wire = EncodeJfrLimitHello(hello);
+    EXPECT_EQ(wire.size(), 56U);
+    EXPECT_EQ(wire[7], std::byte{2});
     EXPECT_EQ(wire[11], std::byte{1});
     EXPECT_EQ(wire[15], std::byte{128});
     EXPECT_EQ(wire[19], std::byte{64});
@@ -212,12 +219,16 @@ TEST(JfrLimitProtocolTest, HelloRoundTripUsesNetworkOrderAndKeepsTimeoutLocal) {
     EXPECT_EQ(wire[43], std::byte{42});
     EXPECT_EQ(wire[44], std::byte{1});
     EXPECT_EQ(wire[47], std::byte{4});
+    EXPECT_EQ(wire[51], std::byte{5});
+    EXPECT_EQ(wire[55], std::byte{2});
     auto decoded = DecodeJfrLimitHello(wire);
     ASSERT_TRUE(decoded);
     EXPECT_TRUE(decoded->server);
     EXPECT_EQ(decoded->endpoint.id, hello.endpoint.id);
     EXPECT_EQ(decoded->endpoint.eid.raw[15], 42);
     EXPECT_EQ(decoded->options.observe_ms, 23U);
+    EXPECT_EQ(decoded->options.crossings, 5U);
+    EXPECT_EQ(decoded->options.rearm, JfrLimitRearm::kToggle);
     hello.options.timeout_ms = 2000;
     EXPECT_EQ(EncodeJfrLimitHello(hello), wire);
 }
@@ -228,11 +239,15 @@ TEST(JfrLimitProtocolTest, HelloRejectsForeignProtocolRoleAndMalformedOptions) {
     const auto valid = EncodeJfrLimitHello(hello);
     ASSERT_TRUE(DecodeJfrLimitHello(valid));
     // 错工具、错版本、非法角色都应在远端导入与 WR 投递之前失败。
-    for (const auto offset : {0U, 7U, 11U, 12U, 16U, 20U, 24U}) {
+    for (const auto offset : {0U, 7U, 11U, 12U, 16U, 20U, 24U, 48U, 55U}) {
         auto corrupted = valid;
         corrupted[offset] = std::byte{0xff};
         EXPECT_FALSE(DecodeJfrLimitHello(corrupted)) << "offset=" << offset;
     }
+    // v1 没有轮次与 rearm 字段，不能按默认两轮继续握手后再让阶段报文错位。
+    auto old_version = valid;
+    old_version[7] = std::byte{1};
+    EXPECT_FALSE(DecodeJfrLimitHello(old_version));
     hello.endpoint.id = 0;
     EXPECT_FALSE(DecodeJfrLimitHello(EncodeJfrLimitHello(hello)));
 }
@@ -255,6 +270,12 @@ TEST(JfrLimitProtocolTest, PeerMustMatchOppositeRoleAndAllTrafficParameters) {
     EXPECT_FALSE(ValidateJfrLimitPeer(local, peer));
     peer = {.server = true};
     peer.options.observe_ms = 10;
+    EXPECT_FALSE(ValidateJfrLimitPeer(local, peer));
+    peer = {.server = true};
+    peer.options.crossings = 3;
+    EXPECT_FALSE(ValidateJfrLimitPeer(local, peer));
+    peer = {.server = true};
+    peer.options.rearm = JfrLimitRearm::kRewrite;
     EXPECT_FALSE(ValidateJfrLimitPeer(local, peer));
 }
 } // namespace

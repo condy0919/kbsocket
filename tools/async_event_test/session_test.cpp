@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MulanPSL-2.0
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -9,6 +10,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include "tools/async_event_test/async_event_test.hpp"
 #include <gmock/gmock.h>
@@ -63,6 +65,7 @@ protected:
         std::size_t created_jetties = 0;
         std::size_t deleted_jetties = 0;
         std::size_t threshold_updates = 0;
+        std::size_t queries = 0;
         std::size_t crossings = 0;
         std::size_t posted = 0;
         std::size_t acknowledged = 0;
@@ -70,6 +73,8 @@ protected:
         bool unregistered = false;
         std::deque<Buffer> buffers;
         std::deque<urma_async_event_t> events;
+        std::vector<std::uint32_t> configured_thresholds;
+        std::vector<std::size_t> configured_occupancies;
         std::array<std::deque<urma_cr_t>, 2> completions;
     };
 
@@ -98,6 +103,16 @@ protected:
 
     Node& ByContext(const urma_context_t* ctx) {
         return nodes_[ctx == &nodes_[0].ctx ? 0 : 1];
+    }
+
+    void EmitLimitEvent(Node& node) {
+        urma_async_event_t event{};
+        event.urma_ctx = &node.ctx;
+        event.element.jfr = &node.jfr;
+        event.event_type = URMA_EVENT_JFR_LIMIT;
+        node.events.push_back(event);
+        const char byte = 'a';
+        EXPECT_EQ(::write(node.pipe[1], &byte, 1), 1);
     }
 
     void SetUp() override {
@@ -143,26 +158,37 @@ protected:
             return &ByContext(ctx).target;
         });
         EXPECT_CALL(*this, ModifyJfr(_, _)).Times(AnyNumber()).WillRepeatedly([this](auto* jfr, auto* attr) {
+            std::lock_guard lock(mutex_);
             auto& node = ByContext(jfr->urma_ctx);
-            // 配置水线时 RX 已投满，而且不应夹带状态切换或在重复观察前暗中 rearm。
+            // 每次重配必须先补满 RX，最后一次清理关水线时才允许保留 63 个 posted 槽位。
             EXPECT_EQ(attr->mask, JFR_RX_THRESHOLD);
-            if (node.threshold_updates == 0) {
-                EXPECT_EQ(node.buffers.size(), node.jfr.jfr_cfg.depth);
-                EXPECT_EQ(attr->rx_threshold, 64U);
-            } else {
-                EXPECT_EQ(node.threshold_updates, 1U);
+            if (attr->rx_threshold == 0 && node.buffers.size() != node.jfr.jfr_cfg.depth) {
                 EXPECT_EQ(node.buffers.size(), 63U);
-                EXPECT_EQ(attr->rx_threshold, 0U);
+            } else {
+                EXPECT_EQ(node.buffers.size(), node.jfr.jfr_cfg.depth);
             }
+            node.configured_thresholds.push_back(attr->rx_threshold);
+            node.configured_occupancies.push_back(node.buffers.size());
             ++node.threshold_updates;
+            if (fail_modify_call_ == node.threshold_updates) {
+                return URMA_EINVAL;
+            }
             node.threshold = attr->rx_threshold;
+            if (emit_config_event_ && node.threshold_updates > 1 && node.buffers.size() == node.jfr.jfr_cfg.depth) {
+                EmitLimitEvent(node);
+            }
             return URMA_SUCCESS;
         });
         EXPECT_CALL(*this, QueryJfr(_, _, _))
             .Times(AnyNumber())
             .WillRepeatedly([this](auto* jfr, auto* cfg, auto* attr) {
+                auto& node = ByContext(jfr->urma_ctx);
+                ++node.queries;
+                if (fail_query_call_ == node.queries) {
+                    return URMA_FAIL;
+                }
                 *cfg = jfr->jfr_cfg;
-                attr->rx_threshold = ByContext(jfr->urma_ctx).threshold;
+                attr->rx_threshold = node.threshold;
                 attr->state = URMA_JFR_STATE_READY;
                 return URMA_SUCCESS;
             });
@@ -171,12 +197,16 @@ protected:
             .WillRepeatedly([this](auto* jfr, auto* wr, auto** bad) {
                 std::lock_guard lock(mutex_);
                 auto& node = ByContext(jfr->urma_ctx);
+                const auto before = node.buffers.size();
                 for (; wr; wr = wr->next) {
                     EXPECT_EQ(std::count_if(node.buffers.begin(), node.buffers.end(),
                                             [&](const auto& entry) { return entry.sge.addr == wr->src.sge[0].addr; }),
                               0);
                     node.buffers.push_back({wr->src.sge[0], wr->user_ctx});
                     ++node.posted;
+                }
+                if (emit_refill_event_ && before == 63) {
+                    EmitLimitEvent(node);
                 }
                 *bad = nullptr;
                 return URMA_SUCCESS;
@@ -196,6 +226,11 @@ protected:
                     const auto buffer = receiver.buffers.back();
                     receiver.buffers.pop_back();
                     const auto length = wr->send.src.sge[0].len;
+                    std::uint32_t payload_sequence;
+                    std::memcpy(&payload_sequence, reinterpret_cast<void*>(wr->send.src.sge[0].addr + 4),
+                                sizeof(payload_sequence));
+                    // 包身份在跨线、恢复流量和 cleanup 之间也必须单调递增，不能每轮重新从零编号。
+                    EXPECT_EQ(::ntohl(payload_sequence), sent_);
                     std::memcpy(reinterpret_cast<void*>(buffer.sge.addr),
                                 reinterpret_cast<void*>(wr->send.src.sge[0].addr), length);
                     urma_cr_t rx{};
@@ -222,16 +257,13 @@ protected:
                         ++sender.completions[0].back().local_id;
                     }
                     ++sent_;
-                    if (receiver.buffers.size() + 1 == receiver.threshold) {
+                    if (receiver.buffers.size() + 1 == 64) {
                         ++receiver.crossings;
-                        if (emit_first_ && (receiver.crossings == 1 || emit_repeat_)) {
-                            urma_async_event_t event{};
-                            event.urma_ctx = &receiver.ctx;
-                            event.element.jfr = &receiver.jfr;
-                            event.event_type = URMA_EVENT_JFR_LIMIT;
-                            receiver.events.push_back(event);
-                            const char byte = 'a';
-                            EXPECT_EQ(::write(receiver.pipe[1], &byte, 1), 1);
+                        if (receiver.threshold == 64 && emit_first_ && (receiver.crossings == 1 || emit_repeat_)) {
+                            EmitLimitEvent(receiver);
+                        }
+                        if (clear_threshold_after_crossing_) {
+                            receiver.threshold = 0;
                         }
                     }
                 }
@@ -302,10 +334,15 @@ protected:
     std::mutex mutex_;
     bool emit_first_ = true;
     bool emit_repeat_ = true;
+    bool emit_config_event_ = false;
+    bool emit_refill_event_ = false;
+    bool clear_threshold_after_crossing_ = false;
     bool duplicate_rx_ = false;
     bool wrong_tx_ = false;
     urma_cr_status_t first_tx_status_ = URMA_CR_SUCCESS;
     std::size_t sent_ = 0;
+    std::size_t fail_modify_call_ = 0;
+    std::size_t fail_query_call_ = 0;
     // 故障测试不析构生产池或注册内存，不能用测试清理掩盖真实 DMA 生命周期问题。
     NoDestructor<JfrLimitSession> receiver_;
     NoDestructor<JfrLimitSession> sender_;
@@ -382,6 +419,179 @@ TEST_F(AsyncSessionTest, LargerJfrCrossingFitsFixedSendBatchAndConsumesCleanupRe
     EXPECT_TRUE(nodes_[0].buffers.empty());
     ASSERT_TRUE(sender_->Close());
     ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncSessionTest, NoneContinuesFiveCrossingsWhenHardwareClearsTheThresholdAfterFirstEvent) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    clear_threshold_after_crossing_ = true;
+    OpenBoth({.bytes = 64, .observe_ms = 1, .timeout_ms = 200, .crossings = 5});
+    RunBoth();
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_EQ(nodes_[0].configured_thresholds, (std::vector<std::uint32_t>{64, 0}));
+    EXPECT_EQ(nodes_[0].crossings, 5U);
+    EXPECT_EQ(nodes_[0].acknowledged, 1U);
+    EXPECT_EQ(receiver_->stats().received, 392U);
+    EXPECT_EQ(sender_->stats().retired, 392U);
+    ASSERT_EQ(receiver_->stats().rounds.size(), 5U);
+    ASSERT_EQ(sender_->stats().rounds.size(), 5U);
+    for (std::size_t i = 0; i < 5; ++i) {
+        const auto& round = receiver_->stats().rounds[i];
+        // 后续查询到硬件清零只记录为观测，不自动重配、更不把未观察到事件当作流量失败。
+        EXPECT_TRUE(round.crossing_completed);
+        EXPECT_EQ(round.observed, i == 0);
+        EXPECT_EQ(sender_->stats().rounds[i].observed, i == 0);
+        EXPECT_TRUE(round.before_rearm.queried);
+        EXPECT_EQ(round.before_rearm.threshold, 0U);
+        EXPECT_TRUE(round.after_rearm.queried);
+        EXPECT_EQ(round.after_rearm.threshold, i == 0 ? 64U : 0U);
+        EXPECT_TRUE(round.after_crossing.queried);
+        EXPECT_EQ(round.after_crossing.threshold, 0U);
+        EXPECT_EQ(round.crossing_events.limit_events, i == 0 ? 1U : 0U);
+        EXPECT_EQ(round.received, i == 0 ? 65U : 66U);
+        EXPECT_EQ(sender_->stats().rounds[i].retired, i == 0 ? 65U : 66U);
+    }
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncSessionTest, RewriteKeepsConfigurationEventsOutsideFourCrossingObservations) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    emit_repeat_ = false;
+    emit_config_event_ = true;
+    OpenBoth({.bytes = 64, .observe_ms = 1, .timeout_ms = 200, .crossings = 4, .rearm = JfrLimitRearm::kRewrite});
+    RunBoth();
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_EQ(nodes_[0].configured_thresholds, (std::vector<std::uint32_t>{64, 64, 64, 64, 0}));
+    EXPECT_EQ(nodes_[0].configured_occupancies, (std::vector<std::size_t>{128, 128, 128, 128, 63}));
+    EXPECT_EQ(nodes_[0].acknowledged, 4U);
+    EXPECT_EQ(receiver_->stats().received, 326U);
+    EXPECT_EQ(sender_->stats().retired, 326U);
+    ASSERT_EQ(receiver_->stats().rounds.size(), 4U);
+    for (std::size_t i = 0; i < 4; ++i) {
+        const auto& round = receiver_->stats().rounds[i];
+        // 模拟每次重写配置都会立即产生事件，但真正后续跨线没有事件，不能误报自动/重臂成功。
+        EXPECT_EQ(round.above_water_events.limit_events, i == 0 ? 0U : 1U);
+        EXPECT_EQ(round.crossing_events.limit_events, i == 0 ? 1U : 0U);
+        EXPECT_EQ(round.observed, i == 0);
+        EXPECT_EQ(sender_->stats().rounds[i].observed, i == 0);
+        EXPECT_FALSE(round.disabled.queried);
+        EXPECT_EQ(round.after_rearm.threshold, 64U);
+    }
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncSessionTest, DelayedEventsDuringRefillDoNotTurnLaterCrossingsIntoObservedResults) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    emit_repeat_ = false;
+    emit_refill_event_ = true;
+    OpenBoth({.bytes = 64, .observe_ms = 1, .timeout_ms = 200, .crossings = 3});
+    RunBoth();
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_EQ(nodes_[0].acknowledged, 3U);
+    ASSERT_EQ(receiver_->stats().rounds.size(), 3U);
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto& round = receiver_->stats().rounds[i];
+        // 补满期间取到的迟到事件必须记录在 refill 窗口，下一轮跨线仍应显示未观察到。
+        EXPECT_EQ(round.refill_events.limit_events, i == 0 ? 0U : 1U);
+        EXPECT_EQ(round.above_water_events.limit_events, 0U);
+        EXPECT_EQ(round.crossing_events.limit_events, i == 0 ? 1U : 0U);
+        EXPECT_EQ(round.observed, i == 0);
+        EXPECT_EQ(sender_->stats().rounds[i].observed, i == 0);
+    }
+    EXPECT_EQ(receiver_->stats().received, 260U);
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncSessionTest, ToggleRecordsDisabledReadbackAndSeparatesConfigurationFromThreeCrossings) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    clear_threshold_after_crossing_ = true;
+    emit_config_event_ = true;
+    OpenBoth({.bytes = 64, .observe_ms = 1, .timeout_ms = 200, .crossings = 3, .rearm = JfrLimitRearm::kToggle});
+    RunBoth();
+    ASSERT_TRUE(receiver_result_) << receiver_result_.error().operation;
+    ASSERT_TRUE(sender_result_) << sender_result_.error().operation;
+    EXPECT_EQ(nodes_[0].configured_thresholds, (std::vector<std::uint32_t>{64, 0, 64, 0, 64, 0}));
+    EXPECT_EQ(nodes_[0].configured_occupancies, (std::vector<std::size_t>{128, 128, 128, 128, 128, 63}));
+    EXPECT_EQ(nodes_[0].acknowledged, 7U);
+    EXPECT_EQ(receiver_->stats().received, 260U);
+    EXPECT_EQ(sender_->stats().retired, 260U);
+    ASSERT_EQ(receiver_->stats().rounds.size(), 3U);
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto& round = receiver_->stats().rounds[i];
+        EXPECT_EQ(round.disabled.queried, i != 0);
+        EXPECT_EQ(round.disabled.threshold, 0U);
+        EXPECT_EQ(round.after_rearm.threshold, 64U);
+        EXPECT_EQ(round.after_crossing.threshold, 0U);
+        EXPECT_EQ(round.above_water_events.limit_events, i == 0 ? 0U : 2U);
+        EXPECT_EQ(round.crossing_events.limit_events, 1U);
+        EXPECT_TRUE(round.observed);
+        EXPECT_TRUE(sender_->stats().rounds[i].observed);
+    }
+    ASSERT_TRUE(sender_->Close());
+    ASSERT_TRUE(receiver_->Close());
+}
+
+TEST_F(AsyncSessionTest, RewriteFailureAfterRefillStopsBeforeNextCrossingAndRetainsDependencies) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    fail_modify_call_ = 2;
+    OpenBoth({.bytes = 64, .observe_ms = 1, .timeout_ms = 200, .crossings = 3, .rearm = JfrLimitRearm::kRewrite});
+    RunBoth();
+    ASSERT_FALSE(receiver_result_);
+    EXPECT_EQ(receiver_result_.error().code, URMA_EINVAL);
+    EXPECT_FALSE(sender_result_);
+    EXPECT_EQ(nodes_[0].configured_thresholds, (std::vector<std::uint32_t>{64, 64}));
+    EXPECT_EQ(nodes_[0].buffers.size(), 128U);
+    EXPECT_EQ(nodes_[0].crossings, 1U);
+    EXPECT_EQ(sender_->stats().retired, 66U);
+    EXPECT_CALL(*this, DeleteJetty(_)).Times(0);
+    EXPECT_CALL(*this, Unregister(_)).Times(0);
+    EXPECT_FALSE(receiver_->Close());
+    EXPECT_FALSE(sender_->Close());
+}
+
+TEST_F(AsyncSessionTest, ToggleDisabledQueryFailureCannotProceedToReenableOrNextCrossing) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    // 第一轮 before/after/after-cross 查询后，第二轮 before 为第4次，禁用确认是第5次。
+    fail_query_call_ = 5;
+    OpenBoth({.bytes = 64, .observe_ms = 1, .timeout_ms = 200, .crossings = 3, .rearm = JfrLimitRearm::kToggle});
+    RunBoth();
+    ASSERT_FALSE(receiver_result_);
+    EXPECT_EQ(receiver_result_.error().code, URMA_FAIL);
+    EXPECT_FALSE(sender_result_);
+    EXPECT_EQ(nodes_[0].configured_thresholds, (std::vector<std::uint32_t>{64, 0}));
+    EXPECT_EQ(nodes_[0].buffers.size(), 128U);
+    EXPECT_EQ(nodes_[0].crossings, 1U);
+    EXPECT_EQ(sender_->stats().retired, 66U);
+    EXPECT_CALL(*this, DeleteJetty(_)).Times(0);
+    EXPECT_CALL(*this, Unregister(_)).Times(0);
+    EXPECT_FALSE(receiver_->Close());
+    EXPECT_FALSE(sender_->Close());
+}
+
+TEST_F(AsyncSessionTest, PostCrossingQueryFailurePreservesTheAlreadyObservedFirstEvent) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    fail_query_call_ = 3;
+    OpenBoth({.bytes = 64, .observe_ms = 1, .timeout_ms = 200, .crossings = 3});
+    RunBoth();
+    ASSERT_FALSE(receiver_result_);
+    EXPECT_EQ(receiver_result_.error().code, URMA_FAIL);
+    EXPECT_FALSE(sender_result_);
+    // 事件已成功 Get/Ack，后续查询失败不能把现场摘要倒退成“首次未观察到”。
+    EXPECT_TRUE(receiver_->stats().first_observed);
+    EXPECT_TRUE(receiver_->stats().rounds[0].observed);
+    EXPECT_EQ(receiver_->stats().rounds[0].crossing_events.limit_events, 1U);
+    EXPECT_FALSE(receiver_->stats().rounds[0].after_crossing.queried);
+    EXPECT_EQ(nodes_[0].acknowledged, 1U);
+    EXPECT_EQ(nodes_[0].crossings, 1U);
+    EXPECT_CALL(*this, DeleteJetty(_)).Times(0);
+    EXPECT_CALL(*this, Unregister(_)).Times(0);
+    EXPECT_FALSE(receiver_->Close());
+    EXPECT_FALSE(sender_->Close());
 }
 
 TEST_F(AsyncSessionTest, MissingFirstEventFailsWithoutRefillOrResourceRelease) {
@@ -489,7 +699,7 @@ TEST_F(AsyncSessionTest, PartialReceivePostRetainsAcceptedPrefixAndMr) {
 TEST_F(AsyncSessionTest, ThresholdQueryMismatchStopsBeforeSend) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     OpenBoth();
-    EXPECT_CALL(*this, QueryJfr(&nodes_[0].jfr, _, _)).WillOnce([](auto* jfr, auto* cfg, auto* attr) {
+    EXPECT_CALL(*this, QueryJfr(&nodes_[0].jfr, _, _)).Times(2).WillRepeatedly([](auto* jfr, auto* cfg, auto* attr) {
         *cfg = jfr->jfr_cfg;
         attr->rx_threshold = 0;
         return URMA_SUCCESS;

@@ -163,6 +163,16 @@ READ/WRITE 按 [rma_test README](../tools/rma_test/README.md) 分别运行 `--op
 
 两组端点均为服务端 `udmac0d1e4:39`、客户端 `udmac0d1e4:42`。首次事件 `last_type=3`，baseline/refill_control/repeat_crossing/cleanup 均未取得事件；最终 `threshold_disabled=true`。首次事件路径与补投恢复已验证，重复跨线的 NOT_OBSERVED 不使整组失败，也不能推定事件永久不会再次触发或 Ack 自动 rearm。显式重写水线后的触发行为尚未测试，详见[硬件观测记录](hardware-observations.md)。
 
+新版工具已支持多轮对照，协议升级为 v2，两端需同步更新。以下各组两端共同指定 `--rx_depth=128 --threshold=64 --bytes=4096 --observe_ms=100 --crossings=8`，具体命令见工具 README：
+
+| 组 | rearm | 判定与当前覆盖 |
+| --- | --- | --- |
+| A5 | `none` | 待真机：只补投、不重配的 8 轮对照；不将历史两轮结果外推至所有轮次 |
+| A6 | `rewrite` | 待真机：每次后续跨线前补满并重写 64，逐轮查看事件及配置前后/跨线后的实际查询值 |
+| A7 | `toggle` | 待真机：每次后续跨线前补满，再执行 0→64 并分别查询；区分配置期间与跨线窗口取得的事件 |
+
+三组各应完成 590 条 SEND，服务端 posted=received=590，客户端 accepted=retired=590。每轮独立报告 OBSERVED/NOT_OBSERVED，首次事件必须出现；后续缺失仍继续观测，不自动切换策略。只有 `requested=completed=observed=8` 才能登记该组所有跨线窗口都取得了事件，单独 PASS 或 repeat_any=true 不足以证明这一点。可将 depth 改为 256 补测，此时总量为 1614，不能继承 depth=128 的结果。
+
 工具记录请求与查询的水线/深度、各阶段事件和流量计数。原始类型或对象归属异常、首次事件缺失、CQE/payload 错误及关闭失败均不能记为通过。结束时禁用水线，以独立收尾流量消费残留 RX，确认数据与控制面静默后释放资源；Ack async 本身不是 WR 终结或 DMA 静默证明。进程监督覆盖可能阻塞的 provider 调用。
 
 本轮仅实现水线场景，不注入 JFC/JFR 错误。当前本地 UDMA 源码的水线档位为 0/64/512/4096；工具回读配置，不能假设任意小阈值都有效，也不能把本地源码直接视为服务器实际版本。
@@ -251,7 +261,7 @@ F5/F6 使用 `--fault_delay_ms=10000`，控制 TCP 尽量走不受影响的链�
 
 | 项目 | 当前缺口 / 后续范围 |
 | --- | --- |
-| 受支持 async 类型的工具记录 | JFR 水线 A1/A3 的首次事件、归属与 Get/Ack 已通过，A2/A4 重复事件未观察到；显式重新使能仍待独立实验。用户确认支持的 JFS/JFR/JFC error 仍待可靠注入方式，当前 JFS/相关 jetty AE 需通过绑定 JFC error 联动 |
+| 受支持 async 类型的工具记录 | JFR 水线 A1/A3 的首次事件、归属与 Get/Ack 已通过，A2/A4 重复事件未观察到；A5–A7 的多轮 none/rewrite/toggle 已实现，待实测。用户确认支持的 JFS/JFR/JFC error 仍待可靠注入方式，当前 JFS/相关 jetty AE 需通过绑定 JFC error 联动 |
 | 四 context D2 首次失败，保留观察 | 第二次已补齐双端四路通知/ack/fd；首次客户端 status 9、服务端 fd 超时仍未定位。工具已增加诊断，用户随后反馈暂未复现；不要求无限追测，不代表根因已修复；四物理设备组暂缓 |
 | 物理故障，低优先级可选 | 按用户要求降低优先级；F5/F6 工具日志尚未取得，用户说明通常 ACK_TIMEOUT，不将无法观察的 PORT_DOWN async 列为通过条件 |
 | 在途中断 | F4 已完成提交后退出流程，但未证实 SIGKILL 命中硬件仍在处理 WR 的窗口；延迟软件 poll 不能补齐这项证据 |

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MulanPSL-2.0
+#include <algorithm>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <expected>
 #include <print>
 
 #include "tools/async_event_test/async_event_test.hpp"
@@ -22,9 +25,11 @@ DEFINE_string(library, "liburma.so", "URMA library path");
 DEFINE_uint32(rx_depth, 128, "RX depth and initially posted buffers, 128..256");
 DEFINE_uint32(threshold, 64, "JFR low waterline; this experiment supports only the 64-buffer hardware level");
 DEFINE_uint32(bytes, 4096, "SEND payload bytes, 32..4096");
+DEFINE_uint32(crossings, 2, "Number of waterline crossings, 2..1000");
+DEFINE_string(rearm, "none", "Before later crossings: none, rewrite (64), or toggle (0 then 64)");
 DEFINE_uint32(observe_ms, 100, "Per-phase async observation window, 1..1000 ms");
 DEFINE_uint32(timeout_ms, 10000, "Per control/traffic timeout; greater than twice observe_ms");
-DEFINE_uint32(watchdog_ms, 60000, "Entire worker deadline including synchronous provider calls");
+DEFINE_uint32(watchdog_ms, 0, "Entire worker deadline; 0 derives a budget from crossings and observation windows");
 
 namespace {
 using kbsocket::raw::UrmaApi;
@@ -32,45 +37,110 @@ struct Hardware {
     kbsocket::raw::RawRuntime runtime;
     kbsocket::tools::JfrLimitSession session;
 };
-kbsocket::tools::JfrLimitOptions Options() {
-    return {.rx_depth = FLAGS_rx_depth,
-            .threshold = FLAGS_threshold,
-            .bytes = FLAGS_bytes,
-            .observe_ms = FLAGS_observe_ms,
-            .timeout_ms = FLAGS_timeout_ms};
+struct WorkerOptions {
+    kbsocket::tools::JfrLimitOptions test;
+    std::uint32_t watchdog_ms = 0;
+};
+std::expected<WorkerOptions, kbsocket::tools::ToolError> Options() {
+    kbsocket::tools::JfrLimitOptions options{.rx_depth = FLAGS_rx_depth,
+                                             .threshold = FLAGS_threshold,
+                                             .bytes = FLAGS_bytes,
+                                             .observe_ms = FLAGS_observe_ms,
+                                             .timeout_ms = FLAGS_timeout_ms,
+                                             .crossings = FLAGS_crossings};
+    using kbsocket::tools::JfrLimitRearm;
+    if (FLAGS_rearm == "none") {
+        options.rearm = JfrLimitRearm::kNone;
+    } else if (FLAGS_rearm == "rewrite") {
+        options.rearm = JfrLimitRearm::kRewrite;
+    } else if (FLAGS_rearm == "toggle") {
+        options.rearm = JfrLimitRearm::kToggle;
+    } else {
+        return std::unexpected(kbsocket::tools::ToolError{"rearm must be none, rewrite or toggle", EINVAL});
+    }
+    if (auto valid = kbsocket::tools::ValidateJfrLimitOptions(options); !valid) {
+        return std::unexpected(valid.error());
+    }
+    // 多轮会累积观察窗口；默认预算随轮数增长，避免合法实验被固定 60 秒上限截断。
+    // 它不是每个操作都用满 timeout 的总和；显式值仍允许现场缩短整个实验的截止时间。
+    const auto automatic =
+        std::max<std::uint64_t>(60000, 4ULL * options.timeout_ms + (6ULL * options.crossings + 8) * options.observe_ms);
+    const std::uint64_t watchdog = FLAGS_watchdog_ms ? FLAGS_watchdog_ms : automatic;
+    if (watchdog <= options.timeout_ms || watchdog > 3600000) {
+        return std::unexpected(kbsocket::tools::ToolError{
+            "require timeout_ms < effective watchdog_ms <= 3600000; reduce observation budget or set watchdog_ms",
+            EINVAL});
+    }
+    return WorkerOptions{options, static_cast<std::uint32_t>(watchdog)};
 }
 int Fail(const kbsocket::tools::ToolError& error) {
     std::println(stderr, "FAIL: {}: {}; unresolved dependencies retained until worker exit", error.operation,
                  error.code);
     return 1;
 }
-void PrintStats(const kbsocket::tools::JfrLimitStats& stats) {
-    std::println("Waterline traffic: posted={} received={} accepted={} accepted_known={} retired={}", stats.posted,
-                 stats.received, stats.accepted, stats.accepted_known, stats.retired);
-    if (!FLAGS_server) {
-        std::println(
-            "Peer waterline observation: first={} repeat={}; event ownership and Get/Ack are reported by server",
-            stats.first_observed, stats.repeat_observed);
-        return;
-    }
-    std::println("Waterline configuration: requested_depth={} requested_threshold={} queried_depth={} "
-                 "queried_threshold={} threshold_disabled={}",
-                 FLAGS_rx_depth, FLAGS_threshold, stats.queried_depth, stats.queried_threshold,
-                 stats.threshold_disabled);
-    for (std::size_t i = 0; i < stats.events.size(); ++i) {
-        const auto& event = stats.events[i];
-        std::println("Async phase={}: get_calls={} retrieved={} acked={} jfr_limit={} last_type={} "
-                     "last_get_status={} last_context_matches={} last_jfr_matches={}",
-                     kbsocket::tools::JfrLimitPhaseName(static_cast<kbsocket::tools::JfrLimitPhase>(i)),
-                     event.get_calls, event.retrieved, event.acknowledged, event.limit_events, event.last_type,
-                     event.last_get_status, event.last_context_matches, event.last_jfr_matches);
-    }
-    std::println("{}: first JFR_LIMIT crossing; threshold={}", stats.first_observed ? "OBSERVED" : "NOT_OBSERVED",
-                 FLAGS_threshold);
-    std::println("{}: repeated JFR_LIMIT observation after refill; no threshold rewrite between crossings",
-                 stats.repeat_observed ? "OBSERVED" : "NOT_OBSERVED");
+void PrintEventStats(const kbsocket::tools::JfrLimitEventStats& event) {
+    std::println("get_calls={} retrieved={} acked={} jfr_limit={} last_type={} last_get_status={} "
+                 "last_context_matches={} last_jfr_matches={}",
+                 event.get_calls, event.retrieved, event.acknowledged, event.limit_events, event.last_type,
+                 event.last_get_status, event.last_context_matches, event.last_jfr_matches);
 }
-int RunWorker(void*) {
+void PrintSnapshot(std::size_t crossing, const char* point, const kbsocket::tools::JfrThresholdSnapshot& snapshot) {
+    std::println("Query crossing={} point={}: queried={} depth={} threshold={}", crossing, point, snapshot.queried,
+                 snapshot.depth, snapshot.threshold);
+}
+void PrintStats(const kbsocket::tools::JfrLimitStats& stats, const kbsocket::tools::JfrLimitOptions& options) {
+    const auto expected = static_cast<std::uint64_t>(options.crossings) * (options.rx_depth - options.threshold + 1) +
+                          options.crossings - 1 + options.threshold - 1;
+    std::println("Waterline traffic: posted={} received={} accepted={} accepted_known={} retired={} expected={}",
+                 stats.posted, stats.received, stats.accepted, stats.accepted_known, stats.retired, expected);
+    if (FLAGS_server) {
+        std::println("Waterline configuration: requested_depth={} requested_threshold={} queried_depth={} "
+                     "queried_threshold={} threshold_disabled={}",
+                     options.rx_depth, options.threshold, stats.queried_depth, stats.queried_threshold,
+                     stats.threshold_disabled);
+        for (std::size_t i = 0; i < stats.events.size(); ++i) {
+            std::print("Async phase={}: ",
+                       kbsocket::tools::JfrLimitPhaseName(static_cast<kbsocket::tools::JfrLimitPhase>(i)));
+            PrintEventStats(stats.events[i]);
+        }
+    }
+    std::size_t completed = 0;
+    std::size_t observed = 0;
+    for (std::size_t i = 0; i < stats.rounds.size(); ++i) {
+        const auto& round = stats.rounds[i];
+        if (!round.started) {
+            break;
+        }
+        completed += round.crossing_completed;
+        observed += round.observed;
+        const char* outcome = !round.crossing_completed ? "INCOMPLETE" : round.observed ? "OBSERVED" : "NOT_OBSERVED";
+        std::println("{}: crossing={} rearm={} completed={} posted={} received={} accepted={} retired={}", outcome,
+                     i + 1, i ? kbsocket::tools::JfrLimitRearmName(options.rearm) : "initial", round.crossing_completed,
+                     round.posted, round.received, round.accepted, round.retired);
+        if (FLAGS_server) {
+            PrintSnapshot(i + 1, "before_rearm", round.before_rearm);
+            PrintSnapshot(i + 1, "disabled", round.disabled);
+            PrintSnapshot(i + 1, "after_rearm", round.after_rearm);
+            PrintSnapshot(i + 1, "after_crossing", round.after_crossing);
+            std::print("Async crossing={} phase=refill_control: ", i + 1);
+            PrintEventStats(round.refill_events);
+            std::print("Async crossing={} phase=above_water: ", i + 1);
+            PrintEventStats(round.above_water_events);
+            std::print("Async crossing={} phase=crossing: ", i + 1);
+            PrintEventStats(round.crossing_events);
+        }
+    }
+    std::println("Waterline observations: requested={} completed={} observed={} first={} repeat_any={} rearm={}",
+                 options.crossings, completed, observed, stats.first_observed, stats.repeat_observed,
+                 kbsocket::tools::JfrLimitRearmName(options.rearm));
+    if (!FLAGS_server) {
+        std::println("Completed crossing observations above are confirmed by the server; detailed ownership and "
+                     "Get/Ack are reported by the server.");
+    }
+}
+int RunWorker(void* argument) {
+    const auto& settings = *static_cast<const WorkerOptions*>(argument);
+    const auto& options = settings.test;
     // 监督进程在加载 URMA 前 fork；失败时 NoDestructor 保留队列、MR 与其内存直到 worker 退出。
     static kbsocket::NoDestructor<Hardware> hardware;
     auto loaded = UrmaApi::Load(FLAGS_library.c_str());
@@ -90,15 +160,17 @@ int RunWorker(void*) {
     if (status != URMA_SUCCESS) {
         return Fail({"query async device", status});
     }
-    auto opened = hardware->session.Open(ctx, attributes.dev_cap, Options(), FLAGS_server);
+    auto opened = hardware->session.Open(ctx, attributes.dev_cap, options, FLAGS_server);
     if (!opened) {
         return Fail(opened.error());
     }
     std::println("{} ready for shared-JFR waterline: device={} eid_index={} rx_depth={} threshold={} "
-                 "bytes={} observe_ms={} jetty_id={} jfr_id={} async_fd={} control={}:{}",
+                 "bytes={} observe_ms={} crossings={} rearm={} watchdog_ms={} jetty_id={} jfr_id={} async_fd={} "
+                 "control={}:{}",
                  FLAGS_server ? "Server" : "Client", FLAGS_device, FLAGS_eid_index, FLAGS_rx_depth, FLAGS_threshold,
-                 FLAGS_bytes, FLAGS_observe_ms, hardware->session.endpoint().id, hardware->session.jfr_id(),
-                 ctx->async_fd, FLAGS_address, FLAGS_port);
+                 FLAGS_bytes, FLAGS_observe_ms, options.crossings, kbsocket::tools::JfrLimitRearmName(options.rearm),
+                 settings.watchdog_ms, hardware->session.endpoint().id, hardware->session.jfr_id(), ctx->async_fd,
+                 FLAGS_address, FLAGS_port);
     std::fflush(stdout);
     kbsocket::tools::ControlChannel channel;
     auto result =
@@ -107,11 +179,11 @@ int RunWorker(void*) {
         result = hardware->session.Run(channel);
     }
     if (!result) {
-        PrintStats(hardware->session.stats());
+        PrintStats(hardware->session.stats(), options);
         return Fail(result.error());
     }
     auto closed = hardware->session.Close();
-    PrintStats(hardware->session.stats());
+    PrintStats(hardware->session.stats(), options);
     if (!closed) {
         return Fail(closed.error());
     }
@@ -132,7 +204,7 @@ int RunWorker(void*) {
     }
     std::println("PASS: first JFR_LIMIT observed and acknowledged; payload and refill validated; "
                  "remaining RX consumed after disabling threshold; both endpoints closed. "
-                 "Repeated-event coverage is reported separately.");
+                 "Inspect every crossing result; PASS does not require repeated events.");
     return 0;
 }
 } // namespace
@@ -141,12 +213,14 @@ int main(int argc, char** argv) {
     gflags::SetUsageMessage(
         "Observe JFR_LIMIT on a shared RM_CTP receive queue, including refill and repeated crossing");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
-    auto valid = kbsocket::tools::ValidateJfrLimitOptions(Options());
-    if (argc != 1 || FLAGS_device.empty() || FLAGS_library.empty() || !FLAGS_port || FLAGS_port > 65535 || !valid ||
-        FLAGS_watchdog_ms <= FLAGS_timeout_ms || FLAGS_watchdog_ms > 3600000) {
+    auto options = Options();
+    if (argc != 1 || FLAGS_device.empty() || FLAGS_library.empty() || !FLAGS_port || FLAGS_port > 65535 || !options) {
         std::println(stderr, "Invalid options: require device, threshold=64, 128<=rx_depth<=256, "
-                             "2*observe_ms<timeout_ms<watchdog_ms<=3600000; use --help");
+                             "2<=crossings<=1000, rearm=none/rewrite/toggle; use --help");
+        if (!options) {
+            std::println(stderr, "{}", options.error().operation);
+        }
         return 2;
     }
-    return kbsocket::tools::RunPeerWatchdog(RunWorker, nullptr, FLAGS_watchdog_ms);
+    return kbsocket::tools::RunPeerWatchdog(RunWorker, &*options, options->watchdog_ms);
 }

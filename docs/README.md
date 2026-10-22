@@ -24,7 +24,7 @@
 | [Provider 提交边界](../tools/provider_boundary_test/README.md) | 容量拒绝、部分接受、非零软件 flush 和 ERROR SQ 原始 post |
 | [真实对端故障](../tools/peer_failure_test/README.md) | 进程退出证明、原始 CQE/SQ 状态与异步事件、现场外部故障窗口 |
 | [持续收发与事件](../tools/streaming_test/README.md) | 无批间 TCP 屏障、多 context、RX 补投及 JFCE 等待/ack |
-| [JFR 水线异步事件](../tools/async_event_test/README.md) | 独立 async fd、事件归属与 Get/Ack、补投后续收发及再次跨水线观察 |
+| [JFR 水线异步事件](../tools/async_event_test/README.md) | 独立 async fd、事件归属与 Get/Ack、补投恢复及多轮水线重新使能对照 |
 | [READ/WRITE 测试](../tools/rma_test/README.md) | 远端 MR 导入、单 WR 大块传输与双方数据校验 |
 
 长期架构与协议规划见 [kbsocket 设计 v1](design/kbsocket-design-v1.md)。当前实现范围以本目录的流程和组件文档、对应源码为准。
