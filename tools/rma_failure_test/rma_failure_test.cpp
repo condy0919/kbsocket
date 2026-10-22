@@ -26,15 +26,20 @@ constexpr std::uint32_t kQuiescent = 0x46460000;
 auto Error(const char* operation, int code = EIO) {
     return std::unexpected(ToolError{operation, code ? code : EPROTO});
 }
-RmaOptions ReadOptions(const RmaFailureOptions& options) {
-    return {.operation = RmaOperation::kRead,
+RmaOptions WriteOptions(const RmaFailureOptions& options) {
+    // 内层协议描述单次 WRITE；本工具用外层 batch 管理并校验整批独立槽位。
+    return {.operation = RmaOperation::kWrite,
             .bytes = options.bytes,
             .rounds = options.rounds,
             .timeout_ms = options.timeout_ms,
-            .window = options.batch};
+            .window = 1};
 }
-std::byte Pattern(std::size_t target, std::size_t slot, std::size_t offset) {
-    return static_cast<std::byte>((target * 91 + slot * 17 + offset + offset / 251) % 251);
+std::byte Pattern(RmaFailurePhase phase, std::uint32_t round, std::size_t target, std::size_t slot,
+                  std::size_t offset) {
+    // 分散编码阶段、轮次和槽号，避免沿用上轮数据仍然通过校验；0xff 专用于未写入目的区。
+    const auto generation = static_cast<std::uint32_t>(phase) * 256U + round;
+    const auto digit = offset % 2 == 0 ? generation % 251 : generation / 251;
+    return static_cast<std::byte>((digit + target * 91 + slot * 17 + offset + offset / 251) % 251);
 }
 bool IsTerminal(urma_cr_status_t status) {
     switch (status) {
@@ -62,23 +67,23 @@ bool IsTerminal(urma_cr_status_t status) {
 std::expected<void, ToolError> RmaFailureResources::Open(urma_context_t* ctx, const urma_device_cap_t& cap,
                                                          const RmaFailureOptions& options, RmaFailureRole role) {
     if (ctx_ || opened_ || failed_close_) {
-        return Error("READ failure resources already opened", EBUSY);
+        return Error("WRITE failure resources already opened", EBUSY);
     }
     auto valid = ValidateRmaFailureOptions(options);
     if (!valid) {
         return valid;
     }
     if (!ctx) {
-        return Error("READ failure context is null", EINVAL);
+        return Error("WRITE failure context is null", EINVAL);
     }
-    auto supported = CheckRmaCapability(ReadOptions(options), cap);
+    auto supported = CheckRmaCapability(WriteOptions(options), cap);
     if (!supported) {
         return supported;
     }
     ctx_ = ctx;
     options_ = options;
     role_ = role;
-    hello_.options = ReadOptions(options);
+    hello_.options = WriteOptions(options);
     hello_.server = role != RmaFailureRole::kClient;
     raw::JettyPoolConfig config;
     config.jetty_count = 1;
@@ -88,16 +93,16 @@ std::expected<void, ToolError> RmaFailureResources::Open(urma_context_t* ctx, co
     config.rx_cq_depth = 1;
     auto opened = pool_.Open(ctx, cap, config);
     if (!opened) {
-        return Error("create READ failure RM_CTP jetty", opened.error().failure.provider_error);
+        return Error("create WRITE failure RM_CTP jetty", opened.error().failure.provider_error);
     }
     auto ticket = pool_.Reserve();
     if (!ticket) {
-        return Error("reserve READ failure lane");
+        return Error("reserve WRITE failure lane");
     }
     auto jetty = pool_.Get(ticket->lane);
     auto canceled = pool_.Cancel(*ticket);
     if (!jetty || !canceled) {
-        return Error("read failure jetty");
+        return Error("get WRITE failure jetty");
     }
     jetty_ = *jetty;
     stats.jetty_id = jetty_->jetty_id.id;
@@ -115,9 +120,7 @@ std::expected<void, ToolError> RmaFailureResources::Open(urma_context_t* ctx, co
     std::fill(registered_.begin(), registered_.end(), kGuard);
     for (std::size_t slot = 0; slot < slots_; ++slot) {
         auto payload = Payload(slot);
-        for (std::size_t i = 0; i < payload.size(); ++i) {
-            payload[i] = hello_.server ? Pattern(role == RmaFailureRole::kFaultSource, slot, i) : kPoison;
-        }
+        std::fill(payload.begin(), payload.end(), kPoison);
     }
     urma_seg_cfg_t cfg{};
     cfg.va = reinterpret_cast<std::uintptr_t>(registered_.data());
@@ -126,7 +129,7 @@ std::expected<void, ToolError> RmaFailureResources::Open(urma_context_t* ctx, co
     errno = 0;
     segment_ = UrmaApi::RegisterSeg(ctx, &cfg);
     if (!segment_) {
-        return Error("register READ failure memory", errno ? errno : EIO);
+        return Error("register WRITE failure memory", errno ? errno : EIO);
     }
     urma_seg_t* exported = nullptr;
     std::uint32_t size = 0;
@@ -137,14 +140,14 @@ std::expected<void, ToolError> RmaFailureResources::Open(urma_context_t* ctx, co
         }
     });
     if (status != URMA_SUCCESS || !exported) {
-        return Error("export READ failure segment", static_cast<int>(status));
+        return Error("export WRITE failure segment", static_cast<int>(status));
     }
     if (size != sizeof(urma_seg_t) || exported->attr.bs.has_user_info) {
-        return Error("READ failure requires raw segment descriptor", EOPNOTSUPP);
+        return Error("WRITE failure requires raw segment descriptor", EOPNOTSUPP);
     }
     hello_.segment = *exported;
     hello_.payload_address = reinterpret_cast<std::uintptr_t>(Payload(0).data());
-    auto descriptor = ValidateRmaHello(hello_);
+    auto descriptor = MatchRmaFailureEndpoint(hello_, options_, hello_.server);
     if (!descriptor) {
         return descriptor;
     }
@@ -154,7 +157,7 @@ std::expected<void, ToolError> RmaFailureResources::Open(urma_context_t* ctx, co
 
 std::expected<void, ToolError> RmaFailureResources::Import(const std::array<RmaHello, 2>& peers) {
     if (!opened_ || role_ != RmaFailureRole::kClient || imported_ || failed_) {
-        return Error("READ failure import not ready", EINVAL);
+        return Error("WRITE failure import not ready", EINVAL);
     }
     for (const auto& peer : peers) {
         auto valid = MatchRmaFailureEndpoint(peer, options_, true);
@@ -164,18 +167,18 @@ std::expected<void, ToolError> RmaFailureResources::Import(const std::array<RmaH
     }
     if (peers[0].endpoint.id == peers[1].endpoint.id &&
         std::memcmp(peers[0].endpoint.eid.raw, peers[1].endpoint.eid.raw, URMA_EID_SIZE) == 0) {
-        return Error("READ targets must differ", EINVAL);
+        return Error("WRITE targets must differ", EINVAL);
     }
     // 部分 import 失败也禁止重新覆盖已导入对象；入口统一保留/释放其完整依赖。
     failed_ = true;
     peers_ = peers;
     for (std::size_t i = 0; i < peers.size(); ++i) {
         urma_import_seg_flag_t flags{};
-        flags.bs.access = URMA_ACCESS_READ;
+        flags.bs.access = URMA_ACCESS_WRITE;
         errno = 0;
         remote_segments_[i] = UrmaApi::ImportSeg(ctx_, &peers_[i].segment, &peers_[i].token, 0, flags);
         if (!remote_segments_[i]) {
-            return Error("import READ failure source", errno ? errno : EIO);
+            return Error("import WRITE failure destination", errno ? errno : EIO);
         }
         urma_rjetty_t remote{};
         remote.jetty_id = peers[i].endpoint;
@@ -186,7 +189,7 @@ std::expected<void, ToolError> RmaFailureResources::Import(const std::array<RmaH
         errno = 0;
         targets_[i] = UrmaApi::ImportJetty(ctx_, &remote, &token);
         if (!targets_[i]) {
-            return Error("import READ failure target", errno ? errno : EIO);
+            return Error("import WRITE failure target", errno ? errno : EIO);
         }
     }
     imported_ = true;
@@ -204,34 +207,59 @@ std::expected<void, ToolError> RmaFailureResources::CheckGuards() {
         const auto memory = registered_.subspan(slot * stride, stride);
         for (std::size_t i = 0; i < kRmaGuardBytes; ++i) {
             if (memory[i] != kGuard || memory[kRmaGuardBytes + options_.bytes + i] != kGuard) {
-                return Error("READ failure guard overwritten", EPROTO);
+                return Error("WRITE failure guard overwritten", EPROTO);
             }
         }
     }
     for (const auto byte : registered_.subspan(slots_ * stride)) {
         if (byte != kGuard) {
-            return Error("READ failure registration padding overwritten", EPROTO);
+            return Error("WRITE failure registration padding overwritten", EPROTO);
         }
     }
     return {};
 }
 
-std::expected<void, ToolError> RmaFailureResources::VerifySource() {
-    if (!opened_ || role_ == RmaFailureRole::kClient) {
-        return Error("READ source not opened", EINVAL);
+std::expected<void, ToolError> RmaFailureResources::VerifyTarget(RmaFailurePhase phase, std::uint32_t round) {
+    const bool fault = role_ == RmaFailureRole::kFaultTarget;
+    const bool baseline = phase == RmaFailurePhase::kHealthyBaseline || phase == RmaFailurePhase::kFaultBaseline;
+    if (!opened_ || failed_ || role_ == RmaFailureRole::kClient ||
+        fault != (phase == RmaFailurePhase::kFaultBaseline) || round >= options_.rounds || (baseline && round)) {
+        return Error("WRITE target verification phase not ready", EINVAL);
     }
+    failed_ = true;
     auto guarded = CheckGuards();
     if (!guarded) {
         return guarded;
     }
+    const auto count = baseline ? 1U : options_.batch;
     for (std::size_t slot = 0; slot < slots_; ++slot) {
         const auto payload = Payload(slot);
         for (std::size_t i = 0; i < payload.size(); ++i) {
-            if (payload[i] != Pattern(role_ == RmaFailureRole::kFaultSource, slot, i)) {
-                return Error("READ source payload modified", EPROTO);
+            const auto expected = slot < count ? Pattern(phase, round, fault, slot, i) : kPoison;
+            if (payload[i] != expected) {
+                return Error("WRITE target payload mismatch", EPROTO);
             }
         }
     }
+    Counters(phase, fault).verified += count;
+    // 仅在对端声明该批 WR 已成功终结并完成校验后清空；确认发出前目的区就绪。
+    for (std::size_t slot = 0; slot < slots_; ++slot) {
+        auto payload = Payload(slot);
+        std::fill(payload.begin(), payload.end(), kPoison);
+    }
+    failed_ = false;
+    return {};
+}
+
+std::expected<void, ToolError> RmaFailureResources::ConfirmRemoteWrites(RmaFailurePhase phase) {
+    auto& counters = Counters(phase, phase == RmaFailurePhase::kFaultBaseline);
+    const bool baseline = phase == RmaFailurePhase::kHealthyBaseline || phase == RmaFailurePhase::kFaultBaseline;
+    const auto count = baseline ? 1U : options_.batch;
+    if (role_ != RmaFailureRole::kClient || failed_ || stats.pending ||
+        counters.verified + count > counters.statuses[URMA_CR_SUCCESS]) {
+        return Error("WRITE remote verification lacks successful local completions", EPROTO);
+    }
+    counters.verified += count;
     return {};
 }
 
@@ -243,12 +271,13 @@ std::expected<void, ToolError> RmaFailureResources::CheckReady() {
     stats.last_query_status = static_cast<int>(status);
     stats.last_state = status == URMA_SUCCESS ? static_cast<int>(attr.state) : -1;
     if (status != URMA_SUCCESS || attr.state != URMA_JETTY_STATE_READY) {
-        return Error("READ failure SQ is not confirmed READY", status != URMA_SUCCESS ? static_cast<int>(status) : EIO);
+        return Error("WRITE failure SQ is not confirmed READY",
+                     status != URMA_SUCCESS ? static_cast<int>(status) : EIO);
     }
     return {};
 }
 
-RmaReadCounters& RmaFailureResources::Counters(RmaFailurePhase phase, std::size_t target) {
+RmaWriteCounters& RmaFailureResources::Counters(RmaFailurePhase phase, std::size_t target) {
     switch (phase) {
     case RmaFailurePhase::kHealthyBaseline:
         return stats.healthy_baseline;
@@ -264,20 +293,20 @@ RmaReadCounters& RmaFailureResources::Counters(RmaFailurePhase phase, std::size_
     return stats.healthy_baseline;
 }
 
-std::expected<void, ToolError> RmaFailureResources::Transfer(RmaFailurePhase phase) {
+std::expected<void, ToolError> RmaFailureResources::Transfer(RmaFailurePhase phase, std::uint32_t round) {
     const bool mixed = phase == RmaFailurePhase::kMixed;
     const bool after_exit = mixed || phase == RmaFailurePhase::kHealthyAfter;
-    if (!opened_ || !imported_ || failed_ || stats.pending || !stats.accepted_known ||
-        after_exit != stats.peer_exit_confirmed) {
-        return Error("READ failure transfer phase not ready", EINVAL);
+    const bool baseline = phase == RmaFailurePhase::kHealthyBaseline || phase == RmaFailurePhase::kFaultBaseline;
+    if (!opened_ || !imported_ || failed_ || stats.pending || !stats.accepted_known || round >= options_.rounds ||
+        (baseline && round) || after_exit != stats.peer_exit_confirmed) {
+        return Error("WRITE failure transfer phase not ready", EINVAL);
     }
-    // 任何失败都禁止再次投递；本测试不重放 READ，也不替硬件恢复/修改 SQ。
+    // 任何失败都禁止再次投递；本测试不重放 WRITE，也不替硬件恢复/修改 SQ。
     failed_ = true;
     auto ready = CheckReady();
     if (!ready) {
         return ready;
     }
-    const bool baseline = phase == RmaFailurePhase::kHealthyBaseline || phase == RmaFailurePhase::kFaultBaseline;
     const std::size_t count = baseline ? 1 : options_.batch * (mixed ? 2U : 1U);
     const auto target_of = [=](std::size_t i) {
         return mixed ? i % 2 : (phase == RmaFailurePhase::kFaultBaseline ? 1U : 0U);
@@ -289,16 +318,18 @@ std::expected<void, ToolError> RmaFailureResources::Transfer(RmaFailurePhase pha
     for (std::size_t i = 0; i < count; ++i) {
         const auto target = target_of(i);
         const auto slot = slot_of(i);
-        auto destination = Payload(target * options_.batch + slot);
-        std::fill(destination.begin(), destination.end(), kPoison);
-        sources_[i] = {.addr = peers_[target].payload_address + slot * RmaSlotStride(hello_.options),
-                       .len = options_.bytes,
-                       .tseg = remote_segments_[target]};
-        destinations_[i] = {
-            .addr = reinterpret_cast<std::uintptr_t>(destination.data()), .len = options_.bytes, .tseg = segment_};
+        auto source = Payload(target * options_.batch + slot);
+        for (std::size_t j = 0; j < source.size(); ++j) {
+            source[j] = Pattern(phase, round, target, slot, j);
+        }
+        sources_[i] = {
+            .addr = reinterpret_cast<std::uintptr_t>(source.data()), .len = options_.bytes, .tseg = segment_};
+        destinations_[i] = {.addr = peers_[target].payload_address + slot * RmaSlotStride(hello_.options),
+                            .len = options_.bytes,
+                            .tseg = remote_segments_[target]};
         auto& wr = wrs_[i];
         wr = {};
-        wr.opcode = URMA_OPC_READ;
+        wr.opcode = URMA_OPC_WRITE;
         wr.flag.bs.complete_enable = 1;
         wr.rw.src = {&sources_[i], 1};
         wr.rw.dst = {&destinations_[i], 1};
@@ -327,7 +358,7 @@ std::expected<void, ToolError> RmaFailureResources::Transfer(RmaFailurePhase pha
         }
         if (!known) {
             stats.accepted_known = false;
-            return Error("READ failure post acceptance unresolved", static_cast<int>(posted));
+            return Error("WRITE failure post acceptance unresolved", static_cast<int>(posted));
         }
         stats.partial_batches += accepted != 0;
     }
@@ -341,7 +372,7 @@ std::expected<void, ToolError> RmaFailureResources::Transfer(RmaFailurePhase pha
     while (remaining) {
         auto polled = pool_.PollSend(completions);
         if (!polled) {
-            return Error("poll READ failure completion", polled.error().provider_error);
+            return Error("poll WRITE failure completion", polled.error().provider_error);
         }
         bool malformed = false;
         for (int i = 0; i < *polled; ++i) {
@@ -352,7 +383,7 @@ std::expected<void, ToolError> RmaFailureResources::Transfer(RmaFailurePhase pha
                 cr.user_ctx < first_id || cr.user_ctx - first_id >= accepted) {
                 malformed = true;
                 if (result) {
-                    result = Error("unexpected READ failure completion type/id", EPROTO);
+                    result = Error("unexpected WRITE failure completion type/id", EPROTO);
                 }
                 continue;
             }
@@ -360,37 +391,26 @@ std::expected<void, ToolError> RmaFailureResources::Transfer(RmaFailurePhase pha
             if (retired_[index]) {
                 malformed = true;
                 if (result) {
-                    result = Error("duplicate READ failure completion", EPROTO);
+                    result = Error("duplicate WRITE failure completion", EPROTO);
                 }
                 continue;
             }
             retired_[index] = true;
             --remaining;
             const auto target = target_of(index);
-            const auto slot = slot_of(index);
             auto& counters = Counters(phase, target);
             ++counters.retired;
             ++counters.statuses[static_cast<std::size_t>(cr.status)];
             const bool expect_success = !mixed || target == 0;
-            if ((cr.status == URMA_CR_SUCCESS) != expect_success && result) {
-                result = Error(expect_success ? "healthy/baseline READ failed"
-                                              : "READ to exited source unexpectedly succeeded",
-                               cr.status == URMA_CR_SUCCESS ? EPROTO : static_cast<int>(cr.status));
+            // 已知芯片限制：任意 status 9 后 jetty 不可继续使用，查询 READY 也不能解除门禁。
+            // 先退休这一批已经受理的 WR，再失败退出；不向同一 SQ 投递后续健康探测。
+            if (cr.status == URMA_CR_ACK_TIMEOUT_ERR && result) {
+                result = Error("WRITE ACK_TIMEOUT makes SQ unusable; stop posting", static_cast<int>(cr.status));
             }
-            if (cr.status == URMA_CR_SUCCESS) {
-                const auto payload = Payload(target * options_.batch + slot);
-                bool matches = true;
-                for (std::size_t j = 0; j < payload.size(); ++j) {
-                    if (payload[j] != Pattern(target, slot, j)) {
-                        matches = false;
-                        break;
-                    }
-                }
-                if (matches) {
-                    ++counters.verified;
-                } else if (result) {
-                    result = Error("READ failure payload mismatch", EPROTO);
-                }
+            if ((cr.status == URMA_CR_SUCCESS) != expect_success && result) {
+                result = Error(expect_success ? "healthy/baseline WRITE failed"
+                                              : "WRITE to exited target unexpectedly succeeded",
+                               cr.status == URMA_CR_SUCCESS ? EPROTO : static_cast<int>(cr.status));
             }
         }
         stats.pending = remaining != 0;
@@ -398,10 +418,22 @@ std::expected<void, ToolError> RmaFailureResources::Transfer(RmaFailurePhase pha
             return result;
         }
         if (remaining && std::chrono::steady_clock::now() >= deadline) {
-            return Error("wait READ failure completion", ETIMEDOUT);
+            return Error("wait WRITE failure completion", ETIMEDOUT);
         }
         if (!*polled) {
             std::this_thread::yield();
+        }
+    }
+    // WRITE 的本地 CQE 不证明远端 payload 校验通过；这里只检查 DMA 源未被修改。
+    // verified 计数在远端 VerifyTarget 成功并通过控制通道确认后更新。
+    for (std::size_t i = 0; i < accepted; ++i) {
+        const auto target = target_of(i);
+        const auto slot = slot_of(i);
+        const auto source = Payload(target * options_.batch + slot);
+        for (std::size_t j = 0; j < source.size(); ++j) {
+            if (source[j] != Pattern(phase, round, target, slot, j) && result) {
+                result = Error("WRITE source payload modified", EPROTO);
+            }
         }
     }
     auto guarded = CheckGuards();
@@ -416,7 +448,7 @@ std::expected<void, ToolError> RmaFailureResources::Transfer(RmaFailurePhase pha
         return queried;
     }
     if (post_failed) {
-        return Error("READ failure accepted prefix retired; no replay", static_cast<int>(posted));
+        return Error("WRITE failure accepted prefix retired; no replay", static_cast<int>(posted));
     }
     failed_ = false;
     return {};
@@ -424,13 +456,13 @@ std::expected<void, ToolError> RmaFailureResources::Transfer(RmaFailurePhase pha
 
 std::expected<void, ToolError> RmaFailureResources::CheckQuiescent() {
     if (!opened_ || stats.pending || !stats.accepted_known) {
-        return Error("READ failure DMA state unresolved", EBUSY);
+        return Error("WRITE failure DMA state unresolved", EBUSY);
     }
     std::array<urma_cr_t, 64> tail{};
     auto polled = pool_.PollSend(tail);
     if (!polled || *polled) {
         failed_ = true;
-        return Error("unexpected READ failure completion before close",
+        return Error("unexpected WRITE failure completion before close",
                      polled ? EPROTO : polled.error().provider_error);
     }
     return CheckGuards();
@@ -438,7 +470,7 @@ std::expected<void, ToolError> RmaFailureResources::CheckQuiescent() {
 
 std::expected<void, ToolError> RmaFailureResources::Close() {
     if (stats.pending || !stats.accepted_known || failed_close_) {
-        return Error("READ failure dependencies still required", EBUSY);
+        return Error("WRITE failure dependencies still required", EBUSY);
     }
     opened_ = false;
     auto failed = [this](const char* operation, int code) -> std::expected<void, ToolError> {
@@ -449,7 +481,7 @@ std::expected<void, ToolError> RmaFailureResources::Close() {
         if (target) {
             const auto status = UrmaApi::UnimportJetty(target);
             if (status != URMA_SUCCESS) {
-                return failed("unimport READ failure target", status);
+                return failed("unimport WRITE failure target", status);
             }
             target = nullptr;
         }
@@ -458,20 +490,20 @@ std::expected<void, ToolError> RmaFailureResources::Close() {
         if (segment) {
             const auto status = UrmaApi::UnimportSeg(segment);
             if (status != URMA_SUCCESS) {
-                return failed("unimport READ failure source", status);
+                return failed("unimport WRITE failure destination", status);
             }
             segment = nullptr;
         }
     }
     auto closed = pool_.Close();
     if (!closed) {
-        return failed("close READ failure queues", closed.error().provider_error);
+        return failed("close WRITE failure queues", closed.error().provider_error);
     }
     jetty_ = nullptr;
     if (segment_) {
         const auto status = UrmaApi::UnregisterSeg(segment_);
         if (status != URMA_SUCCESS) {
-            return failed("unregister READ failure memory", status);
+            return failed("unregister WRITE failure memory", status);
         }
         segment_ = nullptr;
     }
@@ -484,11 +516,11 @@ std::expected<void, ToolError> RmaFailureResources::Close() {
 std::expected<void, ToolError> RmaFailureSession::Open(urma_context_t* ctx, const urma_device_cap_t& cap,
                                                        const RmaFailureOptions& options, bool server) {
     if (opened_ || started_) {
-        return Error("READ failure session already opened", EBUSY);
+        return Error("WRITE failure session already opened", EBUSY);
     }
     options_ = options;
     server_ = server;
-    auto opened = resources.Open(ctx, cap, options, server ? RmaFailureRole::kHealthySource : RmaFailureRole::kClient);
+    auto opened = resources.Open(ctx, cap, options, server ? RmaFailureRole::kHealthyTarget : RmaFailureRole::kClient);
     if (!opened) {
         return opened;
     }
@@ -499,7 +531,7 @@ std::expected<void, ToolError> RmaFailureSession::Open(urma_context_t* ctx, cons
 
 std::expected<void, ToolError> RmaFailureSession::Run(ControlChannel& channel, RmaFailurePeer* fault_peer) {
     if (!opened_ || started_ || server_ != (fault_peer != nullptr)) {
-        return Error("READ failure session not ready", EINVAL);
+        return Error("WRITE failure session not ready", EINVAL);
     }
     started_ = true;
     quiescent_ = false;
@@ -529,38 +561,58 @@ std::expected<void, ToolError> RmaFailureSession::Run(ControlChannel& channel, R
     }
     if (peer->server == server_ || peer->options.bytes != options_.bytes || peer->options.batch != options_.batch ||
         peer->options.rounds != options_.rounds) {
-        return Error("READ failure peer options mismatch", EPROTO);
+        return Error("WRITE failure peer options mismatch", EPROTO);
     }
     if (!server_) {
         auto imported = resources.Import(peer->endpoints);
         if (!imported) {
             return imported;
         }
-        for (auto phase : {RmaFailurePhase::kHealthyBaseline, RmaFailurePhase::kFaultBaseline}) {
-            auto transferred = resources.Transfer(phase);
-            if (!transferred) {
-                return transferred;
-            }
-        }
     }
-    const auto complete = [&](std::uint32_t marker) {
-        // 基线标记之前要完成导入和两次独立 READ，不能只给一次完成等待的预算。
+    const auto transfer = [&](RmaFailurePhase phase, std::uint32_t round,
+                              std::uint32_t marker) -> std::expected<void, ToolError> {
+        const bool fault_baseline = phase == RmaFailurePhase::kFaultBaseline;
+        // 基线还包含 import 的开销；两端都必须等本轮完成与远端校验确认，才能复用槽位。
         const auto wait_ms = marker == kBaseline ? 3 * options_.timeout_ms : options_.timeout_ms;
-        return server_ ? channel.ExpectMarker(marker, wait_ms) : channel.SendMarker(marker, options_.timeout_ms);
+        if (server_) {
+            auto completed = channel.ExpectMarker(marker, wait_ms);
+            if (!completed) {
+                return completed;
+            }
+            if (!fault_baseline) {
+                auto verified = resources.VerifyTarget(phase, round);
+                if (!verified) {
+                    return verified;
+                }
+            }
+            // 故障目标由子进程在退出前校验，这里的应答只同步阶段，不计入 verified。
+            return channel.SendMarker(marker, options_.timeout_ms);
+        }
+        auto transferred = resources.Transfer(phase, round);
+        if (!transferred) {
+            return transferred;
+        }
+        auto completed = channel.SendMarker(marker, options_.timeout_ms);
+        if (!completed) {
+            return completed;
+        }
+        auto verified = channel.ExpectMarker(marker, options_.timeout_ms);
+        if (!verified) {
+            return verified;
+        }
+        return fault_baseline ? std::expected<void, ToolError>{} : resources.ConfirmRemoteWrites(phase);
     };
-    auto baseline = complete(kBaseline);
+    auto baseline = transfer(RmaFailurePhase::kHealthyBaseline, 0, kBaseline);
+    if (!baseline) {
+        return baseline;
+    }
+    baseline = transfer(RmaFailurePhase::kFaultBaseline, 0, kBaseline + 1);
     if (!baseline) {
         return baseline;
     }
     const auto rounds = [&](RmaFailurePhase phase, std::uint32_t marker) -> std::expected<void, ToolError> {
         for (std::uint32_t round = 0; round < options_.rounds; ++round) {
-            if (!server_) {
-                auto transferred = resources.Transfer(phase);
-                if (!transferred) {
-                    return transferred;
-                }
-            }
-            auto completed = complete(marker + round);
+            auto completed = transfer(phase, round, marker + round);
             if (!completed) {
                 return completed;
             }
@@ -572,24 +624,25 @@ std::expected<void, ToolError> RmaFailureSession::Run(ControlChannel& channel, R
         return before;
     }
     if (server_) {
-        auto verified = resources.VerifySource();
-        if (!verified) {
-            return verified;
-        }
-        // 只有两个目标的基线及故障前流量全部终结后，才验证故障源并杀死其进程。
+        // 两个目标的基线及故障前流量均已终结，子进程校验写入与保护区后才被杀死。
         auto exited = fault_peer->FinishBaselineAndExit();
         if (!exited) {
             return exited;
         }
+        resources.stats.fault_baseline.verified = 1;
         auto sent = channel.SendMarker(kExited, options_.timeout_ms);
         if (!sent) {
             return sent;
         }
     } else {
-        // 服务端先校验健康源，再等待故障源校验与 SIGKILL/waitpid；仍由外层 watchdog 兜底。
+        // 等待故障目标校验与 SIGKILL/waitpid；仍由外层 watchdog 兜底。
         auto exited = channel.ExpectMarker(kExited, 3 * options_.timeout_ms);
         if (!exited) {
             return exited;
+        }
+        auto verified = resources.ConfirmRemoteWrites(RmaFailurePhase::kFaultBaseline);
+        if (!verified) {
+            return verified;
         }
     }
     resources.stats.peer_exit_confirmed = true;
@@ -600,12 +653,6 @@ std::expected<void, ToolError> RmaFailureSession::Run(ControlChannel& channel, R
     auto after = rounds(RmaFailurePhase::kHealthyAfter, kAfter);
     if (!after) {
         return after;
-    }
-    if (server_) {
-        auto verified = resources.VerifySource();
-        if (!verified) {
-            return verified;
-        }
     }
     auto empty = resources.CheckQuiescent();
     if (!empty) {
@@ -625,7 +672,7 @@ std::expected<void, ToolError> RmaFailureSession::Run(ControlChannel& channel, R
 
 std::expected<void, ToolError> RmaFailureSession::Close() {
     if (!quiescent_) {
-        return Error("READ failure peer/DMA state unresolved; retain all dependencies", EBUSY);
+        return Error("WRITE failure peer/DMA state unresolved; retain all dependencies", EBUSY);
     }
     auto closed = resources.Close();
     if (closed) {

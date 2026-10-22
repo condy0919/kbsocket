@@ -37,19 +37,19 @@ std::expected<void, ToolError> RunEndpoint(int fd, const char* library, const ch
     static NoDestructor<ChildHardware> hardware;
     ControlChannel channel(fd);
     if (auto loaded = raw::UrmaApi::Load(library); !loaded) {
-        return Error("load disposable READ source URMA", ENOENT);
+        return Error("load disposable WRITE target URMA", ENOENT);
     }
     auto initialized = hardware->runtime.Initialize({{device, eid_index}});
     if (!initialized) {
-        return Error("initialize disposable READ source", initialized.error().provider_error);
+        return Error("initialize disposable WRITE target", initialized.error().provider_error);
     }
     auto* ctx = hardware->runtime.context(0);
     urma_device_attr_t attributes{};
     const auto status = raw::UrmaApi::QueryDevice(ctx->dev, &attributes);
     if (status != URMA_SUCCESS) {
-        return Error("query disposable READ source device", status);
+        return Error("query disposable WRITE target device", status);
     }
-    auto opened = hardware->resources.Open(ctx, attributes.dev_cap, options, RmaFailureRole::kFaultSource);
+    auto opened = hardware->resources.Open(ctx, attributes.dev_cap, options, RmaFailureRole::kFaultTarget);
     if (!opened) {
         return opened;
     }
@@ -57,13 +57,13 @@ std::expected<void, ToolError> RunEndpoint(int fd, const char* library, const ch
     if (!io) {
         return io;
     }
-    // 等待父进程初始化健康源、建立连接及客户端 READ 基线，不将启动时间误判为故障。
+    // 等待父进程初始化健康目标、建立连接及客户端 WRITE 基线，不将启动时间误判为故障。
     io = channel.ExpectMarker(kVerifyBaseline, (options.rounds + 8) * options.timeout_ms);
     if (!io) {
         return io;
     }
-    // 该命令只能在客户端确认基线 READ 的成功 CQE 和目的数据之后发出。
-    auto verified = hardware->resources.VerifySource();
+    // 客户端确认基线 WRITE 的成功 CQE 后，才允许目标检查写入数据及未写槽位。
+    auto verified = hardware->resources.VerifyTarget(RmaFailurePhase::kFaultBaseline);
     if (!verified) {
         return verified;
     }
@@ -80,7 +80,7 @@ std::expected<void, ToolError> RunEndpoint(int fd, const char* library, const ch
 RmaFailurePeerProcess::~RmaFailurePeerProcess() {
     if (pid_ > 0) {
         if (auto stopped = Stop(false); !stopped) {
-            std::println(stderr, "FAIL: dispose READ source: {}: {}", stopped.error().operation, stopped.error().code);
+            std::println(stderr, "FAIL: dispose WRITE target: {}: {}", stopped.error().operation, stopped.error().code);
         }
     }
 }
@@ -88,12 +88,12 @@ RmaFailurePeerProcess::~RmaFailurePeerProcess() {
 std::expected<void, ToolError> RmaFailurePeerProcess::Open(const char* library, const char* device,
                                                            std::uint32_t eid_index, const RmaFailureOptions& options) {
     if (pid_ > 0 || channel_ || !library || !*library || !device || !*device || !ValidateRmaFailureOptions(options)) {
-        return Error("invalid disposable READ source options/lifecycle", EINVAL);
+        return Error("invalid disposable WRITE target options/lifecycle", EINVAL);
     }
     options_ = options;
     int sockets[2]{};
     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
-        return Error("socketpair disposable READ source", errno);
+        return Error("socketpair disposable WRITE target", errno);
     }
     const auto parent = ::getpid();
     std::fflush(nullptr);
@@ -102,7 +102,7 @@ std::expected<void, ToolError> RmaFailurePeerProcess::Open(const char* library, 
         const int saved = errno;
         ::close(sockets[0]);
         ::close(sockets[1]);
-        return Error("fork disposable READ source", saved);
+        return Error("fork disposable WRITE target", saved);
     }
     if (child == 0) {
         ::close(sockets[0]);
@@ -113,12 +113,12 @@ std::expected<void, ToolError> RmaFailurePeerProcess::Open(const char* library, 
         try {
             auto result = RunEndpoint(sockets[1], library, device, eid_index, options);
             if (!result) {
-                std::println(stderr, "FAIL: disposable READ source: {}: {}", result.error().operation,
+                std::println(stderr, "FAIL: disposable WRITE target: {}: {}", result.error().operation,
                              result.error().code);
             }
             code = result ? 0 : 1;
         } catch (...) {
-            std::println(stderr, "FAIL: disposable READ source exception");
+            std::println(stderr, "FAIL: disposable WRITE target exception");
         }
         std::fflush(nullptr);
         std::_Exit(code);
@@ -140,7 +140,7 @@ std::expected<void, ToolError> RmaFailurePeerProcess::Open(const char* library, 
         return matched;
     }
     hello_ = *decoded;
-    std::println("Disposable READ source: pid={} jetty_id={} bytes_per_read={} slots={}; RX_posted=0", pid_,
+    std::println("Disposable WRITE target: pid={} jetty_id={} bytes_per_write={} slots={}; RX_posted=0", pid_,
                  hello_.endpoint.id, options.bytes, options.batch);
     std::fflush(stdout);
     return {};
@@ -154,7 +154,7 @@ std::expected<void, ToolError> RmaFailurePeerProcess::Stop(bool require_sigkill)
 
 std::expected<void, ToolError> RmaFailurePeerProcess::FinishBaselineAndExit() {
     if (pid_ <= 0 || !channel_) {
-        return Error("disposable READ source not alive", EINVAL);
+        return Error("disposable WRITE target not alive", EINVAL);
     }
     auto io = channel_->SendMarker(kVerifyBaseline, options_.timeout_ms);
     if (io) {
@@ -167,7 +167,7 @@ std::expected<void, ToolError> RmaFailurePeerProcess::FinishBaselineAndExit() {
     if (auto stopped = Stop(true); !stopped) {
         return stopped;
     }
-    std::println("OBSERVED: fault source payload/guards unchanged after READ baseline; SIGKILL/waitpid confirmed; "
+    std::println("OBSERVED: fault target payload/guards validated after WRITE baseline; SIGKILL/waitpid confirmed; "
                  "pid={} jetty_id={}",
                  child, hello_.endpoint.id);
     std::fflush(stdout);

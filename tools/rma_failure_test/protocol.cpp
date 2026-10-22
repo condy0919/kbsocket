@@ -9,7 +9,8 @@ namespace kbsocket {
 namespace tools {
 namespace {
 constexpr std::uint32_t kMagic = 0x4b52464c;
-constexpr std::uint32_t kVersion = 1;
+// WRITE 更改了 DMA 方向与逐轮确认语义，禁止与旧 READ 二进制互通。
+constexpr std::uint32_t kVersion = 2;
 void Put(RmaFailureHelloBytes& wire, std::size_t offset, std::uint32_t value) noexcept {
     for (std::size_t i = 0; i < 4; ++i) {
         wire[offset + i] = static_cast<std::byte>(value >> (24 - 8 * i));
@@ -28,21 +29,30 @@ std::expected<void, ToolError> ValidateRmaFailureOptions(const RmaFailureOptions
     if (!options.bytes || options.bytes > 8 * 1024 * 1024 || !options.batch || options.batch > 128 || !options.rounds ||
         options.rounds > 256 || options.timeout_ms < 100 || options.timeout_ms > 120000 ||
         2ULL * options.bytes * options.batch > 256ULL * 1024 * 1024) {
-        return std::unexpected(ToolError{"invalid READ failure probe options", EINVAL});
+        return std::unexpected(ToolError{"invalid WRITE failure probe options", EINVAL});
     }
     return {};
 }
 
 std::expected<void, ToolError> MatchRmaFailureEndpoint(const RmaHello& hello, const RmaFailureOptions& options,
                                                        bool server) noexcept {
+    auto options_valid = ValidateRmaFailureOptions(options);
+    if (!options_valid) {
+        return options_valid;
+    }
     auto valid = ValidateRmaHello(hello);
     if (!valid) {
         return valid;
     }
-    if (hello.server != server || hello.options.operation != RmaOperation::kRead ||
-        hello.options.bytes != options.bytes || hello.options.window != options.batch ||
-        hello.options.rounds != options.rounds || hello.options.mixed_send) {
-        return std::unexpected(ToolError{"READ failure endpoint role/options mismatch", EPROTO});
+    if (hello.server != server || hello.options.operation != RmaOperation::kWrite ||
+        hello.options.bytes != options.bytes || hello.options.window != 1 || hello.options.rounds != options.rounds ||
+        hello.options.mixed_send) {
+        return std::unexpected(ToolError{"WRITE failure endpoint role/options mismatch", EPROTO});
+    }
+    // 通用描述符验证单次 WRITE；本工具还必须保证整批槽位均在远端 MR 内，且不会地址回绕。
+    const auto span = (options.batch - 1) * RmaSlotStride(hello.options) + options.bytes;
+    if (span > hello.segment.len - (hello.payload_address - hello.segment.ubva.va)) {
+        return std::unexpected(ToolError{"WRITE failure batch exceeds remote segment", EPROTO});
     }
     return {};
 }
@@ -64,7 +74,7 @@ RmaFailureHelloBytes EncodeRmaFailureHello(const RmaFailureHello& hello) noexcep
 
 std::expected<RmaFailureHello, ToolError> DecodeRmaFailureHello(const RmaFailureHelloBytes& wire) noexcept {
     if (Get(wire, 0) != kMagic || Get(wire, 4) != kVersion || Get(wire, 8) > 1 || Get(wire, 24) || Get(wire, 28)) {
-        return std::unexpected(ToolError{"invalid READ failure hello header", EPROTO});
+        return std::unexpected(ToolError{"invalid WRITE failure hello header", EPROTO});
     }
     RmaFailureHello hello;
     hello.server = Get(wire, 8) != 0;
@@ -95,7 +105,7 @@ std::expected<RmaFailureHello, ToolError> DecodeRmaFailureHello(const RmaFailure
     } else if (hello.endpoints[0].endpoint.id == hello.endpoints[1].endpoint.id &&
                std::memcmp(hello.endpoints[0].endpoint.eid.raw, hello.endpoints[1].endpoint.eid.raw, URMA_EID_SIZE) ==
                    0) {
-        return std::unexpected(ToolError{"healthy and fault READ targets must differ", EPROTO});
+        return std::unexpected(ToolError{"healthy and fault WRITE targets must differ", EPROTO});
     }
     return hello;
 }

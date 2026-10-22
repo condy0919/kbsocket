@@ -16,10 +16,11 @@ RmaFailureHello ValidFailureHello(bool server = true) {
     for (std::size_t i = 0; i < (server ? 2U : 1U); ++i) {
         auto& endpoint = hello.endpoints[i];
         endpoint.server = server;
-        endpoint.options = {.bytes = hello.options.bytes,
+        endpoint.options = {.operation = RmaOperation::kWrite,
+                            .bytes = hello.options.bytes,
                             .rounds = hello.options.rounds,
                             .timeout_ms = hello.options.timeout_ms,
-                            .window = hello.options.batch};
+                            .window = 1};
         endpoint.endpoint.eid.raw[0] = static_cast<std::uint8_t>(i + 1);
         endpoint.endpoint.id = 0x10203040U + i;
         endpoint.segment.ubva.eid = endpoint.endpoint.eid;
@@ -33,7 +34,7 @@ RmaFailureHello ValidFailureHello(bool server = true) {
     return hello;
 }
 
-TEST(RmaFailureProtocolTest, BothSourcesRoundTripWithoutCopyingAbiStructs) {
+TEST(RmaFailureProtocolTest, BothTargetsRoundTripWithoutCopyingAbiStructs) {
     const auto hello = ValidFailureHello();
     const auto wire = EncodeRmaFailureHello(hello);
     EXPECT_EQ(wire.size(), 256U);
@@ -47,16 +48,17 @@ TEST(RmaFailureProtocolTest, BothSourcesRoundTripWithoutCopyingAbiStructs) {
         EXPECT_EQ(decoded->endpoints[i].payload_address, hello.endpoints[i].payload_address);
         EXPECT_EQ(decoded->endpoints[i].segment.ubva.va, hello.endpoints[i].segment.ubva.va);
         EXPECT_EQ(decoded->endpoints[i].endpoint.id, hello.endpoints[i].endpoint.id);
-        EXPECT_EQ(decoded->endpoints[i].options.window, 32U);
+        EXPECT_EQ(decoded->endpoints[i].options.window, 1U);
+        EXPECT_EQ(decoded->endpoints[i].options.operation, RmaOperation::kWrite);
     }
 }
 
-TEST(RmaFailureProtocolTest, ClientWireHasNoSecondSourceAndRejectsHiddenDescriptor) {
+TEST(RmaFailureProtocolTest, ClientWireHasNoSecondTargetAndRejectsHiddenDescriptor) {
     const auto hello = ValidFailureHello(false);
     auto wire = EncodeRmaFailureHello(hello);
     EXPECT_TRUE(std::all_of(wire.begin() + 144, wire.end(), [](std::byte byte) { return byte == std::byte{0}; }));
     ASSERT_TRUE(DecodeRmaFailureHello(wire));
-    // 客户端不能偷偷携带第二个远端源，保留区必须全部为零。
+    // 客户端不能偷偷携带第二个远端目标，保留区必须全部为零。
     wire[200] = std::byte{1};
     EXPECT_FALSE(DecodeRmaFailureHello(wire));
 }
@@ -70,7 +72,15 @@ TEST(RmaFailureProtocolTest, RejectsBadOuterHeaderAndReservedFields) {
     }
 }
 
-TEST(RmaFailureProtocolTest, RejectsCorruptedInnerProtocolForEitherSource) {
+TEST(RmaFailureProtocolTest, RejectsLegacyReadFailureProtocolVersion) {
+    auto wire = EncodeRmaFailureHello(ValidFailureHello());
+    EXPECT_EQ(wire[7], std::byte{2});
+    // WRITE 修改了数据方向与校验屏障，旧 READ 二进制必须在交换描述符时被拒绝。
+    wire[7] = std::byte{1};
+    EXPECT_FALSE(DecodeRmaFailureHello(wire));
+}
+
+TEST(RmaFailureProtocolTest, RejectsCorruptedInnerProtocolForEitherTarget) {
     const auto good = EncodeRmaFailureHello(ValidFailureHello());
     for (const auto base : {32U, 144U}) {
         auto wire = good;
@@ -91,7 +101,7 @@ TEST(RmaFailureProtocolTest, EndpointRoleOperationWindowAndOptionsMustMatchOuter
             endpoint.server = false;
             break;
         case 1:
-            endpoint.options.operation = RmaOperation::kWrite;
+            endpoint.options.operation = RmaOperation::kRead;
             break;
         case 2:
             ++endpoint.options.bytes;
@@ -100,7 +110,7 @@ TEST(RmaFailureProtocolTest, EndpointRoleOperationWindowAndOptionsMustMatchOuter
             ++endpoint.options.rounds;
             break;
         case 4:
-            --endpoint.options.window;
+            ++endpoint.options.window;
             break;
         case 5:
             endpoint.options.mixed_send = true;
@@ -111,7 +121,7 @@ TEST(RmaFailureProtocolTest, EndpointRoleOperationWindowAndOptionsMustMatchOuter
     }
 }
 
-TEST(RmaFailureProtocolTest, HealthyAndFaultSourcesCannotBeTheSameEndpoint) {
+TEST(RmaFailureProtocolTest, HealthyAndFaultTargetsCannotBeTheSameEndpoint) {
     auto hello = ValidFailureHello();
     hello.endpoints[1] = hello.endpoints[0];
     EXPECT_FALSE(DecodeRmaFailureHello(EncodeRmaFailureHello(hello)));
@@ -134,7 +144,7 @@ TEST(RmaFailureProtocolTest, EntireRemoteWindowMustFitAndAddressesMustNotWrap) {
 
 TEST(RmaFailureProtocolTest, SegmentAccessAndEndpointEidAreValidatedBeforeImport) {
     auto hello = ValidFailureHello();
-    hello.endpoints[1].segment.attr.bs.access = URMA_ACCESS_WRITE;
+    hello.endpoints[1].segment.attr.bs.access = URMA_ACCESS_READ;
     EXPECT_FALSE(DecodeRmaFailureHello(EncodeRmaFailureHello(hello)));
     hello = ValidFailureHello();
     ++hello.endpoints[1].segment.ubva.eid.raw[0];

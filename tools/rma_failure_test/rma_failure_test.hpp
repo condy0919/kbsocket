@@ -23,16 +23,16 @@ struct RmaFailureOptions {
     std::uint32_t timeout_ms = 10000;
 };
 std::expected<void, ToolError> ValidateRmaFailureOptions(const RmaFailureOptions& options) noexcept;
-enum class RmaFailureRole { kClient, kHealthySource, kFaultSource };
+enum class RmaFailureRole { kClient, kHealthyTarget, kFaultTarget };
 enum class RmaFailurePhase { kHealthyBaseline, kFaultBaseline, kHealthyBefore, kMixed, kHealthyAfter };
-struct RmaReadCounters {
+struct RmaWriteCounters {
     std::uint64_t accepted = 0;
     std::uint64_t retired = 0;
     std::uint64_t verified = 0;
     std::array<std::uint64_t, 17> statuses{};
 };
 struct RmaFailureStats {
-    RmaReadCounters healthy_baseline, fault_baseline, healthy_before, healthy_mixed, fault_mixed, healthy_after;
+    RmaWriteCounters healthy_baseline, fault_baseline, healthy_before, healthy_mixed, fault_mixed, healthy_after;
     std::uint64_t post_calls = 0;
     std::uint64_t partial_batches = 0;
     std::uint64_t state_checks = 0;
@@ -49,7 +49,8 @@ struct RmaFailureStats {
 struct RmaFailureHello {
     RmaFailureOptions options;
     bool server = false;
-    // 服务端依次发布健康源、故障源；客户端只发布本地描述符，第二项在线上必须为零。
+    // 服务端依次发布健康目标、故障目标；客户端只发布本地描述符，第二项在线上必须为零。
+    // 内层描述单次 WRITE（window=1），外层 batch 定义槽数并单独校验完整内存范围。
     std::array<RmaHello, 2> endpoints{};
 };
 using RmaFailureHelloBytes = std::array<std::byte, 256>;
@@ -58,7 +59,7 @@ std::expected<RmaFailureHello, ToolError> DecodeRmaFailureHello(const RmaFailure
 std::expected<void, ToolError> MatchRmaFailureEndpoint(const RmaHello& hello, const RmaFailureOptions& options,
                                                        bool server) noexcept;
 
-/// 由监督者提供退出证明；正常 READ 基线完成之后才允许终止故障源。
+/// 由监督者提供退出证明；正常 WRITE 基线经远端校验之后才允许终止故障目标。
 class RmaFailurePeer {
 public:
     virtual ~RmaFailurePeer() = default;
@@ -66,15 +67,15 @@ public:
     virtual std::expected<void, ToolError> FinishBaselineAndExit() = 0;
 };
 
-/// 只读源始终保持不变；客户端各目标/槽使用独立目的区，全部 DMA 终结前禁止复用。
+/// 客户端各目标/槽使用独立源区；远端逐轮校验写入与保护区并确认后才允许复用。
 /// 所有 WR、SGE、身份及内存于 Open 预分配；失败对象必须由入口保留到进程退出。
 class RmaFailureResources {
 public:
     std::expected<void, ToolError> Open(urma_context_t* ctx, const urma_device_cap_t& cap,
                                         const RmaFailureOptions& options, RmaFailureRole role);
     std::expected<void, ToolError> Import(const std::array<RmaHello, 2>& peers);
-    std::expected<void, ToolError> Transfer(RmaFailurePhase phase);
-    std::expected<void, ToolError> VerifySource();
+    std::expected<void, ToolError> Transfer(RmaFailurePhase phase, std::uint32_t round = 0);
+    std::expected<void, ToolError> VerifyTarget(RmaFailurePhase phase, std::uint32_t round = 0);
     std::expected<void, ToolError> CheckQuiescent();
     std::expected<void, ToolError> Close();
     const RmaHello& hello() const noexcept {
@@ -83,10 +84,12 @@ public:
     RmaFailureStats stats;
 
 private:
+    friend class RmaFailureSession;
+    std::expected<void, ToolError> ConfirmRemoteWrites(RmaFailurePhase phase);
     std::expected<void, ToolError> CheckReady();
     std::expected<void, ToolError> CheckGuards();
     std::span<std::byte> Payload(std::size_t slot);
-    RmaReadCounters& Counters(RmaFailurePhase phase, std::size_t target);
+    RmaWriteCounters& Counters(RmaFailurePhase phase, std::size_t target);
     RmaFailureOptions options_;
     RmaFailureRole role_ = RmaFailureRole::kClient;
     urma_context_t* ctx_ = nullptr;

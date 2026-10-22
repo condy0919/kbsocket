@@ -70,6 +70,9 @@ protected:
         kUnknownAcceptance,
         kUnknownStatus,
         kMissingCompletion,
+        kCorruptSourcePayload,
+        kCorruptSourceGuard,
+        kSkipWrite,
     };
     struct Node {
         urma_context_t ctx{};
@@ -180,7 +183,7 @@ protected:
                 EXPECT_EQ(token->token, 0U);
                 EXPECT_EQ(address, 0U);
                 EXPECT_EQ(flags.bs.mapping, static_cast<unsigned>(URMA_SEG_NOMAP));
-                EXPECT_EQ(flags.bs.access, static_cast<unsigned>(URMA_ACCESS_READ));
+                EXPECT_EQ(flags.bs.access, static_cast<unsigned>(URMA_ACCESS_WRITE));
                 auto& target = Find(ctx).imported.at(seg->ubva.eid.raw[0] - 1);
                 target.urma_ctx = ctx;
                 target.seg = *seg;
@@ -207,27 +210,28 @@ protected:
                     *bad = wr;
                     return URMA_ENOMEM;
                 }
-                EXPECT_EQ(wr->opcode, URMA_OPC_READ);
+                EXPECT_EQ(wr->opcode, URMA_OPC_WRITE);
                 EXPECT_EQ(wr->rw.src.num_sge, 1U);
                 EXPECT_EQ(wr->rw.dst.num_sge, 1U);
                 const std::size_t target = wr->tjetty == &nodes_[2].targets[1] ? 1 : 0;
                 EXPECT_EQ(wr->tjetty, &nodes_[2].targets[target]);
-                EXPECT_EQ(wr->rw.src.sge->tseg, &nodes_[2].imported[target]);
-                EXPECT_EQ(wr->rw.dst.sge->tseg, &nodes_[2].segment);
+                EXPECT_EQ(wr->rw.src.sge->tseg, &nodes_[2].segment);
+                EXPECT_EQ(wr->rw.dst.sge->tseg, &nodes_[2].imported[target]);
                 EXPECT_EQ(wr->rw.src.sge->len, options_.bytes);
                 EXPECT_EQ(wr->rw.dst.sge->len, options_.bytes);
-                EXPECT_GE(wr->rw.src.sge->addr, nodes_[target].segment.seg.ubva.va);
+                EXPECT_GE(wr->rw.src.sge->addr, nodes_[2].segment.seg.ubva.va);
                 EXPECT_LE(wr->rw.src.sge->addr + options_.bytes,
-                          nodes_[target].segment.seg.ubva.va + nodes_[target].segment.seg.len);
-                EXPECT_GE(wr->rw.dst.sge->addr, nodes_[2].segment.seg.ubva.va);
-                EXPECT_LE(wr->rw.dst.sge->addr + options_.bytes,
                           nodes_[2].segment.seg.ubva.va + nodes_[2].segment.seg.len);
+                EXPECT_GE(wr->rw.dst.sge->addr, nodes_[target].segment.seg.ubva.va);
+                EXPECT_LE(wr->rw.dst.sge->addr + options_.bytes,
+                          nodes_[target].segment.seg.ubva.va + nodes_[target].segment.seg.len);
                 if (target == 1 && exited_) {
-                    ++fault_reads_after_exit_;
+                    ++fault_writes_after_exit_;
                 }
                 auto* destination = reinterpret_cast<std::byte*>(wr->rw.dst.sge->addr);
                 const bool remote_failed = target == 1 && exited_;
-                if (!remote_failed || fault_status_ == URMA_CR_SUCCESS) {
+                if ((!remote_failed || fault_status_ == URMA_CR_SUCCESS) &&
+                    (fault_ != Fault::kSkipWrite || index != fault_index_)) {
                     std::memcpy(destination, reinterpret_cast<void*>(wr->rw.src.sge->addr), options_.bytes);
                 }
                 urma_cr_t completion{};
@@ -261,6 +265,12 @@ protected:
                         break;
                     case Fault::kCorruptGuard:
                         destination[-1] ^= std::byte{1};
+                        break;
+                    case Fault::kCorruptSourcePayload:
+                        reinterpret_cast<std::byte*>(wr->rw.src.sge->addr)[0] ^= std::byte{1};
+                        break;
+                    case Fault::kCorruptSourceGuard:
+                        reinterpret_cast<std::byte*>(wr->rw.src.sge->addr)[-1] ^= std::byte{1};
                         break;
                     default:
                         break;
@@ -325,12 +335,12 @@ protected:
     }
     void Open() {
         ASSERT_TRUE(server_->Open(&nodes_[0].ctx, cap_, options_, true));
-        ASSERT_TRUE(fault_source_->Open(&nodes_[1].ctx, cap_, options_, RmaFailureRole::kFaultSource));
+        ASSERT_TRUE(fault_target_->Open(&nodes_[1].ctx, cap_, options_, RmaFailureRole::kFaultTarget));
         ASSERT_TRUE(client_->Open(&nodes_[2].ctx, cap_, options_, false));
-        fault_peer_.descriptor = fault_source_->hello();
+        fault_peer_.descriptor = fault_target_->hello();
     }
     void Import() {
-        ASSERT_TRUE(client_->resources.Import({server_->resources.hello(), fault_source_->hello()}));
+        ASSERT_TRUE(client_->resources.Import({server_->resources.hello(), fault_target_->hello()}));
     }
     void RunPair() {
         std::array<int, 2> sockets{};
@@ -342,12 +352,13 @@ protected:
     }
     void ExpectExitAfterBaselines() {
         EXPECT_CALL(fault_peer_, FinishBaselineAndExit()).Times(1).WillOnce([this]() -> std::expected<void, ToolError> {
-            // 只有两条实际 READ 基线均完成后才允许 kill；混合流量必须等该函数完成后的控制确认。
+            // 两条 WRITE 的本地完成不能替代远端校验；先验证故障目标基线，退出确认后客户端才能计入 verified。
             EXPECT_EQ(client_->resources.stats.healthy_baseline.verified, 1U);
-            EXPECT_EQ(client_->resources.stats.fault_baseline.verified, 1U);
+            EXPECT_EQ(client_->resources.stats.fault_baseline.verified, 0U);
+            EXPECT_EQ(client_->resources.stats.fault_baseline.retired, 1U);
             EXPECT_EQ(client_->resources.stats.fault_mixed.accepted, 0U);
-            EXPECT_EQ(fault_reads_after_exit_, 0U);
-            EXPECT_TRUE(fault_source_->VerifySource());
+            EXPECT_EQ(fault_writes_after_exit_, 0U);
+            EXPECT_TRUE(fault_target_->VerifyTarget(RmaFailurePhase::kFaultBaseline));
             if (exit_confirmation_delay_ms_) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(exit_confirmation_delay_ms_));
             }
@@ -383,16 +394,16 @@ protected:
     int poll_limit_ = 256;
     std::uint32_t baseline_post_delay_ms_ = 0;
     std::uint32_t exit_confirmation_delay_ms_ = 0;
-    std::uint64_t fault_reads_after_exit_ = 0;
+    std::uint64_t fault_writes_after_exit_ = 0;
     std::mutex mutex_;
     MockRmaFailurePeer fault_peer_;
     NoDestructor<RmaFailureSession> server_, client_;
-    NoDestructor<RmaFailureResources> fault_source_;
+    NoDestructor<RmaFailureResources> fault_target_;
     std::expected<void, ToolError> server_result_, client_result_;
 };
 
 class RmaFailureStatusTest : public RmaFailureHardwareTest, public ::testing::WithParamInterface<int> {};
-TEST_P(RmaFailureStatusTest, SameSqHealthyReadsSurviveObservedRemoteFailureWithoutAssumingStatusEight) {
+TEST_P(RmaFailureStatusTest, SameSqHealthyWritesSurviveObservedRemoteFailureWithoutAssumingStatusEight) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     fault_status_ = static_cast<urma_cr_status_t>(GetParam());
     reverse_ = true;
@@ -407,31 +418,56 @@ TEST_P(RmaFailureStatusTest, SameSqHealthyReadsSurviveObservedRemoteFailureWitho
     EXPECT_EQ(stats.healthy_before.verified, count);
     EXPECT_EQ(stats.healthy_mixed.verified, count);
     EXPECT_EQ(stats.healthy_after.verified, count);
+    EXPECT_EQ(server_->resources.stats.healthy_baseline.verified, 1U);
+    EXPECT_EQ(server_->resources.stats.healthy_before.verified, count);
+    EXPECT_EQ(server_->resources.stats.healthy_mixed.verified, count);
+    EXPECT_EQ(server_->resources.stats.healthy_after.verified, count);
+    EXPECT_EQ(fault_target_->stats.fault_baseline.verified, 1U);
     EXPECT_EQ(stats.fault_mixed.retired, count);
     EXPECT_EQ(stats.fault_mixed.statuses[GetParam()], count);
     EXPECT_TRUE(stats.peer_exit_confirmed);
     EXPECT_EQ(stats.last_state, URMA_JETTY_STATE_READY);
     EXPECT_FALSE(stats.pending);
-    EXPECT_EQ(fault_reads_after_exit_, count);
+    EXPECT_EQ(fault_writes_after_exit_, count);
     ASSERT_TRUE(server_->Close());
     ASSERT_TRUE(client_->Close());
-    ASSERT_TRUE(fault_source_->Close());
+    ASSERT_TRUE(fault_target_->Close());
     EXPECT_FALSE(nodes_[0].live_memory);
     EXPECT_FALSE(nodes_[2].live_memory);
 }
 INSTANTIATE_TEST_SUITE_P(TerminalStatuses, RmaFailureStatusTest,
                          ::testing::Values(static_cast<int>(URMA_CR_REM_ACCESS_ABORT_ERR),
-                                           static_cast<int>(URMA_CR_ACK_TIMEOUT_ERR),
                                            static_cast<int>(URMA_CR_RNR_RETRY_CNT_EXC_ERR)));
 
-TEST_F(RmaFailureHardwareTest, BaselineBarrierAllowsTwoIndividuallyBoundedReadsToFinish) {
+TEST_F(RmaFailureHardwareTest, FaultAckTimeoutDrainsAcceptedBatchAndNeverPostsToTheSqAgain) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    fault_status_ = URMA_CR_ACK_TIMEOUT_ERR;
+    poll_limit_ = 1;
+    Open();
+    ExpectExitAfterBaselines();
+    // 芯片上 status 9 后 SQ 无法继续使用；即使 query 仍为 READY，也只退休当前批次，禁止后续轮次。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(2 + options_.rounds + 1).WillRepeatedly(DoDefault());
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_FALSE(server_result_);
+    const auto& stats = client_->resources.stats;
+    EXPECT_EQ(stats.healthy_mixed.retired, options_.batch);
+    EXPECT_EQ(stats.fault_mixed.retired, options_.batch);
+    EXPECT_EQ(stats.fault_mixed.statuses[URMA_CR_ACK_TIMEOUT_ERR], options_.batch);
+    EXPECT_EQ(stats.healthy_after.accepted, 0U);
+    EXPECT_FALSE(stats.pending);
+    EXPECT_FALSE(client_->resources.Transfer(RmaFailurePhase::kHealthyAfter));
+    ExpectSessionRetained();
+}
+
+TEST_F(RmaFailureHardwareTest, BaselineBarrierAllowsTwoIndividuallyBoundedWritesToFinish) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     options_.rounds = 1;
     baseline_post_delay_ms_ = 70;
     Open();
     ExpectExitAfterBaselines();
-    // 每次 READ 均少于 100ms，但串行的两个目标基线共需至少 140ms；
-    // 服务端不能将整个基线阶段误限为一个 READ 的截止时间。
+    // 每次 WRITE 均少于 100ms，但串行的两个目标基线共需至少 140ms；
+    // 服务端不能将整个基线阶段误限为一个 WRITE 的截止时间。
     RunPair();
     ASSERT_TRUE(client_result_) << client_result_.error().operation;
     ASSERT_TRUE(server_result_) << server_result_.error().operation;
@@ -440,26 +476,26 @@ TEST_F(RmaFailureHardwareTest, BaselineBarrierAllowsTwoIndividuallyBoundedReadsT
     EXPECT_EQ(client_->resources.stats.healthy_after.verified, options_.batch);
     EXPECT_TRUE(client_->Close());
     EXPECT_TRUE(server_->Close());
-    EXPECT_TRUE(fault_source_->Close());
+    EXPECT_TRUE(fault_target_->Close());
 }
 
-TEST_F(RmaFailureHardwareTest, ExitConfirmationBarrierAllowsSourceVerificationAndReapingToFinish) {
+TEST_F(RmaFailureHardwareTest, ExitConfirmationBarrierAllowsTargetVerificationAndReapingToFinish) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     options_.rounds = 1;
     exit_confirmation_delay_ms_ = 150;
     Open();
     ExpectExitAfterBaselines();
-    // 监督者需依次确认源数据与完成 kill/waitpid，整体可超过一次操作的 100ms；
-    // 客户端仍必须等待退出确认，而不是提前超时或开始失效目标 READ。
+    // 监督者需依次确认目标数据与完成 kill/waitpid，整体可超过一次操作的 100ms；
+    // 客户端仍必须等待退出确认，而不是提前超时或开始失效目标 WRITE。
     RunPair();
     ASSERT_TRUE(client_result_) << client_result_.error().operation;
     ASSERT_TRUE(server_result_) << server_result_.error().operation;
     EXPECT_TRUE(client_->resources.stats.peer_exit_confirmed);
-    EXPECT_EQ(fault_reads_after_exit_, options_.batch);
+    EXPECT_EQ(fault_writes_after_exit_, options_.batch);
     EXPECT_EQ(client_->resources.stats.healthy_after.verified, options_.batch);
     EXPECT_TRUE(client_->Close());
     EXPECT_TRUE(server_->Close());
-    EXPECT_TRUE(fault_source_->Close());
+    EXPECT_TRUE(fault_target_->Close());
 }
 
 TEST_F(RmaFailureHardwareTest, MaximumMixedBatchCompletesInReverseAcrossPollBoundaries) {
@@ -479,10 +515,10 @@ TEST_F(RmaFailureHardwareTest, MaximumMixedBatchCompletesInReverseAcrossPollBoun
     EXPECT_FALSE(client_->resources.stats.pending);
     EXPECT_TRUE(client_->Close());
     EXPECT_TRUE(server_->Close());
-    EXPECT_TRUE(fault_source_->Close());
+    EXPECT_TRUE(fault_target_->Close());
 }
 
-TEST_F(RmaFailureHardwareTest, MixedReadsAreRejectedUntilPeerExitIsConfirmed) {
+TEST_F(RmaFailureHardwareTest, MixedWritesAreRejectedUntilPeerExitIsConfirmed) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     Open();
     Import();
@@ -533,13 +569,13 @@ TEST_F(RmaFailureHardwareTest, HealthyErrorStillRetiresAllAcceptedTerminalsBefor
     EXPECT_FALSE(client_->resources.stats.pending);
 }
 
-TEST_F(RmaFailureHardwareTest, HealthyErrorDrainsRemainingAcceptedReadsAcrossLaterPolls) {
+TEST_F(RmaFailureHardwareTest, HealthyErrorDrainsRemainingAcceptedWritesAcrossLaterPolls) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     Open();
     Import();
     fault_ = Fault::kHealthyError;
     poll_limit_ = 1;
-    // 首次 poll 仅返回失败 CQE，后续三个已接受的 READ 仍必须取得终结证据，不能提前放弃目的区。
+    // 首次 poll 仅返回失败 CQE，后续三个已接受的 WRITE 仍必须取得终结证据，不能提前放弃目的区。
     EXPECT_CALL(*this, Post(_, _, _)).Times(1).WillOnce(DoDefault());
     EXPECT_FALSE(client_->resources.Transfer(RmaFailurePhase::kHealthyBefore));
     EXPECT_EQ(client_->resources.stats.healthy_before.retired, 4U);
@@ -549,7 +585,7 @@ TEST_F(RmaFailureHardwareTest, HealthyErrorDrainsRemainingAcceptedReadsAcrossLat
     EXPECT_FALSE(client_->resources.stats.pending);
 }
 
-TEST_F(RmaFailureHardwareTest, DuplicateCompletionCannotRetireOneReadTwice) {
+TEST_F(RmaFailureHardwareTest, DuplicateCompletionCannotRetireOneWriteTwice) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     Open();
     Import();
@@ -625,28 +661,31 @@ TEST_P(RmaFailureMemoryTest, CorruptLaterDestinationIsRejectedDespiteSuccessfulC
     Import();
     fault_index_ = 2;
     fault_ = GetParam() ? Fault::kCorruptGuard : Fault::kCorruptPayload;
-    EXPECT_FALSE(client_->resources.Transfer(RmaFailurePhase::kHealthyBefore));
+    // 本地 CQE 成功只能证明 WR 退休；目标进程必须单独验证 payload 与 guard。
+    ASSERT_TRUE(client_->resources.Transfer(RmaFailurePhase::kHealthyBefore));
+    EXPECT_EQ(client_->resources.stats.healthy_before.verified, 0U);
+    EXPECT_FALSE(server_->resources.VerifyTarget(RmaFailurePhase::kHealthyBefore));
     EXPECT_EQ(client_->resources.stats.healthy_before.retired, 4U);
     EXPECT_FALSE(client_->resources.stats.pending);
 }
 INSTANTIATE_TEST_SUITE_P(GuardsAndPayload, RmaFailureMemoryTest, ::testing::Bool());
 
-TEST_F(RmaFailureHardwareTest, GuardOfFailedReadDestinationMustStillRemainIntact) {
+TEST_F(RmaFailureHardwareTest, GuardOfFailedWriteSourceMustStillRemainIntact) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     Open();
     Import();
     exited_ = true;
     client_->resources.stats.peer_exit_confirmed = true;
     fault_index_ = 1;
-    fault_ = Fault::kCorruptGuard;
-    // 失败 READ 不保证目的 payload 未写入，但不能掩盖目的槽外的保护区损坏。
+    fault_ = Fault::kCorruptSourceGuard;
+    // 远端目标已经退出也不应改变本地 WRITE 源区；失败 CQE 不能掩盖本地 guard 损坏。
     EXPECT_FALSE(client_->resources.Transfer(RmaFailurePhase::kMixed));
     EXPECT_EQ(client_->resources.stats.healthy_mixed.retired, 4U);
     EXPECT_EQ(client_->resources.stats.fault_mixed.retired, 4U);
     EXPECT_FALSE(client_->resources.stats.pending);
 }
 
-TEST_F(RmaFailureHardwareTest, PollFailureRetainsEveryUnprovenDestinationAndImportedSource) {
+TEST_F(RmaFailureHardwareTest, PollFailureRetainsEveryUnprovenDestinationAndImportedTarget) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     Open();
     Import();
@@ -661,16 +700,75 @@ TEST_F(RmaFailureHardwareTest, PollFailureRetainsEveryUnprovenDestinationAndImpo
     EXPECT_FALSE(client_->resources.Close());
 }
 
-TEST_F(RmaFailureHardwareTest, SourceVerificationChecksImmutablePayloadAndTrailingGuard) {
+TEST_F(RmaFailureHardwareTest, TargetVerificationRequiresWrittenPayloadAndResetsItToPoison) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     Open();
-    auto* payload = reinterpret_cast<std::byte*>(fault_source_->hello().payload_address);
-    ASSERT_TRUE(fault_source_->VerifySource());
-    payload[options_.bytes / 2] ^= std::byte{1};
-    EXPECT_FALSE(fault_source_->VerifySource());
-    payload[options_.bytes / 2] ^= std::byte{1};
-    payload[options_.bytes] ^= std::byte{1};
-    EXPECT_FALSE(fault_source_->VerifySource());
+    Import();
+    auto* payload = reinterpret_cast<std::byte*>(fault_target_->hello().payload_address);
+    ASSERT_TRUE(client_->resources.Transfer(RmaFailurePhase::kFaultBaseline));
+    EXPECT_EQ(client_->resources.stats.fault_baseline.verified, 0U);
+    ASSERT_TRUE(fault_target_->VerifyTarget(RmaFailurePhase::kFaultBaseline));
+    EXPECT_EQ(fault_target_->stats.fault_baseline.verified, 1U);
+    EXPECT_TRUE(std::all_of(payload, payload + options_.bytes, [](auto byte) { return byte == std::byte{0xff}; }));
+    // 没有新写入不能重复确认上次的数据；清毒使漏写不能靠旧 payload 蒙混过关。
+    EXPECT_FALSE(fault_target_->VerifyTarget(RmaFailurePhase::kFaultBaseline));
+}
+
+TEST_F(RmaFailureHardwareTest, SkippedRemoteWriteIsRejectedEvenWithSuccessfulCompletion) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    Open();
+    Import();
+    fault_ = Fault::kSkipWrite;
+    fault_index_ = 2;
+    ASSERT_TRUE(client_->resources.Transfer(RmaFailurePhase::kHealthyBefore));
+    EXPECT_FALSE(server_->resources.VerifyTarget(RmaFailurePhase::kHealthyBefore));
+    EXPECT_EQ(client_->resources.stats.healthy_before.verified, 0U);
+}
+
+TEST_F(RmaFailureHardwareTest, TargetVerificationRejectsPayloadFromAnotherRound) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    Open();
+    Import();
+    ASSERT_TRUE(client_->resources.Transfer(RmaFailurePhase::kHealthyBefore, 0));
+    // 正确地址和 slot 的旧轮次 payload 也必须拒绝，防止迟到写入被归给新轮次。
+    EXPECT_FALSE(server_->resources.VerifyTarget(RmaFailurePhase::kHealthyBefore, 1));
+}
+
+TEST_F(RmaFailureHardwareTest, BaselineVerificationRejectsWritesOutsideTheBaselineSlot) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    Open();
+    Import();
+    ASSERT_TRUE(client_->resources.Transfer(RmaFailurePhase::kHealthyBaseline));
+    auto* next_slot = reinterpret_cast<std::byte*>(server_->resources.hello().payload_address) +
+                      RmaSlotStride(server_->resources.hello().options);
+    next_slot[0] = std::byte{0};
+    // 基线只写 slot 0；其余槽仍应保持 poison，校验不能忽略相邻 payload 的越界写入。
+    EXPECT_FALSE(server_->resources.VerifyTarget(RmaFailurePhase::kHealthyBaseline));
+}
+
+TEST_F(RmaFailureHardwareTest, WriteCompletionCannotHideChangedLocalSourcePayload) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    Open();
+    Import();
+    fault_ = Fault::kCorruptSourcePayload;
+    fault_index_ = 2;
+    EXPECT_FALSE(client_->resources.Transfer(RmaFailurePhase::kHealthyBefore));
+    EXPECT_EQ(client_->resources.stats.healthy_before.retired, options_.batch);
+    EXPECT_FALSE(client_->resources.stats.pending);
+}
+
+TEST_F(RmaFailureHardwareTest, RemoteValidationFailureNeverAcknowledgesVerifiedWrites) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    Open();
+    fault_ = Fault::kCorruptPayload;
+    EXPECT_CALL(fault_peer_, FinishBaselineAndExit()).Times(0);
+    EXPECT_CALL(*this, Post(_, _, _)).Times(1).WillOnce(DoDefault());
+    RunPair();
+    EXPECT_FALSE(server_result_);
+    EXPECT_FALSE(client_result_);
+    EXPECT_EQ(client_->resources.stats.healthy_baseline.retired, 1U);
+    EXPECT_EQ(client_->resources.stats.healthy_baseline.verified, 0U);
+    ExpectSessionRetained();
 }
 
 TEST_F(RmaFailureHardwareTest, ExitFailurePreventsMixedAndAfterTrafficAndRetainsPublishedMemory) {
@@ -678,7 +776,7 @@ TEST_F(RmaFailureHardwareTest, ExitFailurePreventsMixedAndAfterTrafficAndRetains
     Open();
     EXPECT_CALL(fault_peer_, FinishBaselineAndExit()).Times(1).WillOnce([this]() -> std::expected<void, ToolError> {
         EXPECT_EQ(client_->resources.stats.healthy_baseline.verified, 1U);
-        EXPECT_EQ(client_->resources.stats.fault_baseline.verified, 1U);
+        EXPECT_EQ(client_->resources.stats.fault_baseline.verified, 0U);
         return std::unexpected(ToolError{"mock waitpid failed", ECHILD});
     });
     RunPair();
@@ -690,7 +788,7 @@ TEST_F(RmaFailureHardwareTest, ExitFailurePreventsMixedAndAfterTrafficAndRetains
     ExpectSessionRetained();
 }
 
-TEST_F(RmaFailureHardwareTest, BaselineErrorNeverTerminatesTheRemoteSourceOrStartsFaultTraffic) {
+TEST_F(RmaFailureHardwareTest, BaselineErrorNeverTerminatesTheRemoteTargetOrStartsFaultTraffic) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     Open();
     fault_ = Fault::kHealthyError;
@@ -705,7 +803,7 @@ TEST_F(RmaFailureHardwareTest, BaselineErrorNeverTerminatesTheRemoteSourceOrStar
 TEST_F(RmaFailureHardwareTest, RoleOptionsMismatchRejectsBeforeImportOrPost) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     Open();
-    // 服务端发布的故障源与主会话配置不一致，必须在任何 DMA 之前拒绝。
+    // 服务端发布的故障目标与主会话配置不一致，必须在任何 DMA 之前拒绝。
     ++fault_peer_.descriptor.options.rounds;
     EXPECT_CALL(*this, ImportSeg(_, _, _, _, _)).Times(0);
     EXPECT_CALL(*this, ImportJetty(_, _, _)).Times(0);
@@ -717,7 +815,7 @@ TEST_F(RmaFailureHardwareTest, RoleOptionsMismatchRejectsBeforeImportOrPost) {
     ExpectSessionRetained();
 }
 
-TEST_F(RmaFailureHardwareTest, WrongExitMarkerNeverAuthorizesMixedReads) {
+TEST_F(RmaFailureHardwareTest, WrongExitMarkerNeverAuthorizesMixedWrites) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
     Open();
     std::array<int, 2> sockets{};
@@ -735,14 +833,32 @@ TEST_F(RmaFailureHardwareTest, WrongExitMarkerNeverAuthorizesMixedReads) {
         RmaFailureHello hello;
         hello.server = true;
         hello.options = options_;
-        hello.endpoints = {server_->resources.hello(), fault_source_->hello()};
+        hello.endpoints = {server_->resources.hello(), fault_target_->hello()};
         peer_result = channel.Write(EncodeRmaFailureHello(hello), options_.timeout_ms);
         if (!peer_result) {
             return;
         }
         peer_result = channel.ExpectMarker(0x46410000, options_.timeout_ms);
+        if (peer_result) {
+            peer_result = server_->resources.VerifyTarget(RmaFailurePhase::kHealthyBaseline);
+        }
+        if (peer_result) {
+            peer_result = channel.SendMarker(0x46410000, options_.timeout_ms);
+        }
+        if (peer_result) {
+            peer_result = channel.ExpectMarker(0x46410001, options_.timeout_ms);
+        }
+        if (peer_result) {
+            peer_result = channel.SendMarker(0x46410001, options_.timeout_ms);
+        }
         for (std::uint32_t round = 0; peer_result && round < options_.rounds; ++round) {
             peer_result = channel.ExpectMarker(0x46420000 + round, options_.timeout_ms);
+            if (peer_result) {
+                peer_result = server_->resources.VerifyTarget(RmaFailurePhase::kHealthyBefore, round);
+            }
+            if (peer_result) {
+                peer_result = channel.SendMarker(0x46420000 + round, options_.timeout_ms);
+            }
         }
         if (peer_result) {
             // 基线和 before 都真实完成，但错误的退出标记不能替代监督者的 kill/waitpid 证明。
@@ -762,14 +878,23 @@ TEST_F(RmaFailureHardwareTest, WrongExitMarkerNeverAuthorizesMixedReads) {
     EXPECT_FALSE(client_->Close());
 }
 
-TEST_F(RmaFailureHardwareTest, UnsupportedReadCapabilityCreatesNoQueuesOrMemory) {
+TEST_F(RmaFailureHardwareTest, UnsupportedWriteCapabilityCreatesNoQueuesOrMemory) {
     raw::test_support::ScopedUrmaOverride override(MockedFunctions());
-    cap_.max_read_size = 0;
+    cap_.max_write_size = 0;
     EXPECT_CALL(*this, CreateJfc(_, _)).Times(0);
     EXPECT_CALL(*this, Register(_, _)).Times(0);
     auto result = client_->Open(&nodes_[2].ctx, cap_, options_, false);
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error().code, EOPNOTSUPP);
+}
+
+TEST_F(RmaFailureHardwareTest, WriteFailureProbeDoesNotRequireReadCapability) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    cap_.max_read_size = 0;
+    // WRITE 探针仅依赖 max_write_size，READ 能力缺失不能阻止创建。
+    ASSERT_TRUE(client_->Open(&nodes_[2].ctx, cap_, options_, false));
+    EXPECT_EQ(client_->resources.hello().options.operation, RmaOperation::kWrite);
+    EXPECT_TRUE(client_->Close());
 }
 } // namespace
 } // namespace tools

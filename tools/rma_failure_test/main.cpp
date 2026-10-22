@@ -14,14 +14,14 @@
 #include "kbsocket/transport/raw/raw_runtime.hpp"
 #include "kbsocket/transport/raw/urma_api.hpp"
 
-DEFINE_bool(server, false, "Own the healthy READ source and supervise a disposable fault source process");
+DEFINE_bool(server, false, "Own the healthy WRITE target and supervise a disposable fault target process");
 DEFINE_string(address, "127.0.0.1", "Numeric IPv4 control bind/peer address");
-DEFINE_uint32(port, 18528, "TCP control port; payload uses raw URMA READ");
+DEFINE_uint32(port, 18528, "TCP control port; payload uses raw URMA WRITE");
 DEFINE_string(device, "", "Raw UB device name");
 DEFINE_uint32(eid_index, 0, "Local EID index");
 DEFINE_string(library, "liburma.so", "URMA shared library path");
-DEFINE_uint32(bytes, 16384, "Bytes per READ, 1..8MiB; 2*batch*bytes must not exceed 256MiB");
-DEFINE_uint32(batch, 32, "READs per target per round, 1..128; mixed chain has 2*batch WRs");
+DEFINE_uint32(bytes, 16384, "Bytes per WRITE, 1..8MiB; 2*batch*bytes must not exceed 256MiB");
+DEFINE_uint32(batch, 32, "WRITEs per target per round, 1..128; mixed chain has 2*batch WRs");
 DEFINE_uint32(rounds, 8, "Number of rounds per before/mixed/after phase, 1..256; must match peer");
 DEFINE_uint32(timeout_ms, 10000, "Per control/completion deadline, 100..120000 milliseconds");
 DEFINE_uint32(watchdog_ms, 0, "Whole-worker deadline including provider calls; 0 derives a budget, max 3600000");
@@ -40,7 +40,7 @@ int Fail(ToolError error) {
                          "until worker exit");
     return 1;
 }
-void PrintCounters(const char* name, const kbsocket::tools::RmaReadCounters& counters) {
+void PrintCounters(const char* name, const kbsocket::tools::RmaWriteCounters& counters) {
     std::println("{}: accepted={} retired={} verified={}", name, counters.accepted, counters.retired,
                  counters.verified);
     for (std::size_t i = 0; i < counters.statuses.size(); ++i) {
@@ -82,22 +82,22 @@ int RunWorker(void* argument) {
     }
     auto initialized = hardware->runtime.Initialize({{FLAGS_device, FLAGS_eid_index}});
     if (!initialized) {
-        return Fail({"initialize READ failure runtime", initialized.error().provider_error});
+        return Fail({"initialize WRITE failure runtime", initialized.error().provider_error});
     }
     auto* ctx = hardware->runtime.context(0);
     urma_device_attr_t attributes{};
     const auto status = UrmaApi::QueryDevice(ctx->dev, &attributes);
     if (status != URMA_SUCCESS) {
-        return Fail({"query READ failure device", status});
+        return Fail({"query WRITE failure device", status});
     }
     auto& session = hardware->session;
     if (auto opened = session.Open(ctx, attributes.dev_cap, options, FLAGS_server); !opened) {
         return Fail(opened.error());
     }
-    std::println("{} ready for same-SQ READ failure: device={} eid_index={} bytes_per_read={} batch={} rounds={} "
-                 "mixed_wrs={} max_read_size={} RX_posted=0 watchdog_scope=worker_and_fault_child control={}:{}",
+    std::println("{} ready for same-SQ WRITE failure: device={} eid_index={} bytes_per_write={} batch={} rounds={} "
+                 "mixed_wrs={} max_write_size={} RX_posted=0 watchdog_scope=worker_and_fault_child control={}:{}",
                  FLAGS_server ? "Server" : "Client", FLAGS_device, FLAGS_eid_index, options.bytes, options.batch,
-                 options.rounds, 2 * options.batch, attributes.dev_cap.max_read_size, FLAGS_address, FLAGS_port);
+                 options.rounds, 2 * options.batch, attributes.dev_cap.max_write_size, FLAGS_address, FLAGS_port);
     std::fflush(stdout);
     kbsocket::tools::ControlChannel channel;
     auto result =
@@ -110,16 +110,16 @@ int RunWorker(void* argument) {
         return Fail(result.error());
     }
     if (!session.can_close()) {
-        return Fail({"READ failure peer/DMA state unresolved", EBUSY});
+        return Fail({"WRITE failure peer/DMA state unresolved", EBUSY});
     }
     if (auto closed = session.Close(); !closed) {
         return Fail(closed.error());
     }
     if (auto closed = hardware->runtime.Close(); !closed) {
-        return Fail({"close READ failure runtime", closed.error().provider_error});
+        return Fail({"close WRITE failure runtime", closed.error().provider_error});
     }
     if (auto unloaded = UrmaApi::Unload(); !unloaded) {
-        return Fail({"unload READ failure URMA", EBUSY});
+        return Fail({"unload WRITE failure URMA", EBUSY});
     }
     constexpr std::uint32_t kClosed = 0x5246434c;
     if (auto sent = channel.SendMarker(kClosed, options.timeout_ms); !sent) {
@@ -132,15 +132,15 @@ int RunWorker(void* argument) {
                      peer.error().operation, peer.error().code);
         return 1;
     }
-    std::println("PASS: old-target READs retired once with observed error statuses after confirmed SIGKILL/waitpid; "
-                 "healthy READs and guards validated before/during/after on the same READY SQ; "
-                 "no SQ modification/recreation or replay; both endpoints closed resources");
+    std::println("PASS: old-target WRITEs retired once with observed error statuses after confirmed SIGKILL/waitpid; "
+                 "healthy remote payloads and guards validated before/during/after on the same READY SQ; "
+                 "no RX buffers posted, SQ modification/recreation or replay; both endpoints closed resources");
     return 0;
 }
 } // namespace
 
 int main(int argc, char** argv) {
-    gflags::SetUsageMessage("Observe post-exit READ failures and healthy remote access on the same raw RM_CTP SQ");
+    gflags::SetUsageMessage("Observe post-exit WRITE failures and healthy remote access on the same raw RM_CTP SQ");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     RmaFailureOptions options{
         .bytes = FLAGS_bytes, .batch = FLAGS_batch, .rounds = FLAGS_rounds, .timeout_ms = FLAGS_timeout_ms};
@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
     const auto valid = kbsocket::tools::ValidateRmaFailureOptions(options);
     if (!valid || argc != 1 || FLAGS_device.empty() || FLAGS_library.empty() || !FLAGS_port || FLAGS_port > 65535 ||
         watchdog <= options.timeout_ms || watchdog > 3600000) {
-        std::println(stderr, "Invalid READ failure options; require device, bytes/batch/rounds within limits and "
+        std::println(stderr, "Invalid WRITE failure options; require device, bytes/batch/rounds within limits and "
                              "timeout_ms < watchdog_ms <= 3600000. Use --help.");
         return 2;
     }

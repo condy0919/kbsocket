@@ -14,7 +14,7 @@
 
 namespace kbsocket {
 namespace tools {
-/// 必须先于任何 URMA Load 创建；子进程独占不可变 READ 源 MR，父进程持有健康端点和 TCP。
+/// 必须先于任何 URMA Load 创建；子进程独占 WRITE 目标 MR，父进程持有健康端点和 TCP。
 class RmaFailurePeerProcess final : public RmaFailurePeer {
 public:
     ~RmaFailurePeerProcess() override;
