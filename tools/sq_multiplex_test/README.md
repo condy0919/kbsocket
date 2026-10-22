@@ -15,7 +15,7 @@
 2. `mixed`：一次向同一 SQ 提交 `2 * batch` 个 WR，按 `sink[0], healthy[0], sink[1], healthy[1], ...` 排列。
 3. `after`：前一批全部终结且结果符合预期后，用同一 SQ 向 healthy 发送 `batch` 条新消息，验证后续可用性。
 
-工具直接消费 TX CQE，并通过 `AttemptLedger` 精确终结已接受的 WR。它不调用生产 `TxCompletionProcessor`，以免该处理器的遇错排空策略把被测 SQ 主动修改为 ERROR。成功实验和普通 RNR 的处理不修改、不 flush、不重建 SQ，也不重放任何已接受的 WR。若 provider 破坏提交契约、无法确定接受边界或内部记账失败，`TxSender` 可能主动隔离 SQ；此时实验失败并保留未决资源，不能作为普通 RNR 的观测结果。
+工具直接消费 TX CQE，并通过 `AttemptLedger` 精确终结已接受的 WR，保持各错误类别的独立硬件观测。它不调用生产 `TxCompletionProcessor`：生产层仍对 RNR、ACK_TIMEOUT 等错误主动排空，合法 status 8 已改为只退休并携原始状态和 record 上报，由上层决定对应连接与操作的失败处理；完成层不自动关闭连接或重试。成功实验和预期错误的处理不修改、不 flush、不重建 SQ，也不重放任何已接受的 WR。若 provider 破坏提交契约、无法确定接受边界或内部记账失败，`TxSender` 可能主动隔离 SQ；此时实验失败并保留未决资源，不能作为普通终结错误的隔离证据。
 
 ## 构建与本地测试
 
@@ -68,7 +68,9 @@ USE_BAZEL_VERSION=9.3.0 bazel test //tools/sq_multiplex_test:all --test_output=e
 PASS: healthy traffic succeeded before, during and after same-SQ REM_ACCESS_ABORT; fault baseline validated before SIGKILL/waitpid; old-target attempts retired once with status 8; same SQ remained READY without modification or recreation; payload validated; both endpoints closed resources
 ```
 
-状态 8 是本次待验证的目标，不是已经证实的同 SQ 隔离契约。若健康目标也发生错误，或者旧目标返回 ACK_TIMEOUT/RNR 等其他结果，工具继续收齐当前已接受 WR，再向双方报告 FAIL，不继续 after/下一轮。若仍有未终结 DMA，保留整个依赖链到进程退出。
+2026-10-22 反馈的两组硬件日志均满足上述判据：服务端 `udmac0d1e4:39`、客户端 `udmac0d1e4:61`，`batch=32/128` 各运行 8 轮。三个健康阶段各有 256/1024 条 SUCCESS 且服务端 payload 校验通过，旧目标分别产生 256/1024 条 status 8；各有 26 次同 SQ 状态检查通过，baseline 和退出确认完整，两端均 PASS。详细数据见[硬件观测记录](../../docs/hardware-observations.md)。
+
+这确认了当前设备/provider 配置下的同 SQ 功能隔离，不将它扩展为所有环境或所有错误类型的契约。若健康目标也发生错误，或者旧目标返回 ACK_TIMEOUT/RNR 等其他结果，工具继续收齐当前已接受 WR，再向双方报告 FAIL，不继续 after/下一轮。若仍有未终结 DMA，保留整个依赖链到进程退出。
 
 进程模式有外层 watchdog、子进程 `PDEATHSIG` 和有界 `waitpid`。`--watchdog_ms=0` 根据 `timeout_ms` 与 `rounds` 计算整轮上限，也可以显式指定毫秒数。watchdog 超时返回 124，不能视作 PASS。启动、baseline、退出或控制协议失败时回收故障子进程，不用 TCP EOF 代替退出/静默证明。
 
@@ -143,10 +145,10 @@ PASS 要求所有阶段计数和状态正确、每个已接受 WR 恰好终结�
 
 实验失败不一定意味着资源无法关闭。只有双方确认不再发送且全部已接受 TX 已终结、本地 TX/RX 所有权归零时，工具才正常关闭资源并确认对端完成关闭；此时打印 `FAIL: experiment failed; both endpoints closed resources`，仍以非零退出码结束。不能证明 DMA 终结和对端静默时，工具保留整个资源依赖链到进程退出；控制连接断开不能代替静默确认。
 
-已有 `batch=32` 硬件运行出现 healthy 和 sink 的 ACK_TIMEOUT，旧版本在首个非预期状态后提前停止收集，详细数据见[硬件观测记录](../../docs/hardware-observations.md)。修正后 `batch=32 rounds=8` 的硬件复测已通过：三个健康阶段各 256 条 SUCCESS，sink 256 条 RNR，同 SQ 保持 READY，双方成功关闭。此结论属于 RNR 模式；新增 `peer_exit` 模式仍待真实硬件验证。
+已有 `batch=32` 硬件运行出现 healthy 和 sink 的 ACK_TIMEOUT，旧版本在首个非预期状态后提前停止收集，详细数据见[硬件观测记录](../../docs/hardware-observations.md)。修正后 `batch=32 rounds=8` 的硬件复测已通过：三个健康阶段各 256 条 SUCCESS，sink 256 条 RNR，同 SQ 保持 READY，双方成功关闭。此结论属于 RNR 模式；`peer_exit` 的 batch=32/128 也已独立通过，结果登记在前文，两者都不能解释旧 ACK_TIMEOUT 的根因。
 
 ## 观测范围
 
 该实验补充已有 [同一 SQ 在 RNR 后续发](../backpressure_test/README.md) 和 [不同 SQ 故障隔离](../sq_isolation_test/README.md)：前者验证错误后的可用性，后者验证一条 SQ 主动 ERROR 排空时其他 SQ 仍可用，本工具关注同一 SQ 内两个目标之间的影响。
 
-结果仅适用于本次设备、驱动/固件、队列参数和负载。它不测量实际 provider EAGAIN 的部分接受边界、物理链路故障或带剩余 RX 的 JFR 销毁，也不修改生产层如何处理 RNR/status 8 的策略。记录结果时建议保存两端完整输出、设备信息、URMA/provider 与驱动/固件版本。
+结果仅适用于本次设备、驱动/固件、队列参数和负载。它不测量实际 provider EAGAIN 的部分接受边界、物理链路故障或带剩余 RX 的 JFR 销毁。进程退出是本实验产生 status 8 的手段，不是该远端访问中止错误类别的唯一定义；本工具的通过不能替代生产完成层或上层连接状态机的测试。记录结果时建议保存两端完整输出、设备信息、URMA/provider 与驱动/固件版本。

@@ -75,6 +75,7 @@ public:
     /// 最多取 min(events.size(), kMaxPollBatch) 条 CQE；每条均输出到调用方缓冲。
     /// poll 失败通过 expected 返回；单条解析失败放在事件中，不中断整批处理。
     /// 边界事件不读取 user_ctx、不清空账本；所有 WR 仍须逐条获得可信终结证据。
+    /// REM_ACCESS_ABORT 按失败 WR 退休并保留 SQ 状态，由调用方根据 record/status 处理远端连接。
     std::expected<TxCompletionBatch, TxCompletionError> Poll(std::span<TxCompletionEvent> events) noexcept;
 
     /// 收到指定 SQ 的 kFlushDone 后，分批取出软件队列的 WR_UNHANDLED 并退休。

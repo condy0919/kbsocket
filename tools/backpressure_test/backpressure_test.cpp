@@ -532,7 +532,7 @@ std::expected<void, ToolError> BackpressureSession::CheckContinueState() {
 }
 
 std::expected<std::size_t, ToolError> BackpressureSession::PollContinueTx() {
-    // 本实验只观察硬件行为。生产完成层遇到错误会 BeginDrain，使用它会改变被测条件。
+    // 本实验只观察硬件行为。生产完成层仍对 RNR 主动 BeginDrain，使用它会改变被测条件。
     // 仍逐条核验 CQE 身份并通过账本退休，不允许依据计数释放 DMA 内存。
     continue_completions_.fill({});
     auto polled = pool_.PollSend(continue_completions_);
@@ -851,6 +851,17 @@ std::expected<void, ToolError> BackpressureSession::FinishTx(bool cleanup, bool 
         auto state = pool_.lane_state(lanes_[cleanup ? 1 : 0]);
         if (!state) {
             return Error("read TX state", PoolError(state.error()));
+        }
+        const auto& stats = Traffic(cleanup);
+        if (allow_errors && stats.retired > stats.success && *state == raw::JettyLaneState::kReady) {
+            // rx_delay 的失败阶段主动结束本实验独占的 SQ，并用另一 SQ 发送独立清理消息。
+            // 这是工具的关闭决策，不把 status 8 解释成本地 SQ 故障；报告仍须等待完整排空边界。
+            auto drained = pool_.BeginDrain(lanes_[cleanup ? 1 : 0]);
+            if (!drained) {
+                unsafe_ = true;
+                return Error("close failed experiment SQ", PoolError(drained.error()));
+            }
+            continue;
         }
         if (!ledger_.size() && (*state == raw::JettyLaneState::kReady || *state == raw::JettyLaneState::kDrained)) {
             if (*state == raw::JettyLaneState::kDrained) {

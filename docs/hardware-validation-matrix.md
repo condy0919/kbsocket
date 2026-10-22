@@ -2,7 +2,7 @@
 
 [文档入口](README.md) · [已有实测记录](hardware-observations.md)
 
-更新日期：2026-10-20。本矩阵区分已反馈的硬件结果、尚未观察到的行为和可选复测参数；详细计数、历史失败及源码对照放在[硬件观测记录](hardware-observations.md)中。结论仅覆盖现场使用的裸设备 `udmac0d1e4`、RM_CTP 和对应 WR 配置，网卡/固件/provider 完整版本尚未登记。
+更新日期：2026-10-22。本矩阵区分已反馈的硬件结果、尚未观察到的行为和可选复测参数；详细计数、历史失败及源码对照放在[硬件观测记录](hardware-observations.md)中。结论仅覆盖现场使用的裸设备 `udmac0d1e4`、RM_CTP 和对应 WR 配置，网卡/固件/provider 完整版本尚未登记。
 
 “已通过”表示该场景的工具判据成立，不要求故障实验中的 WR 成功发送；“部分覆盖”表示流程通过但目标硬件时序未得到证明；“未观察到”不等于硬件不支持或永远不会发生。本地 gMock 通过不计作硬件证据，计划参数也不自动继承其他参数的通过结论。
 
@@ -14,7 +14,7 @@
 | 共享 JFR/JFC、双向 SEND_WITH_IMM、逐 WR 选择远端 jetty | 已通过 | shared_queue_test 三组通过；双 SQ 每端 accepted/retired/received 均为 2002，IMM 与源/目标配对检查通过 |
 | 单 SQ ERROR 排空及同池隔离 | 已通过 | tx_drain_test、sq_isolation_test 通过；故障 SQ 拒绝新发送，健康 SQ 和共享 RX 继续工作 |
 | 缺 RX 的 RNR、同 SQ 续发与多目标收发 | 已观察到 | rx_delay 出现异步 RNR 并完成错误收尾；rnr_continue 反馈成功；同 SQ mixed 中健康目标 256 条成功、空 JFR 目标 256 条 RNR，前后各有 256 条健康消息成功；旧 ACK_TIMEOUT 原因未解 |
-| status 8 与同 SQ 健康目标隔离 | 待硬件验证 | 新增 sq_multiplex 的 peer_exit 场景：确认故障目标进程退出后，在同一 SQ 混合访问旧目标与存活目标；现有 RNR 隔离和单目标 process_exit 结果不能代替本项 |
+| status 8 与同 SQ 健康目标隔离 | 已通过 | peer_exit 的 batch=32/128、rounds=8：旧目标分别 256/1024 条 status 8；健康 before/mixed/after 各 256/1024 条 SUCCESS，远端 payload 校验通过；每轮实验同一 SQ 的 26 次状态检查通过，双方正常收尾 |
 | 软件 TX 配额耗尽与恢复 | 已通过反馈 | tx_quota 通过；这是 kbsocket 软件额度，不能替代真实 provider 容量拒绝 |
 | 单 WR READ/WRITE 大于 4 KiB | 已通过 | 两种操作各覆盖 4 KiB、16 KiB、1 MiB、8 MiB，每组 8 轮，无 RX 投递；串行单 WR，未验证多 WR 并发 |
 | 持续发送、同设备双 EID/context | 已通过 | 每端两个 context 各完成 100001 条 4096 字节 request/echo，payload 与收发/补投计数通过 |
@@ -39,7 +39,7 @@
 - URMA async event 目前仅部分支持；当前环境明确无法观察到 PORT_DOWN async，不再将其列为故障测试的待补通过条件。
 - 已确认支持 JFS error、JFR error、JFC error 及 JFR 水线相关事件。其中当前 JFS/相关 jetty 的错误 AE 需先触发其绑定的 JFC error，再联动产生，不能按独立 JFS 故障注入理解。
 
-先运行 D1–D3 的两设备四 context 部署验证，再运行下文同 SQ `peer_exit` 场景，确认 status 8 是否影响健康目标。物理故障和受支持 async 类型的工具 Get/Ack 记录可后续补充；不要求任意故障都产生 async，也不以没有 PORT_DOWN 否定错误 CQE。现有进程退出实验的 async=0 记录保持不变。
+同 SQ `peer_exit` 的 Q1/Q2 已取得双端通过日志；当前优先补 D1–D3 的两设备四 context 部署验证。物理故障和受支持 async 类型的工具 Get/Ack 记录可后续补充；不要求任意故障都产生 async，也不以没有 PORT_DOWN 否定错误 CQE。现有进程退出实验的 async=0 记录保持不变，sq_multiplex 本身不采集 async。
 
 ## 统一准备
 
@@ -66,7 +66,7 @@ USE_BAZEL_VERSION=9.2.0 bazel test --lockfile_mode=off \
   //tools/rma_test:session_test --test_output=errors
 ```
 
-已有正常收发、JFR 关闭、provider 边界和进程退出记录；本轮优先补两设备四 context 与同 SQ status 8 隔离，不要求先重跑已通过的全部组。物理故障可能影响后续所有实验，应最后做。测试期间记录完整 stdout/stderr 和退出码，不只摘录 PASS。
+已有正常收发、JFR 关闭、provider 边界、进程退出和同 SQ status 8 隔离记录；当前优先补两设备四 context，不要求先重跑已通过的全部组。物理故障可能影响后续所有实验，应最后做。测试期间记录完整 stdout/stderr 和退出码，不只摘录 PASS。
 
 ## 第一批：正常数据路径与事件
 
@@ -188,7 +188,7 @@ F5/F6 使用 `--fault_delay_ms=10000`，控制 TCP 尽量走不受影响的链�
 
 ## 同 SQ 的 status 8 故障隔离
 
-按 [sq_multiplex_test README](../tools/sq_multiplex_test/README.md) 运行新增的 `--fault=peer_exit`。默认 `--fault=rnr` 保留现有缺 RX 场景；两种模式分开登记，peer_exit 当前状态为**已实现观测入口，待硬件验证**。新协议版本为 3，两端需同步更新工具：
+按 [sq_multiplex_test README](../tools/sq_multiplex_test/README.md) 运行 `--fault=peer_exit`。默认 `--fault=rnr` 保留现有缺 RX 场景；两种模式分开登记。2026-10-22 反馈的 Q1/Q2 双端日志均通过：服务端 `udmac0d1e4:39`、客户端 `udmac0d1e4:61`。协议版本为 3，两端需同步更新工具，实验流程如下：
 
 1. 客户端先用被测 SQ 对专用故障 endpoint 发送一条 baseline，收到 SUCCESS CQE 并查询 SQ READY 后，完成第一阶段结果握手；故障子进程此时仍存活。
 2. 服务端再让故障子进程消费 baseline RX、校验源端点/payload/IMM，成功后 SIGKILL 并 waitpid 确认；第二阶段结果握手确认退出。健康 endpoint 不受该进程回收影响。
@@ -197,19 +197,22 @@ F5/F6 使用 `--fault_delay_ms=10000`，控制 TCP 尽量走不受影响的链�
 
 | 组 | 两端共同参数 | 当前结果 |
 | --- | --- | --- |
-| Q1 | `--fault=peer_exit --batch=32 --rounds=8 --bytes=4096` | 待硬件验证；healthy 三阶段各预期 256 条成功，旧故障目标预期 256 条 status 8 |
-| Q2 | `--fault=peer_exit --batch=128 --rounds=8 --bytes=4096` | 待硬件验证；mixed 每次 256 个 WR，healthy 三阶段各预期 1024 条成功，旧故障目标预期 1024 条 status 8 |
+| Q1 | `--fault=peer_exit --batch=32 --rounds=8 --bytes=4096` | 双端通过；mixed 每次 64 个 WR，healthy 三阶段各 accepted=retired=success=received=256，旧目标 accepted=retired=status8=256；客户端 SQ ID 27048 |
+| Q2 | `--fault=peer_exit --batch=128 --rounds=8 --bytes=4096` | 双端通过；mixed 每次 256 个 WR，healthy 三阶段各 accepted=retired=success=received=1024，旧目标 accepted=retired=status8=1024；客户端 SQ ID 27049 |
 
-两组客户端 baseline 均单独统计 `accepted=retired=success=1`，服务端单独记录 baseline received=1；双方打印 `Peer exit: confirmed=true`，客户端 `state_checks=26`。before 是故障目标退出后、mixed 前的健康发送，不是 SIGKILL 前的流量。任一目标出现非预期状态时仍收集当前已接受 WR 的终结证据，再报告 FAIL；不能将健康目标出错或旧目标变成 RNR/ACK_TIMEOUT 放宽为隔离成功。
+两组客户端 baseline 均单独统计 `accepted=retired=success=1`，服务端记录 baseline received=1 并确认 SIGKILL/waitpid；双方打印 `Peer exit: confirmed=true`。客户端各有 `state_checks=26、last_queried_state=1、accepted_known=true、provider_eagain=0`，其余错误计数全部为零；每个 mixed round 的健康成功数和故障 status 8 数均等于 batch。表中 received 来自服务端，其余流量计数来自客户端，两轮不同 SQ ID 属于分别启动的实验。
 
-本项要回答的是：远端访问中止是否影响同一 SQ 上健康目标的实际收发。F2/F3 的 READY 查询只说明两个采样点的状态，已有 RNR mixed 的通过也不能推出 status 8 隔离。即使本项通过，仍不自动证明不同主机、物理链路或任意错误类型的隔离。
+两端最终均 PASS：存活服务端与客户端完成资源关闭，故障子进程由 SIGKILL/waitpid 回收。before 是故障目标退出后、mixed 前的健康发送，不是 SIGKILL 前的流量。任一目标出现非预期状态时工具仍收集当前已接受 WR 的终结证据，再报告 FAIL；判据没有放宽为允许健康目标出错或旧目标返回 RNR/ACK_TIMEOUT。
+
+这两组已经用实际健康流量确认：在本次 RM_CTP/error-continue 配置下，旧远端上的 status 8 没有导致同一 SQ 的健康目标失败或阻止后续发送。证据包含成功 CQE、远端 payload 校验和状态采样，不再仅依赖 F2/F3 的 READY 查询。结论限定于同一远端主机上故障进程与存活进程的端点；不外推至跨远端主机、物理链路 ACK_TIMEOUT 或任意错误类型，也不证明没有性能干扰。mixed 的 WR 总数为 before/after 的两倍，软件 CQE 消费时间不能直接作为硬件阻塞证据。
+
+本工具直接消费合法终结 CQE，保持 SQ 运行以观察隔离。生产 `TxCompletionProcessor` 随后已为合法 status 8 增加例外：只退休对应 WR，保留原始状态与 `AttemptRecord` 上报，不因该状态调用 `BeginDrain`；连接与操作的失败决策由上层负责，本层不自动关闭连接或重试。status 8 是远端访问中止错误类别，进程退出只是本次注入方式。RNR、ACK_TIMEOUT 等其他错误仍主动排空，硬件观测与生产错误处理分别验证。
 
 ## 剩余硬件缺口
 
 | 项目 | 当前缺口 / 后续范围 |
 | --- | --- |
 | 部署拓扑，优先 | D1–D3：两个物理裸设备、每设备两个 EID 的四 context 持续收发、补投、通知和 recheck；四物理设备组暂缓 |
-| 同 SQ status 8 隔离，优先 | peer_exit：故障 endpoint 退出后，向它和健康 endpoint 混合发送，检查健康 before/mixed/after；新增工具场景尚待硬件日志 |
 | 物理故障 | F5/F6 工具日志尚未取得；用户说明通常 ACK_TIMEOUT，不将无法观察的 PORT_DOWN async 列为通过条件 |
 | 受支持 async 类型的工具记录 | 用户确认支持 JFS/JFR/JFC error 与 JFR 水线事件，Get/Ack 工具日志仍待专门注入；JFS/相关 jetty AE 当前需通过绑定 JFC error 联动，不与链路故障绑定验收 |
 | 在途中断 | F4 已完成提交后退出流程，但未证实 SIGKILL 命中硬件仍在处理 WR 的窗口；延迟软件 poll 不能补齐这项证据 |

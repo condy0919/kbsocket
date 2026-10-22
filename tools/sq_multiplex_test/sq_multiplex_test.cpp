@@ -573,7 +573,7 @@ std::expected<void, ToolError> SqMultiplexSession::ObserveTx(const urma_cr_t& cr
 }
 
 std::expected<std::size_t, ToolError> SqMultiplexSession::PollTx() {
-    // 生产完成层会在普通错误后主动 BeginDrain；本工具直接消费 CQE，保留硬件 error continue 行为。
+    // 生产完成层仍对 RNR 等错误主动 BeginDrain；本工具直接消费 CQE，独立观察硬件 error continue 行为。
     completions_.fill({});
     auto polled = pool_.PollSend(completions_);
     if (!polled) {

@@ -453,7 +453,10 @@ protected:
             } else if (options_.mode == BackpressureMode::kRxDelay && lane == 0) {
                 EXPECT_TRUE(server.recv_batches.empty());
                 ++client.sends_before_rx;
-                if (terminal_error_ && count == 0) {
+                if (count < remote_abort_count_) {
+                    // 远端错误可逐条完成，而本地 SQ 仍可用；其余 WR 留给工具主动关闭时排空。
+                    client.completions[0].push_back(Completion(lane, work.user_ctx, URMA_CR_REM_ACCESS_ABORT_ERR));
+                } else if (terminal_error_ && remote_abort_count_ == 0 && count == 0) {
                     late_work_ = work;
                     const auto status = late_original_ ? URMA_CR_ACK_TIMEOUT_ERR : URMA_CR_RNR_RETRY_CNT_EXC_ERR;
                     client.completions[0].push_back(Completion(lane, work.user_ctx, status));
@@ -760,6 +763,7 @@ protected:
     std::mutex mutex_;
     std::array<Endpoint, 2> endpoints_{};
     bool terminal_error_ = false;
+    std::size_t remote_abort_count_ = 0;
     bool late_original_ = false;
     bool corrupted_ = false;
     Work late_work_{};
@@ -907,6 +911,55 @@ TEST_F(BackpressureHardwareTest, RetryExhaustionDrainsOriginalSqAndUsesDistinctC
     CloseBoth();
 }
 
+class BackpressureRemoteAbortTest : public BackpressureHardwareTest, public ::testing::WithParamInterface<int> {};
+
+TEST_P(BackpressureRemoteAbortTest, FailedDelayExperimentExplicitlyClosesDedicatedSqWithoutReplay) {
+    options_.mode = BackpressureMode::kRxDelay;
+    options_.expect = BackpressureExpectation::kError;
+    terminal_error_ = true;
+    remote_abort_count_ = GetParam();
+    ASSERT_TRUE(OpenBoth());
+    // status 8 只退休失败 WR。工具观察到失败后才主动结束独占 SQ 的实验，不能依赖完成层判坏 SQ。
+    EXPECT_CALL(*this, Modify(&endpoints_[1].jetties[0], _)).Times(1).WillOnce([&](auto* jetty, auto* attr) {
+        EXPECT_EQ(sessions_[1].stats().traffic.remote_access_abort_error, remote_abort_count_);
+        return EnterError(jetty, attr);
+    });
+    EXPECT_CALL(*this, Modify(&endpoints_[1].jetties[1], _)).Times(0);
+    const auto results = RunBoth();
+    for (const auto& result : results) {
+        ASSERT_TRUE(result) << result.error().operation << ": " << result.error().code;
+    }
+
+    const auto& client = sessions_[1].stats();
+    const auto remaining = options_.tx_depth - remote_abort_count_;
+    // 即使整批已用 status 8 退休，报告仍须等显式关闭的边界；部分完成时还要取回所有残留 WR。
+    EXPECT_TRUE(client.terminal_failure);
+    EXPECT_EQ(client.traffic.accepted, options_.tx_depth);
+    EXPECT_EQ(client.traffic.retired, options_.tx_depth);
+    EXPECT_EQ(client.traffic.success, 0u);
+    EXPECT_EQ(client.traffic.remote_access_abort_error, remote_abort_count_);
+    EXPECT_EQ(client.traffic.flush_error, remaining > 0 ? remaining - 1 : 0);
+    EXPECT_EQ(client.traffic.unhandled, remaining > 0 ? 1u : 0u);
+    EXPECT_EQ(client.traffic.flush_done, 1u);
+    EXPECT_GT(client.traffic.rejected_sends, 0u);
+    EXPECT_TRUE(endpoints_[1].boundary_polled[0]);
+    EXPECT_EQ(endpoints_[1].flush_calls[0], remaining > 0 ? 2u : 1u);
+    EXPECT_EQ(sessions_[0].stats().traffic.flush_done, 1u);
+    EXPECT_EQ(sessions_[0].stats().traffic.received, 0u);
+
+    // 清理使用第二条 SQ 和不同的 payload 身份，原始消息不得重放，MR 最后才允许释放。
+    EXPECT_EQ(client.cleanup.accepted, options_.tx_depth);
+    EXPECT_EQ(client.cleanup.retired, options_.tx_depth);
+    EXPECT_EQ(client.cleanup.success, options_.tx_depth);
+    EXPECT_EQ(client.cleanup.flush_done, 0u);
+    EXPECT_EQ(sessions_[0].stats().cleanup.received, options_.tx_depth);
+    EXPECT_EQ(endpoints_[1].send_batches, (std::vector<std::size_t>{options_.tx_depth, options_.tx_depth}));
+    EXPECT_EQ(endpoints_[1].submitted_frames.size(), 2 * options_.tx_depth);
+    CloseBoth();
+}
+
+INSTANTIATE_TEST_SUITE_P(CompletedBeforeClose, BackpressureRemoteAbortTest, ::testing::Values(1, 3));
+
 TEST_F(BackpressureHardwareTest, LateOriginalReceiveCannotTurnCleanupOverpostIntoReplayOrEarlyFree) {
     options_.mode = BackpressureMode::kRxDelay;
     options_.expect = BackpressureExpectation::kError;
@@ -976,6 +1029,12 @@ TEST_F(BackpressureHardwareTest, MissingFlushBoundaryTimesOutAndRetainsDmaDepend
 }
 
 TEST_F(BackpressureHardwareTest, ModifyFailureKeepsAcceptedAttemptsAndPostedReceiveBuffers) {
+    EXPECT_EXIT(RunFailureCase(Failure::kModify), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(BackpressureHardwareTest, RemoteAbortExperimentCloseFailureRetainsPendingAttemptsAndReceiveBuffers) {
+    // 远端错误本身已退休；工具主动关闭失败后仍不能释放剩余 WR、已投 RX 及其 DMA 依赖。
+    remote_abort_count_ = 1;
     EXPECT_EXIT(RunFailureCase(Failure::kModify), ::testing::ExitedWithCode(0), "");
 }
 

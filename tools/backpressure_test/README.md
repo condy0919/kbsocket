@@ -44,8 +44,11 @@ JFR 投递同样数量的 RX buffer。`rounds` 在此模式下不生效，每次
 成功取决于硬件、provider、重试配置和调度；即使 `rx_delay_us=0`，控制同步及线程调度也会产生
 实际等待。本工具不承诺任何延迟值必然成功，也不要求某个固定错误码。
 
-原始 SQ 如果出现错误，按已有协议执行 ERROR 门禁、处理 `FLUSH_ERR_DONE` 并软件 flush，确保
-所有已接受的 WR 都终结一次。**不会重放已接受的原始消息，也不会把错误结果描述成发送恢复。**
+原始 SQ 如果出现错误，本实验决定关闭本轮失败的专用单连接 SQ，执行 ERROR 门禁、处理
+`FLUSH_ERR_DONE` 并软件 flush，确保所有已接受的 WR 都终结一次。RNR、ACK_TIMEOUT 等仍由生产
+完成层发起排空；若 status 8 已退休但 SQ 仍 READY，则由工具显式调用 `BeginDrain`，保留本实验的
+清理与控制报告协议。这不表示 status 8 证明物理 SQ 已损坏，也不要求生产共享 SQ 采取同一策略。
+**不会重放已接受的原始消息，也不会把错误结果描述成发送恢复。**
 
 服务端延迟投递的 RX WR 可能仍有一部分没有被消费。双方先交换原始 TX 终结计数和成功消息
 bitmap。服务端观察已到达的 RX，再请求缺少的数量。客户端使用独立的健康 SQ 发送带有 `cleanup` 标记的新
@@ -68,7 +71,8 @@ RX 与清理流量竞争 RX 槽；清理 SQ 若因此发生 RNR，同样需要�
 
 ### `rnr_continue`：同一条 SQ 在 RNR 后发送新消息
 
-`rx_delay` 在遇到错误 CQE 后会主动把原始 SQ 置为 ERROR，再用另一条健康 SQ 发送清理流量，
+`rx_delay` 在遇到错误 CQE 后会按实验策略关闭原始专用 SQ；若生产完成层未主动排空（status 8），
+工具补充调用 `BeginDrain`，再用另一条健康 SQ 发送清理流量，
 因此不能据此判断硬件是否会因 RNR 自动停用 SQ。`rnr_continue` 专门隔离这个变量：
 
 1. 两端各创建一条 jetty。客户端检查创建配置为 `error_suspend=0`，并查询实际状态为 READY。
@@ -80,8 +84,9 @@ RX 与清理流量竞争 RX 槽；清理 SQ 若因此发生 RNR，同样需要�
 5. 第二批 TX 必须全部成功，服务端逐条校验 payload、IMM 和消息身份。客户端第三次查询状态，
    双方关闭全部资源后，才输出 `PASS: outcome=rnr_continue_success`。
 
-工具只在这个实验分支直接处理原始 TX CQE，避开 `TxCompletionProcessor` 当前“遇错即主动排空”
-的策略。生产代码的错误处理行为保持不变。初始错误不是 RNR、出现排空边界、队列状态变化、
+工具只在这个实验分支直接处理原始 TX CQE，避开 `TxCompletionProcessor` 当前对 RNR 主动排空
+的策略。生产完成层对 RNR/ACK_TIMEOUT 的处理本轮未改；合法 status 8 现只退休并携原始状态和
+record 上报，不主动排空 SQ，由上层决定对应连接与操作的失败处理。初始错误不是 RNR、出现排空边界、队列状态变化、
 第二批 post 失败或 CQE 错误，都使实验失败；超时和无法确认 DMA 终结的情况保留依赖资源。
 
 该模式只接受 `--expect=either`；实验本身已经固定要求“先 RNR、后成功”，没有“只要报错就通过”

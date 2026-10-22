@@ -2,9 +2,9 @@
 
 [文档入口](README.md)
 
-整理日期：2026-10-20。本文记录当前开发过程中用户反馈的真实硬件结果，以及为解释这些结果做的源码对照。测试命令仍以各工具 README 为准。
+整理日期：2026-10-22。本文记录当前开发过程中用户反馈的真实硬件结果，以及为解释这些结果做的源码对照。测试命令仍以各工具 README 为准。
 
-当前已记录正常 SEND/READ/WRITE、共享队列、RNR 后续发、单 SQ 故障排空、provider 提交边界、残留 RX 的 JFR 关闭、持续多 EID 收发/JFC 通知和对端进程退出。**WR 失败、逻辑连接失败、SQ 进入 ERROR 和物理端口故障必须分别判断。** 在本次裸设备 RM_CTP、`error_suspend=0` 配置下，RNR 后同一 SQ 可继续发送；对端退出后的 SEND 可以异步报错而本地 SQ 仍为 READY；已主动置 ERROR 的 SQ 也可能接受 post，必须保留软件发送门禁。
+当前已记录正常 SEND/READ/WRITE、共享队列、RNR 后续发、单 SQ 故障排空、provider 提交边界、残留 RX 的 JFR 关闭、持续多 EID 收发/JFC 通知和对端进程退出。**WR 失败、逻辑连接失败、SQ 进入 ERROR 和物理端口故障必须分别判断。** 在本次裸设备 RM_CTP、`error_suspend=0` 配置下，RNR 后同一 SQ 可继续发送；对端退出后的 SEND 可以异步报错而本地 SQ 仍为 READY；新增两组 peer_exit 实测还确认，同 SQ 上失效目标的 status 8 没有使健康目标的 before/mixed/after 流量失败。已主动置 ERROR 的 SQ 也可能接受 post，必须保留软件发送门禁。
 
 同 SQ 多目标实验先出现过 ACK_TIMEOUT；修正完成收集后，用户再次运行 `batch=32、rounds=8`，健康目标的 before/mixed/after 全部成功，空 JFR 目标的 256 条 WR 全部 RNR，同一 SQ 在 25 次查询中保持 READY。**这支持本次配置下同 SQ 多目标 RNR 隔离；旧 ACK_TIMEOUT 的原因仍未查明，不能由复测成功宣称已修复。**
 
@@ -40,6 +40,7 @@
 | 延迟投递 RX | `rx_delay_us=0` 和 `10000` 均反馈 `rx_delay_terminal_failure`；0 的详细日志见下文 | 缺 RX 可以表现为 post 已接受、随后异步 RNR；错误排空及独立清理可完成 |
 | 同 SQ 的 RNR 后续发 | 用户反馈 `rnr_continue_success` | 首批 RNR 终结后，补投远端 RX，同一 jetty 可成功发送新批次；没有重建或切换 SQ |
 | [同 SQ 多目标](../tools/sq_multiplex_test/README.md) | 首次 mixed 曾出现 ACK_TIMEOUT；复测 `batch=32、rounds=8` 双端 PASS，健康 768 条全部成功、sink 256 条全部 RNR | 本次同 SQ 可交替服务健康/缺 RX 的不同 JFR，失败 WR 未阻止健康流量；旧 ACK_TIMEOUT 原因未明 |
+| 同 SQ 的 status 8 隔离 | peer_exit 的 Q1/Q2（`batch=32/128、rounds=8`）双端 PASS；每个健康阶段分别 256/1024 条 SUCCESS，失效目标分别 256/1024 条 status 8 | 本次已退出 endpoint 与健康 endpoint 共用客户端 SQ，健康收发在 mixed 前、期间及之后均成功；各 26 次状态检查为 READY，无主动 ERROR/flush/重建/重放 |
 | [Provider 提交边界](../tools/provider_boundary_test/README.md) | `tx_depth=64/128/256` 分别接受并退休 `128/256/512` 条，三组均容量拒绝和部分接受；额外 ERROR post 组也通过 | 真实容量拒绝为 `ENOMEM`；ERROR SQ 仍可能接受 post；已观察到非零 `WR_UNHANDLED` |
 | [残留 RX 的 JFR 关闭](../tools/jfr_lifecycle_test/README.md) | `rx_depth/consumed` 为 `1/0、32/0、256/0、32/7、256/255` 五组通过 | 对端静默、依赖 jetty 已删除后，残留 posted RX 不妨碍本次 DeleteJfr；之后释放 MR |
 | [持续收发与 JFC 通知](../tools/streaming_test/README.md) | 同设备两个 EID/context，每 context 100001 条、4096 字节的持续 request/echo 通过；后续 `window=1、arm_delay_us=0` 两端六行 OBSERVED | 持续 buffer 复用、各 context JFC 通知和 JFCE fd readiness 已覆盖；四 context 部署尚未覆盖 |
@@ -154,7 +155,7 @@ direct_ERROR_post status=0 queried_state=3 terminal_pending=false
 
 **此次通过支持“RNR 终结的是首批 WR，同一条物理 SQ 仍可继续发送新请求”。** 它不表示原始数据已送达，不证明任何错误之后都能继续使用 SQ，也不覆盖已经主动置为 ERROR 的 SQ。
 
-测试仅在工具分支直接消费原始 CQE，并通过 AttemptLedger 逐条退休。当前生产 `TxCompletionProcessor` 仍对普通错误执行隔离和 ERROR 排空；本次记录没有修改该策略。
+测试仅在工具分支直接消费原始 CQE，并通过 AttemptLedger 逐条退休。当前生产 `TxCompletionProcessor` 对 RNR 仍执行隔离和 ERROR 排空；后续只为 status 8 增加不主动排空的例外，没有将本节 RNR 实验的处理策略移入生产。
 
 ## 同 SQ 多目标：接收完成后仍出现 ACK_TIMEOUT
 
@@ -269,7 +270,7 @@ READ 在本地成功 CQE 后立即校验目的内存；WRITE 则在发送端成�
 
 status 8 为 `URMA_CR_REM_ACCESS_ABORT_ERR`，与旧 endpoint 已失效的场景相符，但状态本身不能定位具体资源或校验环节。两轮本地 SQ 在 post 前及观察后均查询为 READY；async fd 可用但事件计数为 0，观察包含 TX 轮询及完成后的默认 1 秒额外窗口。客户端全部接受项恰好退休一次并正常关闭；服务端 PASS 表示监督协议完成且子进程被回收，不表示被杀子进程执行了正常 Close。
 
-该结果确认 post 成功不能判断远端存活，远端故障也不必令本地 SQ 进入 ERROR 或发出可见 async 事件。时间从客户端发送逻辑开始到软件消费 CQE，不能当成从 SIGKILL 起计算的故障检测时延。没有继续向健康远端发送，所以不能仅由 READY 查询证明后续正常发送能力。
+该结果确认 post 成功不能判断远端存活，远端故障也不必令本地 SQ 进入 ERROR 或发出可见 async 事件。时间从客户端发送逻辑开始到软件消费 CQE，不能当成从 SIGKILL 起计算的故障检测时延。这两轮没有继续向健康远端发送，所以不能仅由其 READY 查询证明后续正常发送能力；后续组合实测见下文同 SQ status 8 隔离记录。
 
 `inflight_exit、batch=256` 则先在远端投递 256 个 RX，客户端提交 256 条 WR，然后请求监督进程退出 endpoint。实际日志为：
 
@@ -283,15 +284,33 @@ first_cqe_ns=56680 last_cqe_ns=1065049588
 
 本轮本地查询前后仍为 READY，无 async 事件，客户端正常关闭且服务端完成 SIGKILL/回收。它证明提交、退出协调和完成收集流程可完成，但 **224 是软件未退休数，不是硬件在途数**：等待 TCP 退出确认期间，CQE 可能已生成并留在队列中。约 1.065 秒的最后消费时间也包含该控制等待，不能视为硬件处理时延。当前没有证据证明退出中断了仍由硬件执行的 WR，SUCCESS CQE 也不代表对端应用已消费消息。
 
-## 待验证：status 8 与同 SQ 健康目标共存
+## status 8 与同 SQ 健康目标共存
 
-用户希望缩小故障隔离范围，先观察 `URMA_CR_REM_ACCESS_ABORT_ERR`（status 8）是否影响同一 SQ 上的健康目标。现有证据只覆盖同 SQ 的 RNR 隔离，以及单个已退出目标产生 status 8 时本地查询仍为 READY；尚未组合验证健康流量。
+用户贴出 [sq_multiplex_test 的 peer_exit 场景](../tools/sq_multiplex_test/README.md)两组完整双端 PASS 日志。Q1/Q2 分别使用 `batch=32/128、rounds=8、bytes=4096`；服务端为 `udmac0d1e4:39`，客户端为 `udmac0d1e4:61`。两组都先确认故障 endpoint 曾正常收发，再验证 `URMA_CR_REM_ACCESS_ABORT_ERR`（status 8）是否影响同一客户端 SQ 上的健康目标。
 
-新增 [sq_multiplex_test 的 peer_exit 场景](../tools/sq_multiplex_test/README.md)先用同一客户端 SQ 向故障 endpoint 发送一条 baseline；客户端取得 SUCCESS CQE、查询 READY 并完成结果握手后，服务端才让子进程消费并校验 RX payload/IMM，再 SIGKILL 其专用 URMA 进程并 waitpid 确认。第二次握手确认退出后，健康 endpoint 由存活进程继续服务，客户端开始每轮 healthy before/mixed/after；before 也发生在 SIGKILL 之后。
+baseline 使用后续实验的同一客户端 SQ，客户端 `accepted=retired=success=1`，故障 endpoint 收到并校验一条消息。工具先确认客户端 SUCCESS CQE 和 SQ READY，再由服务端确认故障子进程的 RX payload/IMM 校验，执行 SIGKILL 并 waitpid。双方退出握手完成后，健康 endpoint 继续存活，客户端开始每轮 healthy before/mixed/after；before 也发生在 SIGKILL 之后，不是退出前的健康流量。
 
-mixed 将故障/健康目标交替投递到同一 SQ，预期故障目标为 status 8、健康三个阶段均成功，并校验远端 payload。工具要求各检查点 SQ 为 READY，不主动 modify ERROR、不 flush、不重建 SQ，不重放已接受数据；原有 `--fault=rnr` 仍为默认模式。新增 Q1/Q2 分别用 `batch=32/128、rounds=8、bytes=4096`，见[硬件验证矩阵](hardware-validation-matrix.md)，尚无这两组的现场通过日志。
+| 组 / batch | 客户端 jetty ID | 每个 healthy 阶段 accepted / retired / SUCCESS | 服务端每个 healthy 阶段 received | Sink mixed accepted / retired / status 8 |
+| --- | ---: | --- | ---: | --- |
+| Q1 / 32 | 27048 | 256 / 256 / 256 | 256 | 256 / 256 / 256 |
+| Q2 / 128 | 27049 | 1024 / 1024 / 1024 | 1024 | 1024 / 1024 / 1024 |
 
-这是一项待硬件实测的验证方案，不是已经确认的隔离能力，也不直接修改生产错误处理策略。必须根据后续双方日志登记实际状态、计数、SQ 查询与关闭结果；故障端成功 baseline 也不能省略，否则仅凭错误码无法区分失效目标与原本就不可访问的目标。
+表中 healthy 计数分别适用于 before、mixed、after 三个阶段；baseline 单独统计，不包含在这些计数中。每轮 healthy/sink 各为 32 或 128 条，所有健康 WR 都成功，所有失效目标 WR 都以 status 8 终结，其他错误计数均为 0。两组分别使用不同 jetty ID 是重启实验后的新资源；每组内部始终使用同一个 SQ，并未在故障后换 SQ。
+
+两组均为 `state_checks=26、last_queried_state=1、accepted_known=true、provider_eagain=0`。各查询检查点为 READY；工具没有主动 modify ERROR、flush、重建或重放。健康 payload 校验通过，每个已接受 WR 恰好退休一次，双方存活端点显式关闭，故障子进程已由 waitpid 回收。故障子进程是被 SIGKILL 退出，不是执行了正常 Close。
+
+软件观察到的 mixed CQE 耗时如下，单位为 μs：
+
+| batch | Healthy mixed 最小～最大 | Sink mixed 最小～最大 |
+| ---: | --- | --- |
+| 32 | 17.750～39.600 | 17.400～39.310 |
+| 128 | 60.459～118.640 | 60.129～118.460 |
+
+batch=128 时 healthy before 为 `32.280～63.670 μs`，after 为 `32.450～61.000 μs`。计时从批次 `TxSender::Send` 调用之前到软件 CQE 记账完成，包含 Send 内部账本准备、WR 构造、provider 调用，以及网络/硬件和 poll/退休开销；不包含调用前的 payload 填充和 `TxSendRequest` 构造。mixed 一次提交的 WR 总数为普通阶段的两倍，不能由 mixed 数值较大就认定硬件队头阻塞，也不能据这些样本证明完全没有队头阻塞。RNR 相关时间字段为 0 是本轮未出现 RNR、指标不适用，不代表零延迟。
+
+这两组支持：在本次设备/provider、RM_CTP error-continue 场景下，已退出 endpoint 的 status 8 可以与同 SQ 上健康目标的成功完成共存，健康目标在 mixed 之后仍可使用。两个远端 endpoint 位于同一主机；结果不自动扩展到物理链路故障、ACK_TIMEOUT、所有错误类型或不同主机间的故障隔离。它也不表示失效目标可以继续提供正常通信。
+
+上述硬件工具直接消费 CQE，验证结果独立于生产策略。随后[生产 TxCompletionProcessor](../kbsocket/transport/raw/tx_completion_processor.cpp)已调整为：合法 status 8 完成退休对应 WR，并携原始状态和 `AttemptRecord` 上报，不因该状态调用 `BeginDrain`；连接与操作的失败决策仍由上层负责，完成层不自动关闭连接或重试。status 8 不仅可能由进程退出产生，不能将本次故障注入方式作为该状态的唯一定义。RNR、ACK_TIMEOUT 等其他错误仍沿用主动排空策略。
 
 ## 接口与查询值的解释边界
 
@@ -310,11 +329,11 @@ status 9 是 ACK_TIMEOUT，status 10 才是 RNR 重试耗尽：[urma_opcode.h](.
 
 ## 对 kbsocket 设计的约束
 
-- 将逐 WR 结果、逻辑连接状态、物理 SQ 状态和设备/端口健康分开记录。单条 RNR 不足以把共享 SQ 或整个裸设备判为失效。
+- 将逐 WR 结果、逻辑连接状态、物理 SQ 状态和设备/端口健康分开记录。已实测 RNR 和失效 endpoint 的 status 8 可与同 SQ 健康发送共存，不能仅由这两类单条 WR 错误推定共享 SQ 或整个裸设备失效。
 - SQ 仍能发送新消息，不代表失败的字节流可以无条件继续。原请求错误必须显式交给上层处理，不能跳过缺失数据或自动重放已接受的请求。
 - 继续保留软件发送门禁与逐 WR 退休规则；已实测 ERROR post 仍可成功返回。只有明确的 ERROR 排空契约才解释 FLUSH_ERR_DONE，不能从普通 RNR 或计数相等推导队列已经停机。
 - 对端退出不能代替逐 WR 终结证据，async 缺失也不能否定 CQE 已报告的远端故障；共享 JFR 删除要先满足整个资源域静默和依赖释放顺序。
-- 是否缩小生产层遇到 RNR 时的隔离范围，需要单独修改状态机及测试；本文只记录证据，不宣称该改动已经完成。
+- status 8 同 SQ 隔离已有 Q1/Q2 通过证据。生产 `TxCompletionProcessor` 现在只退休并上报这类合法终结完成，不主动排空整 SQ；原始状态和 record 仍交给上层决定对应连接与操作如何失败。此调整不自动实现连接管理，也不使已经隔离的 SQ 恢复 READY；RNR/ACK_TIMEOUT 的排空策略未改，硬件通过也不能替代生产实现验证。
 
 ## 尚未覆盖与后续记录
 
@@ -324,7 +343,7 @@ status 9 是 ACK_TIMEOUT，status 10 才是 RNR 重试耗尽：[urma_opcode.h](.
 - 延迟 RX 后原始批次全部成功，以及 RNR 的实际重试次数和时间窗口。
 - provider 同步 `URMA_EAGAIN`；已观察到的是 `ENOMEM` 容量拒绝及部分接受，尚不能证明 socket 的 EAGAIN 到 EPOLLOUT/NotifyWritable 闭环。
 - ERROR probe 的逐 WR 终结状态及来源；整轮已取得非零 `WR_UNHANDLED`，但汇总日志未将它与 probe 绑定。
-- 优先补同一共享 SQ 的 status 8 故障隔离：新 peer_exit 场景尚未实测，已有 RNR mixed 和单目标 process_exit 不能代替健康目标的实际成功完成；跨远端主机/链路的隔离也不能据此推定。
+- 同一共享 SQ 的跨远端主机/链路及其他错误类型隔离；同一远端主机上已退出 endpoint 的 status 8 与健康流量共存已由 Q1/Q2 验证，不再列为未测，但不能外推到 ACK_TIMEOUT 等故障。
 - 优先补两个物理裸设备、每设备两个 EID 的四 context 持续收发、补投与通知，使用严格拓扑模式分别执行矩阵 D1–D3；四个物理裸设备并行按用户部署范围暂缓。
 - 真正中断硬件在途 WR 的对端退出；`inflight_exit` 已验证提交后退出的控制时序，但本次全部 SUCCESS，硬件在途未确认。
 - 链路/端口真实故障的工具日志：用户说明通常为 ACK_TIMEOUT，现有 external 场景尚无日志，不把当前无法观察的 PORT_DOWN async 列作通过条件。

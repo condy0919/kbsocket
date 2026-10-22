@@ -38,9 +38,9 @@ sequenceDiagram
 
 已知接受边界的 `URMA_EAGAIN` 是普通提交失败，不会独自令 `blocked_` 置位。`blocked_` 表示接受范围不可信或内部记账失败，此时不能通过重新 Open 就认为旧请求已安全消失。当前没有 `errno=EAGAIN` 的 socket 适配、等待队列或 `NotifyWritable()`；退休额度只是后续实现可写通知的输入。
 
-[背压硬件工具](../tools/backpressure_test/README.md) 分别验证本地 SQ 配额与远端 RX 延迟：`tx_quota` 将账本容量设为 `tx_depth+1`，暂停 TX poll 后验证额外 WR 在 SQ 预留阶段被拒绝，再退休前一批并提交这条未被接受的 WR。`rx_delay` 则先接受发送，再延迟补投远端 RX，区分成功完成与异步错误排空。两者都不要求 provider 返回 `URMA_EAGAIN`；同步 post 失败单独报告，不冒充本地配额拒绝。用户已确认两组硬件测试通过，其中 `rx_delay` 观察到原始 WR 全部 RNR、另一条 SQ 的清理消息全部成功。
+[背压硬件工具](../tools/backpressure_test/README.md) 分别验证本地 SQ 配额与远端 RX 延迟：`tx_quota` 将账本容量设为 `tx_depth+1`，暂停 TX poll 后验证额外 WR 在 SQ 预留阶段被拒绝，再退休前一批并提交这条未被接受的 WR。`rx_delay` 则先接受发送，再延迟补投远端 RX，区分成功完成与异步错误排空。该实验使用专用单连接 SQ；任何错误终结后，若 SQ 仍为 READY，工具显式调用 `BeginDrain` 关闭本轮 SQ，再通过另一 SQ 清理 RX，保留既有终结报告格式。这是实验的关闭决策，不表示 status 8 必须导致生产共享 SQ 整体排空。两者都不要求 provider 返回 `URMA_EAGAIN`；同步 post 失败单独报告，不冒充本地配额拒绝。用户已确认两组硬件测试通过，其中 `rx_delay` 观察到原始 WR 全部 RNR、另一条 SQ 的清理消息全部成功。
 
-`rnr_continue` 单独验证 error continue 下同一条 SQ 在 RNR 后是否仍能发送：服务端不投 RX，等客户端逐条收到全批 RNR 后再补投；客户端不切 ERROR，使用同一 jetty 提交具有新身份的第二批消息，要求全部成功且远端 payload 校验通过。该模式只在工具内直接消费 TX CQE 并退休账本，避免生产 `TxCompletionProcessor` 的主动排空改变实验条件。提交前、首批 RNR 后、第二批成功后均通过 `QueryJetty` 检查 READY。用户已反馈 `rnr_continue_success`，证明本次硬件与配置下 RNR 终结原始 WR 后，同一条 SQ 仍能成功发送新消息；生产侧仍按当前策略主动排空，其他错误是否可继续发送没有因此得到证明。证据与限制见 [硬件观测记录](hardware-observations.md)。
+`rnr_continue` 单独验证 error continue 下同一条 SQ 在 RNR 后是否仍能发送：服务端不投 RX，等客户端逐条收到全批 RNR 后再补投；客户端不切 ERROR，使用同一 jetty 提交具有新身份的第二批消息，要求全部成功且远端 payload 校验通过。该模式只在工具内直接消费 TX CQE 并退休账本，避免生产 `TxCompletionProcessor` 对 RNR 的主动排空改变实验条件。提交前、首批 RNR 后、第二批成功后均通过 `QueryJetty` 检查 READY。用户已反馈 `rnr_continue_success`，证明本次硬件与配置下 RNR 终结原始 WR 后，同一条 SQ 仍能成功发送新消息；生产侧对 RNR 仍主动排空。后续 status 8 同 SQ 隔离已有独立实测，不能将 RNR 结果本身推广到其他错误；证据与限制见 [硬件观测记录](hardware-observations.md)。
 
 ## AttemptLedger 发送账本
 
@@ -86,7 +86,9 @@ Poll 的 expected 错误表示本次未成功取得 CQE；成功结果包含 `co
 - `kFlushDone` / `kSuspendDone`：公共 URMA 状态定义中的假 CQE 边界，user_ctx 无效；输出中将其清零，不查账本、不退休其他 WR。
 - `kRejected`：方向/对象类型不符、未知队列、重复或未知 id、通道不匹配、未提交记录或不支持的状态。原始 CQE 与错误信息交给上层诊断，不猜测完成范围、不释放其资源。
 
-普通错误 CQE 会先隔离该 SQ，再主动 modify 为 ERROR；只标记本地故障不足以停止 error continue 模式的硬件。首版不做 suspend/resume 或在线恢复；其他在途 WR 仍需各自的终结证据。已隔离队列仍可通过 local_id 查找并处理尾部完成。`WR_FLUSH_ERR` 是具体 WR 的终结错误，可退休对应记录；`FLUSH_ERR_DONE` 不能推导整个账本已经排空。`WR_UNHANDLED` 属于显式 urma_flush_jetty 返回语义，不作为普通 poll 的终结依据。
+合法的 `REM_ACCESS_ABORT_ERR`（status 8）完成只退休对应 WR，保留原始 `completion.status` 和 `AttemptRecord` 返回上层，不因该状态调用 `BeginDrain` 或主动 modify ERROR。它表示远端访问中止这一错误类别，不能唯一归因为进程退出；连接与操作的失败决策由上层依据 record 处理，本层不自动关闭连接、不重试，也不把错误改写为 SUCCESS。SQ 若已因其他原因隔离，不会因为后续 status 8 恢复可发送。
+
+其余普通终结错误仍先隔离该 SQ，再主动 modify 为 ERROR；RNR、ACK_TIMEOUT 和本地访问错误等策略本轮未改。只标记本地故障不足以停止 error continue 模式的硬件。首版不做 suspend/resume 或在线恢复；其他在途 WR 仍需各自的终结证据。已隔离队列仍可通过 local_id 查找并处理尾部完成。`WR_FLUSH_ERR` 是具体 WR 的终结错误，可退休对应记录；`FLUSH_ERR_DONE` 不能推导整个账本已经排空。`WR_UNHANDLED` 属于显式 urma_flush_jetty 返回语义，不作为普通 poll 的终结依据。
 
 收到合法 kFlushDone 后，owner 可调用 Flush(lane, events) 分批处理软件残留 WR，见下节。此层不调度后台排空、不处理异步事件或自动销毁故障队列。错误完成不是连接级 ACK，也不能自动宣称同 SQ 上其他连接全部失败或全部完成。
 
@@ -116,7 +118,7 @@ stateDiagram-v2
     kFlushReady --> kDrained: flush 返回 0 且本 SQ 无票据
 ```
 
-`MarkFaulted` 仅执行本地隔离，硬件排空使用 BeginDrain。普通错误 CQE 以及 TxSender 在 post 后遇到接受边界不可信或记账异常时，已接入 BeginDrain。外部故障检测也可由同一 owner 显式调用 BeginDrain；禁止绕过池直接 modify 后继续使用缓存的 jetty 指针。
+`MarkFaulted` 仅执行本地隔离，硬件排空使用 BeginDrain。除合法 `REM_ACCESS_ABORT_ERR` 外的普通终结错误 CQE，以及 TxSender 在 post 后遇到接受边界不可信或记账异常时，已接入 BeginDrain。status 8 例外不放宽 CQE 身份、方向、lane epoch 或账本校验。外部故障检测也可由同一 owner 显式调用 BeginDrain；禁止绕过池直接 modify 后继续使用缓存的 jetty 指针。
 
 `Flush` 的 expected 错误表示参数、状态或 provider 调用失败，也包括 provider 已空但池票据仍有残留的 kInUse；它不自动丢弃资源或继续重试。Poll 返回 completed 事件也可能携带 modify 失败：调用方应先接收退休记录，再处理控制错误。需要用事件中的 lane 重试 BeginDrain，并继续 Poll 等待边界。
 
