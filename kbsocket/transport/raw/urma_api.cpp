@@ -122,6 +122,10 @@ constexpr SymbolBinding kSymbolBindings[] = {
         .resolve = ResolveMember<&UrmaFunctions::modify_jfr>,
     },
     {
+        .name = "urma_query_jfr",
+        .resolve = ResolveMember<&UrmaFunctions::query_jfr>,
+    },
+    {
         .name = "urma_create_jetty",
         .resolve = ResolveMember<&UrmaFunctions::create_jetty>,
     },

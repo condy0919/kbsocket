@@ -50,7 +50,7 @@ std::expected<SqMultiplexHello, ToolError> ExchangeWithPeer(const SqMultiplexHel
 using PhaseWire = std::array<std::byte, 24>;
 
 PhaseWire PhaseResultWire(std::uint32_t phase_id = 0, std::uint32_t flags = 3, int error_code = 0) {
-    const std::array<std::uint32_t, 6> fields{0x4b424d52, 3, phase_id, flags, static_cast<std::uint32_t>(error_code),
+    const std::array<std::uint32_t, 6> fields{0x4b424d52, 4, phase_id, flags, static_cast<std::uint32_t>(error_code),
                                               0};
     PhaseWire wire{};
     for (std::size_t i = 0; i < fields.size(); ++i) {
@@ -106,7 +106,7 @@ TEST(MultiplexProtocol, HelloUsesNetworkOrderAndKeepsTimeoutLocal) {
     EXPECT_EQ(wire.size(), 72u);
     EXPECT_EQ(wire[0], std::byte{'K'});
     EXPECT_EQ(wire[3], std::byte{'X'});
-    EXPECT_EQ(wire[7], std::byte{3});
+    EXPECT_EQ(wire[7], std::byte{4});
     EXPECT_EQ(wire[11], std::byte{1});
     EXPECT_EQ(wire[15], std::byte{64});
     EXPECT_EQ(wire[19], std::byte{3});
@@ -142,9 +142,12 @@ TEST(MultiplexProtocol, HelloRejectsUnknownVersionFlagsAndOptions) {
         EXPECT_FALSE(DecodeMultiplexHello(wire)) << "offset=" << offset;
     }
     // 阶段结果引入新报文，旧版本必须在 hello 阶段拒绝，避免后续报文错位。
-    auto old_version = valid;
-    old_version[7] = std::byte{1};
-    EXPECT_FALSE(DecodeMultiplexHello(old_version));
+    // 特别拒绝仍直接 poll 的 v3，防止新服务端把旧客户端当成正式完成层回归。
+    for (const auto version : {1u, 2u, 3u}) {
+        auto old_version = valid;
+        old_version[7] = static_cast<std::byte>(version);
+        EXPECT_FALSE(DecodeMultiplexHello(old_version));
+    }
     auto invalid = Hello(true);
     invalid.options.batch = 129;
     EXPECT_FALSE(DecodeMultiplexHello(EncodeMultiplexHello(invalid)));

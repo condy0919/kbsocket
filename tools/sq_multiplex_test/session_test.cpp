@@ -269,7 +269,7 @@ protected:
                                                                                   : URMA_JETTY_STATE_READY;
             return URMA_SUCCESS;
         });
-        // 主动 ERROR/flush 会改变硬件的自然 RNR 行为，使本实验失去意义。
+        // RNR 保留硬件自然行为；peer_exit 的正式完成层也不得因 status 8 修改或排空整个 SQ。
         EXPECT_CALL(*this, Modify(_, _)).Times(0);
         EXPECT_CALL(*this, Flush(_, _, _)).Times(0);
         InstallCleanup();
@@ -710,7 +710,12 @@ protected:
     NoDestructor<std::array<SqMultiplexSession, 2>> sessions_;
 };
 
-TEST_F(SqMultiplexHardwareTest, RemoteAbortOnExitedTargetLeavesHealthyTrafficOnTheSameSqUsable) {
+class SqMultiplexProcessorTest : public SqMultiplexHardwareTest,
+                                 public ::testing::WithParamInterface<std::tuple<int, bool>> {};
+
+TEST_P(SqMultiplexProcessorTest, RemoteAbortOnExitedTargetLeavesHealthyTrafficOnTheSameSqUsable) {
+    options_.batch = std::get<0>(GetParam());
+    healthy_first_ = std::get<1>(GetParam());
     ExpectFaultExit();
     ASSERT_TRUE(OpenBoth());
     const auto results = RunBoth();
@@ -732,6 +737,11 @@ TEST_F(SqMultiplexHardwareTest, RemoteAbortOnExitedTargetLeavesHealthyTrafficOnT
     EXPECT_EQ(client.sink.remote_access_abort_error, expected);
     EXPECT_EQ(client.sink.rnr, 0u);
     EXPECT_EQ(client.state_checks, 2 + 3 * options_.rounds);
+    // mixed 最大 256 WR 跨多个 64 CQE 批次；正式完成层恰好退休一次，后续轮次须重新获得全部额度。
+    EXPECT_TRUE(client.uses_completion_processor);
+    EXPECT_EQ(client.processor_events, 1 + 4 * expected);
+    EXPECT_EQ(client.processor_retired, 1 + 4 * expected);
+    EXPECT_EQ(client.lane_state, raw::JettyLaneState::kReady);
     EXPECT_EQ(endpoints_[0].created_jetties, 1u);
     EXPECT_EQ(endpoints_[1].created_jetties, 1u);
     for (const auto& round : client.rounds) {
@@ -740,6 +750,86 @@ TEST_F(SqMultiplexHardwareTest, RemoteAbortOnExitedTargetLeavesHealthyTrafficOnT
     }
     CloseBoth();
 }
+
+INSTANTIATE_TEST_SUITE_P(BatchesAndCompletionOrders, SqMultiplexProcessorTest,
+                         ::testing::Combine(::testing::Values(1, 32, 128), ::testing::Bool()));
+
+TEST_F(SqMultiplexHardwareTest, ProcessorRejectsDuplicateButAccountsForLaterHealthyEventsInTheSameBatch) {
+    EXPECT_EXIT(([&] {
+                    ExpectFaultExit();
+                    failure_ = Failure::kDuplicateCompletion;
+                    healthy_first_ = false;
+                    options_.timeout_ms = 100;
+                    ASSERT_TRUE(OpenBoth());
+                    const auto results = RunBoth();
+                    EXPECT_FALSE(results[0]);
+                    EXPECT_FALSE(results[1]);
+                    const auto& stats = (*sessions_)[1].stats();
+                    // duplicate 位于 sink 与 healthy 完成之间；整批已由完成层处理，后续健康记录不能丢。
+                    EXPECT_EQ(stats.processor_events, 2 + 3 * options_.batch);
+                    EXPECT_EQ(stats.processor_retired, 1 + 3 * options_.batch);
+                    EXPECT_EQ(stats.sink.retired, options_.batch);
+                    EXPECT_EQ(stats.sink.remote_access_abort_error, options_.batch);
+                    EXPECT_EQ(stats.healthy[1].retired, options_.batch);
+                    EXPECT_EQ(stats.healthy[1].success, options_.batch);
+                    EXPECT_EQ(stats.healthy[2].accepted, 0u);
+                    EXPECT_EQ(stats.lane_state, raw::JettyLaneState::kReady);
+                    // 即使全部可信 WR 已退休，重复 CQE 仍意味着本次观测失败，不能宣称资源安全。
+                    for (std::size_t i = 0; i < sessions_->size(); ++i) {
+                        EXPECT_FALSE((*sessions_)[i].Close());
+                        EXPECT_TRUE(endpoints_[i].registration.live);
+                        EXPECT_EQ(endpoints_[i].unregistered, 0u);
+                    }
+                    const bool verified = ::testing::Mock::VerifyAndClearExpectations(this);
+                    std::_Exit(verified && !HasFailure() ? 0 : 1);
+                }()),
+                ::testing::ExitedWithCode(0), "");
+}
+
+class SqMultiplexProcessorIsolationFailureTest : public SqMultiplexHardwareTest,
+                                                 public ::testing::WithParamInterface<bool> {};
+
+TEST_P(SqMultiplexProcessorIsolationFailureTest, NonRemoteAbortKeepsProductionIsolationAndRetirementEvidence) {
+    EXPECT_EXIT(([&] {
+                    ExpectFaultExit();
+                    failure_ = Failure::kOtherStatus;
+                    healthy_first_ = false;
+                    options_.timeout_ms = 100;
+                    const bool modify_fails = GetParam();
+                    EXPECT_CALL(*this, Modify(&endpoints_[1].queues[0].jetty, _)).WillOnce([&](auto*, auto* attr) {
+                        EXPECT_EQ(attr->mask, JETTY_STATE);
+                        EXPECT_EQ(attr->state, URMA_JETTY_STATE_ERROR);
+                        return modify_fails ? EIO : URMA_SUCCESS;
+                    });
+                    ASSERT_TRUE(OpenBoth());
+                    const auto results = RunBoth();
+                    EXPECT_FALSE(results[0]);
+                    ASSERT_FALSE(results[1]);
+                    EXPECT_EQ(results[1].error().code, modify_fails ? EIO : URMA_CR_ACK_TIMEOUT_ERR);
+                    const auto& stats = (*sessions_)[1].stats();
+                    // ACK_TIMEOUT 仍执行生产隔离；modify 失败时 event 同时有 error 和 record，不能丢失
+                    // 当前失败 WR 或随后健康 WR 的退休记录，也不能把它们重新 Lookup/Complete 一次。
+                    EXPECT_EQ(stats.processor_retired, 1 + 3 * options_.batch);
+                    EXPECT_EQ(stats.processor_events, stats.processor_retired);
+                    EXPECT_EQ(stats.sink.retired, options_.batch);
+                    EXPECT_EQ(stats.sink.ack_timeout_error, 1u);
+                    EXPECT_EQ(stats.sink.remote_access_abort_error, options_.batch - 1);
+                    EXPECT_EQ(stats.healthy[1].success, options_.batch);
+                    EXPECT_EQ(stats.healthy[2].accepted, 0u);
+                    EXPECT_EQ(stats.lane_state,
+                              modify_fails ? raw::JettyLaneState::kFaulted : raw::JettyLaneState::kError);
+                    for (std::size_t i = 0; i < sessions_->size(); ++i) {
+                        EXPECT_FALSE((*sessions_)[i].Close());
+                        EXPECT_TRUE(endpoints_[i].registration.live);
+                        EXPECT_EQ(endpoints_[i].unregistered, 0u);
+                    }
+                    const bool verified = ::testing::Mock::VerifyAndClearExpectations(this);
+                    std::_Exit(verified && !HasFailure() ? 0 : 1);
+                }()),
+                ::testing::ExitedWithCode(0), "");
+}
+
+INSTANTIATE_TEST_SUITE_P(ModifySucceedsOrFails, SqMultiplexProcessorIsolationFailureTest, ::testing::Bool());
 
 TEST_F(SqMultiplexHardwareTest, HealthyRemoteAbortCollectsTheWholeMixedBatchThenFailsWithoutContinuation) {
     ExpectFaultExit();
@@ -758,6 +848,9 @@ TEST_F(SqMultiplexHardwareTest, HealthyRemoteAbortCollectsTheWholeMixedBatchThen
     EXPECT_EQ(client.sink.retired, options_.batch);
     EXPECT_EQ(client.sink.remote_access_abort_error, options_.batch);
     EXPECT_EQ(client.healthy[2].accepted, 0u);
+    EXPECT_EQ(client.processor_retired, 1 + 3 * options_.batch);
+    EXPECT_EQ(client.processor_events, client.processor_retired);
+    EXPECT_EQ(client.lane_state, raw::JettyLaneState::kReady);
     EXPECT_EQ(endpoints_[1].send_batches, (std::vector<std::size_t>{1, options_.batch, 2 * options_.batch}));
     CloseBoth();
 }
@@ -869,6 +962,10 @@ TEST_P(SqMultiplexOrderingTest, OnePhysicalSqServesBothTargetsAndContinuesWithou
     EXPECT_EQ(client.sink.other_error, 0u);
     EXPECT_EQ(server.sink.received, 0u);
     EXPECT_TRUE(client.accepted_known);
+    EXPECT_FALSE(client.uses_completion_processor);
+    EXPECT_EQ(client.processor_events, 0u);
+    EXPECT_EQ(client.processor_retired, 0u);
+    EXPECT_EQ(client.lane_state, raw::JettyLaneState::kReady);
     EXPECT_EQ(client.provider_eagain, 0u);
     EXPECT_EQ(endpoints_[0].created_jetties, 2u);
     EXPECT_EQ(endpoints_[0].created_jfrs, 2u);

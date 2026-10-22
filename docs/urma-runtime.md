@@ -6,7 +6,7 @@
 
 ## 动态加载
 
-`urma_api.hpp/.cpp` 参考 ubsocket 的函数表加载方式，使用 `decltype` 从 URMA 头文件取得准确签名。当前与 UMQ 的 URMA 符号表对齐，共加载 50 个必需符号，覆盖设备/context、JFC/JFCE/JFR、jetty 与收发、内存段、异步事件、日志、user_ctl、EID 转换和性能统计。UVS 的 `uvs_get_path_set` 属于独立 `libtpsa.so`，不纳入该表。部署库缺少其中任一符号时，加载整体失败。
+`urma_api.hpp/.cpp` 参考 ubsocket 的函数表加载方式，使用 `decltype` 从 URMA 头文件取得准确签名。在 UMQ 的 URMA 符号表基础上补充 JFR/jetty 查询入口，覆盖设备/context、JFC/JFCE/JFR、jetty 与收发、内存段、异步事件、日志、user_ctl、EID 转换和性能统计；完整列表以 `UrmaFunctions` 和 `kSymbolBindings` 为准。UVS 的 `uvs_get_path_set` 属于独立 `libtpsa.so`，不纳入该表。部署库缺少其中任一符号时，加载整体失败。
 
 `UrmaApi::Load()` 默认加载 `liburma.so`，也支持指定路径。全部符号解析成功才发布只读函数表；打开失败或缺符号时返回 `std::unexpected(LoadError)`，包含失败码和复制到固定长度数组中的错误文本，允许重试。已加载时再次 Load 返回 `LoadErrorCode::kAlreadyLoaded`，不替换现有库。
 
@@ -22,7 +22,7 @@ USE_BAZEL_VERSION=9.2.0 bazel run //tools/capabilities:device_info -- --library 
 
 ## 进程级调用入口与 gMock
 
-业务使用 `UrmaApi::CreateJfr(ctx, cfg)` 等静态接口，全部 50 个 URMA 函数都有对应入口。生产启动顺序为 `UrmaApi::Load()` → `UrmaApi::Init()` → 创建资源/业务运行；退出时先停止调用并释放资源，再 `Uninit()` 和 `Unload()`。UrmaApi 直接持有进程级库句柄和唯一的常驻函数表；Load 使用局部临时表解析，全部成功后才发布。
+业务使用 `UrmaApi::CreateJfr(ctx, cfg)` 等静态接口，每个已加载的 URMA 函数都有对应入口。`QueryJfr` 可读取 provider 报告的深度与水线，不能用创建时保存的请求配置代替查询结果。生产启动顺序为 `UrmaApi::Load()` → `UrmaApi::Init()` → 创建资源/业务运行；退出时先停止调用并释放资源，再 `Uninit()` 和 `Unload()`。UrmaApi 直接持有进程级库句柄和唯一的常驻函数表；Load 使用局部临时表解析，全部成功后才发布。
 
 `UrmaApi` 不自动计数业务资源或多 runtime 引用；进程的控制线程负责协调初始化和退出。没有加载或测试未填某个符号时，入口设置 errno=ENOSYS，并按签名返回 nullptr、URMA_FAIL 或 -1；void 接口只设置 errno。
 

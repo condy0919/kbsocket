@@ -5,7 +5,10 @@ cc_library(
     name = "peer_process",
     srcs = ["process.cpp"],
     hdrs = ["process.hpp"],
-    visibility = ["//tools/sq_multiplex_test:__pkg__"],
+    visibility = [
+        "//tools/async_event_test:__pkg__",
+        "//tools/sq_multiplex_test:__pkg__",
+    ],
     deps = ["//tools/common:control_channel"],
 )
 

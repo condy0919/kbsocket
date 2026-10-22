@@ -19,11 +19,12 @@
 | [TX 故障排空测试](../tools/tx_drain_test/README.md) | 独立双端工具，验证主动 ERROR、硬件边界、软件 flush 和关闭 |
 | [同池 SQ 故障隔离测试](../tools/sq_isolation_test/README.md) | 一条 SQ 排空时，共享 JFR/JFC 的健康 SQ 持续双向收发 |
 | [背压与 RNR 续发测试](../tools/backpressure_test/README.md) | 本地 TX 配额、延迟投递 RX、RNR 后同一条 SQ 发送新消息 |
-| [同 SQ 多目标观测](../tools/sq_multiplex_test/README.md) | 同一 SQ 交替访问健康与缺 RX 的独立 JFR，记录完成顺序、耗时及后续可用性 |
+| [同 SQ 多目标观测](../tools/sq_multiplex_test/README.md) | RNR 原始观测，以及 status 8 经正式 TX 完成层后的健康目标隔离与续发 |
 | [共享 JFR 关闭观测](../tools/jfr_lifecycle_test/README.md) | 未消费或部分消费 RX 的真实删除、耗时与 watchdog |
 | [Provider 提交边界](../tools/provider_boundary_test/README.md) | 容量拒绝、部分接受、非零软件 flush 和 ERROR SQ 原始 post |
 | [真实对端故障](../tools/peer_failure_test/README.md) | 进程退出证明、原始 CQE/SQ 状态与异步事件、现场外部故障窗口 |
 | [持续收发与事件](../tools/streaming_test/README.md) | 无批间 TCP 屏障、多 context、RX 补投及 JFCE 等待/ack |
+| [JFR 水线异步事件](../tools/async_event_test/README.md) | 独立 async fd、事件归属与 Get/Ack、补投后续收发及再次跨水线观察 |
 | [READ/WRITE 测试](../tools/rma_test/README.md) | 远端 MR 导入、单 WR 大块传输与双方数据校验 |
 
 长期架构与协议规划见 [kbsocket 设计 v1](design/kbsocket-design-v1.md)。当前实现范围以本目录的流程和组件文档、对应源码为准。

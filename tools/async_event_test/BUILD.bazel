@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+cc_library(
+    name = "async_event_support",
+    srcs = ["async_event_test.cpp"],
+    hdrs = ["async_event_test.hpp"],
+    deps = [
+        "//kbsocket/transport/raw:attempt_ledger",
+        "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:rx_buffer_pool",
+        "//kbsocket/transport/raw:tx_completion_processor",
+        "//kbsocket/transport/raw:tx_sender",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+    ],
+)
+
+cc_binary(
+    name = "async_event_test",
+    srcs = ["main.cpp"],
+    deps = [
+        ":async_event_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:raw_runtime",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+        "//tools/peer_failure_test:peer_process",
+        "@gflags",
+    ],
+)
+
+cc_test(
+    name = "async_event_test_test",
+    srcs = [
+        "async_event_test_test.cpp",
+        "session_test.cpp",
+    ],
+    deps = [
+        ":async_event_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:urma_api",
+        "//kbsocket/transport/raw:urma_test_support",
+        "//tools/common:control_channel",
+        "@googletest//:gtest_main",
+    ],
+)

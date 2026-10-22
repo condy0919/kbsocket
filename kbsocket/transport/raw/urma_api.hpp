@@ -45,6 +45,7 @@ struct UrmaFunctions {
     decltype(&::urma_create_jfr) create_jfr = nullptr;
     decltype(&::urma_delete_jfr) delete_jfr = nullptr;
     decltype(&::urma_modify_jfr) modify_jfr = nullptr;
+    decltype(&::urma_query_jfr) query_jfr = nullptr;
 
     // Jetty 与收发
     decltype(&::urma_create_jetty) create_jetty = nullptr;
@@ -200,6 +201,10 @@ public:
 
     static urma_status_t ModifyJfr(urma_jfr_t* jfr, urma_jfr_attr_t* attr) {
         return Invoke<true>(functions_.modify_jfr, jfr, attr);
+    }
+
+    static urma_status_t QueryJfr(urma_jfr_t* jfr, urma_jfr_cfg_t* cfg, urma_jfr_attr_t* attr) {
+        return Invoke<true>(functions_.query_jfr, jfr, cfg, attr);
     }
 
     static urma_jetty_t* CreateJetty(urma_context_t* ctx, urma_jetty_cfg_t* jetty_cfg) {

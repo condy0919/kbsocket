@@ -24,6 +24,15 @@ auto Error(const char* operation, int code) noexcept {
 int PoolError(const raw::JettyPoolFailure& error) noexcept {
     return error.provider_error ? error.provider_error : static_cast<int>(error.code);
 }
+int CompletionError(const raw::TxCompletionError& error) noexcept {
+    if (error.pool_error) {
+        return PoolError(*error.pool_error);
+    }
+    if (error.ledger_error) {
+        return static_cast<int>(error.ledger_error->code);
+    }
+    return static_cast<int>(error.code);
+}
 bool SameEndpoint(const urma_jetty_id_t& a, const urma_jetty_id_t& b) noexcept {
     return a.id == b.id && std::memcmp(a.eid.raw, b.eid.raw, sizeof(a.eid.raw)) == 0;
 }
@@ -88,6 +97,7 @@ std::expected<void, ToolError> SqMultiplexSession::Open(urma_context_t* ctx, con
     local_ = {.options = options, .server = server};
     peer_ = {};
     stats_ = {};
+    stats_.uses_completion_processor = !server && options.fault == MultiplexFault::kPeerExit;
     if (!server) {
         stats_.rounds.resize(options.rounds);
     }
@@ -240,6 +250,11 @@ std::expected<void, ToolError> SqMultiplexSession::Run(ControlChannel& channel) 
     }
     if (!stats_.accepted_known || ledger_.size() || rx_.posted() || rx_.held()) {
         return Error("final DMA ownership not fully returned", EBUSY);
+    }
+    if (stats_.uses_completion_processor &&
+        (stats_.processor_retired != 1 + 4 * expected || stats_.processor_events != stats_.processor_retired ||
+         stats_.lane_state != raw::JettyLaneState::kReady)) {
+        return Error("production completion accounting or lane state mismatch", EPROTO);
     }
     auto done = MultiplexBarrier(channel, kDone, options_.timeout_ms);
     if (!done) {
@@ -452,6 +467,8 @@ std::expected<void, ToolError> SqMultiplexSession::Send() {
 }
 
 std::expected<void, ToolError> SqMultiplexSession::CheckState() {
+    const auto state = pool_.lane_state(lane_);
+    stats_.lane_state = state ? std::optional(*state) : std::nullopt;
     auto jetty = pool_.Get(lane_);
     if (!jetty || *jetty != jetty_ || !SameEndpoint((*jetty)->jetty_id, local_.endpoints[0])) {
         return Error("sending SQ identity changed or no longer usable", EPROTO);
@@ -486,22 +503,43 @@ std::expected<void, ToolError> SqMultiplexSession::ObserveTx(const urma_cr_t& cr
         return Error("unexpected TX CQE status/direction/jetty", static_cast<int>(cr.status));
     }
     auto record = ledger_.Lookup(cr.user_ctx);
-    if (!record || !SameLane(record->ticket.lane, lane_) || !record->metadata.buffer_lease ||
-        record->metadata.buffer_lease > RequestCount()) {
+    if (!record) {
         return Error("unknown or foreign TX attempt", EPROTO);
     }
-    const auto slot = static_cast<std::size_t>(record->metadata.buffer_lease - 1);
-    const auto frame = Frame(slot);
-    if (record->id != ids_[slot] || tx_seen_[slot] || record->metadata.target != remotes_[frame.sink] ||
-        record->metadata.connection_id != (frame.sink ? 2u : 1u) || record->metadata.operation_id != slot + 1 ||
-        record->metadata.opcode != URMA_OPC_SEND_IMM ||
-        record->metadata.operation_generation != round_ * 3 + static_cast<std::uint32_t>(phase_)) {
-        return Error("duplicate or foreign TX identity", EPROTO);
+    const auto slot = ValidateTxRecord(cr, *record);
+    if (!slot) {
+        return std::unexpected(slot.error());
     }
     auto retired = ledger_.Complete(cr.user_ctx);
     if (!retired) {
         return Error("retire TX attempt", static_cast<int>(retired.error().code));
     }
+    RecordTx(cr, *slot);
+    return {};
+}
+
+std::expected<std::size_t, ToolError> SqMultiplexSession::ValidateTxRecord(const urma_cr_t& cr,
+                                                                           const raw::AttemptRecord& record) const {
+    if (!IsTerminal(cr.status) || cr.flag.bs.s_r || !cr.flag.bs.jetty || cr.local_id != local_.endpoints[0].id) {
+        return Error("unexpected TX CQE status/direction/jetty", static_cast<int>(cr.status));
+    }
+    if (!SameLane(record.ticket.lane, lane_) || !record.metadata.buffer_lease ||
+        record.metadata.buffer_lease > RequestCount()) {
+        return Error("unknown or foreign TX attempt", EPROTO);
+    }
+    const auto slot = static_cast<std::size_t>(record.metadata.buffer_lease - 1);
+    const auto frame = Frame(slot);
+    if (record.id != cr.user_ctx || record.id != ids_[slot] || tx_seen_[slot] ||
+        record.metadata.target != remotes_[frame.sink] || record.metadata.connection_id != (frame.sink ? 2u : 1u) ||
+        record.metadata.operation_id != slot + 1 || record.metadata.opcode != URMA_OPC_SEND_IMM ||
+        record.metadata.operation_generation != round_ * 3 + static_cast<std::uint32_t>(phase_)) {
+        return Error("duplicate or foreign TX identity", EPROTO);
+    }
+    return slot;
+}
+
+void SqMultiplexSession::RecordTx(const urma_cr_t& cr, std::size_t slot) {
+    const auto frame = Frame(slot);
     tx_seen_[slot] = true;
     auto& traffic = Traffic(frame.sink);
     const auto ns = static_cast<std::uint64_t>(
@@ -569,11 +607,13 @@ std::expected<void, ToolError> SqMultiplexSession::ObserveTx(const urma_cr_t& cr
             }
         }
     }
-    return {};
 }
 
 std::expected<std::size_t, ToolError> SqMultiplexSession::PollTx() {
-    // 生产完成层仍对 RNR 等错误主动 BeginDrain；本工具直接消费 CQE，独立观察硬件 error continue 行为。
+    if (stats_.uses_completion_processor) {
+        return PollProcessedTx();
+    }
+    // RNR 模式保留原始 CQE 路径，避免生产策略的 BeginDrain 改变待观测的硬件行为。
     completions_.fill({});
     auto polled = pool_.PollSend(completions_);
     if (!polled) {
@@ -592,6 +632,50 @@ std::expected<std::size_t, ToolError> SqMultiplexSession::PollTx() {
         return std::unexpected(*failure);
     }
     return static_cast<std::size_t>(*polled);
+}
+
+std::expected<std::size_t, ToolError> SqMultiplexSession::PollProcessedTx() {
+    const auto batch = processor_.Poll(tx_events_);
+    const auto state = pool_.lane_state(lane_);
+    stats_.lane_state = state ? std::optional(*state) : std::nullopt;
+    if (!batch) {
+        unsafe_ = true;
+        return Error("poll production TX completion processor", CompletionError(batch.error()));
+    }
+    stats_.processor_events += batch->count;
+    stats_.processor_retired += batch->retired;
+    std::optional<ToolError> failure;
+    for (const auto& event : std::span(tx_events_).first(batch->count)) {
+        if (event.error && !failure) {
+            failure = ToolError{"production TX completion error", CompletionError(*event.error)};
+        }
+        if (event.kind != raw::TxCompletionKind::kCompleted || !event.record || !event.lane ||
+            !SameLane(*event.lane, lane_)) {
+            if (!failure) {
+                failure = ToolError{"unexpected production TX completion event", EPROTO};
+            }
+            continue;
+        }
+        // Poll 已经退休整批。只消费返回的 record，不能再 Lookup/Complete；即使本项附带控制错误，
+        // 其可信退休记录以及本批后续记录仍须统计，避免遇到首个异常就遗失所有权归还证据。
+        const auto slot = ValidateTxRecord(event.completion, *event.record);
+        if (!slot) {
+            if (!failure) {
+                failure = slot.error();
+            }
+            continue;
+        }
+        RecordTx(event.completion, *slot);
+    }
+    if (!failure && (!state || *state != raw::JettyLaneState::kReady)) {
+        // 非预期错误可能已按生产策略隔离 SQ。本工具不恢复或重建它，也不把账本变空当作排空完成。
+        failure = phase_error_.value_or(ToolError{"production completion processor isolated shared SQ", EPROTO});
+    }
+    if (failure) {
+        unsafe_ = true;
+        return std::unexpected(*failure);
+    }
+    return batch->count;
 }
 
 std::expected<void, ToolError> SqMultiplexSession::FinishTx() {

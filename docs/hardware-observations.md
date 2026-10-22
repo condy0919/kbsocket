@@ -375,7 +375,9 @@ batch=128 时 healthy before 为 `32.280～63.670 μs`，after 为 `32.450～61.
 
 这两组支持：在本次设备/provider、RM_CTP error-continue 场景下，已退出 endpoint 的 status 8 可以与同 SQ 上健康目标的成功完成共存，健康目标在 mixed 之后仍可使用。两个远端 endpoint 位于同一主机；结果不自动扩展到物理链路故障、ACK_TIMEOUT、所有错误类型或不同主机间的故障隔离。它也不表示失效目标可以继续提供正常通信。
 
-上述硬件工具直接消费 CQE，验证结果独立于生产策略。随后[生产 TxCompletionProcessor](../kbsocket/transport/raw/tx_completion_processor.cpp)已调整为：合法 status 8 完成退休对应 WR，并携原始状态和 `AttemptRecord` 上报，不因该状态调用 `BeginDrain`；连接与操作的失败决策仍由上层负责，完成层不自动关闭连接或重试。status 8 不仅可能由进程退出产生，不能将本次故障注入方式作为该状态的唯一定义。RNR、ACK_TIMEOUT 等其他错误仍沿用主动排空策略。
+上述实测时的工具版本直接消费 CQE，验证结果独立于生产策略。随后[生产 TxCompletionProcessor](../kbsocket/transport/raw/tx_completion_processor.cpp)已调整为：合法 status 8 完成退休对应 WR，并携原始状态和 `AttemptRecord` 上报，不因该状态调用 `BeginDrain`；连接与操作的失败决策仍由上层负责，完成层不自动关闭连接或重试。status 8 不仅可能由进程退出产生，不能将本次故障注入方式作为该状态的唯一定义。RNR、ACK_TIMEOUT 等其他错误仍沿用主动排空策略。
+
+新版 `sq_multiplex_test --fault=peer_exit` 已使用正式完成处理器，并输出 `completion_path=processor`、生产退休计数和软件 lane 状态；这条集成路径仍待新的真机日志，不能将上述旧日志重新解释为已覆盖它。独立的 [JFR 水线工具](../tools/async_event_test/README.md) 也已实现，首次及重复事件的硬件结果待记录。
 
 ## 接口与查询值的解释边界
 

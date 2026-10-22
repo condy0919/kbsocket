@@ -18,7 +18,8 @@ namespace {
 constexpr std::uint32_t kHelloMagic = 0x4b424d58;   // KBMX
 constexpr std::uint32_t kPayloadMagic = 0x4b424d46; // KBMF
 constexpr std::uint32_t kPhaseMagic = 0x4b424d52;   // KBMR
-constexpr std::uint32_t kVersion = 3;
+// v4 要求 peer_exit 使用正式 TX 完成层，避免旧客户端绕过该路径却被新服务端报告为通过。
+constexpr std::uint32_t kVersion = 4;
 constexpr std::uint32_t kClosedMarker = 0x4d58434c;
 constexpr std::uint32_t kMaxBatch = 128;
 constexpr std::uint32_t kMaxRounds = 1000;

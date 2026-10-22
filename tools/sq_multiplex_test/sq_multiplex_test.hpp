@@ -16,6 +16,7 @@
 #include "kbsocket/transport/raw/attempt_ledger.hpp"
 #include "kbsocket/transport/raw/jetty_pool.hpp"
 #include "kbsocket/transport/raw/rx_buffer_pool.hpp"
+#include "kbsocket/transport/raw/tx_completion_processor.hpp"
 #include "kbsocket/transport/raw/tx_sender.hpp"
 #include "kbsocket/transport/raw/urma_api.hpp"
 
@@ -118,6 +119,11 @@ struct SqMultiplexStats {
     std::optional<std::uint32_t> queried_state;
     std::uint64_t provider_eagain = 0;
     bool accepted_known = true;
+    bool uses_completion_processor = false;
+    std::uint64_t processor_events = 0;
+    std::uint64_t processor_retired = 0;
+    // 完成消费或状态检查时读取的软件通道状态，独立于硬件 QueryJetty 的结果。
+    std::optional<raw::JettyLaneState> lane_state;
 };
 
 /// 服务端独立故障进程的控制边界。端点公布前必须已投递一个 baseline RX。
@@ -129,7 +135,7 @@ public:
     virtual std::expected<void, ToolError> FinishBaselineAndExit(const urma_jetty_id_t& sender) = 0;
 };
 
-/// 单 owner 硬件实验：客户端一条 SQ，服务端两个独立 JFR，普通 RNR 不触发 ERROR 排空。
+/// 单 owner 实验：peer_exit 使用正式完成层验证 status 8 隔离；RNR 直接消费 CQE 观察硬件行为。
 /// 正常关闭前须证明所有 TX/RX 终结并完成双端屏障；未决资源由入口常驻保留。
 class SqMultiplexSession {
 public:
@@ -150,7 +156,11 @@ private:
     std::expected<void, ToolError> Send();
     std::expected<void, ToolError> FinishTx();
     std::expected<std::size_t, ToolError> PollTx();
+    std::expected<std::size_t, ToolError> PollProcessedTx();
     std::expected<void, ToolError> ObserveTx(const urma_cr_t& completion);
+    std::expected<std::size_t, ToolError> ValidateTxRecord(const urma_cr_t& completion,
+                                                           const raw::AttemptRecord& record) const;
+    void RecordTx(const urma_cr_t& completion, std::size_t slot);
     std::expected<void, ToolError> Receive();
     std::expected<std::size_t, ToolError> PollRx();
     std::expected<void, ToolError> ValidateRx(const raw::RxBufferEvent& event);
@@ -170,6 +180,7 @@ private:
     raw::RxBufferPool rx_;
     raw::AttemptLedger ledger_;
     raw::TxSender sender_;
+    raw::TxCompletionProcessor processor_{ledger_};
     raw::JettyLane lane_{};
     urma_jetty_t* jetty_ = nullptr;
     std::vector<std::byte> storage_;
@@ -180,6 +191,7 @@ private:
     std::array<bool, raw::TxSender::kMaxBatch / 2> rx_seen_{};
     std::array<raw::TxSendRequest, raw::TxSender::kMaxBatch> requests_{};
     std::array<urma_cr_t, 64> completions_{};
+    std::array<raw::TxCompletionEvent, raw::TxCompletionProcessor::kMaxPollBatch> tx_events_{};
     std::array<raw::RxBufferEvent, raw::RxBufferPool::kPollBatch> rx_events_{};
     MultiplexPhase phase_ = MultiplexPhase::kBefore;
     std::uint32_t round_ = 0;

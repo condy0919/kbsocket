@@ -113,4 +113,5 @@ bazel test //tools/peer_failure_test:peer_failure_unit_test --test_output=errors
 本工具只向一个故障目标观察状态；若要确认 status 8 是否影响同一 SQ 上的健康目标，使用
 [sq_multiplex_test 的 `--fault=peer_exit` 场景](../sq_multiplex_test/README.md)。该场景先验证故障目标
 曾可接收，再确认其进程退出，与存活健康目标混合发送，独立检查 healthy before/mixed/after；其硬件结果
-仍待记录，不能从本工具的 READY 查询或现有 RNR 隔离结果推定已通过。
+已在[硬件观测记录](../../docs/hardware-observations.md)中登记 Q1/Q2；新版接入正式完成处理器后的集成结果仍待记录。
+不能从本工具的 READY 查询推定同 SQ 隔离或生产完成层验证已通过。

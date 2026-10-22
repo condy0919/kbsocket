@@ -18,6 +18,7 @@
 #include <gflags/gflags.h>
 
 #include "kbsocket/base/no_destructor.hpp"
+#include "kbsocket/transport/raw/jetty_pool.hpp"
 #include "kbsocket/transport/raw/raw_runtime.hpp"
 #include "kbsocket/transport/raw/urma_api.hpp"
 
@@ -86,6 +87,26 @@ void PrintTraffic(std::string_view label, const kbsocket::tools::MultiplexTraffi
                  traffic.last_other_status, traffic.min_cqe_ns, traffic.max_cqe_ns);
 }
 
+std::string_view LaneStateName(const kbsocket::tools::SqMultiplexStats& stats) {
+    if (!stats.lane_state) {
+        return "unknown";
+    }
+    using kbsocket::raw::JettyLaneState;
+    switch (*stats.lane_state) {
+    case JettyLaneState::kReady:
+        return "READY";
+    case JettyLaneState::kFaulted:
+        return "FAULTED";
+    case JettyLaneState::kError:
+        return "ERROR";
+    case JettyLaneState::kFlushReady:
+        return "FLUSH_READY";
+    case JettyLaneState::kDrained:
+        return "DRAINED";
+    }
+    return "unknown";
+}
+
 void PrintStats(const kbsocket::tools::SqMultiplexStats& stats) {
     if (FLAGS_fault == "peer_exit") {
         PrintTraffic("Fault baseline", stats.fault_baseline, stats.accepted_known);
@@ -105,6 +126,9 @@ void PrintStats(const kbsocket::tools::SqMultiplexStats& stats) {
         return;
     }
     PrintTraffic("Sink mixed", stats.sink, stats.accepted_known);
+    std::println("TX completion: completion_path={} processor_events={} processor_retired={} last_lane_state={}",
+                 stats.uses_completion_processor ? "processor" : "raw", stats.processor_events, stats.processor_retired,
+                 LaneStateName(stats));
     const auto queried_state = stats.queried_state ? std::to_string(*stats.queried_state) : "unknown";
     std::println(
         "Same SQ: jetty_id={} state_checks={} requested_rnr_retry={} requested_err_timeout={} "
@@ -226,6 +250,7 @@ int Run() {
     if (FLAGS_fault == "peer_exit") {
         std::println("PASS: healthy traffic succeeded before, during and after same-SQ REM_ACCESS_ABORT; "
                      "fault baseline validated before SIGKILL/waitpid; old-target attempts retired once with status 8; "
+                     "client used TxCompletionProcessor; "
                      "same SQ remained READY without modification or recreation; payload validated; "
                      "both endpoints closed resources");
     } else {
