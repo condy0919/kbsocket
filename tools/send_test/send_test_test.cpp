@@ -30,7 +30,7 @@ TEST(SendTestProtocol, WireFormatAndPayloadRejectCorruption) {
     EXPECT_EQ(decoded->endpoint.id, hello.endpoint.id);
     EXPECT_EQ(decoded->endpoint.eid.raw[15], 42);
     EXPECT_EQ(decoded->options.bytes, 4096u);
-    wire[7] = std::byte{2};
+    wire[7] = std::byte{1};
     EXPECT_FALSE(DecodeHello(wire));
     hello.options.batch = 257;
     EXPECT_FALSE(DecodeHello(EncodeHello(hello)));
@@ -45,6 +45,46 @@ TEST(SendTestProtocol, WireFormatAndPayloadRejectCorruption) {
     EXPECT_TRUE(ValidateOptions({.bytes = 4096}));
     EXPECT_FALSE(ValidateOptions({.messages = 0}));
     EXPECT_FALSE(ValidateOptions({.timeout_ms = 0}));
+}
+
+TEST(SendTestProtocol, SegmentedPayloadAndWireOptionsPreserveWholeMessageIdentity) {
+    SendTestOptions options{.bytes = 4096, .sges = 8, .header_bytes = 33, .send_imm = true};
+    ASSERT_TRUE(ValidateOptions(options));
+    auto wire = EncodeHello({.options = options});
+    auto decoded = DecodeHello(wire);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->options.sges, 8u);
+    EXPECT_EQ(decoded->options.header_bytes, 33u);
+    EXPECT_TRUE(decoded->options.send_imm);
+    wire[51] = std::byte{2};
+    EXPECT_FALSE(DecodeHello(wire));
+
+    // 各段独立填充，接收端只按线上的连续报文校验；长度不能被 SGE 数整除也不丢尾部。
+    std::array<std::byte, 4096> assembled{};
+    std::size_t offset = 0;
+    for (std::size_t piece = 0; piece < options.sges; ++piece) {
+        const auto length = SendSgeLength(options, piece);
+        FillPayload(std::span(assembled).subspan(offset, length), 1001, offset);
+        offset += length;
+    }
+    EXPECT_EQ(offset, options.bytes);
+    EXPECT_EQ(CheckPayload(assembled), 1001u);
+    // 段偏移错 256 字节或复用相隔 256 条消息的数据都必须被识别。
+    FillPayload(std::span(assembled).subspan(512, 256), 1001, 256);
+    EXPECT_FALSE(CheckPayload(assembled));
+    FillPayload(assembled, 1001);
+    FillPayload(std::span(assembled).subspan(512, 256), 745, 512);
+    EXPECT_FALSE(CheckPayload(assembled));
+    EXPECT_NE(SendImmediate(1), SendImmediate(257));
+    EXPECT_NE(SendImmediate(1) >> 32, 0u);
+
+    EXPECT_FALSE(ValidateOptions({.sges = 0}));
+    EXPECT_FALSE(ValidateOptions({.sges = 9}));
+    EXPECT_FALSE(ValidateOptions({.bytes = 32, .sges = 2}));
+    EXPECT_FALSE(ValidateOptions({.bytes = 64, .sges = 2, .header_bytes = 7}));
+    EXPECT_FALSE(ValidateOptions({.bytes = 35, .sges = 8, .header_bytes = 32}));
+    EXPECT_TRUE(ValidateOptions({.bytes = 8}));
+    EXPECT_TRUE(ValidateOptions({.bytes = 9, .sges = 2, .header_bytes = 8}));
 }
 
 TEST(SendTestProtocol, ControlTimeoutEofAndMarkerMismatchAreBounded) {
@@ -103,8 +143,12 @@ protected:
         jetty_.jetty_id.id = 7;
         EXPECT_CALL(*this, CreateJfc(&ctx_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
         EXPECT_CALL(*this, CreateJfr(&ctx_, _)).WillOnce(Return(&jfr_));
-        EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce(Return(&jetty_));
-        EXPECT_CALL(*this, Register(&ctx_, _)).WillOnce([&](auto*, auto* cfg) {
+        EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce([&](auto*, auto* cfg) {
+            EXPECT_EQ(cfg->jfs_cfg.max_sge, options_.sges);
+            return &jetty_;
+        });
+        std::size_t next_segment = 0;
+        EXPECT_CALL(*this, Register(&ctx_, _)).Times(server ? 1 : options_.sges).WillRepeatedly([&](auto*, auto* cfg) {
             // 小于一页的 payload 仍按完整页注册，地址和长度均不能沿用普通堆分配的对齐。
             const auto page = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
             EXPECT_EQ(cfg->va % page, 0u);
@@ -112,7 +156,7 @@ protected:
             EXPECT_GE(cfg->len, 64u * 3);
             EXPECT_EQ(cfg->flag.bs.access,
                       static_cast<unsigned>(URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC));
-            return &seg_;
+            return Segment(next_segment++);
         });
         urma_device_cap_t cap{};
         cap.max_msg_size = 4096;
@@ -120,7 +164,8 @@ protected:
         cap.rm_tp_cap.bs.ctp = 1;
         cap.max_jetty = 1;
         cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 256;
-        cap.max_jfs_sge = cap.max_jfs_rsge = cap.max_jfr_sge = 1;
+        cap.max_jfs_sge = options_.sges;
+        cap.max_jfs_rsge = cap.max_jfr_sge = 1;
         ASSERT_TRUE(session_.Open(&ctx_, cap, options_, server));
     }
     void ExpectClose(bool imported, bool server = false) {
@@ -137,8 +182,13 @@ protected:
         EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
         if (!server) {
-            EXPECT_CALL(*this, Unregister(&seg_)).WillOnce(Return(URMA_SUCCESS));
+            for (std::size_t i = 0; i < options_.sges; ++i) {
+                EXPECT_CALL(*this, Unregister(Segment(i))).WillOnce(Return(URMA_SUCCESS));
+            }
         }
+    }
+    urma_target_seg_t* Segment(std::size_t index) {
+        return index ? &extra_segments_[index - 1] : &seg_;
     }
     static inline SendTestHardware* active_;
     raw::test_support::ScopedUrmaOverride scope_{Functions()};
@@ -149,6 +199,7 @@ protected:
     urma_jfr_t jfr_{};
     urma_jetty_t jetty_{};
     urma_target_seg_t seg_{};
+    std::array<urma_target_seg_t, kMaxSendSges - 1> extra_segments_{};
     urma_target_jetty_t remote_{};
 };
 
@@ -198,7 +249,116 @@ TEST_F(SendTestHardware, ClientRunsMultipleBatchesAndChecksRemoteAcknowledgment)
     ASSERT_TRUE(session_.Close());
 }
 
+TEST_F(SendTestHardware, MultipleRegisteredSgesProduceOneOrderedMessageAndImmediatePerWr) {
+    options_.bytes = 4096;
+    options_.sges = 3;
+    options_.header_bytes = 33;
+    options_.send_imm = true;
+    Open();
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
+    ControlChannel client(fds[0]), peer(fds[1]);
+    ASSERT_TRUE(peer.Write(EncodeHello({.options = options_}), 100));
+    for (auto marker : {3u, 3u, 5u, 5u}) {
+        ASSERT_TRUE(peer.SendMarker(marker, 100));
+    }
+    EXPECT_CALL(*this, Import(&ctx_, _, _)).WillOnce(Return(&remote_));
+    std::array<urma_cr_t, 3> completions{};
+    int pending = 0;
+    std::uint64_t sequence = 0;
+    EXPECT_CALL(*this, PostSend(&jetty_, _, _)).Times(2).WillRepeatedly([&](auto*, auto* wr, auto**) {
+        pending = 0;
+        for (; wr; wr = wr->next) {
+            EXPECT_EQ(wr->opcode, URMA_OPC_SEND_IMM);
+            EXPECT_EQ(wr->send.imm_data, SendImmediate(sequence));
+            EXPECT_EQ(wr->send.src.num_sge, 3u);
+            std::array<std::byte, 4096> assembled{};
+            std::size_t offset = 0;
+            for (std::size_t piece = 0; piece < 3; ++piece) {
+                const auto& sge = wr->send.src.sge[piece];
+                EXPECT_EQ(sge.tseg, Segment(piece));
+                EXPECT_EQ(sge.len, SendSgeLength(options_, piece));
+                const auto* data = reinterpret_cast<const std::byte*>(sge.addr);
+                EXPECT_EQ(data[-1], std::byte{0xa5});
+                EXPECT_EQ(data[sge.len], std::byte{0xa5});
+                std::copy_n(data, sge.len, assembled.begin() + offset);
+                offset += sge.len;
+            }
+            // 仅测试接收模拟端做拼接；实际工具提交分散 MR 中的原始 SGE，不生成连续 TX 副本。
+            EXPECT_EQ(offset, options_.bytes);
+            EXPECT_EQ(CheckPayload(assembled), sequence++);
+            auto& cr = completions[pending++];
+            cr = {};
+            cr.local_id = 7;
+            cr.flag.bs.jetty = 1;
+            cr.user_ctx = wr->user_ctx;
+        }
+        return URMA_SUCCESS;
+    });
+    EXPECT_CALL(*this, Poll(&tx_, _, _)).Times(2).WillRepeatedly([&](auto*, int, auto* cr) {
+        std::reverse_copy(completions.begin(), completions.begin() + pending, cr);
+        return pending;
+    });
+    ASSERT_TRUE(session_.Run(client, false));
+    EXPECT_EQ(session_.stats().accepted, 5u);
+    EXPECT_EQ(session_.stats().retired, 5u);
+    EXPECT_EQ(session_.stats().guarded_segments, 15u);
+    ExpectClose(true);
+    ASSERT_TRUE(session_.Close());
+}
+
+TEST_F(SendTestHardware, GuardCorruptionFailsAfterRetirementWithoutClaimingDmaIsPending) {
+    options_.sges = 2;
+    options_.messages = 3;
+    Open();
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
+    ControlChannel client(fds[0]), peer(fds[1]);
+    ASSERT_TRUE(peer.Write(EncodeHello({.options = options_}), 100));
+    ASSERT_TRUE(peer.SendMarker(3, 100));
+    EXPECT_CALL(*this, Import(&ctx_, _, _)).WillOnce(Return(&remote_));
+    std::array<urma_cr_t, 3> completions{};
+    EXPECT_CALL(*this, PostSend(&jetty_, _, _)).WillOnce([&](auto*, auto* wr, auto**) {
+        // 模拟越界破坏第二段尾部，正常 CQE 不能掩盖 guard 失败。
+        auto& sge = wr->send.src.sge[1];
+        reinterpret_cast<std::byte*>(sge.addr)[sge.len] = std::byte{};
+        std::size_t index = 0;
+        for (; wr; wr = wr->next, ++index) {
+            completions[index].local_id = 7;
+            completions[index].flag.bs.jetty = 1;
+            completions[index].user_ctx = wr->user_ctx;
+        }
+        return URMA_SUCCESS;
+    });
+    EXPECT_CALL(*this, Poll(&tx_, _, _)).WillOnce([&](auto*, int, auto* cr) {
+        std::copy(completions.begin(), completions.end(), cr);
+        return 3;
+    });
+    auto result = session_.Run(client, false);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, EILSEQ);
+    EXPECT_THAT(result.error().operation, ::testing::HasSubstr("guard"));
+    EXPECT_EQ(session_.stats().retired, 3u);
+    ExpectClose(true);
+    EXPECT_TRUE(session_.Close());
+}
+
+TEST_F(SendTestHardware, UnsupportedSgeCapabilityFailsBeforeCreatingQueues) {
+    options_.sges = 2;
+    urma_device_cap_t cap{};
+    cap.max_msg_size = 4096;
+    cap.max_jfs_sge = 1;
+    EXPECT_CALL(*this, CreateJfc(_, _)).Times(0);
+    EXPECT_CALL(*this, Register(_, _)).Times(0);
+    auto result = session_.Open(&ctx_, cap, options_);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, EINVAL);
+    EXPECT_TRUE(session_.Close());
+}
+
 TEST_F(SendTestHardware, ServerPrepostsAndValidatesOutOfOrderReceiveCompletions) {
+    options_.sges = 2;
+    options_.send_imm = true;
     Open(true);
     int fds[2];
     ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
@@ -217,6 +377,8 @@ TEST_F(SendTestHardware, ServerPrepostsAndValidatesOutOfOrderReceiveCompletions)
             FillPayload({reinterpret_cast<std::byte*>(sge.addr), options_.bytes}, sequence++);
             auto& cr = completions[pending++];
             cr = {};
+            cr.opcode = URMA_CR_OPC_SEND_WITH_IMM;
+            cr.imm_data = SendImmediate(sequence - 1);
             cr.flag.bs.s_r = 1;
             cr.completion_len = options_.bytes;
             cr.flag.bs.jetty = 1;
@@ -234,6 +396,7 @@ TEST_F(SendTestHardware, ServerPrepostsAndValidatesOutOfOrderReceiveCompletions)
     });
     ASSERT_TRUE(session_.Run(server, true));
     EXPECT_EQ(sequence, 5u);
+    EXPECT_EQ(session_.stats().received, 5u);
     ExpectClose(false, true);
     ASSERT_TRUE(session_.Close());
 }
@@ -271,6 +434,162 @@ TEST_F(SendTestHardware, ServerReturnsEveryLeaseWhenOnePayloadIsCorrupt) {
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error().code, EILSEQ);
     ExpectClose(false, true);
+    EXPECT_TRUE(session_.Close());
+}
+
+TEST_F(SendTestHardware, ServerRejectsWrongImmediateOrSourceAndReleasesWholeCompletionBatch) {
+    for (bool wrong_source : {false, true}) {
+        options_.sges = 2;
+        options_.send_imm = true;
+        Open(true);
+        int fds[2];
+        ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
+        ControlChannel server(fds[0]), peer(fds[1]);
+        SendTestHello hello{.options = options_};
+        hello.endpoint.id = 99;
+        hello.endpoint.eid.raw[15] = 42;
+        ASSERT_TRUE(peer.Write(EncodeHello(hello), 100));
+        std::array<urma_cr_t, 3> completions{};
+        EXPECT_CALL(*this, PostRecv(&jfr_, _, _)).WillOnce([&](auto*, auto* wr, auto**) {
+            std::size_t index = 0;
+            for (; wr; wr = wr->next, ++index) {
+                FillPayload({reinterpret_cast<std::byte*>(wr->src.sge[0].addr), options_.bytes}, index);
+                auto& cr = completions[index];
+                cr.opcode = URMA_CR_OPC_SEND_WITH_IMM;
+                cr.imm_data = SendImmediate(index);
+                cr.remote_id = hello.endpoint;
+                cr.flag.bs.s_r = cr.flag.bs.jetty = 1;
+                cr.local_id = jetty_.jetty_id.id;
+                cr.user_ctx = wr->user_ctx;
+                cr.completion_len = options_.bytes;
+            }
+            // 首条 CQE 的载荷完整，但通知或来源错误；同批后续 lease 仍必须归还。
+            if (wrong_source) {
+                completions[0].remote_id.eid.raw[15] ^= 1;
+            } else {
+                completions[0].imm_data ^= 1ULL << 48;
+            }
+            return URMA_SUCCESS;
+        });
+        EXPECT_CALL(*this, Poll(&rx_, _, _)).WillOnce([&](auto*, int, auto* cr) {
+            std::copy(completions.begin(), completions.end(), cr);
+            return 3;
+        });
+        auto result = session_.Run(server, true);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, EPROTO);
+        EXPECT_EQ(session_.stats().received, 3u);
+        ExpectClose(false, true);
+        EXPECT_TRUE(session_.Close());
+        ::testing::Mock::VerifyAndClearExpectations(this);
+    }
+}
+
+TEST_F(SendTestHardware, PartialPostRetainsEveryRegisteredSegmentAndDoesNotReplay) {
+    options_.sges = 2;
+    Open();
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
+    ControlChannel client(fds[0]), peer(fds[1]);
+    ASSERT_TRUE(peer.Write(EncodeHello({.options = options_}), 100));
+    ASSERT_TRUE(peer.SendMarker(3, 100));
+    EXPECT_CALL(*this, Import(&ctx_, _, _)).WillOnce(Return(&remote_));
+    EXPECT_CALL(*this, PostSend(&jetty_, _, _)).WillOnce([](auto*, auto* wr, auto** bad) {
+        // 只接受第一个 WR，第二个及以后未接受；不得把部分成功当作可以重放整批。
+        *bad = wr->next;
+        return URMA_ENOMEM;
+    });
+    EXPECT_CALL(*this, Unimport(_)).Times(0);
+    EXPECT_CALL(*this, Unregister(_)).Times(0);
+    EXPECT_CALL(*this, DeleteJetty(_)).Times(0);
+    auto result = session_.Run(client, false);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(session_.stats().accepted, 1u);
+    EXPECT_TRUE(session_.stats().accepted_known);
+    EXPECT_EQ(session_.stats().retired, 0u);
+    auto closed = session_.Close();
+    ASSERT_FALSE(closed);
+    EXPECT_EQ(closed.error().code, EBUSY);
+}
+
+TEST_F(SendTestHardware, UnknownPostBoundaryRetainsAllSgesUntilProcessExit) {
+    options_.sges = 2;
+    Open();
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
+    ControlChannel client(fds[0]), peer(fds[1]);
+    ASSERT_TRUE(peer.Write(EncodeHello({.options = options_}), 100));
+    ASSERT_TRUE(peer.SendMarker(3, 100));
+    EXPECT_CALL(*this, Import(&ctx_, _, _)).WillOnce(Return(&remote_));
+    EXPECT_CALL(*this, PostSend(&jetty_, _, _)).WillOnce([](auto*, auto*, auto** bad) {
+        // 返回失败但没有可信 bad_wr，整批 DMA 归属未知，不能注销任一段。
+        *bad = nullptr;
+        return URMA_ENOMEM;
+    });
+    EXPECT_CALL(*this, Unimport(_)).Times(0);
+    EXPECT_CALL(*this, Unregister(_)).Times(0);
+    EXPECT_CALL(*this, DeleteJetty(_)).Times(0);
+    EXPECT_FALSE(session_.Run(client, false));
+    EXPECT_FALSE(session_.stats().accepted_known);
+    auto closed = session_.Close();
+    ASSERT_FALSE(closed);
+    EXPECT_EQ(closed.error().code, EBUSY);
+}
+
+TEST_F(SendTestHardware, LayoutMismatchIsRejectedBeforeAnyDataWork) {
+    for (unsigned mismatch = 0; mismatch < 3; ++mismatch) {
+        options_.sges = 2;
+        Open();
+        int fds[2];
+        ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), 0);
+        ControlChannel client(fds[0]), peer(fds[1]);
+        auto other = options_;
+        if (!mismatch) {
+            other.sges = 3;
+        } else if (mismatch == 1) {
+            other.header_bytes = 31;
+        } else {
+            other.send_imm = true;
+        }
+        ASSERT_TRUE(peer.Write(EncodeHello({.options = other}), 100));
+        EXPECT_CALL(*this, Import(_, _, _)).Times(0);
+        EXPECT_CALL(*this, PostSend(_, _, _)).Times(0);
+        auto result = session_.Run(client, false);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, EPROTO);
+        ExpectClose(false);
+        EXPECT_TRUE(session_.Close());
+        ::testing::Mock::VerifyAndClearExpectations(this);
+    }
+}
+
+TEST_F(SendTestHardware, LaterRegistrationFailureCleansOnlyThePreviouslyRegisteredSegments) {
+    options_.sges = 2;
+    EXPECT_CALL(*this, CreateJfc(&ctx_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
+    EXPECT_CALL(*this, CreateJfr(&ctx_, _)).WillOnce(Return(&jfr_));
+    EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce(Return(&jetty_));
+    EXPECT_CALL(*this, Register(&ctx_, _)).WillOnce(Return(&seg_)).WillOnce([](auto*, auto*) -> urma_target_seg_t* {
+        errno = ENOMEM;
+        return nullptr;
+    });
+    urma_device_cap_t cap{};
+    cap.max_msg_size = 4096;
+    cap.trans_mode = URMA_TM_RM;
+    cap.rm_tp_cap.bs.ctp = 1;
+    cap.max_jetty = 1;
+    cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 256;
+    cap.max_jfs_sge = 2;
+    cap.max_jfs_rsge = cap.max_jfr_sge = 1;
+    auto result = session_.Open(&ctx_, cap, options_);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, ENOMEM);
+    // 尚未提交 WR，失败的第二段无注销对象；第一段仍须显式注销后才释放其内存。
+    ::testing::InSequence order;
+    EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, Unregister(&seg_)).WillOnce(Return(URMA_SUCCESS));
     EXPECT_TRUE(session_.Close());
 }
 

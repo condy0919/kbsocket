@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+cc_library(
+    name = "peer_process",
+    srcs = ["process.cpp"],
+    hdrs = ["process.hpp"],
+    visibility = [
+        "//tools/async_error_test:__pkg__",
+        "//tools/async_event_test:__pkg__",
+        "//tools/rma_failure_test:__pkg__",
+        "//tools/sq_multiplex_test:__pkg__",
+    ],
+    deps = ["//tools/common:control_channel"],
+)
+
+cc_library(
+    name = "peer_failure_support",
+    srcs = ["peer_failure_test.cpp"],
+    hdrs = ["peer_failure_test.hpp"],
+    deps = [
+        ":peer_process",
+        "//kbsocket/transport/raw:attempt_ledger",
+        "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:rx_buffer_pool",
+        "//kbsocket/transport/raw:tx_sender",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+    ],
+)
+
+cc_binary(
+    name = "peer_failure_test",
+    srcs = ["main.cpp"],
+    deps = [
+        ":peer_failure_support",
+        ":peer_process",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:raw_runtime",
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+        "@gflags",
+    ],
+)
+
+cc_test(
+    name = "peer_failure_unit_test",
+    srcs = ["peer_failure_unit_test.cpp"],
+    deps = [
+        ":peer_failure_support",
+        ":peer_process",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:urma_api",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)

@@ -45,11 +45,13 @@ struct UrmaFunctions {
     decltype(&::urma_create_jfr) create_jfr = nullptr;
     decltype(&::urma_delete_jfr) delete_jfr = nullptr;
     decltype(&::urma_modify_jfr) modify_jfr = nullptr;
+    decltype(&::urma_query_jfr) query_jfr = nullptr;
 
     // Jetty 与收发
     decltype(&::urma_create_jetty) create_jetty = nullptr;
     decltype(&::urma_delete_jetty) delete_jetty = nullptr;
     decltype(&::urma_modify_jetty) modify_jetty = nullptr;
+    decltype(&::urma_query_jetty) query_jetty = nullptr;
     decltype(&::urma_bind_jetty) bind_jetty = nullptr;
     decltype(&::urma_unbind_jetty) unbind_jetty = nullptr;
     decltype(&::urma_import_jetty) import_jetty = nullptr;
@@ -201,6 +203,10 @@ public:
         return Invoke<true>(functions_.modify_jfr, jfr, attr);
     }
 
+    static urma_status_t QueryJfr(urma_jfr_t* jfr, urma_jfr_cfg_t* cfg, urma_jfr_attr_t* attr) {
+        return Invoke<true>(functions_.query_jfr, jfr, cfg, attr);
+    }
+
     static urma_jetty_t* CreateJetty(urma_context_t* ctx, urma_jetty_cfg_t* jetty_cfg) {
         return Invoke(functions_.create_jetty, ctx, jetty_cfg);
     }
@@ -211,6 +217,10 @@ public:
 
     static urma_status_t ModifyJetty(urma_jetty_t* jetty, urma_jetty_attr_t* attr) {
         return Invoke<true>(functions_.modify_jetty, jetty, attr);
+    }
+
+    static urma_status_t QueryJetty(urma_jetty_t* jetty, urma_jetty_cfg_t* cfg, urma_jetty_attr_t* attr) {
+        return Invoke<true>(functions_.query_jetty, jetty, cfg, attr);
     }
 
     static urma_status_t BindJetty(urma_jetty_t* jetty, urma_target_jetty_t* tjetty) {

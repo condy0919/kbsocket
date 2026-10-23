@@ -16,7 +16,8 @@
 
 namespace kbsocket {
 namespace raw {
-/// 单个 Raw 设备的配置项，指定设备名称及其绑定的本地 EID 索引。
+/// 单个本地端点的配置项，指定裸设备名称及其绑定的 EID 索引。
+/// 同一设备可配置多个不同 EID，每项独立创建 context；设备名称与 EID 索引的组合不得重复。
 struct DeviceConfig {
     std::string device_name;
     std::uint32_t eid_index = 0;
@@ -41,6 +42,7 @@ enum class RuntimeCloseErrorCode : std::uint8_t {
 /// 运行时关闭失败的详细错误信息。
 struct RuntimeCloseError {
     RuntimeCloseErrorCode code;
+    // 完整配置中的端点索引，同设备的不同 EID 分别编号。
     std::size_t device_index = 0;
     // 底层 URMA 状态码（如 context 关闭失败或 urma_uninit 失败）。
     int provider_error = 0;
@@ -49,6 +51,7 @@ struct RuntimeCloseError {
 /// 运行时初始化失败的详细错误信息。
 struct RuntimeError {
     RuntimeErrorCode code;
+    // 完整配置中的端点索引，同设备的不同 EID 分别编号。
     std::size_t device_index = 0;
     // 底层 URMA 状态码（如 urma_init 失败时）。
     int provider_error = 0;
@@ -58,7 +61,8 @@ struct RuntimeError {
     std::optional<RuntimeCloseError> cleanup_error;
 };
 
-/// 单个 URMA 会话的核心所有者，管理设备的目录枚举与 context 创建（每个配置设备绑定一个 EID/context）。
+/// 单个 URMA 会话的核心所有者，管理设备目录及按配置顺序创建的端点 context。
+/// 同一设备的多个 EID 共用一次目录查询，每个配置端点独立拥有一个 context。
 ///
 /// 生命周期与使用契约：
 /// - 宿主须在初始化前完成 `UrmaApi::Load()`；本类负责驱动 `UrmaApi::Init()` 与 `UrmaApi::Uninit()`；
@@ -77,7 +81,7 @@ public:
 
     ~RawRuntime();
 
-    /// 初始化 URMA 会话、枚举设备目录并为配置的设备依次打开 context。
+    /// 初始化 URMA 会话、按不同设备枚举目录，并按完整配置顺序为每个端点依次打开 context。
     /// 任一环节失败均会自动执行回滚，并在返回的错误中保留原始失败原因及回滚状态。
     std::expected<void, RuntimeError> Initialize(const std::vector<DeviceConfig>& devices) noexcept;
 
@@ -91,8 +95,8 @@ public:
         return ready_;
     }
 
-    /// 获取成功打开的 context 数量；未就绪时返回 0。
-    std::size_t device_count() const noexcept {
+    /// 获取成功打开的 context 数量；同一设备的多个 EID 分别计数，未就绪时返回 0。
+    std::size_t context_count() const noexcept {
         return ready_ ? contexts_.size() : 0;
     }
 

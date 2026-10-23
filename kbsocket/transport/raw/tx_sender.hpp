@@ -15,11 +15,13 @@
 
 namespace kbsocket {
 namespace raw {
-/// 首版仅支持普通、非 inline、全 signal SEND，SGE 必须引用已注册的本地内存。
+/// 支持非 inline、全 signal 的 SEND 和 SEND_WITH_IMM，SGE 必须引用已注册的本地内存。
 /// 描述符覆盖 Send 调用；目标、注册段和 payload 覆盖对应 attempt 的完整生命周期。
 struct TxSendRequest {
     AttemptMetadata metadata;
     std::span<urma_sge_t> sges;
+    /// 仅 URMA_OPC_SEND_IMM 使用，按 URMA 契约传递主机字节序的 64 位值。
+    std::uint64_t imm_data = 0;
 };
 
 enum class TxSendErrorCode : std::uint8_t {
@@ -62,7 +64,7 @@ public:
     std::expected<void, TxSendError> Open(AttemptLedger& ledger) noexcept;
     std::expected<void, TxSendError> Close() noexcept;
 
-    /// 支持一条或多条 SEND，同一批使用一个 SQ，可指定 lane 或由池选择。
+    /// 支持一条或多条 SEND/SEND_WITH_IMM 混合提交，同一批使用一个 SQ，可指定 lane 或由池选择。
     /// post 前预留整批；额度不足则全部撤销，不提交部分预留的请求。
     /// ids 至少与 requests 等长；有效输入下清零对应范围，仅保留未退休记录的 id。
     /// 成功返回请求数；部分失败返回 accepted，前缀 id 留在账本，已取消后缀 id 为 0。

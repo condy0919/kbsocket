@@ -27,6 +27,8 @@ public:
     MOCK_METHOD(urma_status_t, DeleteJetty, (urma_jetty_t*));
     MOCK_METHOD(urma_status_t, Post, (urma_jetty_t*, urma_jfs_wr_t*, urma_jfs_wr_t**));
     MOCK_METHOD(int, Poll, (urma_jfc_t*, int, urma_cr_t*));
+    MOCK_METHOD(urma_status_t, Modify, (urma_jetty_t*, urma_jetty_attr_t*));
+    MOCK_METHOD(int, Flush, (urma_jetty_t*, int, urma_cr_t*));
 };
 
 class JettyPoolTest : public ::testing::Test {
@@ -58,6 +60,8 @@ public:
         f.delete_jetty = [](auto* q) { return active_->DeleteJetty(q); };
         f.poll_jfc = [](auto* q, int n, auto* cr) { return active_->Poll(q, n, cr); };
         f.post_jetty_send_wr = [](auto* q, auto* wr, auto** bad) { return active_->Post(q, wr, bad); };
+        f.modify_jetty = [](auto* q, auto* attr) { return active_->Modify(q, attr); };
+        f.flush_jetty = [](auto* q, int n, auto* cr) { return active_->Flush(q, n, cr); };
         return f;
     }
 
@@ -612,6 +616,70 @@ TEST_F(JettyPoolTest, LinkPriorityFlagIsParsedAndValidatedBeforeCreatingResource
         ASSERT_FALSE(result);
         EXPECT_EQ(result.error().failure.code, JettyPoolErrorCode::kInvalidArgument);
     }
+}
+
+TEST_F(JettyPoolTest, FlushRequestFitsSqDepthAndCallerBufferEvenWithNoOutstandingTickets) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    struct FlushCase {
+        unsigned tx_depth;
+        std::size_t buffer_size;
+        int expected_count;
+    };
+    // CQ poll 缓冲可大于单个 SQ；flush 却受该 SQ 深度约束，二者不能共用数量假设。
+    const std::array cases{FlushCase{1, 64, 1}, FlushCase{32, 64, 32}, FlushCase{128, 64, 64}, FlushCase{32, 8, 8}};
+    std::array<urma_cr_t, 64> completions{};
+    for (const auto& test : cases) {
+        SCOPED_TRACE(test.tx_depth);
+        JettyPoolConfig config;
+        config.tx_depth = test.tx_depth;
+        ExpectCreate(-1, test.tx_depth);
+        JettyPool pool;
+        ASSERT_TRUE(pool.Open(&ctx_, cap_, config));
+        auto ticket = pool.Reserve();
+        ASSERT_TRUE(ticket);
+        const auto lane = ticket->lane;
+        ASSERT_TRUE(pool.Cancel(*ticket));
+        EXPECT_CALL(mock_, Modify(&jetty_, _)).WillOnce(Return(URMA_SUCCESS));
+        ASSERT_TRUE(pool.BeginDrain(lane));
+        ASSERT_TRUE(pool.ObserveFlushDone(lane));
+
+        // 即使票据已清零，也必须以合法正数请求一次 flush，取得软件队列为空的证据。
+        EXPECT_CALL(mock_, Flush(&jetty_, test.expected_count, completions.data())).WillOnce(Return(0));
+        EXPECT_EQ(pool.FlushSend(lane, std::span(completions).first(test.buffer_size)), 0);
+        EXPECT_EQ(pool.lane_state(lane), JettyLaneState::kDrained);
+        ExpectDelete();
+        EXPECT_TRUE(pool.Close());
+    }
+}
+
+TEST_F(JettyPoolTest, FlushRejectsCountExceedingClampedRequestEvenWhenBufferCanHoldIt) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    JettyPoolConfig config;
+    config.tx_depth = 32;
+    ExpectCreate(-1, 32);
+    JettyPool pool;
+    ASSERT_TRUE(pool.Open(&ctx_, cap_, config));
+    auto ticket = pool.Reserve();
+    ASSERT_TRUE(ticket);
+    const auto lane = ticket->lane;
+    ASSERT_TRUE(pool.Cancel(*ticket));
+    EXPECT_CALL(mock_, Modify(&jetty_, _)).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_TRUE(pool.BeginDrain(lane));
+    ASSERT_TRUE(pool.ObserveFlushDone(lane));
+    std::array<urma_cr_t, 64> completions{};
+
+    // 33 虽未超过输出数组长度，却超过本次实际请求的 32；不得将它发布给完成处理器。
+    EXPECT_CALL(mock_, Flush(&jetty_, 32, completions.data())).WillOnce(Return(33));
+    auto invalid = pool.FlushSend(lane, completions);
+    ASSERT_FALSE(invalid);
+    EXPECT_EQ(invalid.error().code, JettyPoolErrorCode::kFlushFailed);
+    EXPECT_EQ(invalid.error().provider_error, 33);
+    EXPECT_EQ(pool.lane_state(lane), JettyLaneState::kFlushReady);
+    EXPECT_CALL(mock_, Flush(&jetty_, 32, completions.data())).WillOnce(Return(0));
+    EXPECT_EQ(pool.FlushSend(lane, completions), 0);
+    EXPECT_EQ(pool.lane_state(lane), JettyLaneState::kDrained);
+    ExpectDelete();
+    EXPECT_TRUE(pool.Close());
 }
 
 TEST_F(JettyPoolTest, InvalidLimitsNeverCallProvider) {

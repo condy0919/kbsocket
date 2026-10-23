@@ -4,6 +4,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 
 #include <gmock/gmock.h>
@@ -92,7 +93,13 @@ protected:
         f.post_jfr_wr = [](auto* q, auto* w, auto** b) { return active_->PostRecv(q, w, b); };
         f.modify_jetty = [](auto* q, auto* a) { return active_->Modify(q, a); };
         f.poll_jfc = [](auto* q, int n, auto* cr) { return active_->Poll(q, n, cr); };
-        f.flush_jetty = [](auto* q, int n, auto* cr) { return active_->Flush(q, n, cr); };
+        f.flush_jetty = [](auto* q, int n, auto* cr) {
+            // 原 mock 未检查 liburma 的深度上限，导致小 SQ 使用 64 条 flush 预算也能通过测试。
+            if (q == nullptr || cr == nullptr || n <= 0 || static_cast<unsigned>(n) > q->jetty_cfg.jfs_cfg.depth) {
+                return -URMA_EINVAL;
+            }
+            return active_->Flush(q, n, cr);
+        };
         f.unimport_jetty = [](auto* q) { return active_->Unimport(q); };
         f.delete_jetty = [](auto* q) { return active_->DeleteJetty(q); };
         f.delete_jfr = [](auto* q) { return active_->DeleteJfr(q); };
@@ -120,6 +127,7 @@ protected:
         EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce([&](auto*, auto* cfg) {
             EXPECT_EQ(cfg->jfs_cfg.flag.bs.error_suspend, 0u);
             EXPECT_EQ(cfg->jfs_cfg.depth, server ? 1u : options_.batch);
+            jetty_.jetty_cfg = *cfg;
             return &jetty_;
         });
         if (server) {
@@ -264,8 +272,9 @@ TEST_P(TxDrainDistribution, EveryAttemptRetiresOnceAcrossHardwareAndSoftwareBatc
                 }
                 return count;
             });
-        EXPECT_CALL(*this, Flush(&jetty_, 64, _))
-            .Times((options_.batch - hardware + 63) / 64 + 1)
+        const auto flush_budget = std::min(64u, options_.batch);
+        EXPECT_CALL(*this, Flush(&jetty_, flush_budget, _))
+            .Times((options_.batch - hardware + flush_budget - 1) / flush_budget + 1)
             .WillRepeatedly([&](auto*, int n, auto* out) {
                 int count = 0;
                 while (count < n && flushed < options_.batch) {
@@ -402,7 +411,7 @@ TEST_F(TxDrainHardware, EmptySoftwareQueueWithResidualAttemptsFailsAndRetainsMem
         out[0] = Completion(ids_[0], URMA_CR_WR_FLUSH_ERR_DONE);
         return 1;
     });
-    EXPECT_CALL(*this, Flush(&jetty_, 64, _)).WillOnce(Return(0));
+    EXPECT_CALL(*this, Flush(&jetty_, std::min(64u, options_.batch), _)).WillOnce(Return(0));
     EXPECT_FALSE(session_->Run(client));
     EXPECT_EQ(session_->stats().retired, 0u);
     ExpectRetained();
@@ -433,7 +442,7 @@ TEST_F(TxDrainHardware, SoftwareFlushFailureDoesNotDeclareEmptyOrFreeBuffers) {
         out[0] = Completion(0, URMA_CR_WR_FLUSH_ERR_DONE);
         return 1;
     });
-    EXPECT_CALL(*this, Flush(&jetty_, 64, _)).WillOnce(Return(-7));
+    EXPECT_CALL(*this, Flush(&jetty_, std::min(64u, options_.batch), _)).WillOnce(Return(-7));
     auto result = session_->Run(client);
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error().code, -7);

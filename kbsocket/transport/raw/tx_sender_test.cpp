@@ -3,6 +3,7 @@
 #include "kbsocket/transport/raw/tx_sender.hpp"
 
 #include <array>
+#include <limits>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -109,6 +110,13 @@ protected:
         return {Metadata(connection), std::span(&sge_, 1)};
     }
 
+    TxSendRequest ImmediateRequest(std::uint64_t value, std::uint64_t connection = 1) {
+        auto request = Request(connection);
+        request.metadata.opcode = URMA_OPC_SEND_IMM;
+        request.imm_data = value;
+        return request;
+    }
+
     void CheckUncertainBoundary(bool success, bool foreign) {
         std::array requests{Request(), Request(2)};
         std::array<AttemptId, 2> ids{};
@@ -199,6 +207,135 @@ TEST_F(TxSenderTest, SingleSubmissionsShareLaneWhileFirstRequestRemainsInFlight)
     EXPECT_EQ(completed_second->submission_sequence, 2u);
     EXPECT_TRUE(ledger_.Lookup(first_id[0]));
     ASSERT_TRUE(ledger_.Complete(first_id[0]));
+}
+
+TEST_F(TxSenderTest, ImmediateValuesPreserveAll64BitsAndLedgerOpcode) {
+    // 同时检查全零、全一和仅最高位，防止截断为 32 位、字节序转换或把零值当作普通 SEND。
+    constexpr std::array<std::uint64_t, 3> values{0, std::numeric_limits<std::uint64_t>::max(), std::uint64_t{1} << 63};
+    std::array requests{ImmediateRequest(values[0]), ImmediateRequest(values[1], 2), ImmediateRequest(values[2])};
+    std::array<AttemptId, 3> ids{};
+    EXPECT_CALL(*this, Post(&jetty_, _, _)).WillOnce([&](auto*, auto* wr, auto**) {
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+            if (!wr) {
+                ADD_FAILURE() << "missing immediate WR";
+                return URMA_EINVAL;
+            }
+            EXPECT_EQ(wr->opcode, URMA_OPC_SEND_IMM);
+            EXPECT_EQ(wr->send.imm_data, values[i]);
+            EXPECT_EQ(wr->send.src.sge, &sge_);
+            EXPECT_EQ(wr->send.src.num_sge, 1u);
+            EXPECT_EQ(wr->flag.bs.complete_enable, 1u);
+            EXPECT_EQ(wr->flag.bs.inline_flag, 0u);
+            EXPECT_EQ(wr->tjetty, requests[i].metadata.target);
+            EXPECT_EQ(wr->user_ctx, ids[i]);
+            wr = wr->next;
+        }
+        EXPECT_EQ(wr, nullptr);
+        return URMA_SUCCESS;
+    });
+    ASSERT_EQ(sender_.Send(requests, ids), requests.size());
+    for (auto id : ids) {
+        auto record = ledger_.Complete(id);
+        ASSERT_TRUE(record);
+        EXPECT_EQ(record->metadata.opcode, URMA_OPC_SEND_IMM);
+    }
+}
+
+TEST_F(TxSenderTest, MixedBatchIgnoresImmediateFieldForPlainSendAndClearsReusedDescriptor) {
+    std::array requests{ImmediateRequest(0xFEDCBA9876543210ULL), Request(2), ImmediateRequest(0x8000000000000001ULL)};
+    requests[1].imm_data = 0xFFFFFFFFFFFFFFFFULL;
+    std::array<AttemptId, 3> ids{};
+    EXPECT_CALL(*this, Post(&jetty_, _, _)).WillOnce([&](auto*, auto* wr, auto**) {
+        for (const auto& request : requests) {
+            if (!wr) {
+                ADD_FAILURE() << "missing mixed WR";
+                return URMA_EINVAL;
+            }
+            EXPECT_EQ(wr->opcode, request.metadata.opcode);
+            EXPECT_EQ(wr->send.imm_data, request.metadata.opcode == URMA_OPC_SEND_IMM ? request.imm_data : 0);
+            wr = wr->next;
+        }
+        EXPECT_EQ(wr, nullptr);
+        return URMA_SUCCESS;
+    });
+    ASSERT_EQ(sender_.Send(requests, ids), requests.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        auto record = ledger_.Complete(ids[i]);
+        ASSERT_TRUE(record);
+        EXPECT_EQ(record->metadata.opcode, requests[i].metadata.opcode);
+    }
+    // 下一批复用第一个描述符时，普通 SEND 不得携带上一批的 IMM 或 next 指针。
+    std::array plain{Request()};
+    plain[0].imm_data = 42;
+    EXPECT_CALL(*this, Post(&jetty_, _, _)).WillOnce([](auto*, auto* wr, auto**) {
+        EXPECT_EQ(wr->opcode, URMA_OPC_SEND);
+        EXPECT_EQ(wr->send.imm_data, 0u);
+        EXPECT_EQ(wr->next, nullptr);
+        return URMA_SUCCESS;
+    });
+    ASSERT_EQ(sender_.Send(plain, ids), 1u);
+    ASSERT_TRUE(ledger_.Complete(ids[0]));
+}
+
+TEST_F(TxSenderTest, MixedPartialPostRetriesOnlyUnacceptedSuffixWithOriginalImmediateData) {
+    std::array requests{ImmediateRequest(0x123456789ABCDEF0ULL), Request(2),
+                        ImmediateRequest(0x8000000000000000ULL, 2)};
+    std::array<AttemptId, 3> ids{};
+    EXPECT_CALL(*this, Post(&jetty_, _, _)).WillOnce([&](auto*, auto* wr, auto** bad) {
+        EXPECT_EQ(wr->opcode, URMA_OPC_SEND_IMM);
+        EXPECT_EQ(wr->send.imm_data, requests[0].imm_data);
+        *bad = wr->next;
+        return URMA_EAGAIN;
+    });
+    auto first = sender_.Send(requests, ids);
+    ASSERT_FALSE(first);
+    EXPECT_EQ(first.error().code, TxSendErrorCode::kPostFailed);
+    EXPECT_EQ(first.error().accepted, 1u);
+    EXPECT_EQ(first.error().provider_status, URMA_EAGAIN);
+    EXPECT_EQ(ledger_.posted(), 1u);
+    ASSERT_NE(ids[0], 0u);
+    EXPECT_EQ(ids[1], 0u);
+    EXPECT_EQ(ids[2], 0u);
+    const auto accepted_id = ids[0];
+    // 前缀保持在途；后缀撤销后可立即重试，并保留原 opcode 和 IMM，不能重放前缀。
+    EXPECT_CALL(*this, Post(&jetty_, _, _)).WillOnce([&](auto*, auto* wr, auto**) {
+        EXPECT_EQ(wr->opcode, URMA_OPC_SEND);
+        EXPECT_EQ(wr->send.imm_data, 0u);
+        EXPECT_NE(wr->user_ctx, accepted_id);
+        if (!wr->next) {
+            ADD_FAILURE() << "missing retried immediate WR";
+            return URMA_EINVAL;
+        }
+        EXPECT_EQ(wr->next->opcode, URMA_OPC_SEND_IMM);
+        EXPECT_EQ(wr->next->send.imm_data, requests[2].imm_data);
+        EXPECT_NE(wr->next->user_ctx, accepted_id);
+        EXPECT_EQ(wr->next->next, nullptr);
+        return URMA_SUCCESS;
+    });
+    ASSERT_EQ(sender_.Send(std::span(requests).subspan(1), std::span(ids).subspan(1)), 2u);
+    EXPECT_EQ(ids[0], accepted_id);
+    EXPECT_EQ(ledger_.posted(), 3u);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        auto record = ledger_.Complete(ids[i]);
+        ASSERT_TRUE(record);
+        EXPECT_EQ(record->submission_sequence, i + 1);
+        EXPECT_EQ(record->metadata.opcode, requests[i].metadata.opcode);
+        EXPECT_EQ(record->metadata.target, requests[i].metadata.target);
+    }
+}
+
+TEST_F(TxSenderTest, UnsupportedOpcodeRejectsWholeMixedBatchBeforePreparing) {
+    // 非法 opcode 放在合法 IMM 后面，确保整个批次先检查，不能先提交或预留合法前缀。
+    std::array requests{ImmediateRequest(0xFFFFFFFFFFFFFFFFULL), Request()};
+    requests[1].metadata.opcode = URMA_OPC_WRITE;
+    std::array<AttemptId, 2> ids{100, 200};
+    const auto result = sender_.Send(requests, ids);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, TxSendErrorCode::kInvalidArgument);
+    EXPECT_EQ(result.error().accepted, 0u);
+    EXPECT_EQ(ledger_.size(), 0u);
+    EXPECT_EQ(ids[0], 0u);
+    EXPECT_EQ(ids[1], 0u);
 }
 
 TEST_F(TxSenderTest, AccountingFailureNeverCancelsAcceptedRequests) {

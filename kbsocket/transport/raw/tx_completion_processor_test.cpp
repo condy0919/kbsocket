@@ -192,7 +192,106 @@ TEST_F(TxCompletionProcessorTest, DuplicateAndUnknownIdsDoNotDropLaterValidCqes)
     EXPECT_EQ(events[3].record->metadata.connection_id, 2u);
 }
 
-TEST_F(TxCompletionProcessorTest, ErrorTransitionsHardwareBeforeBoundaryAndSoftwareDrain) {
+TEST_F(TxCompletionProcessorTest, RemoteAbortRetiresOnlyItsAttemptAndKeepsTheSharedSqUsable) {
+    std::array requests{Request(1), Request(2), Request(2)};
+    std::array<AttemptId, 3> ids{};
+    auto lane = pool_.FindLane(jetty_.jetty_id.id);
+    ASSERT_TRUE(lane);
+    EXPECT_CALL(*this, Post(&jetty_, _, _)).WillOnce([&](auto*, auto* wr, auto**) {
+        EXPECT_EQ(wr->tjetty, &remote_a_);
+        EXPECT_EQ(wr->next->tjetty, &remote_b_);
+        EXPECT_EQ(wr->next->next->tjetty, &remote_b_);
+        return URMA_SUCCESS;
+    });
+    ASSERT_TRUE(sender_.Send(requests, ids, *lane));
+    EXPECT_EQ(ledger_.posted(), 3u);
+    EXPECT_EQ(pool_.available(), 0u);
+
+    // 两个目标共用同一 SQ；故障目标先返回 status 8，再出现重复 CQE 和健康目标完成。
+    // 重复完成不能多退额度，首条远端失败也不能阻止本批后面的健康完成或主动 modify/flush。
+    std::array<TxCompletionEvent, 3> events{};
+    EXPECT_CALL(*this, Poll(&tx_, 3, _)).WillOnce([&](auto*, int, auto* out) {
+        out[0] = Completion(ids[0], URMA_CR_REM_ACCESS_ABORT_ERR);
+        out[1] = out[0];
+        out[2] = Completion(ids[1]);
+        return 3;
+    });
+    auto batch = processor_.Poll(events);
+    ASSERT_TRUE(batch);
+    EXPECT_EQ(batch->count, 3u);
+    EXPECT_EQ(batch->retired, 2u);
+    EXPECT_EQ(events[0].kind, TxCompletionKind::kCompleted);
+    EXPECT_EQ(events[0].completion.status, URMA_CR_REM_ACCESS_ABORT_ERR);
+    EXPECT_FALSE(events[0].error);
+    ASSERT_TRUE(events[0].record);
+    const auto& failed = *events[0].record;
+    EXPECT_EQ(failed.id, ids[0]);
+    EXPECT_EQ(failed.metadata.connection_id, 1u);
+    EXPECT_EQ(failed.metadata.target, &remote_a_);
+    EXPECT_EQ(failed.metadata.operation_id, 42u);
+    EXPECT_EQ(failed.metadata.operation_generation, 7u);
+    EXPECT_EQ(failed.metadata.buffer_lease, 10u);
+    EXPECT_EQ(failed.metadata.grant_lease, 100u);
+    EXPECT_EQ(failed.metadata.opcode, URMA_OPC_SEND);
+    EXPECT_EQ(events[1].kind, TxCompletionKind::kRejected);
+    ASSERT_TRUE(events[1].error);
+    EXPECT_EQ(events[1].error->code, TxCompletionErrorCode::kLedgerFailure);
+    EXPECT_FALSE(events[1].record);
+    EXPECT_EQ(events[2].completion.status, URMA_CR_SUCCESS);
+    ASSERT_TRUE(events[2].record);
+    EXPECT_EQ(events[2].record->metadata.connection_id, 2u);
+    EXPECT_EQ(events[2].record->metadata.target, &remote_b_);
+    EXPECT_EQ(ledger_.posted(), 1u);
+    EXPECT_FALSE(ledger_.Lookup(ids[0]));
+    EXPECT_FALSE(ledger_.Lookup(ids[1]));
+    EXPECT_TRUE(ledger_.Lookup(ids[2]));
+    EXPECT_EQ(pool_.lane_state(*lane), JettyLaneState::kReady);
+
+    // 恰好归还两个额度：健康连接可经真实 TxSender 再提交两条，第三条仍因满额被拒绝。
+    // 使用新的 attempt 身份，不能把失败请求悄悄重放或把重复 CQE 误当成额外空闲额度。
+    std::array followup{Request(2), Request(2)};
+    std::array<AttemptId, 2> followup_ids{};
+    EXPECT_CALL(*this, Post(&jetty_, _, _)).WillOnce([&](auto*, auto* wr, auto**) {
+        EXPECT_EQ(wr->tjetty, &remote_b_);
+        EXPECT_EQ(wr->next->tjetty, &remote_b_);
+        EXPECT_EQ(wr->next->next, nullptr);
+        return URMA_SUCCESS;
+    });
+    ASSERT_TRUE(sender_.Send(followup, followup_ids, *lane));
+    EXPECT_EQ(ledger_.posted(), 3u);
+    EXPECT_EQ(pool_.available(), 0u);
+    EXPECT_GT(followup_ids[0], ids[2]);
+    std::array extra{Request(2)};
+    std::array<AttemptId, 1> extra_ids{};
+    auto full = sender_.Send(extra, extra_ids, *lane);
+    ASSERT_FALSE(full);
+    EXPECT_EQ(full.error().accepted, 0u);
+    EXPECT_EQ(ledger_.posted(), 3u);
+    EXPECT_CALL(*this, Poll(&tx_, 3, _)).WillOnce([&](auto*, int, auto* out) {
+        out[0] = Completion(ids[2]);
+        out[1] = Completion(followup_ids[0]);
+        out[2] = Completion(followup_ids[1]);
+        return 3;
+    });
+    batch = processor_.Poll(events);
+    ASSERT_TRUE(batch);
+    EXPECT_EQ(batch->retired, 3u);
+    for (const auto& event : events) {
+        EXPECT_EQ(event.kind, TxCompletionKind::kCompleted);
+        EXPECT_EQ(event.completion.status, URMA_CR_SUCCESS);
+        EXPECT_FALSE(event.error);
+        ASSERT_TRUE(event.record);
+        EXPECT_EQ(event.record->metadata.connection_id, 2u);
+    }
+    EXPECT_EQ(ledger_.size(), 0u);
+    EXPECT_EQ(pool_.lane_state(*lane), JettyLaneState::kReady);
+    EXPECT_EQ(pool_.available(), 1u);
+}
+
+class TxCompletionDrainStatusTest : public TxCompletionProcessorTest,
+                                    public ::testing::WithParamInterface<urma_cr_status_t> {};
+
+TEST_P(TxCompletionDrainStatusTest, ErrorTransitionsHardwareBeforeBoundaryAndSoftwareDrain) {
     std::array requests{Request(), Request(2), Request()};
     std::array<AttemptId, 3> ids{};
     EXPECT_CALL(*this, Post(&jetty_, _, _)).WillOnce(Return(URMA_SUCCESS));
@@ -200,6 +299,7 @@ TEST_F(TxCompletionProcessorTest, ErrorTransitionsHardwareBeforeBoundaryAndSoftw
     auto lane = pool_.FindLane(jetty_.jetty_id.id);
     ASSERT_TRUE(lane);
     std::array<TxCompletionEvent, 3> events{};
+    // 本次只豁免 status 8；ACK_TIMEOUT/RNR 仍保留原有排空策略，不能顺便放宽其他错误。
     // error continue 不自动停止硬件。软件先禁止新提交，才发 modify(ERROR)。
     EXPECT_CALL(*this, Modify(&jetty_, _)).WillOnce([&](auto*, auto* attr) {
         EXPECT_EQ(attr->mask, JETTY_STATE);
@@ -209,7 +309,7 @@ TEST_F(TxCompletionProcessorTest, ErrorTransitionsHardwareBeforeBoundaryAndSoftw
         return URMA_SUCCESS;
     });
     EXPECT_CALL(*this, Poll(&tx_, 3, _)).WillOnce([&](auto*, int, auto* out) {
-        out[0] = Completion(ids[0], URMA_CR_ACK_TIMEOUT_ERR);
+        out[0] = Completion(ids[0], GetParam());
         return 1;
     });
     auto batch = processor_.Poll(events);
@@ -260,6 +360,63 @@ TEST_F(TxCompletionProcessorTest, ErrorTransitionsHardwareBeforeBoundaryAndSoftw
     EXPECT_FALSE(sender_.Send(retry, retry_ids, *lane));
     ASSERT_TRUE(processor_.Flush(*lane, events)); // 已排空后不再访问 provider。
 }
+
+INSTANTIATE_TEST_SUITE_P(UnchangedDrainPolicy, TxCompletionDrainStatusTest,
+                         ::testing::Values(URMA_CR_ACK_TIMEOUT_ERR, URMA_CR_RNR_RETRY_CNT_EXC_ERR));
+
+class TxCompletionRemoteAbortOnFaultedLaneTest : public TxCompletionProcessorTest,
+                                                 public ::testing::WithParamInterface<bool> {};
+
+TEST_P(TxCompletionRemoteAbortOnFaultedLaneTest, RetiresKnownAttemptsWithoutReopeningTheLane) {
+    std::array requests{Request(1), Request(2)};
+    std::array<AttemptId, 2> ids{};
+    EXPECT_CALL(*this, Post(&jetty_, _, _)).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_TRUE(sender_.Send(requests, ids));
+    auto lane = pool_.FindLane(jetty_.jetty_id.id);
+    ASSERT_TRUE(lane);
+    const bool hardware_error = GetParam();
+    if (hardware_error) {
+        EXPECT_CALL(*this, Modify(&jetty_, _)).WillOnce(Return(URMA_SUCCESS));
+        ASSERT_TRUE(pool_.BeginDrain(*lane));
+    } else {
+        ASSERT_TRUE(pool_.MarkFaulted(*lane));
+    }
+    // SQ 已因其他原因隔离；迟到的 status 8 只退休对应 WR，不重试 modify，也不能恢复 READY。
+    const auto expected_state = hardware_error ? JettyLaneState::kError : JettyLaneState::kFaulted;
+    std::array<TxCompletionEvent, 2> events{};
+    EXPECT_CALL(*this, Poll(&tx_, 2, _)).WillOnce([&](auto*, int, auto* out) {
+        out[0] = Completion(ids[0], URMA_CR_REM_ACCESS_ABORT_ERR);
+        out[1] = Completion(ids[1]);
+        return 2;
+    });
+    auto batch = processor_.Poll(events);
+    ASSERT_TRUE(batch);
+    EXPECT_EQ(batch->retired, 2u);
+    EXPECT_EQ(events[0].completion.status, URMA_CR_REM_ACCESS_ABORT_ERR);
+    ASSERT_TRUE(events[0].record);
+    EXPECT_EQ(events[0].record->metadata.target, &remote_a_);
+    EXPECT_FALSE(events[0].error);
+    EXPECT_EQ(ledger_.size(), 0u);
+    EXPECT_EQ(pool_.lane_state(*lane), expected_state);
+    EXPECT_EQ(pool_.available(), 0u);
+    std::array followup{Request(2)};
+    std::array<AttemptId, 1> followup_ids{};
+    EXPECT_FALSE(sender_.Send(followup, followup_ids, *lane));
+    if (hardware_error) {
+        // 已经发起的 ERROR 排空仍须等待 FLUSH_DONE 和空 flush，不能因账本变空跳过关闭契约。
+        EXPECT_FALSE(pool_.Close());
+        EXPECT_CALL(*this, Poll(&tx_, 2, _)).WillOnce([&](auto*, int, auto* out) {
+            out[0] = Completion(0, URMA_CR_WR_FLUSH_ERR_DONE);
+            return 1;
+        });
+        ASSERT_TRUE(processor_.Poll(events));
+        EXPECT_CALL(*this, Flush(&jetty_, 2, _)).WillOnce(Return(0));
+        ASSERT_TRUE(processor_.Flush(*lane, events));
+        EXPECT_EQ(pool_.lane_state(*lane), JettyLaneState::kDrained);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(SoftwareAndHardwareIsolation, TxCompletionRemoteAbortOnFaultedLaneTest, ::testing::Bool());
 
 TEST_F(TxCompletionProcessorTest, SuspendAndUnhandledDoNotImplyWrRetirement) {
     auto id = ledger_.Prepare(Metadata(1));
@@ -572,35 +729,45 @@ TEST_F(TxCompletionProcessorTest, SoftwareFlushValidatesEveryRecordAndContinuesA
     });
     ASSERT_TRUE(processor_.Poll(events));
     EXPECT_FALSE(processor_.Flush(*lane, {}));
-    // 非法数量不能让调用方读取越界，也不能归还任何额度。
-    EXPECT_CALL(*this, Flush(&jetty_, 6, _)).WillOnce(Return(7));
+    // SQ 深度为 3，即使输出缓冲有 6 个元素，provider 返回 4 也违反本次请求的边界。
+    EXPECT_CALL(*this, Flush(&jetty_, 3, _)).WillOnce(Return(4));
     EXPECT_FALSE(processor_.Flush(*lane, events));
     EXPECT_EQ(ledger_.size(), 2u);
-    EXPECT_CALL(*this, Flush(&jetty_, 6, _)).WillOnce([&](auto*, int, auto* out) {
+    EXPECT_CALL(*this, Flush(&jetty_, 3, _)).WillOnce([&](auto*, int, auto* out) {
         out[0] = Completion(ids[0]); // 软件 flush 只认 WR_UNHANDLED。
         out[1] = Completion(ids[0], URMA_CR_WR_UNHANDLED);
         out[1].flag.bs.s_r = 1;
         out[2] = Completion(999, URMA_CR_WR_UNHANDLED);
-        out[3] = Completion(ids[0], URMA_CR_WR_UNHANDLED);
-        out[4] = out[3]; // 重复完成不能再次归还额度。
-        out[5] = Completion(ids[1], URMA_CR_WR_UNHANDLED);
-        return 6;
+        return 3;
     });
     auto batch = processor_.Flush(*lane, events);
     ASSERT_TRUE(batch);
-    EXPECT_EQ(batch->count, 6u);
-    EXPECT_EQ(batch->retired, 2u);
-    for (const auto i : {0, 1, 2, 4}) {
+    EXPECT_EQ(batch->count, 3u);
+    EXPECT_EQ(batch->retired, 0u);
+    for (const auto i : {0, 1, 2}) {
         EXPECT_EQ(events[i].kind, TxCompletionKind::kRejected);
         EXPECT_FALSE(events[i].record);
     }
-    ASSERT_TRUE(events[3].record);
-    ASSERT_TRUE(events[5].record);
-    EXPECT_EQ(events[3].record->id, ids[0]);
-    EXPECT_EQ(events[5].record->id, ids[1]);
-    // 分批 flush 直到明确返回 0；调用方输出大于 64 时仍限制 provider 批次。
+    // 分成两个符合 SQ 深度的批次；第二批中的重复完成也不能阻止后续合法 WR 退休。
+    EXPECT_CALL(*this, Flush(&jetty_, 3, _)).WillOnce([&](auto*, int, auto* out) {
+        out[0] = Completion(ids[0], URMA_CR_WR_UNHANDLED);
+        out[1] = out[0];
+        out[2] = Completion(ids[1], URMA_CR_WR_UNHANDLED);
+        return 3;
+    });
+    batch = processor_.Flush(*lane, events);
+    ASSERT_TRUE(batch);
+    EXPECT_EQ(batch->count, 3u);
+    EXPECT_EQ(batch->retired, 2u);
+    ASSERT_TRUE(events[0].record);
+    EXPECT_EQ(events[1].kind, TxCompletionKind::kRejected);
+    EXPECT_FALSE(events[1].record);
+    ASSERT_TRUE(events[2].record);
+    EXPECT_EQ(events[0].record->id, ids[0]);
+    EXPECT_EQ(events[2].record->id, ids[1]);
+    // 分批 flush 直到明确返回 0；大输出缓冲也不能突破单个 SQ 的深度限制。
     std::array<TxCompletionEvent, TxCompletionProcessor::kMaxPollBatch + 1> large{};
-    EXPECT_CALL(*this, Flush(&jetty_, TxCompletionProcessor::kMaxPollBatch, _)).WillOnce(Return(0));
+    EXPECT_CALL(*this, Flush(&jetty_, 3, _)).WillOnce(Return(0));
     ASSERT_TRUE(processor_.Flush(*lane, large));
     EXPECT_EQ(pool_.lane_state(*lane), JettyLaneState::kDrained);
 }

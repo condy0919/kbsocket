@@ -2,6 +2,7 @@
 
 #include "kbsocket/transport/raw/raw_runtime.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <new>
 #include <stdexcept>
@@ -56,7 +57,7 @@ std::expected<void, RuntimeError> RawRuntime::Initialize(const std::vector<Devic
         });
     }
 
-    // 在调用底层 Init 之前校验白名单参数，避免非法配置触发 provider 初始化产生不可逆副作用。
+    // 在调用底层 Init 之前校验端点配置，避免非法配置触发 provider 初始化产生不可逆副作用。
     for (std::size_t i = 0; i < devices.size(); ++i) {
         const auto& name = devices[i].device_name;
         if (name.empty() || name.size() >= URMA_MAX_NAME || name.find('\0') != std::string::npos) {
@@ -66,7 +67,7 @@ std::expected<void, RuntimeError> RawRuntime::Initialize(const std::vector<Devic
             });
         }
         for (std::size_t j = 0; j < i; ++j) {
-            if (name == devices[j].device_name) {
+            if (name == devices[j].device_name && devices[i].eid_index == devices[j].eid_index) {
                 return std::unexpected(RuntimeError{
                     .code = RuntimeErrorCode::kInvalidArgument,
                     .device_index = i,
@@ -75,7 +76,7 @@ std::expected<void, RuntimeError> RawRuntime::Initialize(const std::vector<Devic
         }
     }
 
-    // 白名单校验通过后再抢占进程级独占标记，避免非法参数误占全局标记；若已有实例活跃则拒绝。
+    // 配置校验通过后再抢占进程级独占标记，避免非法参数误占全局标记；若已有实例活跃则拒绝。
     if (runtime_claimed.test_and_set(std::memory_order_acquire)) {
         return std::unexpected(RuntimeError{
             .code = RuntimeErrorCode::kInUse,
@@ -89,7 +90,11 @@ std::expected<void, RuntimeError> RawRuntime::Initialize(const std::vector<Devic
         names.reserve(devices.size());
         contexts_.reserve(devices.size());
         for (const auto& device : devices) {
-            names.push_back(device.device_name);
+            // 同一设备的多个端点共用目录快照，只查询一次设备能力和 EID 列表。
+            // 白名单保留设备首次出现的顺序，context 则与完整配置逐项对应。
+            if (std::ranges::find(names, device.device_name) == names.end()) {
+                names.push_back(device.device_name);
+            }
             contexts_.push_back(std::make_unique<UrmaContext>());
         }
 

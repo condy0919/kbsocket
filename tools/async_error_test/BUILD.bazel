@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+cc_library(
+    name = "async_error_support",
+    srcs = ["async_error_test.cpp"],
+    hdrs = ["async_error_test.hpp"],
+    deps = [
+        "//kbsocket/transport/raw:urma_api",
+        "//tools/common:control_channel",
+    ],
+)
+
+cc_binary(
+    name = "async_error_test",
+    srcs = ["main.cpp"],
+    deps = [
+        ":async_error_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:raw_runtime",
+        "//tools/peer_failure_test:peer_process",
+        "@gflags",
+    ],
+)
+
+cc_test(
+    name = "async_error_unit_test",
+    srcs = ["async_error_unit_test.cpp"],
+    deps = [
+        ":async_error_support",
+        "//kbsocket/base:no_destructor",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)

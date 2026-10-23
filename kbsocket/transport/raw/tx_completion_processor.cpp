@@ -142,9 +142,10 @@ TxCompletionEvent TxCompletionProcessor::Process(JettyPool& pool, const urma_cr_
                 return event;
             }
         }
-        // error continue 下普通错误不会自行停止硬件；先封住软件提交，再显式切 ERROR。
+        // 远端访问中止只终结对应 WR，不能据此判定共享 SQ 故障；原状态和连接身份仍交给上层。
+        // 其他错误沿用排空策略：error continue 不自动停止硬件，先封住软件提交，再显式切 ERROR。
         // modify 失败仍处理当前可信终结 CQE，避免消耗了 CQE 却遗失其退休记录。
-        if (cr.status != URMA_CR_SUCCESS) {
+        if (cr.status != URMA_CR_SUCCESS && cr.status != URMA_CR_REM_ACCESS_ABORT_ERR) {
             auto fault = pool.BeginDrain(*lane);
             if (!fault) {
                 event.error = TxCompletionError{
