@@ -1,6 +1,6 @@
 # 同 SQ 的单边 WRITE 故障隔离观测
 
-本工具验证：故障远端进程已经退出之后，向其旧 endpoint/MR 发起单边 WRITE 时，WR 如何终结，以及同一条本地 SQ 对健康远端的 WRITE 能否继续成功。当前固定执行 WRITE，不接受 `--operation` 或 `--mixed_send`，不要求故障 CQE 一定是 status 8，也不构造硬件在途 WRITE 期间的退出。
+本工具验证：故障远端进程已经退出之后，向其旧 endpoint/MR 发起单边 WRITE 时，WR 如何终结，以及同一条本地 SQ 对健康远端的 WRITE 能否继续成功。当前固定执行 WRITE，不接受 `--operation`、`--mixed_send` 或 `--write_notify`，也拒绝声明通知模式的对端描述符；不要求故障 CQE 一定是 status 8，也不构造硬件在途 WRITE 期间的退出。
 
 服务端由两个独立 URMA 进程组成：主进程持有健康 WRITE 目的 MR 和 TCP 控制连接，子进程持有故障 WRITE 目的 MR。创建子进程发生在服务端主进程第一次 `UrmaApi::Load()` 之前，避免 fork 继承 provider 状态或健康端点。客户端以同一条 RM_CTP jetty/SQ 访问两个远端；每条 WRITE 使用独立本地源区间和远端目的区间，区间带保护区，每轮数据包含阶段和轮次信息。
 
@@ -17,7 +17,7 @@ bazel build //tools/rma_failure_test:rma_failure_test
 bazel test //tools/rma_failure_test:all --test_output=errors
 ```
 
-可执行文件：`bazel-bin/tools/rma_failure_test/rma_failure_test`。两端使用同一版本；WRITE 版本协议与旧 READ 版本不兼容。编译与单测不需要本机安装 `liburma.so`；实际运行通过 `dlopen` 加载库，可用 `--library=/path/to/liburma.so` 指定。
+可执行文件：`bazel-bin/tools/rma_failure_test/rma_failure_test`。两端使用同一版本；外层 WRITE failure 协议仍为 v2，与旧 READ 版本不兼容；嵌入的通用 RMA 描述符协议已升级为 v3，因此即使不使用通知模式，也必须同时更新两端二进制。编译与单测不需要本机安装 `liburma.so`；实际运行通过 `dlopen` 加载库，可用 `--library=/path/to/liburma.so` 指定。
 
 ## 双端运行
 

@@ -46,7 +46,7 @@ std::expected<void, ToolError> MatchRmaFailureEndpoint(const RmaHello& hello, co
     }
     if (hello.server != server || hello.options.operation != RmaOperation::kWrite ||
         hello.options.bytes != options.bytes || hello.options.window != 1 || hello.options.rounds != options.rounds ||
-        hello.options.mixed_send) {
+        hello.options.mixed_send || hello.options.write_notify) {
         return std::unexpected(ToolError{"WRITE failure endpoint role/options mismatch", EPROTO});
     }
     // 通用描述符验证单次 WRITE；本工具还必须保证整批槽位均在远端 MR 内，且不会地址回绕。

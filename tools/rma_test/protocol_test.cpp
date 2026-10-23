@@ -158,6 +158,66 @@ TEST(RmaProtocolTest, CapsWindowMemoryAndRejectsMixedWriteBeforeAllocation) {
     EXPECT_FALSE(ValidateRmaOptions({.operation = RmaOperation::kWrite, .window = 2}));
 }
 
+TEST(RmaProtocolTest, WriteNotificationNegotiatesExplicitModeAndRejectsOlderProtocol) {
+    auto hello = ValidHello();
+    hello.options.operation = RmaOperation::kWrite;
+    hello.options.write_notify = true;
+    hello.options.window = 128;
+    hello.segment.len = 64 + 127 * RmaSlotStride(hello.options) + hello.options.bytes;
+    auto wire = EncodeRmaHello(hello);
+    EXPECT_EQ(wire.size(), 112U);
+    EXPECT_EQ(wire[7], std::byte{3});
+    EXPECT_EQ(wire[95], std::byte{1});
+    EXPECT_EQ(wire[111], std::byte{0});
+    auto decoded = DecodeRmaHello(wire);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->options.operation, RmaOperation::kWrite);
+    EXPECT_EQ(decoded->options.window, 128U);
+    EXPECT_TRUE(decoded->options.write_notify);
+    EXPECT_FALSE(decoded->options.mixed_send);
+    // v2 没有通知后的可见性确认协议，不能把旧端点当成已同意新的 buffer 复用边界。
+    wire[7] = std::byte{2};
+    EXPECT_FALSE(DecodeRmaHello(wire));
+    wire = EncodeRmaHello(hello);
+    wire[95] = std::byte{2};
+    EXPECT_FALSE(DecodeRmaHello(wire));
+    --hello.segment.len;
+    EXPECT_FALSE(ValidateRmaHello(hello));
+}
+
+TEST(RmaProtocolTest, WriteNotificationRequiresWriteIdentitySpaceAndIndependentMode) {
+    RmaOptions options{.operation = RmaOperation::kWrite, .bytes = 16, .window = 128, .write_notify = true};
+    EXPECT_TRUE(ValidateRmaOptions(options));
+    options.bytes = 15;
+    EXPECT_FALSE(ValidateRmaOptions(options));
+    options.bytes = 16;
+    options.operation = RmaOperation::kRead;
+    EXPECT_FALSE(ValidateRmaOptions(options));
+    options.operation = RmaOperation::kWrite;
+    options.mixed_send = true;
+    EXPECT_FALSE(ValidateRmaOptions(options));
+    options.mixed_send = false;
+    options.bytes = 2U * 1024 * 1024;
+    EXPECT_TRUE(ValidateRmaOptions(options));
+    ++options.bytes;
+    EXPECT_FALSE(ValidateRmaOptions(options));
+}
+
+TEST(RmaProtocolTest, WriteNotificationChecksBothWriteAndSendCapabilities) {
+    urma_device_cap_t cap{};
+    cap.trans_mode = URMA_TM_RM;
+    cap.rm_tp_cap.bs.ctp = 1;
+    cap.max_write_size = 16384;
+    cap.max_msg_size = kRmaSendBytes;
+    RmaOptions options{.operation = RmaOperation::kWrite, .bytes = 16384, .window = 32, .write_notify = true};
+    EXPECT_TRUE(CheckRmaCapability(options, cap));
+    --cap.max_msg_size;
+    EXPECT_FALSE(CheckRmaCapability(options, cap));
+    cap.max_msg_size = kRmaSendBytes;
+    --cap.max_write_size;
+    EXPECT_FALSE(CheckRmaCapability(options, cap));
+}
+
 TEST(RmaProtocolTest, RejectsInvalidOptions) {
     EXPECT_FALSE(ValidateRmaOptions({.bytes = 0}));
     EXPECT_FALSE(ValidateRmaOptions({.bytes = 64U * 1024 * 1024 + 1}));

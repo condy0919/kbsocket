@@ -7,6 +7,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -63,7 +64,13 @@ protected:
         kWrongRemote,
         kWrongImmediate,
         kBadReceivePayload,
+        kAckTimeout,
+        kDuplicateNotification,
+        kOldNotification,
+        kMissingNotificationRx,
+        kOldWriteGeneration,
     };
+    enum class PostPhase { kAny, kWrite, kNotification };
     struct Node {
         urma_context_t ctx{};
         std::array<urma_jfc_t, 2> cqs{};
@@ -206,18 +213,35 @@ protected:
             std::lock_guard lock(mutex_);
             EXPECT_TRUE(nodes_[0].live_memory);
             EXPECT_TRUE(nodes_[1].live_memory);
-            if (fault_ == Fault::kUnknownAcceptance || fault_ == Fault::kRejected) {
+            const bool notification = options_.write_notify && first->opcode == URMA_OPC_SEND_IMM;
+            const auto round = options_.write_notify ? (first->user_ctx - 1) / (2 * options_.window) : 0;
+            const bool inject =
+                (fault_phase_ == PostPhase::kAny || (fault_phase_ == PostPhase::kNotification && notification) ||
+                 (fault_phase_ == PostPhase::kWrite && !notification)) &&
+                (fault_round_ < 0 || round == static_cast<std::uint32_t>(fault_round_));
+            if (options_.write_notify) {
+                if (notification) {
+                    ++notification_posts_;
+                    // 通知的提交边界必须由整个 WRITE 批次的成功 CQE 证明，不能只等第一条。
+                    EXPECT_EQ(write_cqes_consumed_, (round + 1) * options_.window);
+                    EXPECT_EQ(pending_delay_polls_, 0U);
+                    pending_delay_polls_ = notification_delay_polls_;
+                } else {
+                    ++write_posts_;
+                }
+            }
+            if (inject && (fault_ == Fault::kUnknownAcceptance || fault_ == Fault::kRejected)) {
                 *bad = fault_ == Fault::kRejected ? first : nullptr;
                 return URMA_EINVAL;
             }
             std::uint32_t index = 0;
             for (auto* wr = first; wr; wr = wr->next, ++index) {
-                if (partial_prefix_ >= 0 && index == static_cast<std::uint32_t>(partial_prefix_)) {
+                if (inject && partial_prefix_ >= 0 && index == static_cast<std::uint32_t>(partial_prefix_)) {
                     *bad = wr;
                     return URMA_ENOMEM;
                 }
                 const auto slot = index / (options_.mixed_send ? 2 : 1);
-                const bool send = options_.mixed_send && index % 2 == 1;
+                const bool send = wr->opcode == URMA_OPC_SEND_IMM;
                 if (send) {
                     EXPECT_EQ(wr->opcode, URMA_OPC_SEND_IMM);
                     EXPECT_EQ(wr->send.src.num_sge, 1U);
@@ -241,14 +265,27 @@ protected:
                     rx.opcode = URMA_CR_OPC_SEND_WITH_IMM;
                     rx.completion_len = kRmaSendBytes;
                     rx.imm_data = wr->send.imm_data;
-                    if (fault_ == Fault::kWrongRemote) {
+                    if (inject && fault_ == Fault::kWrongRemote) {
                         ++rx.remote_id.id;
-                    } else if (fault_ == Fault::kWrongImmediate) {
+                    } else if (inject && fault_ == Fault::kWrongImmediate) {
                         ++rx.imm_data;
-                    } else if (fault_ == Fault::kBadReceivePayload) {
+                    } else if (inject && fault_ == Fault::kBadReceivePayload) {
                         payload[0] ^= std::byte{1};
+                    } else if (inject && fault_ == Fault::kDuplicateNotification && index == 1) {
+                        // 使用另一个合法 RX lease，重放相同 slot 身份，不能仅依赖 RX user_ctx 去重。
+                        std::copy(first_notification_.begin(), first_notification_.end(), payload);
+                        rx.imm_data = first_notification_imm_;
+                    } else if (inject && fault_ == Fault::kOldNotification) {
+                        std::copy(first_notification_.begin(), first_notification_.end(), payload);
+                        rx.imm_data = first_notification_imm_;
                     }
-                    if (reverse_cq_) {
+                    if (notification && round == 0 && index == 0) {
+                        std::copy_n(payload, first_notification_.size(), first_notification_.begin());
+                        first_notification_imm_ = rx.imm_data;
+                    }
+                    if (inject && fault_ == Fault::kMissingNotificationRx && index == fault_index_) {
+                        // RX 已被硬件消费但没有 CQE；不允许用 TX 成功猜测该 lease 可回收。
+                    } else if (reverse_cq_) {
                         server.receive_completions.push_front(rx);
                     } else {
                         server.receive_completions.push_back(rx);
@@ -272,14 +309,20 @@ protected:
                               (read ? nodes_[1].segment.seg.ubva.va : nodes_[0].segment.seg.ubva.va) + 64 +
                                   slot * RmaSlotStride(options_));
                     std::memcpy(destination, source, options_.bytes);
+                    if (options_.write_notify && round == 0 && index == 0) {
+                        std::copy_n(source, first_write_identity_.size(), first_write_identity_.begin());
+                    }
+                    if (inject && fault_ == Fault::kOldWriteGeneration) {
+                        std::copy(first_write_identity_.begin(), first_write_identity_.end(), destination);
+                    }
                     delayed_source_ = source;
                     delayed_destination_ = destination;
                     std::copy_n(source, delayed_snapshot_.size(), delayed_snapshot_.begin());
                     pending_delay_polls_ = delay_polls_;
-                    if (index == fault_index_ && fault_ == Fault::kCorruptPayload) {
+                    if (inject && index == fault_index_ && fault_ == Fault::kCorruptPayload) {
                         destination[0] ^= std::byte{1};
                     }
-                    if (index == fault_index_ && fault_ == Fault::kCorruptGuard) {
+                    if (inject && index == fault_index_ && fault_ == Fault::kCorruptGuard) {
                         destination[-1] ^= std::byte{1};
                     }
                 }
@@ -288,7 +331,7 @@ protected:
                 cr.flag.bs.jetty = 1;
                 cr.user_ctx = wr->user_ctx;
                 cr.local_id = jetty->jetty_id.id;
-                if (index == fault_index_) {
+                if (inject && index == fault_index_) {
                     if (fault_ == Fault::kWrongId) {
                         ++cr.local_id;
                     } else if (fault_ == Fault::kWrongUserContext) {
@@ -302,17 +345,20 @@ protected:
                         cr.status = URMA_CR_RNR_RETRY_CNT_EXC_ERR;
                     } else if (fault_ == Fault::kUnknownStatus) {
                         cr.status = static_cast<urma_cr_status_t>(255);
+                    } else if (fault_ == Fault::kAckTimeout) {
+                        cr.status = URMA_CR_ACK_TIMEOUT_ERR;
                     }
                 }
                 auto& node = ByContext(jetty->urma_ctx);
-                if (fault_ != Fault::kMissingCompletion || index != fault_index_) {
+                if (!(inject && fault_ == Fault::kMissingCompletion && index == fault_index_) &&
+                    !(notification && missing_notification_tx_)) {
                     if (reverse_cq_) {
                         node.completions.push_front(cr);
                     } else {
                         node.completions.push_back(cr);
                     }
                 }
-                if (fault_ == Fault::kDuplicateCompletion && index == fault_index_) {
+                if (inject && fault_ == Fault::kDuplicateCompletion && index == fault_index_) {
                     node.completions.push_back(cr);
                 }
             }
@@ -349,9 +395,20 @@ protected:
                 return 0;
             }
             int count = 0;
+            if (options_.write_notify && cq == &nodes_[0].cqs[1] && check_immediate_visibility_) {
+                // 上次只返回一个通知；下一次 poll 前该 slot 应已校验，不能积攒到 TCP completed。
+                EXPECT_EQ(server_->stats().visibility_verified, notification_rx_consumed_);
+                limit = 1;
+            }
             while (!completions.empty() && count < limit) {
                 output[count++] = completions.front();
                 completions.pop_front();
+                if (options_.write_notify && cq == &nodes_[1].cqs[0] &&
+                    (output[count - 1].user_ctx - 1) % (2 * options_.window) < options_.window) {
+                    ++write_cqes_consumed_;
+                } else if (options_.write_notify && cq == &nodes_[0].cqs[1]) {
+                    ++notification_rx_consumed_;
+                }
             }
             return count;
         });
@@ -425,14 +482,26 @@ protected:
     urma_device_cap_t cap_{};
     RmaOptions options_{.rounds = 3, .timeout_ms = 1000};
     Fault fault_ = Fault::kNone;
+    PostPhase fault_phase_ = PostPhase::kAny;
+    int fault_round_ = -1;
     std::uint32_t fault_index_ = 0;
     int partial_prefix_ = -1;
     bool reverse_cq_ = false;
+    bool check_immediate_visibility_ = false;
+    bool missing_notification_tx_ = false;
+    std::uint32_t write_posts_ = 0;
+    std::uint32_t notification_posts_ = 0;
+    std::uint32_t write_cqes_consumed_ = 0;
+    std::uint32_t notification_rx_consumed_ = 0;
+    std::array<std::byte, kRmaSendBytes> first_notification_{};
+    std::array<std::byte, 16> first_write_identity_{};
+    std::uint32_t first_notification_imm_ = 0;
     std::mutex mutex_;
     std::array<std::byte, 64> delayed_snapshot_{};
     const std::byte* delayed_source_ = nullptr;
     const std::byte* delayed_destination_ = nullptr;
     std::uint32_t delay_polls_ = 0;
+    std::uint32_t notification_delay_polls_ = 0;
     std::uint32_t pending_delay_polls_ = 0;
     std::uint32_t delay_checks_ = 0;
     bool safe_to_close_ = true;
@@ -742,6 +811,270 @@ TEST_F(RmaHardwareTest, UnimportFailureRetainsLocalQueueAndMemoryAndCannotRetryC
     EXPECT_FALSE(client_->Close());
     EXPECT_TRUE(nodes_[1].live_memory);
     EXPECT_TRUE(server_->Close());
+}
+
+class WriteNotifyWindowTest : public RmaHardwareTest, public ::testing::WithParamInterface<std::uint32_t> {};
+
+TEST_P(WriteNotifyWindowTest, AllWritesFinishBeforeNotifyAndEachReceiveVerifiesItsSlotImmediately) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.operation = RmaOperation::kWrite;
+    options_.write_notify = true;
+    options_.window = GetParam();
+    options_.bytes = 16384;
+    options_.timeout_ms = 5000;
+    reverse_cq_ = true;
+    check_immediate_visibility_ = true;
+    delay_polls_ = 3;
+    notification_delay_polls_ = 5;
+    OpenPair();
+    // WRITE 和通知均反序返回；128 槽跨多个 poll，通知每次只交一个以检查逐槽即时读取。
+    // 两个阶段都延迟 CQE，期间 mock 检查 WRITE 源/目的未提前按下一轮覆盖。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(2 * options_.rounds).WillRepeatedly(::testing::DoDefault());
+    RunPair();
+    ASSERT_TRUE(client_result_) << client_result_.error().operation;
+    ASSERT_TRUE(server_result_) << server_result_.error().operation;
+    const auto count = options_.rounds * options_.window;
+    EXPECT_EQ(write_posts_, options_.rounds);
+    EXPECT_EQ(notification_posts_, options_.rounds);
+    EXPECT_EQ(write_cqes_consumed_, count);
+    EXPECT_EQ(delay_checks_, options_.rounds * (delay_polls_ + notification_delay_polls_));
+    EXPECT_EQ(client_->stats().accepted, 2 * count);
+    EXPECT_EQ(client_->stats().retired, 2 * count);
+    EXPECT_EQ(client_->stats().send_accepted, count);
+    EXPECT_EQ(client_->stats().send_retired, count);
+    EXPECT_EQ(client_->stats().verified, count);
+    EXPECT_EQ(server_->stats().send_received, count);
+    EXPECT_EQ(server_->stats().verified, count);
+    EXPECT_EQ(server_->stats().visibility_verified, count);
+    EXPECT_EQ(server_->stats().rx_leases_released, count);
+    EXPECT_FALSE(client_->stats().pending);
+    ASSERT_TRUE(client_->Close());
+    ASSERT_TRUE(server_->Close());
+    EXPECT_FALSE(nodes_[0].rx_live);
+}
+
+INSTANTIATE_TEST_SUITE_P(Windows, WriteNotifyWindowTest, ::testing::Values(1U, 32U, 128U));
+
+class WriteNotifyVisibilityFailureTest : public RmaHardwareTest, public ::testing::WithParamInterface<bool> {};
+
+TEST_P(WriteNotifyVisibilityFailureTest, StalePayloadOrGuardFailsAtNotificationWithoutTcpCompletion) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.operation = RmaOperation::kWrite;
+    options_.write_notify = true;
+    options_.window = 4;
+    options_.timeout_ms = 25;
+    fault_ = GetParam() ? Fault::kCorruptGuard : Fault::kCorruptPayload;
+    fault_phase_ = PostPhase::kWrite;
+    fault_index_ = 2;
+    missing_notification_tx_ = true;
+    OpenPair();
+    // 本地 WRITE 回成功，但远端槽不正确；通知 TX 的 CQE 全缺失，客户端绝不会发送 completed。
+    // 服务端仍必须直接报告 payload/guard 错误，而不是等 TCP 超时才发现未确认。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(2).WillRepeatedly(::testing::DoDefault());
+    RunPair();
+    ASSERT_FALSE(server_result_);
+    const std::string_view operation(server_result_.error().operation);
+    EXPECT_NE(operation.find(GetParam() ? "guard" : "payload"), std::string_view::npos);
+    EXPECT_FALSE(client_result_);
+    EXPECT_EQ(server_->stats().visibility_verified, 3U);
+    EXPECT_EQ(server_->stats().rx_leases_released, 4U);
+    EXPECT_EQ(client_->stats().retired, 4U);
+    EXPECT_TRUE(client_->stats().pending);
+    EXPECT_EQ(write_posts_, 1U);
+    ExpectRetained();
+}
+
+INSTANTIATE_TEST_SUITE_P(Visibility, WriteNotifyVisibilityFailureTest, ::testing::Bool());
+
+TEST_F(RmaHardwareTest, CurrentNotificationCannotPublishOldWriteWhenPatternRepeats) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.operation = RmaOperation::kWrite;
+    options_.write_notify = true;
+    options_.bytes = 64;
+    options_.rounds = 252;
+    options_.timeout_ms = 100;
+    fault_ = Fault::kOldWriteGeneration;
+    fault_phase_ = PostPhase::kWrite;
+    fault_round_ = 251;
+    OpenPair();
+    // 旧 Pattern 每 251 轮重复；第 252 轮保留首轮 payload 身份，但通知内容和 IMM 都是当前轮。
+    // 只有 WRITE payload 中的完整 round 身份能识别该错误，不能只依赖通知或周期性字节模式。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(2 * options_.rounds).WillRepeatedly(::testing::DoDefault());
+    RunPair();
+    ASSERT_FALSE(server_result_);
+    EXPECT_NE(std::string_view(server_result_.error().operation).find("payload"), std::string_view::npos);
+    EXPECT_FALSE(client_result_);
+    EXPECT_EQ(server_->stats().visibility_verified, 251U);
+    EXPECT_EQ(server_->stats().send_received, 252U);
+    EXPECT_EQ(server_->stats().rx_leases_released, 252U);
+    EXPECT_EQ(write_posts_, 252U);
+    ExpectRetained();
+}
+
+class WriteNotifyIdentityFailureTest : public RmaHardwareTest, public ::testing::WithParamInterface<int> {
+public:
+    static constexpr int kWrongImmediate = static_cast<int>(Fault::kWrongImmediate);
+    static constexpr int kWrongPeer = static_cast<int>(Fault::kWrongRemote);
+    static constexpr int kWrongPayload = static_cast<int>(Fault::kBadReceivePayload);
+    static constexpr int kDuplicate = static_cast<int>(Fault::kDuplicateNotification);
+    static constexpr int kOld = static_cast<int>(Fault::kOldNotification);
+};
+
+TEST_P(WriteNotifyIdentityFailureTest, SuccessfulWriteCannotMaskInvalidNotificationIdentity) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.operation = RmaOperation::kWrite;
+    options_.write_notify = true;
+    options_.window = 4;
+    options_.timeout_ms = 25;
+    fault_ = static_cast<Fault>(GetParam());
+    fault_phase_ = PostPhase::kNotification;
+    const auto failed_round = fault_ == Fault::kOldNotification ? 1U : 0U;
+    fault_round_ = static_cast<int>(failed_round);
+    OpenPair();
+    // 旧通知来自上一轮已使用的同一槽；即使目标 WRITE 内容正确也不能把旧通知作为本轮发布。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(2 * (failed_round + 1)).WillRepeatedly(::testing::DoDefault());
+    RunPair();
+    ASSERT_FALSE(server_result_);
+    EXPECT_FALSE(client_result_);
+    EXPECT_EQ(server_->stats().rx_leases_released, (failed_round + 1) * options_.window);
+    EXPECT_LT(server_->stats().visibility_verified, (failed_round + 1) * options_.window);
+    EXPECT_EQ(write_posts_, failed_round + 1);
+    ExpectRetained();
+}
+
+INSTANTIATE_TEST_SUITE_P(Identity, WriteNotifyIdentityFailureTest,
+                         ::testing::Values(WriteNotifyIdentityFailureTest::kWrongImmediate,
+                                           WriteNotifyIdentityFailureTest::kWrongPeer,
+                                           WriteNotifyIdentityFailureTest::kWrongPayload,
+                                           WriteNotifyIdentityFailureTest::kDuplicate,
+                                           WriteNotifyIdentityFailureTest::kOld));
+
+class WriteNotifyPostFailureTest : public RmaHardwareTest, public ::testing::WithParamInterface<bool> {};
+
+TEST_P(WriteNotifyPostFailureTest, PartialStageRetiresOnlyKnownPrefixAndDoesNotReplayOrReuse) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.operation = RmaOperation::kWrite;
+    options_.write_notify = true;
+    options_.window = 4;
+    options_.timeout_ms = 25;
+    const bool notification = GetParam();
+    fault_phase_ = notification ? PostPhase::kNotification : PostPhase::kWrite;
+    partial_prefix_ = 2;
+    reverse_cq_ = true;
+    OpenPair();
+    // WRITE 的部分接受不能发布任何通知；通知部分接受也不能把已写数据当成已确认复用。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(notification ? 2 : 1).WillRepeatedly(::testing::DoDefault());
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_FALSE(server_result_);
+    EXPECT_EQ(client_->stats().accepted, notification ? 6U : 2U);
+    EXPECT_EQ(client_->stats().retired, notification ? 6U : 2U);
+    EXPECT_EQ(client_->stats().send_accepted, notification ? 2U : 0U);
+    EXPECT_EQ(client_->stats().send_retired, notification ? 2U : 0U);
+    EXPECT_EQ(client_->stats().partial_batches, 1U);
+    EXPECT_TRUE(client_->stats().accepted_known);
+    EXPECT_FALSE(client_->stats().pending);
+    EXPECT_EQ(notification_posts_, notification ? 1U : 0U);
+    ExpectRetained();
+}
+
+TEST_P(WriteNotifyPostFailureTest, UnknownAcceptanceRetainsDmaDependenciesInEitherStage) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.operation = RmaOperation::kWrite;
+    options_.write_notify = true;
+    options_.window = 4;
+    options_.timeout_ms = 25;
+    const bool notification = GetParam();
+    fault_ = Fault::kUnknownAcceptance;
+    fault_phase_ = notification ? PostPhase::kNotification : PostPhase::kWrite;
+    OpenPair();
+    // 非零 status 配空 bad_wr 无法证明接受边界，不能重试通知或释放已经发布的段。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(notification ? 2 : 1).WillRepeatedly(::testing::DoDefault());
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_FALSE(server_result_);
+    EXPECT_FALSE(client_->stats().accepted_known);
+    EXPECT_TRUE(client_->stats().pending);
+    EXPECT_EQ(client_->stats().retired, notification ? 4U : 0U);
+    EXPECT_EQ(notification_posts_, notification ? 1U : 0U);
+    ExpectRetained();
+}
+
+INSTANTIATE_TEST_SUITE_P(Stages, WriteNotifyPostFailureTest, ::testing::Bool());
+
+TEST_F(RmaHardwareTest, WriteAckTimeoutStopsBeforeAnyNotificationOrNextRound) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.operation = RmaOperation::kWrite;
+    options_.write_notify = true;
+    options_.window = 32;
+    options_.timeout_ms = 25;
+    fault_ = Fault::kAckTimeout;
+    fault_phase_ = PostPhase::kWrite;
+    OpenPair();
+    // status 9 后 jetty 不能继续使用；同次 poll 的其余成功终结仍需记账，但绝不发布通知。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(1).WillOnce(::testing::DoDefault());
+    RunPair();
+    ASSERT_FALSE(client_result_);
+    EXPECT_FALSE(server_result_);
+    EXPECT_EQ(client_->stats().accepted, 32U);
+    EXPECT_EQ(client_->stats().retired, 32U);
+    EXPECT_EQ(client_result_.error().code, URMA_CR_ACK_TIMEOUT_ERR);
+    EXPECT_EQ(notification_posts_, 0U);
+    EXPECT_EQ(server_->stats().visibility_verified, 0U);
+    ExpectRetained();
+}
+
+class WriteNotifyCompletionFailureTest : public RmaHardwareTest, public ::testing::WithParamInterface<int> {
+public:
+    static constexpr int kMissingTx = static_cast<int>(Fault::kMissingCompletion);
+    static constexpr int kFailedTx = static_cast<int>(Fault::kRnrCompletion);
+    static constexpr int kMissingRx = static_cast<int>(Fault::kMissingNotificationRx);
+};
+
+TEST_P(WriteNotifyCompletionFailureTest, MissingOrFailedNotificationNeverConfirmsReuse) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.operation = RmaOperation::kWrite;
+    options_.write_notify = true;
+    options_.window = 4;
+    options_.timeout_ms = 25;
+    fault_ = static_cast<Fault>(GetParam());
+    fault_phase_ = PostPhase::kNotification;
+    OpenPair();
+    // WRITE 数据正确不够：还需通知本地终结、远端通知 CQE 与校验 ACK 都成立才可进入下一轮。
+    EXPECT_CALL(*this, Post(_, _, _)).Times(2).WillRepeatedly(::testing::DoDefault());
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_FALSE(server_result_);
+    EXPECT_EQ(write_posts_, 1U);
+    EXPECT_EQ(client_->stats().accepted, 8U);
+    EXPECT_EQ(client_->stats().retired, fault_ == Fault::kMissingCompletion ? 7U : 8U);
+    const auto received = fault_ == Fault::kMissingNotificationRx ? 3U : 4U;
+    EXPECT_EQ(server_->stats().visibility_verified, received);
+    EXPECT_EQ(server_->stats().rx_leases_released, received);
+    ExpectRetained();
+}
+
+INSTANTIATE_TEST_SUITE_P(Notifications, WriteNotifyCompletionFailureTest,
+                         ::testing::Values(WriteNotifyCompletionFailureTest::kMissingTx,
+                                           WriteNotifyCompletionFailureTest::kFailedTx,
+                                           WriteNotifyCompletionFailureTest::kMissingRx));
+
+TEST_F(RmaHardwareTest, PeerNotificationModeMismatchStopsBeforeImportOrDma) {
+    raw::test_support::ScopedUrmaOverride override(MockedFunctions());
+    options_.operation = RmaOperation::kWrite;
+    options_.timeout_ms = 25;
+    options_.write_notify = true;
+    ASSERT_TRUE(server_->Open(&nodes_[0].ctx, cap_, options_, true));
+    auto client_options = options_;
+    client_options.write_notify = false;
+    ASSERT_TRUE(client_->Open(&nodes_[1].ctx, cap_, client_options, false));
+    EXPECT_CALL(*this, ImportSeg(_, _, _, _, _)).Times(0);
+    EXPECT_CALL(*this, ImportJetty(_, _, _)).Times(0);
+    EXPECT_CALL(*this, Post(_, _, _)).Times(0);
+    RunPair();
+    EXPECT_FALSE(client_result_);
+    EXPECT_FALSE(server_result_);
+    ExpectRetained();
 }
 } // namespace
 } // namespace tools

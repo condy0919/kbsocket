@@ -50,6 +50,7 @@ TEST(RmaFailureProtocolTest, BothTargetsRoundTripWithoutCopyingAbiStructs) {
         EXPECT_EQ(decoded->endpoints[i].endpoint.id, hello.endpoints[i].endpoint.id);
         EXPECT_EQ(decoded->endpoints[i].options.window, 1U);
         EXPECT_EQ(decoded->endpoints[i].options.operation, RmaOperation::kWrite);
+        EXPECT_FALSE(decoded->endpoints[i].options.write_notify);
     }
 }
 
@@ -89,6 +90,34 @@ TEST(RmaFailureProtocolTest, RejectsCorruptedInnerProtocolForEitherTarget) {
         wire = good;
         wire[base + 92] = std::byte{1};
         EXPECT_FALSE(DecodeRmaFailureHello(wire));
+    }
+}
+
+TEST(RmaFailureProtocolTest, RejectsLegacyEmbeddedRmaVersionForEitherTarget) {
+    const auto good = EncodeRmaFailureHello(ValidFailureHello());
+    EXPECT_EQ(good[7], std::byte{2});
+    for (const auto base : {32U, 144U}) {
+        auto wire = good;
+        EXPECT_EQ(wire[base + 7], std::byte{3});
+        // 外层 WRITE failure 协议仍为 v2；嵌入描述符升级后，两端也必须一起更新。
+        wire[base + 7] = std::byte{2};
+        EXPECT_FALSE(DecodeRmaFailureHello(wire));
+    }
+}
+
+TEST(RmaFailureProtocolTest, RejectsWriteNotifyEvenWhenExpandedSlotsFitTheRemoteSegment) {
+    for (const bool server : {false, true}) {
+        for (std::size_t target = 0; target < (server ? 2U : 1U); ++target) {
+            auto hello = ValidFailureHello(server);
+            auto& endpoint = hello.endpoints[target];
+            endpoint.options.write_notify = true;
+            // 特意提供足够容纳通知模式 stride 的 MR，确保拒绝来自模式边界而非长度不足。
+            endpoint.segment.len =
+                64 + (hello.options.batch - 1) * RmaSlotStride(endpoint.options) + hello.options.bytes;
+            ASSERT_TRUE(ValidateRmaHello(endpoint));
+            EXPECT_FALSE(MatchRmaFailureEndpoint(endpoint, hello.options, server));
+            EXPECT_FALSE(DecodeRmaFailureHello(EncodeRmaFailureHello(hello)));
+        }
     }
 }
 

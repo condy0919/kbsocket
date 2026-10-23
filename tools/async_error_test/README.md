@@ -59,4 +59,6 @@ TX `accepted/retired` 与 RX `posted/rx_retired/received` 分开：错误 RX 可
 
 默认 `timeout_ms=10000`；观察窗口最多 60000 ms。父进程在加载 URMA 前 fork，以 `watchdog_ms` 覆盖同步 provider 调用和删除可能阻塞的情况；0 自动按窗口/轮数/操作截止推导，启动前校验最大一小时。故障资源均由 NoDestructor 保留，失败不运行可能提前释放 DMA 内存的析构。
 
-这只能验证同 context 下独立队列组的隔离，不证明其他 context/物理设备完全独立，也不证明错误 CQ 中所有丢失终结都能通过软件 flush 重建。RX 模式 X1 已有硬件 `PASS + RETAINED` 记录；TX 模式 X4 为新增实验，硬件结果待记录。
+这只能验证同 context 下独立队列组的隔离，不证明其他 context/物理设备完全独立，也不证明错误 CQ 中所有丢失终结都能通过软件 flush 重建。RX 模式 X1 与 TX 模式 X4 均已有硬件 `PASS + RETAINED` 记录，详情见[硬件观测记录](../../docs/hardware-observations.md)。
+
+X4 使用上面的 512/64/16/2000 参数，客户端 observation 取得并 Ack 指定 TX JFC_ERR 与关联 jetty0 的 JETTY_ERR 各 1 个；客户端窗口内故障 poll 为 0，服务端持续 poll，独立健康组双端 18 条全部成功。故障组客户端 accepted=514、retired=66，服务端 received=314；514 包含两条 baseline，缺少的 448 条 TX 终结不能解释成 448 次发送失败。客户端主动清理前状态为 ERROR/READY，共用故障 TX JFC 的 jetty1 仍 READY 不代表可以复用。随后 Modify(ERROR) 返回成功，但 `flush_done0/1=0`，未进入实际 FlushJetty 调用，`flush_status=0` 不代表 flush 成功；双端故障资源正常回收仍未验证。

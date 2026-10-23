@@ -29,10 +29,14 @@ struct RmaOptions {
     std::uint32_t timeout_ms = 10000;
     std::uint32_t window = 1;
     bool mixed_send = false;
+    bool write_notify = false;
 };
-/// 每个并发槽含独立 RMA payload、前后保护区，混合模式另有 SEND 区及尾部保护区。
+constexpr bool RmaHasSend(const RmaOptions& options) noexcept {
+    return options.mixed_send || options.write_notify;
+}
+/// 每个并发槽含独立 RMA payload、前后保护区，含通知的模式另有 SEND 区及尾部保护区。
 constexpr std::uint64_t RmaSlotStride(const RmaOptions& options) noexcept {
-    return options.bytes + 2 * kRmaGuardBytes + (options.mixed_send ? kRmaSendBytes + kRmaGuardBytes : 0);
+    return options.bytes + 2 * kRmaGuardBytes + (RmaHasSend(options) ? kRmaSendBytes + kRmaGuardBytes : 0);
 }
 std::expected<void, ToolError> ValidateRmaOptions(const RmaOptions& options) noexcept;
 std::expected<void, ToolError> CheckRmaCapability(const RmaOptions& options, const urma_device_cap_t& cap) noexcept;
@@ -57,6 +61,8 @@ struct RmaStats {
     std::uint32_t send_accepted = 0;
     std::uint32_t send_retired = 0;
     std::uint32_t send_received = 0;
+    std::uint32_t visibility_verified = 0;
+    std::uint32_t rx_leases_released = 0;
     std::uint32_t partial_batches = 0;
     bool accepted_known = true;
     std::uint64_t min_cqe_ns = 0;
@@ -66,7 +72,7 @@ struct RmaStats {
     bool pending = false;
 };
 
-/// 每轮提交 window 条独立 READ，可在同一 SQ 交错小 SEND；WRITE 保留串行，不拆分或重放请求。
+/// 每轮提交独立 RMA；READ 可交错 SEND，WRITE 通知须等本批 WRITE 全部成功后再提交。
 /// 显式双端静默确认前保留 MR；入口须保证失败后的整个对象与 context 存活至进程退出。
 class RmaSession {
 public:
@@ -80,13 +86,15 @@ public:
 
 private:
     std::expected<void, ToolError> Exchange(ControlChannel& channel);
-    std::expected<void, ToolError> Transfer(std::uint32_t round);
+    std::expected<void, ToolError> Transfer(std::uint32_t round, bool notification = false);
     std::expected<void, ToolError> Receive(std::uint32_t round);
     std::span<std::byte> Payload(std::uint32_t slot);
     std::span<std::byte> SendPayload(std::uint32_t slot);
     std::expected<void, ToolError> Barrier(ControlChannel& channel, std::uint32_t marker);
     void Prepare(std::uint32_t round);
     std::expected<void, ToolError> Verify(std::uint32_t round);
+    std::expected<void, ToolError> VerifySlot(std::uint32_t round, std::uint32_t slot);
+    std::expected<void, ToolError> VerifyPadding();
 
     urma_context_t* ctx_ = nullptr;
     raw::JettyPool pool_;

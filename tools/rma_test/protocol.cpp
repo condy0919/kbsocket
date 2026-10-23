@@ -12,7 +12,8 @@ namespace kbsocket {
 namespace tools {
 namespace {
 constexpr std::uint32_t kMagic = 0x4b42524d;
-constexpr std::uint32_t kVersion = 2;
+// WRITE 通知要求接收 CQE 时立即验证目的内存，不能与旧版 TCP 完成屏障语义混用。
+constexpr std::uint32_t kVersion = 3;
 void Put32(RmaHelloBytes& wire, std::size_t offset, std::uint32_t value) {
     value = ::htonl(value);
     std::memcpy(wire.data() + offset, &value, 4);
@@ -44,8 +45,13 @@ std::expected<void, ToolError> ValidateRmaOptions(const RmaOptions& options) noe
         static_cast<std::uint64_t>(options.bytes) * options.window > 256ULL * 1024 * 1024) {
         return Error("require window=1..128 and bytes*window<=256MiB");
     }
-    if (options.operation == RmaOperation::kWrite && (options.mixed_send || options.window != 1)) {
-        return Error("write requires window=1 and mixed_send=false");
+    if (options.write_notify &&
+        (options.operation != RmaOperation::kWrite || options.mixed_send || options.bytes < 16)) {
+        return Error("write_notify requires operation=write, mixed_send=false and bytes>=16");
+    }
+    if (options.operation == RmaOperation::kWrite &&
+        (options.mixed_send || (!options.write_notify && options.window != 1))) {
+        return Error("write requires mixed_send=false and window=1 unless write_notify is enabled");
     }
     return {};
 }
@@ -57,7 +63,7 @@ std::expected<void, ToolError> CheckRmaCapability(const RmaOptions& options, con
     }
     const auto limit = options.operation == RmaOperation::kRead ? cap.max_read_size : cap.max_write_size;
     if (!(cap.trans_mode & URMA_TM_RM) || !cap.rm_tp_cap.bs.ctp || options.bytes > limit ||
-        (options.mixed_send && cap.max_msg_size < kRmaSendBytes)) {
+        (RmaHasSend(options) && cap.max_msg_size < kRmaSendBytes)) {
         return Error("requested RM_CTP operation/size exceeds advertised device capability", EOPNOTSUPP);
     }
     return {};
@@ -107,6 +113,7 @@ RmaHelloBytes EncodeRmaHello(const RmaHello& hello) noexcept {
     Put32(wire, 80, hello.segment.attr.value);
     Put32(wire, 84, hello.segment.token_id);
     Put32(wire, 88, hello.token.token);
+    Put32(wire, 92, hello.options.write_notify ? 1 : 0);
     Put64(wire, 96, hello.payload_address);
     Put32(wire, 104, hello.options.window);
     Put32(wire, 108, hello.options.mixed_send ? 1 : 0);
@@ -114,7 +121,7 @@ RmaHelloBytes EncodeRmaHello(const RmaHello& hello) noexcept {
 }
 
 std::expected<RmaHello, ToolError> DecodeRmaHello(const RmaHelloBytes& wire) noexcept {
-    if (Get32(wire, 0) != kMagic || Get32(wire, 4) != kVersion || Get32(wire, 8) > 1 || Get32(wire, 92) ||
+    if (Get32(wire, 0) != kMagic || Get32(wire, 4) != kVersion || Get32(wire, 8) > 1 || Get32(wire, 92) > 1 ||
         Get32(wire, 108) > 1) {
         return Error("invalid RMA protocol header/reserved fields", EPROTO);
     }
@@ -125,6 +132,7 @@ std::expected<RmaHello, ToolError> DecodeRmaHello(const RmaHelloBytes& wire) noe
     hello.options.rounds = Get32(wire, 20);
     hello.options.window = Get32(wire, 104);
     hello.options.mixed_send = Get32(wire, 108) != 0;
+    hello.options.write_notify = Get32(wire, 92) != 0;
     std::memcpy(hello.endpoint.eid.raw, wire.data() + 24, 16);
     hello.endpoint.id = Get32(wire, 40);
     std::memcpy(hello.segment.ubva.eid.raw, wire.data() + 44, 16);
