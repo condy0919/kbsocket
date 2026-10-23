@@ -45,6 +45,8 @@ Lease 是校验身份，不是 `shared_ptr`；复制不增加引用计数，只�
 
 **带未消费接收 WR 的共享 JFR 关闭尚未实现。** 正常收发持续 poll、归还并补投，单连接关闭不撤销 JFR 中的 buffer；该关闭能力用于整个接收域显式停用。空 CQ、对端断开或 TX 的 FLUSH_ERR_DONE 都不证明 RX buffer 安全；不能推测回收仍在 Posted 的槽位。若剩余 WR 没有终结证据，调用方须保留 RX 池、JettyPool、context 和 URMA 会话到进程退出。析构清理失败会记录日志并保留 DMA slab，但不代替让整个依赖链常驻的退出契约。
 
+2026-10-23 用户明确确认：**JFR 删除成功后，残留 RX 不再访问相关内存。** 结合已有依赖 jetty 先删除的生命周期测试，后续可以实现停止补投、删除依赖 jetty、成功删除 JFR 后终结残留 Posted 记录的关闭路径；删除失败仍须保留依赖。这个 DMA 停止保证不撤销上层仍持有的 Held lease，也不允许忽略尚待处理的 CQE/软件引用后直接释放 slab。当前 `Close()` 的 `posted()==0 && held()==0` 门禁及实现不变；新契约与实测证据见 [硬件观测记录](hardware-observations.md#2026-10-23-人工确认的硬件契约)。
+
 ## 验证
 
 ```sh

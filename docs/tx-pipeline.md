@@ -67,6 +67,8 @@ Bazel 目标为 `//kbsocket/transport/raw:tx_sender`。同一个账本由一个 
 
 一批 WR 在同一个 SQ 上 post，逐条设置远端目标和 `user_ctx = AttemptId`。未指定 lane 时由第一个预留选择 SQ，余下请求固定在该 SQ 上预留；不会跨 SQ 拆分或因容量不足自动换队列。整批预留失败时撤销本批已有预留，不调用 provider；不会影响此前已在途的记录。
 
+同 SQ 提交只确定本地提交与记账顺序，不保证同一远端按此顺序收到 SEND。用户已确认当前 RM_CTP 默认存在这一乱序可能；TxSender 不承担保序，上层连接协议须携带 SN/字节位置并在接收端重排。JFS fence order 不作为默认保序方案，见 [连接内顺序设计](design/kbsocket-design-v1.md#6-连接内顺序保留薄适配不构建重放协议)。
+
 调用方预分配至少 requests.size() 个 ids。正常成功返回提交数量；普通 post 失败返回 `TxSendError`，其中 accepted 是硬件已接受的前缀长度，provider_status 保留原始返回值。前缀完成 Commit 并保留 id；后缀被 Cancel，对应 id 为 0，可以由上层决定是否再次提交。发送器只归还未接受请求的额度，不自动释放任何 buffer/grant，也不回放已接受前缀。完成层仍通过账本处理返回 id 对应的最终结果。
 
 输入长度或就绪状态检查失败时 ids 不变；通过这些检查后对应范围会清零并填入仍保留的记录身份。不要将上一批仍需使用的 ids 缓冲区作为下一批输出，须先将其转存到操作记录。不能把 expected 失败统一理解为“零条被接受”。
@@ -89,6 +91,8 @@ Poll 的 expected 错误表示本次未成功取得 CQE；成功结果包含 `co
 合法的 `REM_ACCESS_ABORT_ERR`（status 8）完成只退休对应 WR，保留原始 `completion.status` 和 `AttemptRecord` 返回上层，不因该状态调用 `BeginDrain` 或主动 modify ERROR。它表示远端访问中止这一错误类别，不能唯一归因为进程退出；连接与操作的失败决策由上层依据 record 处理，本层不自动关闭连接、不重试，也不把错误改写为 SUCCESS。SQ 若已因其他原因隔离，不会因为后续 status 8 恢复可发送。
 
 其余普通终结错误仍先隔离该 SQ，再主动 modify 为 ERROR；RNR、ACK_TIMEOUT 和本地访问错误等策略本轮未改。只标记本地故障不足以停止 error continue 模式的硬件。首版不做 suspend/resume 或在线恢复；其他在途 WR 仍需各自的终结证据。已隔离队列仍可通过 local_id 查找并处理尾部完成。`WR_FLUSH_ERR` 是具体 WR 的终结错误，可退休对应记录；`FLUSH_ERR_DONE` 不能推导整个账本已经排空。`WR_UNHANDLED` 属于显式 urma_flush_jetty 返回语义，不作为普通 poll 的终结依据。
+
+用户于 2026-10-23 补充确认：status 9 后可删除旧 jetty 并重新创建，无需仅因这一错误重建整个 context；jetty 异常不影响正常 JFC 上的排空流程。因此 ACK_TIMEOUT 继续采用阻止新提交并排空旧请求的策略，重建时须分配新代次，不重放旧请求。在线替换尚未实现；该契约也不覆盖 JFC 自身故障后的终结与回收。
 
 收到合法 kFlushDone 后，owner 可调用 Flush(lane, events) 分批处理软件残留 WR，见下节。此层不调度后台排空、不处理异步事件或自动销毁故障队列。错误完成不是连接级 ACK，也不能自动宣称同 SQ 上其他连接全部失败或全部完成。
 
@@ -130,4 +134,4 @@ stateDiagram-v2
 
 单测覆盖正常错误 → modify → FLUSH_ERR → FLUSH_ERR_DONE → WR_UNHANDLED → 排空、modify/flush 失败与重试、错误/重复边界、错误完成身份、残留票据，以及共享 JFC 中健康 SQ 继续发送。Close 在仍有票据、等待硬件边界或尚未确认软件队列为空时拒绝关闭并保留 poll 能力。
 
-[独立 TX 排空工具](../tools/tx_drain_test/README.md) 和 [同池 SQ 故障隔离工具](../tools/sq_isolation_test/README.md) 已获得用户的真实硬件通过反馈，后者观察到了非零 `FLUSH_ERR`，且健康 SQ 和共享 RX 保持可用。非零 `WR_UNHANDLED` 仍只有 gMock 覆盖，生产侧异步事件与排空调度仍未实现。基础 SEND 工具遇到这类错误仍按原策略失败并保留无法安全释放的资源；硬件记录见 [硬件观测记录](hardware-observations.md)。
+[独立 TX 排空工具](../tools/tx_drain_test/README.md) 和 [同池 SQ 故障隔离工具](../tools/sq_isolation_test/README.md) 已获得用户的真实硬件通过反馈，后者观察到了非零 `FLUSH_ERR`，且健康 SQ 和共享 RX 保持可用。后续 [provider 边界实验](../tools/provider_boundary_test/README.md) 的 P4 已观察到非零 `WR_UNHANDLED`，但聚合计数尚未严格对应到那一条 ERROR probe。生产侧异步事件与排空调度仍未实现。基础 SEND 工具遇到这类错误仍按原策略失败并保留无法安全释放的资源；硬件记录见 [硬件观测记录](hardware-observations.md)。

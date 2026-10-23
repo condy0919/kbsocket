@@ -2,7 +2,7 @@
 
 [文档入口](README.md)
 
-整理日期：2026-10-22。本文记录当前开发过程中用户反馈的真实硬件结果，以及为解释这些结果做的源码对照。测试命令仍以各工具 README 为准。
+整理日期：2026-10-23。本文记录当前开发过程中用户反馈的真实硬件结果、现场契约说明，以及为解释这些结果做的源码对照。测试命令仍以各工具 README 为准。
 
 当前已记录单/多 SGE SEND、串行 READ/WRITE、并发 READ 与同 SQ READ/SEND 混合、READ 故障后的同 SQ 失败、共享队列、RNR 后续发、单 SQ 故障排空、provider 提交边界、残留 RX 的 JFR 关闭、分阶段及持续收包期间的水线重配、RX/TX JFC_ERR 与关联 jetty 错误、持续多 EID 收发/JFC 通知和对端进程退出。**WR 失败、逻辑连接失败、SQ 进入 ERROR 和物理端口故障必须分别判断。** 在本次裸设备 RM_CTP、`error_suspend=0` 配置下，RNR 后同一 SQ 可继续发送；对端退出后的 SEND 可以异步报错而本地 SQ 仍为 READY；peer_exit 的原始 CQE 路径和正式完成层集成均已实测确认，同 SQ 上失效目标的 status 8 没有使健康目标的 before/mixed/after 流量失败。已主动置 ERROR 的 SQ 也可能接受 post，必须保留软件发送门禁。
 
@@ -10,7 +10,7 @@
 
 用户随后确认当前芯片存在 status 9（ACK_TIMEOUT）后 jetty 不可复用的缺陷，即使查询仍为 READY 也必须停止新提交；大并发 READ 容易触发，用户说明大并发 WRITE 不出现这一现象。旧 READ 故障实验已出现后续健康 READ 失败，工具因此改为单边 WRITE；新版 WF0/WF3 及 WF2 同命令复测已双端通过，旧目标 WRITE 以 status 8 终结，同 SQ 健康写入持续成功。WF2 首次运行在第一条健康基线 WRITE 返回 status 9，尚未进入故障注入或混合批次；复测使用新 jetty，通过结果不表示原 jetty 恢复，也未定位首次失败原因。这些结果不改变已知 status 9 规避要求，也不自动定位历史 SEND/provider 各次 status 9 的触发原因。
 
-当前优先级按用户最新要求调整：暂缓故障 CQ 的软件处理与资源回收，保留 X1/X4 的 PASS + RETAINED 证据和未决契约；优先补充 WRITE 完成后 SEND_WITH_IMM 通知的远端可见性。WN1–WN4 已有工具支持，尚无真机结果，不写成已观测通过。
+当前优先级按用户最新要求调整：暂缓故障 CQ 的软件处理与资源回收，保留 X1/X4 的 PASS + RETAINED 证据和未决契约。用户自 2026-10-23 起暂时无法访问 UB 真机；WRITE 完成后 SEND_WITH_IMM 通知远端可见性的 WN1–WN4 已有工具支持，继续保留为待真机验证，不写成已观测通过。下文单独记录用户人工确认的硬件契约，软件实现与单测可以据此继续推进。
 
 ## 证据与环境范围
 
@@ -32,6 +32,30 @@
 - 已确认支持 JFS error、JFR error、JFC error，以及 JFR 水线相关事件。当前 JFS/相关 jetty 的错误 AE 需先触发其绑定的 JFC error，再联动产生，不能把它记作可独立注入的 JFS 错误事件。
 
 上述说明没有改变下文 `process_exit/inflight_exit` 实际得到 async=0 的历史结果。事件支持与某次故障触发事件是两回事；JFC 的错误 async 事件也不同于 streaming 已验证的正常完成通知。受支持事件的实际 Get/Ack 工具日志可在对应注入条件下单独登记，不要求任意 CQE 错误或端口故障都伴随 async。
+
+### 2026-10-23 人工确认的硬件契约
+
+以下是用户对当前硬件行为的明确答复，不是新增的测试 PASS，也不推定其他芯片/固件版本具有相同保证。
+
+| 契约 | 用户确认 / 未决项 | 软件处理依据 |
+| --- | --- | --- |
+| status 9 后恢复 | 原 jetty 不可使用，删除后重新创建一个 jetty 即可 | 隔离旧 jetty、完成旧请求收尾后重建；不要求为此重建整个 context。新对象须使用新代次，不恢复或重放旧请求 |
+| jetty 异常后的 TX 排空 | jetty 异常不影响正常 JFC 上的排空流程 | 保持 `ERROR → FLUSH_ERR_DONE → FlushJetty` 和逐 WR 记账；边界本身不能清空账本。该答复不覆盖 JFC 自身损坏的 X1/X4 |
+| 残留 RX 的 DMA 停止 | JFR 删除成功后，剩余 RX 不再访问相关内存 | 在停止补投、删除依赖 jetty 后，可将成功删除 JFR 作为残留 RX 的 DMA 停止依据；仍须处理软件记录、CQE 引用和上层持有的 lease。生产 RxBufferPool 的该关闭路径尚未实现 |
+| SEND 顺序 | 默认同 SQ、同目标 SEND 不保证顺序；可用 JFS 的 fence order，但用户说明其性能代价较大 | 按连接 SN/字节位置进行有界软件重排，只交付连续前缀；不依赖 SQ 固定映射或 CQE 到达顺序保序，不将 fence order 作为默认策略 |
+| RNR 重试 | 用户尚不确定 `rnr_retry`、`min_rnr_timer` 的实际效果 | 保留为未决；不能依赖硬件等待远端补投，也不由设置值推算重试窗口 |
+| 已有 CQE 时 rearm | rearm 时 CQ 中已有 CQE 仍会触发通知 | 保留 poll/rearm/recheck/wait 与 Get/Ack 流程；通知可能在 recheck 后被消费，不能按通知次数推断 CQE 数量。这条答复不补写通知合并规则或精确时序的实测结果 |
+
+以新 jetty 替换故障 jetty 的策略与软件保序属于后续实现工作；硬件契约确认不表示 kbsocket 已经具备在线 lane 重建、带残留 RX 的关闭或完整连接层。WRITE 数据可见性也不由 SEND 顺序或 rearm 契约推出，WN1–WN4 仍待验证。
+
+### 对应源码核对
+
+- bonding 的 `bondp_rebuild_pjetty` 复制旧配置，在原物理 context 中创建新 jetty，更新映射后删除旧 jetty，见 [bondp_dp_failback.c](../../umdk/src/urma/lib/urma/bond/bondp_dp_failback.c)。health probe 收到 ACK_TIMEOUT 后调用 `hc_rebuild_probe_jetty`，按 Modify(ERROR)、DeleteJetty、CreateJetty 的顺序处理，复用原 context/JFC/JFR，见 [bondp_dp_health.c](../../umdk/src/urma/lib/urma/bond/bondp_dp_health.c)。这两条路径都使用新对象，不是把故障对象改回 READY。
+- raw UMQ 在 `umq_ub_process_cr_err_for_jetty_pool` 中将 status 9 的 pool node 标错；bonding 分支则标记 recovering、等待底层恢复。TX poll 继续处理 FLUSH_ERR_DONE，设置 `tx_flush_done` 后才进入软件 flush，见 [umq_pro_ub.c](../../umdk/src/urpc/umq/umq_ub/core/private/umq_pro_ub.c) 与 [umq_ub_jetty_pool.c](../../umdk/src/urpc/umq/umq_ub/core/jetty_pool/umq_ub_jetty_pool.c)。UBSocket 的上层替换入口 `UmqTransportPool::RebuildTp` 执行 resource_modify、resource_destroy、CreateOneTp，见 [umq_transport_pool.cpp](../../ubs-comm/src/ubsocket/csrc/core/umq/umq_transport_pool.cpp)。UMQ 资源节点同时销毁专用 TX JFC/JFCE 是其资源组织方式，不表示硬件要求随 jetty 重建整个 context/JFC。
+- bonding 的 failover 还包含在途 WR 重投，见 [bondp_datapath.c](../../umdk/src/urma/lib/urma/bond/bondp_datapath.c)。kbsocket 只参考对象替换及排空职责；仍要求逐 WR 终结、显式失败与新代次，不引入 bonding 的透明恢复或重放。
+- UBSocket 在 [umq_data_tx_ops.cpp](../../ubs-comm/src/ubsocket/csrc/core/umq/umq_data_tx_ops.cpp) 为 SEND_IMM 分配 SN，在 [umq_buffer_receive_queue.cpp](../../ubs-comm/src/ubsocket/csrc/core/umq/umq_buffer_receive_queue.cpp) 的 `EnqueueInOrder` 暂存乱序消息，`ProcessNormalInOrder` 只推进连续 SN 前缀。kbsocket 采用相同的逻辑保序方向，重排存储须预分配、有界，不能复制其热路径懒分配堆的做法。
+
+上述核对基于当前工作区源码，不代替现场二进制版本验证。当前 kbsocket raw 层按 `user_ctx`/逐 WR 身份处理完成，工具按 SN/slot 校验和判重，未以接收先后次序推导消息身份；既有 PASS 不证明 SEND 有序。用户所称 fence order 不直接映射成 `wr.flag.fence=1`：本地 [urma_types.h](../../umdk/src/urma/lib/urma/core/include/urma_types.h) 将 JFS `order_type`、WR `place_order`/`comp_order` 和 `fence` 分开定义，其中 WR fence 注释涉及前置 READ/atomic；默认软件保序不依赖这些位的具体选择。
 
 ## 已记录的硬件验证
 
