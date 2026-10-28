@@ -2,7 +2,7 @@
 
 [文档入口](README.md) · [已有实测记录](hardware-observations.md)
 
-更新日期：2026-10-23。本矩阵区分已反馈的硬件结果、人工确认的契约、尚未观察到的行为和可选复测参数；详细计数、历史失败及源码对照放在[硬件观测记录](hardware-observations.md)中。结论仅覆盖现场使用的裸设备、RM_CTP 和对应 WR 配置：此前主要为 `udmac0d1e4`，四 context 组还使用 `udmac1d1e4`；网卡/固件/provider 完整版本尚未登记。
+更新日期：2026-10-26。本矩阵区分已反馈的硬件结果、人工确认的契约、尚未观察到的行为和可选复测参数；详细计数、历史失败及源码对照放在[硬件观测记录](hardware-observations.md)中。结论仅覆盖现场使用的裸设备、RM_CTP 和对应 WR 配置：此前主要为 `udmac0d1e4`，四 context 组还使用 `udmac1d1e4`；网卡/固件/provider 完整版本尚未登记。
 
 “已通过”表示该场景的工具判据成立，不要求故障实验中的 WR 成功发送；“部分覆盖”表示流程通过但目标硬件时序未得到证明；“未观察到”不等于硬件不支持或永远不会发生。本地 gMock 通过不计作硬件证据，计划参数也不自动继承其他参数的通过结论。
 
@@ -42,6 +42,8 @@
 以下保留运行方法，并在各组旁登记实际覆盖。status 9 后 jetty 不可复用已由用户明确为芯片缺陷；历史各次 ACK_TIMEOUT 的触发原因仍须分别判断。
 
 ## 现场能力说明与当前优先级
+
+2026-10-26 用户确认：`max_msg_size=65536` 对应 RM_TP；当前 RM_CTP SEND 上限为 4096 字节，单边 READ/WRITE 上限为 200 MiB（209715200 字节）。这两项不再列为待确认能力；日志中的 RMA 256 MiB 查询值和已测 8 MiB 范围分别保留，不新增边界测试 PASS。
 
 自 2026-10-23 起用户暂时无法访问 UB 真机；下列命令保留为恢复硬件访问后的实验入口，不要求当前继续执行。当天人工确认的契约单列如下，不新增测试 PASS；详细依据和 bonding/UMQ/UBSocket 源码对照见 [人工确认记录](hardware-observations.md#2026-10-23-人工确认的硬件契约)。
 
@@ -174,7 +176,7 @@ READ/WRITE 按 [rma_test README](../tools/rma_test/README.md) 分别运行 `--op
 | 1048576 | 已通过，8 轮 | 已通过，8 轮 |
 | 8388608 | 已通过，8 轮 | 已通过，8 轮 |
 
-各组客户端 `accepted=retired=verified=8、pending=false`，post/CQE 状态均成功，payload 与 guard 校验通过。双方没有投递 RX；这是串行单 WR 正向路径。设备上报 READ/WRITE 上限 256 MiB，本次只验证到 8 MiB；WRITE 的远端校验发生在 TX 完成后的 TCP 通知之后，不能代替正式 UB 数据面通知的可见性验证。曾出现的 `8188608/8388608` 两端参数不一致是控制协议拒绝，不能记作 RMA 硬件错误。
+各组客户端 `accepted=retired=verified=8、pending=false`，post/CQE 状态均成功，payload 与 guard 校验通过。双方没有投递 RX；这是串行单 WR 正向路径。READ/WRITE 查询报告值为 `268435456`（256 MiB），用户已确认实际适用上限为 200 MiB（209715200 字节），本次实测到 8 MiB；WRITE 的远端校验发生在 TX 完成后的 TCP 通知之后，不能代替正式 UB 数据面通知的可见性验证。曾出现的 `8188608/8388608` 两端参数不一致是控制协议拒绝，不能记作 RMA 硬件错误。
 
 ## 当前优先：WRITE 后的数据面通知可见性
 
@@ -244,7 +246,7 @@ A6 的服务端为 `udmac0d1e4:39`（jetty=23442，JFR=9626），客户端为 `u
 | X2/X3 | 同上，改 `--fault=external_jfc` / `--fault=external_jfr`，`--observe_ms=30000` | 现场可靠注入作用于服务端指定对象；窗口内仍有流量及独立健康对照；待具备注入工具后再测 |
 | X4 | 同上，`--fault=tx_jfc_overflow --attempts=512 --cq_depth=64 --healthy_rounds=16 --observe_ms=2000` | 客户端指定 TX JFC_ERR（type 0）、jetty0 JETTY_ERR（type 4）各 Get/Ack 1 个；accepted=514、retired=66，服务端 RX=314；健康 18 条双端成功，PASS + RETAINED，资源关闭未验证 |
 
-G2/G3/G4 均为 4096 字节总 wire 长度，其中包含 32/33 字节 header；不是 4096 字节业务 payload 再额外加 header。设备报告 max_msg_size=65536、max_jfs_sge=13，仅表示能力报告，已测的是 4096 字节和 2/3/8 SGE。
+G2/G3/G4 均为 4096 字节总 wire 长度，其中包含 32/33 字节 header；不是 4096 字节业务 payload 再额外加 header。设备报告 `max_msg_size=65536` 对应 RM_TP，RM_CTP SEND 上限已确认为 4096 字节；本组覆盖该大小和 2/3/8 SGE，报告的 `max_jfs_sge=13` 尚未实测。
 
 A8 的七个后续 active 窗口各在高位接收 32 条，没有跨越 64，配置保持到后续 crossing 才触发并回读 0。A9 在已确认余量 63 的基础上，首次接收后软件 posted=62，再重写 64；七个窗口各取得事件且阈值回读 0。之后补满不再重写，所以 crossing 的 NOT_OBSERVED 与先前已触发禁用相符。A9 实际取得并 Ack 的事件总数为 8，汇总 observed=1 不包含 active_rearm，不能解读为七次丢事件。日志不能区分低位 Modify 本身触发还是后续收包触发。
 

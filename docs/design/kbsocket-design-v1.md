@@ -58,11 +58,11 @@ V1 仍保留：
 
 ### 2.1 硬件约束
 
-以下来自用户描述，是本设计的输入；实施时应通过设备能力查询和硬件文档确认，而不是硬编码为所有 UB 设备的通则。
+以下来自用户对当前目标硬件的说明，是本设计的输入，不推广为所有 UB 设备的通则。2026-10-26 用户已明确确认 SEND 的模式差异和 READ/WRITE 大小上限；这两项不再列为待确认参数，设备查询值不能脱离传输模式和现场契约解释。
 
 - 可实际采用的模式只有 RM_CTP。
-- RM_CTP 双边 SEND 的单 WR 最大数据量为 4 KiB；协议头占用其中空间。
-- 单边 READ/WRITE 不受这一 4 KiB 限制，当前设备单次可操作约“200M”数据。原始描述未明确 MB/MiB，能力字段必须以查询到的字节数记录。
+- RM_CTP 双边 SEND 的单 WR 最大数据量为 4 KiB（4096 字节）；协议头占用其中空间。查询报告的 `max_msg_size=65536` 对应 RM_TP 的 64 KiB 上限，不适用于 RM_CTP。
+- 单边 READ/WRITE 不受这一 4 KiB 限制，当前硬件单次操作上限为 200 MiB（209715200 字节）。历史日志中的 `max_read_size=max_write_size=268435456`（256 MiB）保留为查询报告值，不用它扩大已确认上限；已提供的单 WR 测试覆盖到 8 MiB，能力契约与实测覆盖分别记录。
 - 单个共享 JFR 最大深度为 32,768。以每个 WR 4 KiB 计算，承载的接收 buffer 总量上限约为 128 MiB，不是无限的连接级缓存。
 - 后续流控讨论按一个端点可配置 4 个这样的接收域计算：最大合计 131,072 RQE、约 512 MiB 接收 buffer。它们仍是四个独立预算，不能把某一域的空额度用于向另一已满 JFR 发送；最大值也不意味着必须满配。
 - 现有 bonding 对外暴露聚合设备，底层涉及 4 个 raw 设备/端口资源，分布在 2 个 IOdie，每个 IOdie 有 2 个 port。设备、context、EID 和物理 port 的实际映射需要运行时确认。
@@ -541,7 +541,7 @@ READ 也说明硬件 TX/RX 方向不能直接用作业务所有权边界：
 
 本地类型和 provider 编码确认 READ 远端 source、WRITE 远端 destination 分别只能使用一个远端 SGE；WRITE 可编码多个本地源 SGE，符合 writev 的形状。具体本地 SGE 数量仍受设备能力限制。[WR 类型](umdk/src/urma/lib/urma/core/include/urma_types.h)、[WRITE 编码](umdk/src/urma/hw/udma/udma_u_jfs.c)
 
-“200M 单操作能力”不是调度 chunk 的默认值。大 chunk 减少 WR，却加大占用时间、取消粒度及共享 lane 的不公平；应按吞吐、尾延迟和活跃连接数确定 chunk 上限。
+200 MiB 的单操作能力不是调度 chunk 的默认值。大 chunk 减少 WR，却加大占用时间、取消粒度及共享 lane 的不公平；应按吞吐、尾延迟和活跃连接数确定 chunk 上限。
 
 ### 8.5 WRITE 发布是独立能力门禁
 
@@ -771,7 +771,7 @@ RTS received
 
 一组供实验的起点为：大包接收/驻留预算 128 MiB，在途 DMA 字节预算 4 MiB，chunk 128 KiB，同时 DMA 操作最多 32。四者不是同一个限制，128 MiB 也不代表整个库的内存总额。发送源、待发响应、隔离内存与应用其他分配还需纳入容器级总上限。
 
-100 KiB 通常可用一个数据 chunk，1 MiB 可分块；也要对照整包单 WR。分块改善公平性、占队列时间和取消粒度，却增加 WR/CQE 成本，不能把硬件约 200M 单操作能力当默认 chunk，也不能未经测量认定 128 KiB 最优。
+100 KiB 通常可用一个数据 chunk，1 MiB 可分块；也要对照整包单 WR。分块改善公平性、占队列时间和取消粒度，却增加 WR/CQE 成本，不能把硬件 200 MiB 单操作能力当默认 chunk，也不能未经测量认定 128 KiB 最优。
 
 大包使用按字节计费的公平调度，必要时优先短 transfer，同时保证长 transfer 不饥饿。小包和控制保留提交机会，避免一条大包填满共享 SQ。WRITE 可见性和 READ/WRITE grant 的安全终结仍受第 8 节门禁约束。
 
@@ -1363,7 +1363,7 @@ QD=10 不能让这一轮自动变成 30000 个同目标请求。30000 是客户�
 - RM_CTP 多目标共享 SQ 的本地完成范围、错误影响范围、RNR/HOL 和 flush 终结保证。
 - selective signaling 与 SEND/READ/WRITE 混合、ordering 配置、remote target 变化的合法组合。
 - WRITE/WRITE_IMM 对接收 CPU 的可见性、跨 chunk/跨 lane 发布，以及远端 grant 撤销能力。
-- 设备 inline/SGE/WR 大小/队列深度等实际能力；“200M”最终字节上限。
+- 设备 inline/SGE/队列深度等尚未确认的能力与组合约束；RM_CTP SEND 的 4096 字节和单边 READ/WRITE 的 200 MiB 上限已由用户确认，见第 2.1 节。
 - eager/RNDV 阈值、WRITE chunk、lane 数、CQ 深度、RX 池和 credit 批量；全部通过目标负载确定。
 - 注册内存池的映射/注册/slab 粒度、size class、缓存字节预算、基础容量、扩缩容水位与观察时间，以及设备/context 注册数量限制；按第 15.7 节验证，ODP 与显式 hugepage 不作为已具备能力。
 - 第 2.4 节 full-mesh 的请求/响应实际字节数、短时 peer 分布及宿主机容器密度；第 9.6/9.8 节候选窗口和内存/DMA 参数仍需第 15.6 节验证，不能写成已达标默认值。
@@ -1538,7 +1538,7 @@ region 使用 `memfd_create(MFD_CLOEXEC | MFD_ALLOW_SEALING)`、定长 backing �
 
 提交成功、源可复用、对端流可读、对端应用执行业务是不同完成点；最后一项不由库保证。失败/取消时仍需兑现借用 buffer 契约。共享 view 也不意味着允许跨对端任意转发：转给第三个 runtime 要有新的映射授权，或走 copy/其他后端。
 
-100 KiB/1 MiB 可直接引用已准入 slab，或按例如 128 KiB 的候选 chunk 公平调度；比较整块和分块，不把 UB 的 200M 能力或 RNDV 门槛硬套到 SHM。新增 slab 的 FD 交换和页面准备属于冷路径，应通过有界预热降低首请求成本，不能靠把冷态等待移出计时来制造收益。
+100 KiB/1 MiB 可直接引用已准入 slab，或按例如 128 KiB 的候选 chunk 公平调度；比较整块和分块，不把 UB 的 200 MiB 能力或 RNDV 门槛硬套到 SHM。新增 slab 的 FD 交换和页面准备属于冷路径，应通过有界预热降低首请求成本，不能靠把冷态等待移出计时来制造收益。
 
 ### 18.7 SHM 反压：descriptor 与 payload 分开计账
 
