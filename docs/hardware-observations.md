@@ -2,7 +2,7 @@
 
 [文档入口](README.md)
 
-整理日期：2026-10-23。本文记录当前开发过程中用户反馈的真实硬件结果、现场契约说明，以及为解释这些结果做的源码对照。测试命令仍以各工具 README 为准。
+整理日期：2026-10-26。本文记录当前开发过程中用户反馈的真实硬件结果、现场契约说明，以及为解释这些结果做的源码对照。测试命令仍以各工具 README 为准。
 
 当前已记录单/多 SGE SEND、串行 READ/WRITE、并发 READ 与同 SQ READ/SEND 混合、READ 故障后的同 SQ 失败、共享队列、RNR 后续发、单 SQ 故障排空、provider 提交边界、残留 RX 的 JFR 关闭、分阶段及持续收包期间的水线重配、RX/TX JFC_ERR 与关联 jetty 错误、持续多 EID 收发/JFC 通知和对端进程退出。**WR 失败、逻辑连接失败、SQ 进入 ERROR 和物理端口故障必须分别判断。** 在本次裸设备 RM_CTP、`error_suspend=0` 配置下，RNR 后同一 SQ 可继续发送；对端退出后的 SEND 可以异步报错而本地 SQ 仍为 READY；peer_exit 的原始 CQE 路径和正式完成层集成均已实测确认，同 SQ 上失效目标的 status 8 没有使健康目标的 before/mixed/after 流量失败。已主动置 ERROR 的 SQ 也可能接受 post，必须保留软件发送门禁。
 
@@ -48,6 +48,13 @@
 
 以新 jetty 替换故障 jetty 的策略与软件保序属于后续实现工作；硬件契约确认不表示 kbsocket 已经具备在线 lane 重建、带残留 RX 的关闭或完整连接层。WRITE 数据可见性也不由 SEND 顺序或 rearm 契约推出，WN1–WN4 仍待验证。
 
+### 2026-10-26 人工确认的传输大小上限
+
+- 查询报告的 `max_msg_size=65536` 对应 RM_TP 的 64 KiB SEND 上限；RM_CTP 的单 WR SEND 最大为 4096 字节，包含协议头，不再列为待确认项。
+- 当前硬件单边 READ/WRITE 的单次操作上限为 200 MiB（209715200 字节）。历史 `max_read_size=max_write_size=268435456`（256 MiB）仅保留为查询报告值，不能覆盖用户确认的适用上限。
+
+以上是现场能力契约，不是新增的边界测试 PASS；已有单 WR READ/WRITE 的实测覆盖仍为最大 8 MiB。
+
 ### 对应源码核对
 
 - bonding 的 `bondp_rebuild_pjetty` 复制旧配置，在原物理 context 中创建新 jetty，更新映射后删除旧 jetty，见 [bondp_dp_failback.c](../../umdk/src/urma/lib/urma/bond/bondp_dp_failback.c)。health probe 收到 ACK_TIMEOUT 后调用 `hc_rebuild_probe_jetty`，按 Modify(ERROR)、DeleteJetty、CreateJetty 的顺序处理，复用原 context/JFC/JFR，见 [bondp_dp_health.c](../../umdk/src/urma/lib/urma/bond/bondp_dp_health.c)。这两条路径都使用新对象，不是把故障对象改回 READY。
@@ -92,7 +99,7 @@
 
 ## 多 SGE SEND：独立源段组成一条消息
 
-G2/G3/G4 的完整双端日志均使用服务端 `udmac0d1e4:39`、客户端 `udmac0d1e4:51`，共同参数为 `--bytes=4096 --messages=1001 --send_imm --timeout_ms=60000`。设备报告 `max_msg_size=65536、max_jfs_sge=13`，实际测试如下：
+G2/G3/G4 的完整双端日志均使用服务端 `udmac0d1e4:39`、客户端 `udmac0d1e4:51`，共同参数为 `--bytes=4096 --messages=1001 --send_imm --timeout_ms=60000`。设备报告 `max_msg_size=65536、max_jfs_sge=13`；前者对应 RM_TP，当前 RM_CTP SEND 上限为 4096 字节，实际测试如下：
 
 | 组 | SGE 数 / header_bytes / batch | 客户端 accepted / retired | 服务端 received | guarded_segments |
 | --- | --- | --- | ---: | ---: |
@@ -102,7 +109,7 @@ G2/G3/G4 的完整双端日志均使用服务端 `udmac0d1e4:39`、客户端 `ud
 
 各组 `accepted_known=true`，发送端打印 TX 与远端 RX 均确认，接收端通过 payload 校验，双方释放资源。工具将每个 SGE 放在独立注册的源内存中，按消息内全局偏移直接填充，不先复制到连续 TX buffer；接收端仍为一个连续 RX buffer，并检查来源、序号、opcode、IMM 与完整 payload。guarded_segments 为 `messages*sges`，是源段保护区校验次数，接收端没有这些源段所以为 0。
 
-这支持使用分离的 fragment header/payload 作为一条 SEND_WITH_IMM 的两个 SGE。`bytes=4096` 包含 header；32 字节 header 时业务 payload 为 4064 字节。33 字节 header 组覆盖非整齐分段长度。能力报告的 64 KiB/13 SGE 不是实测上限，本轮只验证到 4096 字节和 8 SGE；G1 的 64 字节小消息尚无日志。该实验不验证跨消息保序，也不证明硬件或 provider 内部完全没有复制。
+这支持使用分离的 fragment header/payload 作为一条 SEND_WITH_IMM 的两个 SGE。`bytes=4096` 包含 header；32 字节 header 时业务 payload 为 4064 字节。33 字节 header 组覆盖非整齐分段长度。本轮覆盖已确认的 RM_CTP 4096 字节 SEND 上限及最多 8 SGE；报告的 13 SGE 尚未实测，G1 的 64 字节小消息尚无日志。该实验不验证跨消息保序，也不证明硬件或 provider 内部完全没有复制。
 
 ## ERROR 排空与同池隔离
 
@@ -266,7 +273,7 @@ direct_ERROR_post status=0 queried_state=3 terminal_pending=false
 - 双端均 `RX_posted=0`；JettyPool 仍创建 JFR 对象，不代表完全不需要该对象。
 - 每轮是单个 WR、单 SGE，前一轮完成后才进入下一轮；不覆盖多个并发 RMA WR 或大包 SEND。
 
-这确认本次 RM_CTP READ/WRITE 单 WR 能传输到 8 MiB，无需按 SEND 的 4 KiB RX buffer 限制软件切片。设备报告 `max_read_size=max_write_size=268435456`（256 MiB），但不能将报告上限记为已测试大小。
+这确认本次 RM_CTP READ/WRITE 单 WR 能传输到 8 MiB，无需按 SEND 的 4 KiB 上限软件切片。设备报告 `max_read_size=max_write_size=268435456`（256 MiB）；2026-10-26 用户确认实际适用的单次操作上限为 200 MiB（209715200 字节）。查询报告值、现场能力契约与实测 8 MiB 分别记录，不将前两者记为边界测试 PASS。
 
 READ 在本地成功 CQE 后立即校验目的内存；WRITE 则在发送端成功 CQE 后，经 TCP 完成消息通知服务端再校验。因此本次没有测定远端内存对 CPU 可见的精确时间点，也未验证生产协议中 WRITE 加数据面通知的发布顺序。软件测得 8 MiB CQE 消费耗时约 183–190 μs；这些串行小样本不是吞吐或延迟基准。
 
