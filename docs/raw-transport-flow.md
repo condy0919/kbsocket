@@ -76,7 +76,7 @@ flowchart TD
 
 ## 已验证范围
 
-以下均来自用户的真实硬件运行反馈，本地未重复进行硬件测试。具体参数、计数、证据来源和结论边界统一记录在 [硬件观测记录](hardware-observations.md)。
+下表来自用户的真实硬件运行反馈，本地未重复进行硬件测试。具体参数、计数、通过范围及历史失败统一记录在 [硬件观测记录](hardware-observations.md)和 [硬件验证矩阵](hardware-validation-matrix.md)，工具通过与生产组件完成分别登记。
 
 | 场景 | 已确认的行为 |
 | --- | --- |
@@ -87,7 +87,16 @@ flowchart TD
 | TX 配额与延迟 RX | 配额测试通过；延迟 RX 观察到原始 WR 全部 RNR，再由另一条 SQ 的独立清理流量消费 RX 槽 |
 | 同 SQ 的 RNR 后续发 | 用户反馈 `rnr_continue_success`；原始 WR RNR 终结后，未切 ERROR 或重建的同一条 SQ 成功发送新消息 |
 | 同 SQ 多目标 RNR | `batch=32、rounds=8` 双端 PASS，健康流量 768 条成功、sink 256 条 RNR；不推广到其他错误/独立主机故障 |
+| 同 SQ status 8 隔离 | 原始 CQE 与正式 `TxCompletionProcessor` 路径均通过；失效目标逐 WR 报错，健康目标在前、中、后三阶段成功，正式完成层不因 status 8 调用整 SQ `BeginDrain`；见矩阵 Q1–Q4 |
+| 两裸设备×每设备两 EID | 四 context 持续收发、RX 补投、payload 与关闭通过，并观察到各 context 的 JFC 通知和 JFCE fd readiness；D2 首次 ACK_TIMEOUT/等待超时的历史保留，复测通过不证明该问题已修复 |
+| Provider 提交边界 | 已观测 `ENOMEM` 容量拒绝、部分接受前缀，以及 ERROR post 和非零软件 `WR_UNHANDLED`；失败返回不撤销已接受项，仍需逐 WR 退休 |
+| 残留 RX 的 JFR 删除 | 专项工具覆盖全部未消费、部分已消费的 RX；先删除依赖 jetty，再成功删除 JFR，随后释放 MR。它不代表生产 `RxBufferPool` 已支持带残留 RX 关闭 |
+| JFR 水线 async | 已观测事件归属与 Get/Ack、重写 threshold 后的重复通知，以及持续收包时高位/低位重配；仅 Ack/补投不等于重新使能 |
+| RX/TX JFC 错误 | overflow 工具已观察 JFC_ERR 与关联 jetty 错误，独立健康队列继续成功；故障域终结证据不足时保留 DMA 依赖，工具 PASS 不代表坏 CQ 已安全排空或恢复 |
+| READ/WRITE 与多 SGE | 单 WR READ/WRITE、并发 READ 和 READ/SEND 混合、多 SGE SEND/IMM 均有通过记录；WRITE 失效目标 status 8 与同 SQ 健康写入共存。READ 故障后的 status 9 和 WRITE 首条基线的偶发 status 9 同样保留，不能由成功样本推断始终可靠 |
 
-尚未验证延迟 RX 后原始流量全部成功、多设备或独立 peer 并行、持续无批间屏障收发、EAGAIN 到 EPOLLOUT 唤醒、非零软件 flush、异步事件及带未消费 WR 的共享 JFR 关闭。RNR 后续发成功不能推广到其他错误，也不代表原始消息被重放或恢复。单元测试中的故障注入用于验证代码契约，不能替代硬件专项测试。
+用户另外确认：RM_CTP SEND 上限为 4096 字节，单边 READ/WRITE 上限为 200 MiB，WRITE 与 READ 的完成可见性一致；**status 9 后原 jetty 不可继续使用，即使查询仍 READY，需要删除并重新创建**。这些是[人工确认的硬件契约](hardware-observations.md#2026-10-23-人工确认的硬件契约)及同页后续补充，不等同于所有边界参数已有实测 PASS。WRITE 完成后 SEND/IMM 通知的工具已实现，WN1–WN4 仍待真机回归，软件实现不再被其可见性契约阻塞。
 
-新增观察工具及完整运行顺序见 [硬件验证矩阵](hardware-validation-matrix.md)。它们直接观察当前 raw provider 的边界，不改变生产错误隔离、RX 关闭或 socket 语义。
+仍需区分生产实现缺口：带残留 RX 的完整接收域关闭、在线 jetty 替换、统一 owner reactor/事件生命周期、连接级错误分发与 socket `EAGAIN → EPOLLOUT` 尚未完成，按 [roadmap](roadmap.md) 推进。故障 CQ 的完整回收/在线恢复暂缓。现有四 context 工具不证明多 owner 性能、四物理设备、跨设备故障隔离或物理带宽叠加。
+
+延迟 RX 后原始流量全部成功、实际 RNR 重试参数/窗口等硬件缺口仍按矩阵保留；RNR 后新消息成功不代表失败的原始消息被重放或恢复。单元测试中的故障注入验证代码契约，不能替代硬件专项测试；新增工具观测也不自动改变生产错误隔离、关闭或 socket 语义。

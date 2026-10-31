@@ -1,9 +1,10 @@
 # kbsocket 文档
 
-梳理当前代码建议先读 [Raw 传输流程](raw-transport-flow.md)，再沿初始化、资源准备、数据路径逐层阅读。下列参考文档描述已实现的行为；长期设计中的目标不等于当前已有能力。
+梳理当前代码建议先读 [Raw 传输流程](raw-transport-flow.md)，再沿初始化、资源准备、数据路径逐层阅读。组件文档描述当前实现，观测文档记录证据；roadmap 和长期设计中的目标不等于当前已有能力。
 
 | 文档 | 内容 |
 | --- | --- |
+| [实施 roadmap](roadmap.md) | M0 契约修订、M1–M7 交付依赖与验收，SHM/观测支线和当前实现缺口 |
 | [Raw 传输流程](raw-transport-flow.md) | 所有权、初始化、双端 SEND、退出和当前验证范围 |
 | [硬件观测记录](hardware-observations.md) | 用户实测的 SEND/RMA、水线重配、错误事件与隔离、资源回收及验证边界 |
 | [硬件验证矩阵](hardware-validation-matrix.md) | 残留 RX、provider 边界、进程/链路故障、持续多设备收发、JFC 通知与 READ/WRITE 的完整运行顺序 |

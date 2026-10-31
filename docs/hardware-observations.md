@@ -2,7 +2,7 @@
 
 [文档入口](README.md)
 
-整理日期：2026-10-26。本文记录当前开发过程中用户反馈的真实硬件结果、现场契约说明，以及为解释这些结果做的源码对照。测试命令仍以各工具 README 为准。
+整理日期：2026-10-28。本文记录当前开发过程中用户反馈的真实硬件结果、现场契约说明，以及为解释这些结果做的源码对照。测试命令仍以各工具 README 为准。
 
 当前已记录单/多 SGE SEND、串行 READ/WRITE、并发 READ 与同 SQ READ/SEND 混合、READ 故障后的同 SQ 失败、共享队列、RNR 后续发、单 SQ 故障排空、provider 提交边界、残留 RX 的 JFR 关闭、分阶段及持续收包期间的水线重配、RX/TX JFC_ERR 与关联 jetty 错误、持续多 EID 收发/JFC 通知和对端进程退出。**WR 失败、逻辑连接失败、SQ 进入 ERROR 和物理端口故障必须分别判断。** 在本次裸设备 RM_CTP、`error_suspend=0` 配置下，RNR 后同一 SQ 可继续发送；对端退出后的 SEND 可以异步报错而本地 SQ 仍为 READY；peer_exit 的原始 CQE 路径和正式完成层集成均已实测确认，同 SQ 上失效目标的 status 8 没有使健康目标的 before/mixed/after 流量失败。已主动置 ERROR 的 SQ 也可能接受 post，必须保留软件发送门禁。
 
@@ -10,7 +10,7 @@
 
 用户随后确认当前芯片存在 status 9（ACK_TIMEOUT）后 jetty 不可复用的缺陷，即使查询仍为 READY 也必须停止新提交；大并发 READ 容易触发，用户说明大并发 WRITE 不出现这一现象。旧 READ 故障实验已出现后续健康 READ 失败，工具因此改为单边 WRITE；新版 WF0/WF3 及 WF2 同命令复测已双端通过，旧目标 WRITE 以 status 8 终结，同 SQ 健康写入持续成功。WF2 首次运行在第一条健康基线 WRITE 返回 status 9，尚未进入故障注入或混合批次；复测使用新 jetty，通过结果不表示原 jetty 恢复，也未定位首次失败原因。这些结果不改变已知 status 9 规避要求，也不自动定位历史 SEND/provider 各次 status 9 的触发原因。
 
-当前优先级按用户最新要求调整：暂缓故障 CQ 的软件处理与资源回收，保留 X1/X4 的 PASS + RETAINED 证据和未决契约。用户自 2026-10-23 起暂时无法访问 UB 真机；WRITE 完成后 SEND_WITH_IMM 通知远端可见性的 WN1–WN4 已有工具支持，继续保留为待真机验证，不写成已观测通过。下文单独记录用户人工确认的硬件契约，软件实现与单测可以据此继续推进。
+当前优先级按用户最新要求调整：暂缓故障 CQ 的软件处理与资源回收，保留 X1/X4 的 PASS + RETAINED 证据和未决契约。用户自 2026-10-23 起暂时无法访问 UB 真机；2026-10-28 已人工确认 WRITE 的可见性与 READ 一致，不再作为方案推进的待确认硬件能力。WRITE 成功完成后 SEND_WITH_IMM 通知的 WN1–WN4 保留为实现回归，尚无真机日志，不写成已观测通过。下文单独记录用户人工确认的硬件契约，软件实现与单测可以据此继续推进。
 
 ## 证据与环境范围
 
@@ -46,7 +46,7 @@
 | RNR 重试 | 用户尚不确定 `rnr_retry`、`min_rnr_timer` 的实际效果 | 保留为未决；不能依赖硬件等待远端补投，也不由设置值推算重试窗口 |
 | 已有 CQE 时 rearm | rearm 时 CQ 中已有 CQE 仍会触发通知 | 保留 poll/rearm/recheck/wait 与 Get/Ack 流程；通知可能在 recheck 后被消费，不能按通知次数推断 CQE 数量。这条答复不补写通知合并规则或精确时序的实测结果 |
 
-以新 jetty 替换故障 jetty 的策略与软件保序属于后续实现工作；硬件契约确认不表示 kbsocket 已经具备在线 lane 重建、带残留 RX 的关闭或完整连接层。WRITE 数据可见性也不由 SEND 顺序或 rearm 契约推出，WN1–WN4 仍待验证。
+以新 jetty 替换故障 jetty 的策略与软件保序属于后续实现工作；硬件契约确认不表示 kbsocket 已经具备在线 lane 重建、带残留 RX 的关闭或完整连接层。WRITE 数据可见性另由下文 2026-10-28 的用户答复确认，不由 SEND 顺序或 rearm 契约推出。
 
 ### 2026-10-26 人工确认的传输大小上限
 
@@ -54,6 +54,12 @@
 - 当前硬件单边 READ/WRITE 的单次操作上限为 200 MiB（209715200 字节）。历史 `max_read_size=max_write_size=268435456`（256 MiB）仅保留为查询报告值，不能覆盖用户确认的适用上限。
 
 以上是现场能力契约，不是新增的边界测试 PASS；已有单 WR READ/WRITE 的实测覆盖仍为最大 8 MiB。
+
+### 2026-10-28 人工确认的 WRITE 可见性
+
+用户明确确认：**WRITE 的可见性与 READ 一致。** 当前软件方案可依据这一硬件契约，在取得对应 WRITE 的成功完成 CQE 后，通过 SEND/IMM 通知远端读取目的数据；不再将 WRITE 可见性列为 M0 或 WRITE 方案推进的待确认能力。
+
+WN1–WN4 仍用于验证 WRITE 完成后提交通知、通知身份、远端数据校验及槽位复用的实现，尚无真机日志，不新增 PASS。该确认不扩展为未等待完成的 WRITE/SEND 链式提交、跨 SQ 顺序或 WRITE_WITH_IMM 语义保证，也不改变失败时远端 grant 撤销、复用和 DMA 生命周期的要求。
 
 ### 对应源码核对
 
@@ -299,15 +305,15 @@ READ 在本地成功 CQE 后立即校验目的内存；WRITE 则在发送端成�
 
 既有矩阵 R9/R10 的建议参数是 window=8；实际反馈为 window=32，因此保留 R9/R10 未运行的记录，将四个 window=32 组合另列为 R12–R15，不追认原参数已执行。
 
-## WRITE 后 SEND_WITH_IMM 通知：工具已实现，待真机
+## WRITE 后 SEND_WITH_IMM 通知：实现回归待真机
 
-[rma_test](../tools/rma_test/README.md) 新增 `--operation=write --write_notify`，与 READ 的 `--mixed_send` 分开。当前计划四组：WN1 为 `bytes=16384、window=1、rounds=8`；WN2 为 `16384/32/8`；WN3 为 `16384/128/8`；WN4 为 `1048576/32/8`。参数与运行说明见[验证矩阵](hardware-validation-matrix.md)。四组尚未收到现场日志，不能从既有串行 WRITE、WRITE 故障隔离或 READ/SEND 混合实验追认结果。
+[rma_test](../tools/rma_test/README.md) 新增 `--operation=write --write_notify`，与 READ 的 `--mixed_send` 分开。当前计划四组：WN1 为 `bytes=16384、window=1、rounds=8`；WN2 为 `16384/32/8`；WN3 为 `16384/128/8`；WN4 为 `1048576/32/8`。参数与运行说明见[验证矩阵](hardware-validation-matrix.md)。WRITE 可见性已由用户于 2026-10-28 人工确认；四组改为通知链路的实现回归，不再用于阻塞该硬件能力的采用。四组尚未收到现场日志，不能从人工确认、既有串行 WRITE、WRITE 故障隔离或 READ/SEND 混合实验追认 PASS。
 
 源码采用明确的两阶段提交：先取得本批全部 WRITE 的成功终结 CQE，再由同一 SQ 向同一远端逐槽发送 64 字节 SEND_WITH_IMM。服务端处理通知 CQE 时立即按完整轮次、槽、长度和远端身份检查对应目的 payload/guards；该检查在读取 TCP 完成标记之前执行。通知 RX 使用 RxBufferPool，取得的 lease 按批归还。目的区每轮重新 poison，且完整轮次/槽身份同时写入数据与通知，防止历史内容或陈旧通知被当成本轮成功。
 
 后续 TCP 完成/验证 ACK 只负责授权槽位复用和关闭，不作为目的数据可见的触发点。故障或部分接受不会引发重放，WRITE 未全部成功时也不会继续提交通知。未来记录须核对服务端 `visibility_verified` 与通知、lease 计数，客户端本地源校验的 `verified` 不能替代该证据。
 
-本项观测的是软件消费通知时的数据可见性，不测量硬件精确可见时刻，也不证明未等待 WRITE CQE 的链式提交、跨 SQ 顺序或 WRITE_WITH_IMM 语义。它没有实现故障 CQ 处理或生产 WRITE 发送路径。
+本项回归检查软件消费通知时是否正确使用已确认的数据可见性契约，不测量硬件精确可见时刻，也不证明未等待 WRITE CQE 的链式提交、跨 SQ 顺序或 WRITE_WITH_IMM 语义。它没有实现故障 CQ 处理或生产 WRITE 发送路径。
 
 ## READ 故障：status 9 后健康目标也失败
 
@@ -710,9 +716,9 @@ status 9 是 ACK_TIMEOUT，status 10 才是 RNR 重试耗尽：[urma_opcode.h](.
 
 ## 尚未覆盖与后续记录
 
-已完成的范围见上文；当前先执行 WRITE 通知的 WN1–WN4，故障 CQ 处理及资源回收暂缓。剩余问题不能以工具最终 PASS 自动勾选：
+已完成的范围见上文；WRITE 可见性已人工确认，WN1–WN4 保留为恢复真机访问后的实现回归，软件设计与开发可据契约继续推进。故障 CQ 处理及资源回收仍暂缓。剩余问题不能以工具最终 PASS 自动勾选：
 
-- WRITE 成功后经 SEND_WITH_IMM 通知的远端可见性；WN1–WN4 工具已实现、待真机，要求目的校验发生在通知处理时、TCP 完成标记之前。
+- WRITE 成功后经 SEND_WITH_IMM 通知的实现回归；WN1–WN4 工具已实现、尚无真机日志，要求目的校验发生在通知处理时、TCP 完成标记之前。WRITE 可见性本身不再是待确认能力。
 - status 9 后 jetty 不可复用的芯片缺陷已由用户确认，软件规避不再等待重复定位；历史 SEND mixed、provider 边界和四 context D2 首次 status 9 的具体触发原因仍须分别判断，不能仅凭状态码认定这些实验同源，也不能用复测 PASS 宣称芯片缺陷已消失。
 - 延迟 RX 后原始批次全部成功，以及 RNR 的实际重试次数和时间窗口。
 - provider 同步 `URMA_EAGAIN`；已观察到的是 `ENOMEM` 容量拒绝及部分接受，尚不能证明 socket 的 EAGAIN 到 EPOLLOUT/NotifyWritable 闭环。
@@ -722,7 +728,7 @@ status 9 是 ACK_TIMEOUT，status 10 才是 RNR 重试耗尽：[urma_opcode.h](.
 - 真正中断硬件在途 WR 的对端退出；`inflight_exit` 已验证提交后退出的控制时序，但本次全部 SUCCESS，硬件在途未确认。
 - 链路/端口真实故障的工具日志：用户说明通常为 ACK_TIMEOUT，现有 external 场景尚无日志，不把当前无法观察的 PORT_DOWN async 列作通过条件。
 - JFR 水线 A6 和并发 A8/A9 已有 depth=128 记录；A9 的七个后续事件位于 active_rearm 而非独立 crossing 阶段。不重写阈值的历史第二次跨线未观察到事件，新版 none/toggle 的 8 轮及 depth=256 多轮仍待记录。X1/X4 已分别取得 RX/TX JFC_ERR 与关联 JETTY_ERR；外部 JFR 错误待具备可靠注入工具后再测，独立 JFS 场景仍未记录，不能将现场能力说明当作实际注入通过。
-- 单边 WRITE 故障隔离的 WF1，以及 WF2 首次健康基线 status 9 的原因定位；大于 8 MiB 的传输仍待验证，WRITE 数据面通知则按上述 WN1–WN4 优先执行。WF0/WF3 及 WF2 同命令复测已独立实测通过，每轮 256 条混合 WRITE 已覆盖；多 WR READ 和同 SQ READ/SEND 正向混合的五组历史通过、旧版 rma_failure_test 的 READ 故障 RF0–RF3 失败均保留。
+- 单边 WRITE 故障隔离的 WF1，以及 WF2 首次健康基线 status 9 的原因定位；大于 8 MiB 的传输仍待验证，WRITE 数据面通知的 WN1–WN4 实现回归待恢复真机访问后执行。WF0/WF3 及 WF2 同命令复测已独立实测通过，每轮 256 条混合 WRITE 已覆盖；多 WR READ 和同 SQ READ/SEND 正向混合的五组历史通过、旧版 rma_failure_test 的 READ 故障 RF0–RF3 失败均保留。
 - 故障 CQ 处理与 JFC 错误后完成不全时的正常资源回收按用户要求暂缓；X1/X4 均为 PASS + RETAINED，没有尝试故障对象的正常删除。X4 主动 Modify(ERROR) 返回成功，但未取得 FLUSH_ERR_DONE，不能推导 DMA 已终结。多 SGE 的 G2/G3/G4 已通过，G1 小消息仍无日志。
 - 对端仍活跃时的共享 JFR 删除，以及 brpc worker 仍访问资源时的进程退出；已通过的是受控静默后的残留 RX 删除。
 
