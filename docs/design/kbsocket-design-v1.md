@@ -1,2612 +1,684 @@
-# kbsocket 架构设计 V1
+# kbsocket 架构设计 V1（基于 UB 硬件实测与契约修订版）
 
-> 状态：设计提案，尚未完成实现及性能验收。本文记录当前会话的约束、架构演进、源码分析和用户提供的测试结果，不把设计目标写成已经验证的能力。
->
-> 初稿整理日期：2026-09-14；tracing 细化更新：2026-09-15；tail-based sampling 增补：2026-09-16；shard/reactor 与资源所有权细化：2026-09-18；CQE 观测边界、自动调度采集与 lease 审计增补：2026-09-27。目标：替换 `ubs-comm/src/ubsocket`，在单容器 40k 连接规模下提供低开销的 UB 加速，并以 40k 次建链/秒为验收目标。
+> **状态**：M0 契约基线与待实现方案；主被动 Jetty 分离、线协议和运行时仍须按门禁验证，不能视为已交付能力
+> **修订日期**：2026-11-05（工作区改动复核）
+> **设计目标**：替换 `ubs-comm/src/ubsocket`，在 4 CPU / 16 GiB 容器约束下支撑 **40k 常驻连接**、**40k 次建链/秒**，以及 **3000×3000 full-mesh（单客户端总 QPS=1000、总 QD=10）** 的生产负载。
+> **配套文档**：[实施 Roadmap](../roadmap.md) · [UB 硬件观测记录](../hardware-observations.md) · [UB 硬件验证矩阵](../hardware-validation-matrix.md) · [可观测性设计指南](../OBSERVABILITY-DESIGN-GUIDE.md) · [当前 Raw 传输流程](../raw-transport-flow.md)
 
-2026-10-29 完成 M0 契约修订：吸收硬件实测及人工确认，区分目标设计与当前 raw 实现。阶段、依赖和验收条件以 [实施 roadmap](../roadmap.md) 为准；M0 完成不表示生产连接层、在线重建或 RNDV 已实现。
+---
 
-## 1. 最终决策与适用边界
+## 1. 架构定位与核心决策
 
-V1 定位为：**连接内有序、故障显式失败的 socket 加速库；跨机加速基于 raw URMA RM_CTP，同机增加有授权门禁的 SHM 后端，NativeTCP 保留为兼容路径及性能基线；既有连接不做无损传输迁移。** 同机 TCP 核验、SHM spec 与上线门禁见第 18 节。
+`kbsocket` 定位为：**连接内有序、内存有界、故障显式失败的用户态高性能通信加速库**。跨机加速仅基于裸设备（raw URMA）的 `RM_CTP` 模式；同宿主机提供具备身份授权门禁的 `SHM` 后端；`NativeTCP` 作为兼容保底与性能基线。
 
-| 主题 | V1 决策 | 原因与代价 |
-|---|---|---|
-| UB 传输模式 | 仅 RM_CTP | RM_TP 的 TP 内存开销不能满足当前 40k 连接约束；不保留依赖它的扩展方案 |
-| 设备访问 | 直接操作 raw 设备/context | 去掉 bonding 正常路径的 WR shadow、引用与锁开销；放弃 bonding 内部逐 WR 故障重发 |
-| 故障语义 | 旧加速连接失败，上层决定重连；新连接重新选择 SHM/UB/TCP | 删除跨传输重放和恢复状态；上层必须处理请求执行结果不确定性 |
-| 同宿主机 | 规划 runtime-pair SHM；通过授权、正确性及性能门禁后优先使用，不可用则选本机 TCP | 常见同机 TCP 不必经过物理网卡；SHM-copy 主要省协议栈，真正零拷贝另需共享 BufferLease |
-| socket 语义 | 保留连接内有序读取、部分读写、反压、明确错误 | 不向现有 socket 调用者暴露 RM_CTP 的接收乱序 |
-| 物理资源 | 逻辑连接与 jetty/JFR/JFC 解耦，按 owner shard 和 raw context 池化 | 资源规模不再与逻辑连接一一对应；接受共享 lane 的故障影响范围 |
-| 并发模型 | 一个 shard、一个 reactor、一个固定 owner 线程，统一推进所属 TX/RX；外部通过有界提交队列接入 | 以资源所有权分片消除队列争用，不按业务收发方向拆线程；跨 owner 提交仍有成本 |
-| 小包 | inline / registered copy，按负载批处理 | inline、CQ moderation 和批量 post 各有独立条件，不假定“越大越快” |
-| 流控 | peer runtime 共享的长期小基础窗口＋弹性池；RNDV 独立做字节与 DMA 准入 | 避免逐 socket 小窗口卡住首请求；基础授信是有限容量承诺，不是无限首发 |
-| 大包 | 最小版本使用有界分片 copy eager；生产 RNDV 优先 WRITE，READ 保留显式可选路径 | WRITE 与 READ 的完成可见性一致；READ 存在并发诱发 status 9 的已知风险，WRITE 仍须处理错误、通知与 grant 终结 |
-| TX CQE | 全 signal 建立正确性基线，验证后按物理 SQ 自适应 selective signaling | 不直接把 consumer index 前进解释为跨目标、跨 opcode 的累计成功 |
-| multi-rail | 保留路径抽象，当前负载先按 peer runtime 归属接收域，不默认单消息跨 rail 条带化 | 避免把一份基础授信复制到四个 JFR；当前数据也未证明双物理端口收益 |
-| 运行模式 | busy-poll 与事件模式共用同一 progress 状态机 | 正确性不依赖持续忙轮询；仅等待策略不同 |
-| 可观测性 | 常驻 metrics；启用因果诊断时全请求有界轻量暂存、尾部优先保留慢/错请求及少量正常对照；高成本 detail 限时采集 | 尾采样主要减少导出而非前置埋点开销；以 Perfetto 展示/查询，预算丢弃与缺失可见，详见第 19 节及 19.17 |
-| 依赖 | 核心不依赖 brpc；C ABI、socket 兼容层、可选 P2300 风格接口分层 | sender/receiver 提供组合与生命周期模型，不替代网络运行时 |
+### 1.1 核心架构红线与设计取舍
 
-### 1.1 从“无损 TCP 切换”收敛到“失败后重连”
+| 维度 | V1 架构决策 | 硬件约束依据与工程取舍 |
+| :--- | :--- | :--- |
+| **UB 传输模式** | 仅支持 raw URMA `RM_CTP` | `RM_TP` 的单 TP 硬件上下文内存开销无法支撑单容器 40k 连接；放弃依赖 `RM_TP` 的方案 |
+| **设备访问层** | 直接操作裸设备 `UrmaContext`（绕过 `bonding_dev`） | `bonding` 正常发送路径维护逐 WR shadow 与互斥锁；历史 `send_lat` 样本支持 raw 路径较低时延，但差值不能全部归因于锁，适用范围见 §2.3 |
+| **故障语义** | **显式失败（Fail-Fast）**，严禁库内跨 TCP 无损切换与 WR 重放 | 本地无 CQE 不等于远端未收包，有本地 CQE 不等于远端应用已消费；删除重放缓存、连接级 ACK 与恢复握手，由上层负责重连与幂等重试 |
+| **物理队列模型** | 逻辑连接与物理 `Jetty`/`JFR`/`JFC` 解耦；**被动接收端点与主动发送通道分离** | 单个共享 `JFR` 最大 32,768 槽，无法每连接独占；分离被动 `rx_target_jetty` 与主动 `tx_lanes`，使发送侧 `status 9` 重建不波及远端导入句柄 |
+| **并发与执行模型** | **1 `RuntimeShard` = 1 `ShardReactor` = 1 固定 `OwnerThread`** | 单线程 Owner 串行推进所属队列的 post/poll/refill/flush，数据面零互斥锁（`lock_free=1`）；跨线程通过有界无锁队列（MPSC/SPSC）接入 |
+| **连接内保序** | 32-bit 逻辑帧序号（SN）+ 预分配有界乱序重排窗口（`ReorderWindow`） | 硬件实测确认同 SQ、同目标 `RM_CTP SEND` **不保证接收顺序**；硬件 JFS fence 代价高，软件仅重排 `RxBufferLease` 描述符（零 payload 拷贝） |
+| **小包（Eager）** | 64-bit `IMM` 紧凑帧头 + 必要时的完整身份扩展头 | `RM_CTP SEND` 硬件上限为 **4096 B（含 payload 内头）**；仅满足紧凑身份条件的普通数据帧可承载 4096 B 业务数据，扩展身份与捎带授信须扣除头部长度 |
+| **大包（RNDV）** | **仅支持接收端授权、发送端主动单边 `WRITE` + `SEND_WITH_IMM` 完成通知** | 硬件实测高并发 `READ` 易触发芯片级 `status 9`（`ACK_TIMEOUT`）导致 原 Jetty 不可继续使用；`WRITE` 完成可见性已确认与 `READ` 一致，**V1 彻底剔除 `READ RNDV`** |
+| **TX 完成信号** | **全 Signal（`complete_enable=1`）** + 批量 Poll/Post | 硬件仅在 `wr_cnt==1 && pi-ci==1` 时走低时延 DWQE；unsignaled WR（`Q>1`）实测增加小包时延 0.2–0.3 µs，且在多目标共享 SQ 错误隔离下难以安全界定逐 WR DMA 生命周期 |
+| **流控与反压** | `PeerRuntime` 级长期暖窗口（`q_base=8`）+ 域级弹性池 + `WRITE` 独立字节准入 | 规避旧版 per-socket 2-credit 导致 10 KiB 首请求停顿；硬件 `rnr_retry` 行为受限不可靠，采用严格软件守恒授信避免常规 RNR |
+| **可观测性** | 分片 Cacheline 对齐计数器 + USDT 探针（`KBS_PROBE`）+ 按需 eBPF 采样 | 硬件无 CQE 时间戳；未激活探针点采用 NOP，但参数求值、代码布局和启用后的 uprobe/BPF 成本仍须实测，不承诺固定纳秒开销；过滤须有容量和丢事件指标 |
+| **依赖与接口** | 核心库零业务/bRPC 依赖；分层暴露 C ABI、POSIX Socket 兼容层与 P2300 异步接口 | 保持核心传输层纯净可测，bRPC 的 `Block`/`bthread` 适配封装于独立的 `adapters/brpc` 层 |
 
-会话最初考虑维护未完成 WR 列表，UB 故障后经原 TCP fd 重发，进而构建可跨传输恢复的可靠字节流。最终选择不实施这一方案。
+### 1.2 为什么彻底放弃“无损 TCP 切换与未完成 WR 重放”
 
-原因不只是代码复杂：CQE 与对端应用执行结果不是同一件事。没有 CQE 的 WR 可能已经到达；有本地 CQE 也不能普遍解释为远端应用已经接收或处理。只重发“没有 CQE 的 WR”无法同时避免重复和遗漏。无损切换还需要连接级交付确认、重放缓存、去重、恢复握手，以及 UB/TCP 并发到达时的统一顺序。
+早期曾讨论维护未完成 WR 列表并在 UB 故障后经原 TCP fd 重发，V1 明确否决该方案，核心依据如下：
 
-V1 删除：
+1. **硬件完成语义边界**：硬件实测（如 `sq_multiplex_test` 首轮、`async_error_test` X1/X4）证明，远端已成功接收并通过校验的报文，发送端仍可能收到 `ACK_TIMEOUT`（`status 9`）或因 `JFC_ERR` 丢失本地完成证据；反之，本地收到 `URMA_CR_SUCCESS` 也仅代表 NIC 层面完成，不代表对端应用已消费。仅重发“无成功 CQE 的 WR”必然引入静默数据重复或乱序破坏。
+2. **数据路径零分配与内存持有成本**：若支持跨传输重放，所有已发送数据在获得对端应用层 ACK 前均不得释放 `BufferLease`，使 40k 连接下的内存占用与管理复杂度失控。
+3. **资源生命周期与业务重试解耦**：V1 保留 `AttemptLedger` 与 `BufferLease` 账本，其唯一职责是**确保在硬件 DMA 与远端访问权（Grant）确证终结前不提前释放或复用物理内存**，绝不用于业务数据重放。
 
-- 为跨传输恢复维护的发送重放日志、连接级数据 ACK/SACK、恢复 offset 和迁移握手。
-- UB 故障后的库内业务重发，以及后台将既有 TCP 连接重新升级为 UB。
-- 为了未来重放而长期保留已经满足源内存复用条件的 buffer。
+---
 
-V1 仍保留：
+## 2. UB 硬件限制全景与架构映射
 
-- 已接受 WR 的完成账本、内存租约和故障清理状态；它们服务于资源安全，不服务于业务重放。
-- RM_CTP 乱序重组、RNDV 完成通知、接收 credits、连接身份与代际。
-- 设备错误传播、路径健康缓存、新连接降级协商。
+本节汇总真机实测与用户提供的硬件契约（见 [硬件观测记录](../hardware-observations.md)、[验证矩阵](../hardware-validation-matrix.md)）。人工确认、实际运行记录、源码行为和软件设计推断必须分开：SEND 乱序、200 MiB RMA 上限、status 9 后停用及 WRITE 可见性包含人工确认；WN1–WN4 通知实现回归尚无真机日志，单 WR RMA 实测至 8 MiB。既有 PASS 不覆盖所有版本、负载与故障，也不抹去历史 ACK_TIMEOUT。
 
-### 1.2 是否提高“包的利用率”
+### 2.1 当前 UB 硬件能力与刚性限制表
 
-需要区分三种收益：
+| 编号 | 硬件维度 | 实测现象 / 已确认硬件契约 | 对 `kbsocket` 架构的强制约束 |
+| :--- | :--- | :--- | :--- |
+| **H1** | **双边 `SEND` 大小上限** | `query_device` 报告 `max_msg_size=65536` 仅适用于 `RM_TP`；**`RM_CTP` 单 WR `SEND`/`SEND_WITH_IMM` 最大长度为 4096 字节（含任何 payload 内头部）**。支持多 SGE（已测 8 SGE，报告 13 SGE）。 | 1. 超过 4096 B 的 Eager 数据必须分片；<br>2. 满足紧凑身份条件的普通数据帧头放进 64 位 `imm_data`，使 4096 B 业务写入可由单条 WR 承载，避免因几十字节头部拆成 2 条 WR；<br>3. 需要 payload 扩展头时使用独立注册头 SGE + 数据 SGE，总长硬限 $\le 4096\text{ B}$。 |
+| **H2** | **单边 `READ`/`WRITE` 限制** | 单次 `READ`/`WRITE` 硬件上限为 **200 MiB**（查询值 256 MiB 不作为可用承诺，已实测至 8 MiB/WR）。远端目标仅支持 **`max_rsge = 1`**（连续虚拟地址区间），本地源支持多 SGE。 | RNDV 接收端分配连续目标虚拟地址 Slice；发送端可多 SGE 聚合有效注册 Lease，普通 `writev` 先复制已接受前缀进 staging，再按有界 Chunk 公平调度。 |
+| **H3** | **同 SQ 同目标 `SEND` 乱序** | `RM_CTP` 下即使同一条物理 SQ 向同一远端目标顺序提交 `SEND`，**接收端也不保证按序到达**。启用硬件 JFS fence order 性能损耗显著。 | 连接层必须维护单调逻辑序号（SN）与预分配乱序重排窗口（`ReorderWindow`），仅向 Socket 层发布连续可读前缀；RNDV 逻辑字节区间未完成前，后续 Eager 数据不得越洞交付。 |
+| **H4** | **芯片 `status 9`（`ACK_TIMEOUT`）缺陷与 `READ` 风险** | 1. **当前目标芯片上，WR 返回 status 9 后原 Jetty 不可继续发送**，即使查询 READY；<br>2. 用户确认高并发 READ 易触发已知问题，WRITE 未观察到相同并发触发模式；但 **WF2 首次健康 WRITE 已出现 status 9**，不能承诺 WRITE 免疫；<br>3. 正常 JFC/JFR 可供新建 Jetty 复用；坏 JFC 不适用此恢复路径。 | 1. V1 大包选用 WRITE RNDV，READ 不在交付范围；<br>2. 任意操作出现 status 9 都必须封禁、按逐 WR 和事件屏障排空后替换 Jetty，不能凭 READY 恢复；<br>3. 主被动 Jetty 分离用于缩小发送 Lane 重建的影响，仍需生产路径回归。 |
+| **H5** | **`WRITE` 完成可见性契约** | 已确认硬件上 **`WRITE` 的数据可见性与 `READ` 一致**：发送端在集齐全部 `WRITE` WR 的 `URMA_CR_SUCCESS` CQE 后，再发送 `SEND_WITH_IMM` 完成通知；接收端收到该通知 CQE 时，目的内存数据已完整可见。 | 采用严格的两阶段发布：`WRITE` 全部成功退休 $\rightarrow$ 发送携带 `(session_id, transfer_id, grant_gen)` 的 `SEND_WITH_IMM` 通知 $\rightarrow$ 接收端校验完整后推进可读边界。严禁使用未经确认的无等待链式提交或 `WRITE_WITH_IMM`。 |
+| **H6** | **共享 SQ 错误隔离（`status 8` 与 `status 10`）** | 在已测 error-continue 配置下，SEND 的 status 8/10 可与同 SQ 健康 SEND 共存；WRITE 的 status 8 可与同 SQ 健康 WRITE 共存。普通 WRITE 不消耗 JFR RQE，不能把 SEND RNR 结果写成 WRITE RNR 验证。status 8 也不唯一代表进程退出。 | 合法 status 8/10 仅退休该 WR 并上报所属操作/连接，不因此新触发整 SQ `BeginDrain`；若 Lane 已因其他错误停用，不把它重新打开。此规则不承诺健康 WR 永远不会遇到其他故障。 |
+| **H7** | **硬件 RNR 重试与超时档位限制** | 驱动仅在私有 `UDMA_CAP_FEATURE_RNR_RETRY` 置位时写入 `rnr_retry`，且 `err_timeout` 按 `/8` 映射为 `128 / 1000 / 8000 / 64000 ms` 粗粒度档位（实测 `queried_rnr_retry=0`，超时约 129.6 ms）。 | **严禁依赖硬件 RNR 重试等待远端补投 RX**；必须实施严格的软件接收 Credit 预授信，从源头避免 RNR。 |
+| **H8** | **Provider 提交容量、部分接受与 `ERROR` 态投递** | 1. 队列满时返回 `ENOMEM(12)`（而非 `EAGAIN`），且可能仅接受批次前缀（由 `bad_wr` 指向首个未接受 WR）；<br>2. 实测向已处于 `ERROR(3)` 状态的 Jetty 直接 `PostJettySend` 仍可返回 `URMA_SUCCESS(0)`；<br>3. `urma_flush_jetty` 请求数不得超过单 SQ `tx_depth`。 | 1. 软件必须通过 `JettyPool` 票据严格限制在途 WR 数（$\le \text{tx\_depth}$），并满足防 CQ 溢出不变量 $\text{jetty\_count} \times (\text{tx\_depth}+1) \le \text{tx\_cq\_depth}$；<br>2. 严格按 `bad_wr` 拆分 `Commit`（前缀）与 `Cancel`（后缀）；<br>3. 严禁绕过 `JettyPool` 软件门禁缓存裸 `urma_jetty_t*` 投递。 |
+| **H9** | **共享 `JFR` 容量上限与残留 RX 关闭** | 1. 单 `JFR` 最大深度 **32,768**（以 4 KiB 计为 128 MiB）；<br>2. 接收域关闭时，未消费的 `Posted` RX WR 不会自动产生 CQE；实测确认（`jfr_lifecycle_test` J1–J5）：**停止对端发送并删除所有依赖该 `JFR` 的 Jetty 后，调用 `DeleteJfr` 成功即可终止全部残留 RX 的硬件 DMA 访问**。 | 1. 40k 连接共享每 Context 1 个 `JFR`，按 `PeerRuntime` 而非单 Socket 分配基础窗口；<br>2. `RxBufferPool` 关闭支持两阶段：先由 `JettyPool` 成功执行 `DeleteJetty` + `DeleteJfr` 终结残留 `Posted` 槽位的 DMA 所有权，再等上层 `Held` 租约归零后注销 MR 并释放内存。 |
+| **H10** | **`JFR_LIMIT` 水线单次触发与异步事件边界** | 1. 剩余 RX 低于阈值触发 `JFR_LIMIT`（type 3）后，**硬件/驱动自动将 `rx_threshold` 清零**，仅 `AckAsyncEvent` 和 `Refill` 不会恢复下次通知（A1–A9 系列记录，具体覆盖见验证矩阵）；<br>2. **`PORT_DOWN` 异步事件明确不可观测**；<br>3. `JFC_ERR` 会导致在途 WR 丢失终结 CQE（X1/X4 实证）。 | 1. 收到 `JFR_LIMIT` 后优先补投至水线以上，再显式调用 `ModifyJfr` 重写 `rx_threshold`；<br>2. 故障检测不依赖 `PORT_DOWN`，依靠 CQE 错误与控制面探活；<br>3. 按 CQ 容量约束提交以预防溢出；发生 `JFC_ERR` 时封闭关联依赖域，隔离尚无终结证据的 DMA 内存。当前不承诺故障 CQ 在线恢复，无法证明安全时保留至进程退出。 |
+| **H11** | **`RearmJfc` 通知契约与 DWQE 快路径** | 1. `RearmJfc` 时若 CQ 中已有未消费 CQE，仍会触发通知（已由四 Context `streaming_test` D1–D3 验证）；<br>2. 驱动仅在 `wr_cnt==1 && pi-ci==1` 时走低时延 DWQE，启用 selective signaling（`Q>1`）导致 `ci` 滞后、退化为普通 doorbell，实测 `send_lat` 中 `Q4..Q64` 比 `Q1` 慢 0.19–0.29 µs；<br>3. 硬件 CQE 无时间戳字段。 | 1. 事件模式统一采用 `Poll -> RearmJfc -> Recheck -> WaitJfc -> AckJfc`；<br>2. V1 **全面采用全 Signal（`Q=1`）**，兼顾低在途时的 DWQE 极低时延与共享 SQ 逐 WR 精确记账；<br>3. 可观测性不依赖硬件 CQE 时间戳，采用 USDT + eBPF 与空 CQ 观测窗口界定。 |
+| **H12** | **容器裸设备拓扑** | 目标生产容器暴露 **2 个物理裸设备 × 每设备 2 个 EID = 4 个 `UrmaContext`**（跨 2 个 IOdie）。同 EID 双进程 `read_bw` 已达单进程 1.85 倍。 | `RawRuntime` 按 `(device_name, eid_index)` 建立 4 个独立 `UrmaContext`；单 `RuntimeShard` 可统一轮询 4 个 Context，亦可按 2/4 Shard 分片归属，不假定 4 个 EID 等于 4 倍物理端口线速。 |
 
-1. **CPU、内存与状态效率：有明确的结构性改善。** 删除重放、恢复确认和切换状态，减少持有 buffer 的时间及异常分支。
-2. **线速有效载荷占比：可能改善，但不能直接量化。** 可以减少仅为无损恢复而存在的确认/恢复控制流量；普通数据仍需 demux、顺序与长度等元信息。不能承诺每个 4 KiB 包都因此增加多少 payload。
-3. **故障期间业务有效吞吐：可能变差。** 已建立连接必须失败，上层重连与重试可能重新执行或重传整个请求。这是主动接受的取舍。
+### 2.2 目标负载模型与容量推演（3000×3000 Full-Mesh & 40k 规模）
 
-“packet-based”并不意味着有序 socket 必须额外复制一遍所有数据。V1 用轻量顺序适配和 slice 队列满足 socket 语义，不在其上再构建一套跨故障重传协议。若未来提供 message API，可暴露消息边界，但它不能直接取代已有字节流调用者。
+| 参数维度 | 约束口径 | 架构设计含义 |
+| :--- | :--- | :--- |
+| **连接规模** | 单容器承载上限 **40,000 常驻连接**，峰值 **40,000 次建链/秒** | 物理队列数按 $O(\text{Shards} \times \text{Contexts} \times \text{Lanes})$ 常数级收敛；逻辑连接状态为 $O(\text{Connections})$；同 Peer 远端导入句柄（`urma_target_jetty_t`）必须缓存复用 |
+| **Full-Mesh 拓扑** | 3000 Client $\times$ 3000 Server（全局 900 万条连接，**每容器 3000 个活跃对端 Runtime**） | 区分“40k 逻辑 Socket”与“3000 个对端 `KbRuntime` 实例”；流控基础窗口按对端 `KbRuntime` 分配，多条同 Peer 连接共享同一份授信 |
+| **吞吐与并发度** | 每客户端进程总 **QPS = 1000**，跨全部 Peer 总在途 **QD = 10**；请求与响应等长（1 KiB / 10 KiB / 100 KiB / 1 MiB 分别压测） | 平均每对 Client/Server 约 3 秒 1 次请求（极度稀疏），但可能发生 3000 客户端同相位访问同一 Server 的旋转 Incast；小包须有暖窗口免除首包 RTT，大包须有 RNDV 准入防内存打爆 |
+| **容器资源配额** | **4 CPU / 16 GiB RAM** | 注册内存池（MR Slab）硬上限控制在 512 MiB–1 GiB 量级；4 CPU 需同时支撑业务线程（如 bRPC worker）与 `ShardReactor`，严禁无预算的全核死循环自旋 |
 
-## 2. 约束、证据与验收目标
+### 2.3 性能证据与容量验收口径
 
-### 2.1 硬件约束
+本次精简保留历史基线的适用范围：旧设计（提交 `29c6993`）记录 raw 相对 bonding 的 `send_lat` 样本改善，但环境、调度与版本均影响结果；未显式设置 TX 深度的旧延迟测试会将请求的 Q8–Q64 截断为实际 Q1，不能据此判断 selective signaling。另组明确设置 `-T128` 的样本及 provider DWQE 分支支持全 Signal 的当前选择，不构成所有负载下的最优证明。
 
-以下来自用户对当前目标硬件的说明，是本设计的输入，不推广为所有 UB 设备的通则。2026-10-26 用户已明确确认 SEND 的模式差异和 READ/WRITE 大小上限；这两项不再列为待确认参数，设备查询值不能脱离传输模式和现场契约解释。
+同 EID 双进程 `read_bw` 聚合约 22477.64 MiB/s，相对单进程 12160.91 MiB/s 约 1.85 倍；同时增加了线程、context 和队列，不能归因为多 EID、多物理端口或推广为 SEND/生产 RNDV 吞吐。未报告重复试验方差的百分比只作基线参考。
 
-- 可实际采用的模式只有 RM_CTP。
-- RM_CTP 双边 SEND 的单 WR 最大数据量为 4 KiB（4096 字节）；协议头占用其中空间。查询报告的 `max_msg_size=65536` 对应 RM_TP 的 64 KiB 上限，不适用于 RM_CTP。
-- 单边 READ/WRITE 不受这一 4 KiB 限制，当前硬件单次操作上限为 200 MiB（209715200 字节）。历史日志中的 `max_read_size=max_write_size=268435456`（256 MiB）保留为查询报告值，不用它扩大已确认上限；已提供的单 WR 测试覆盖到 8 MiB，能力契约与实测覆盖分别记录。
-- 单个共享 JFR 最大深度为 32,768。以每个 WR 4 KiB 计算，承载的接收 buffer 总量上限约为 128 MiB，不是无限的连接级缓存。
-- 后续流控讨论按一个端点可配置 4 个这样的接收域计算：最大合计 131,072 RQE、约 512 MiB 接收 buffer。它们仍是四个独立预算，不能把某一域的空额度用于向另一已满 JFR 发送；最大值也不意味着必须满配。
-- 现有 bonding 对外暴露聚合设备，底层涉及 4 个 raw 设备/端口资源，分布在 2 个 IOdie，每个 IOdie 有 2 个 port。设备、context、EID 和物理 port 的实际映射需要运行时确认。
-- 旧 jetty pool 为 100 时，曾以一半 `{0,1}`、一半 `{1,0}` 的 port 优先序分散正常流量。这是 bonding 的选择策略，不能原样当作 raw 的物理映射。
-- 当前容器目标和持续收发实测是两个裸设备、每设备两个 EID，共四个 context；它不等于上述历史 bonding 的四设备拓扑。资源按实际 `(device, eid)` 和 context 建立，物理端口带宽与故障域另行映射。
+- 40k 常驻与 40k/s 建链分别验收；区分相同 Peer 的暖缓存命中与新 Peer 的冷导入，记录错误率、CPU 配额、持续时间、建链延迟分位数和实际完成的双方 READY 数。
+- 内存预算按 RX、TX staging、RNDV 目标、重排描述符、连接/导入缓存及隔离区分别计账；多 context 注册同一 storage 不重复计算物理页，但须统计注册句柄/锁页及驱动资源成本。4×8192 RX 已用 128 MiB，4×32768 已用 512 MiB，注册池上限须为其余用途留空间，RSS 与注册内存口径分开。
+- Full-mesh 负载同时测试随机散布与 3000-way 同相位 incast；报告吞吐、P50/P99/P99.9、credit 停顿、控制开销、RNR 和隔离峰值，并与同资源 NativeTCP 比较。没有明确采样窗口与延迟目标时，不将“尾延迟无毛刺”作为验收条件。
 
-### 2.2 证据等级与源码快照
+---
 
-本文区分四类依据：
+## 3. 总体架构与单 Owner 分片模型
 
-- **实测记录**：用户贴出的硬件日志及其参数范围，汇总在 [硬件观测记录](../hardware-observations.md)和 [验证矩阵](../hardware-validation-matrix.md)；第 14 节保留历史性能结果。未在本次整理中重新跑真机测试。
-- **人工确认的硬件契约**：用户明确确认的目标芯片/provider 行为，可以用于实现，不因缺少本仓库测试日志重新列为未知；仍与已运行的实现回归分开标记。
-- **源码确认**：本地实现中可直接观察到的控制流或数据结构，不自动扩展为完整硬件保证。
-- **设计/假设**：拟实现机制或待实验验证的解释，不能作为已达标能力。
-
-gMock/模型测试用于验证软件遵守契约，不记作硬件 PASS。已确认的能力和错误作用域不必等待重新取得真机才能开始实现；尚未采用的优化语义不阻塞基础路径。当前生产组件及缺口见 [roadmap 的现状表](../roadmap.md#当前实现与目标之间的边界)。
-
-源码基线：
-
-| 仓库                         | 基线与范围                                                                                                                                                                                              |
-|------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `umdk`                       | `c164b85668ad51b0c022ed707bc07fe3ca472e27`                                                                                                                                                              |
-| `umdk` CQE 时间戳增量核验    | 2026-09-27 在上述基线检查后，于 `08b305081b490b9ac44b7fa889df77d95268fb80` 复核 CQE、公共 CR、poll 和 JFCE wait 接口；仍未暴露硬件完成时间戳。仅用于 19.18 的能力边界，不表示其他章节已全面升级至此版本 |
-| `ubs-comm` 历史问题分析      | 从 `5dfb3ae64071f56be443a65bf5f68bcc9cc13388` 之后，选取修复分析至 `7d62be17078589b7e630bb9252c349ce3f2c6c5b`；不是该区间每个提交的完整审计                                                             |
-| `ubs-comm` 初稿整理时 HEAD   | `d0669a66d68daec58ee659ff8479f5c9637c9ed5`；对 ArraySet、cooldown 和相关建链路径做了增量复核，不是对新 HEAD 的全面审计                                                                                  |
-| `ubs-comm` 流控增补时 HEAD   | `d5127e13bf229545f56fea5418e925f9b2b82ba9`；只增量复核初始授信、低水位申请、WR 截断和相关历史修复，未全面审计新增提交                                                                                   |
-| `ubs-comm` tracing 核验 HEAD | `acbaa8eddd3ce3511cfa3c0388b8c19f6ee60631`；核验 PROF、SplitTrace、packet/stage trace 与离线 join，不将旧文档中的打点接线视为当前仍有效                                                                 |
-| `brpc` 压测语义补充          | `fa93433265827196490182271b2af6fda9ae1153`；检查 `example/ub_test` 等当前工具，不认定现场必然使用此版本                                                                                                 |
-| Linux 同机 TCP 核验          | 上游 `torvalds/linux` 的 `v6.16` tag 及 6.16 内核文档；是指定版本的源码结论，不代表已核验测试机的厂商补丁、CNI、路由或实际数据路径，详见第 18 节                                                        |
-| 测试机二进制/驱动/固件       | 未提供准确版本；perftest 语义分析以本地 `umdk` 为条件依据                                                                                                                                               |
-
-### 2.3 性能目标必须定义口径
-
-“40k 连接”和“40k 次建链/秒”是两个独立目标：前者衡量稳态资源，后者衡量准入与握手能力。
-
-建链成功必须至少满足双方 READY、接收路由已发布，并能完成首个有效数据交换；不能只数 `socket()`、TCP connect 或本地句柄创建。需要分别测量：
-
-- 热运行时、已预建池、相同 peer 的大量逻辑连接。
-- 新 peer 引入的 endpoint import、协商与缓存未命中。
-- 冷启动时设备/context、注册内存、物理池初始化。
-- 40k 常驻连接与 40k/s 创建/关闭并存时的内存、尾延迟和回收滞后。
-
-物理队列尽量按 `O(shards × raw contexts × lanes)` 增长；逻辑连接状态仍是 `O(connections)`。若 40k 连接对应 40k 个不同远端 endpoint，远端导入与路由状态不可能凭池化自动变成常数。
-
-FD 上限、backlog、临时端口、容器 CPU 配额、内核 socket 内存和双方 CPU 成本也属于验收口径。目前没有数据证明 40k/s 已经实现。
-
-### 2.4 已确认的 full-mesh 目标负载
-
-本节来自用户后续明确补充，是第 9 节流控基线的依据，不是已经完成的 full-mesh 测试结果。
-
-| 参数 | 已确认含义 |
-|---|---|
-| 组网 | 3000 个客户端与 3000 个服务端 full-mesh |
-| 连接关系 | 合计 900 万条逻辑连接；该实验中每个端点有 3000 个对端，不是每容器 900 万条连接 |
-| 客户端 QPS | 每个客户端进程总共 1000 请求/s；每秒可以向 1000 个服务端各发一个请求，不是每个 peer 1000 QPS |
-| `queue_depth=10` | 每个客户端进程跨全部 peer 合计最多 10 个在途请求，不是每条连接各 10 个 |
-| 消息大小 | 1K、10K、100K、1M 分别压测，不是四种大小等比例混合 |
-| 响应 | 与请求等长；请求与响应都要配置相应数据路径和预算 |
-| 容器 | 每个客户端、服务端均为 4 CPU、16G 内存 |
-| 与 40k 目标的关系 | 40k 是库需承载的连接规模；本负载最多约 3000 个活跃客户端。逻辑连接数、peer runtime 数、已准入暖窗口数不能混为一谈 |
-
-下述容量计算统一用 KiB/MiB；部署时应以实际字节配置确认用户所称 K/M 的单位。假设请求长期均匀分布到全部服务端，则：
-
-- 全局请求率为 300 万 QPS，每服务端平均为 1000 QPS。
-- 每对 client/server 平均约 1/3 QPS，即约 3 秒一次请求。
-- 稳态客户端合计在途请求上限为 30000，不是 `3000×3000×10`。每服务端的实际在途取决于分布与时延，不能由此认为每个服务端也被硬限制为 10。
-- 每客户端以 QD=10 达到 1000 QPS，要求平均请求驻留时间满足约 10 ms 的必要上界；这不是 p99 SLA，也不是实际性能保证。
-
-均匀 1000 QPS、请求响应等长时，每端点的 payload 吞吐如下。客户端 TX 为请求、RX 为响应，服务端相反；TX+RX 只是主机双向处理量，不是单方向线速需求。
-
-| 请求/响应各自大小 | TX MiB/s | RX MiB/s | TX+RX MiB/s | 数据路径基线 |
-|---|---:|---:|---:|---|
-| 1 KiB | 0.9766 | 0.9766 | 1.9531 | eager，通常 1 个 SEND WR |
-| 10 KiB | 9.7656 | 9.7656 | 19.5313 | eager，通常 3 个 SEND WR |
-| 100 KiB | 97.6563 | 97.6563 | 195.3125 | RNDV 启用后请求和响应优先 WRITE |
-| 1 MiB | 1000.0000 | 1000.0000 | 2000.0000 | RNDV 启用后请求和响应优先 WRITE |
-
-实际 WR 数还受协议头、SGE 限制和打包效果影响，表中不含控制/协议流量。RNDV 上线前的大写入按已准入前缀分片 copy eager，允许部分写/反压，不承诺本表目标性能。上述长期平均不能排除同步 incast，也不能与第 14 节的持续小工作集 raw READ 带宽直接对比。
-
-## 3. 总体架构与所有权
+### 3.1 架构分层图
 
 ```mermaid
 flowchart TB
-    A["应用 / brpc 适配器<br/>Socket / C ABI / sender-receiver + BufferLease"]
-    R["KbRuntime：一个通信库实例<br/>实例身份、配置、总预算、生命周期"]
-    A --> R
-    R --> S0["RuntimeShard 0<br/>归属连接、资源和协议状态"]
-    R --> SN["其他 RuntimeShard<br/>独立资源与 owner"]
-    S0 --> E0["ShardReactor 0 / 固定 OwnerThread 0<br/>统一 TX/RX、mailbox、timer、refill、retire"]
-    SN --> EN["各自 ShardReactor / 固定 OwnerThread"]
-    E0 --> UB["RawBackend：按 raw context 分组<br/>jetty pool + TX JFC<br/>ReceiveDomain：JFR + RX JFC<br/>registered arena / import cache"]
-    E0 --> SHM["ShmBackend<br/>runtime-pair rings / shared arenas / eventfd"]
-    E0 --> TCP["NativeTCP<br/>内核 socket / epoll"]
+    subgraph AppLayer["应用与框架适配层"]
+        POSIX["POSIX Socket / Epoll 兼容层<br/>(kbsocket/socket)"]
+        CABI["显式零拷贝 C ABI + BufferLease<br/>(kbsocket/api)"]
+        P2300["现代 C++23 Sender/Receiver 异步层<br/>(kbsocket/api/execution)"]
+        BRPC["bRPC 协议与协程适配器<br/>(adapters/brpc)"]
+    end
+
+    subgraph CoreRuntime["kbsocket 核心运行时 (KbRuntime)"]
+        FD["无锁代际 FD 路由表 (FdTable)<br/>fd + binding_generation + Hazard Pointer"]
+        CTRL["异步控制执行器 (ControlExecutor)<br/>有界线程池：import_jetty / register_seg / lane 重建"]
+        HEALTH["健康与探测注册表 (HealthRegistry)<br/>错误分级 / 60s 冷却 / Single-Flight 探测"]
+
+        subgraph Shard0["RuntimeShard 0 (固定 OwnerThread 0)"]
+            R0["ShardReactor 0<br/>有界公平轮询：Mailbox / TX CQ / RX CQ & Refill / Timer / Retire"]
+            C0["ConnectionTable & ReorderWindow<br/>逻辑连接状态 / 32-bit SN 保序 / 连续字节流"]
+            CR0["CreditAccount & WriteRndvEngine<br/>PeerRuntime 授信总账 / WRITE 分块与通知"]
+            M0["ShardMemorySlicePool<br/>预注册 MR 本地空闲表 + 跨线程归还队列"]
+        end
+
+        subgraph ShardN["RuntimeShard 1..N-1 (各自固定 OwnerThread)"]
+            RN["独立 ShardReactor / 连接 / 账本 / 队列"]
+        end
+    end
+
+    subgraph Transports["多后端传输层 (kbsocket/transport)"]
+        RAW["RawBackend (URMA RM_CTP)<br/>4 UrmaContext × (ReceiveDomain + JettyPool + AttemptLedger)"]
+        SHM["ShmBackend (同机进程对)<br/>UDS 授权 + memfd Seals + SPSC Ring + eventfd"]
+        TCP["NativeTcpBackend (兼容与降级基线)<br/>Non-blocking Socket + Epoll"]
+    end
+
+    BRPC --> CABI
+    POSIX --> FD
+    CABI --> R0
+    P2300 --> R0
+    FD --> R0
+    FD --> RN
+    R0 --> C0
+    C0 --> CR0
+    CR0 --> M0
+    R0 --> RAW
+    R0 --> SHM
+    R0 --> TCP
+    R0 -.->|"阻塞控制任务交接"| CTRL
+    R0 -.->|"更新/读取快照"| HEALTH
 ```
 
-图中展开一个 shard，其余 shard 遵循相同所有权约束，但不要求复制全部 raw context。每个逻辑连接固定归属一个 shard 和已选 backend；TCP/本地协商、授权、健康探测与事件同样纳入有界推进。每线程执行环境称为 reactor，进程内通信实例称为 runtime，详见第 3.3 节。
+### 3.2 代码目录结构与模块职责映射
 
-### 3.1 模块边界
+为保证代码可读性、可维护性与最小耦合，项目源码按职责严格分层：
 
-| 模块 | 负责 | 不负责 |
-|---|---|---|
-| `SocketAdapter` | fd、errno、部分读写、epoll 兼容 | 直接持有 provider queue 指针作为连接身份 |
-| `Connection` | 顺序空间、可读区间、发送额度、FIN/错误 | 一连接独占一个 JFR 或 jetty |
-| `KbRuntime` | 实例身份、shard 集合、配置、总预算与生命周期协调 | 把所有数据面操作集中到一个全局锁或队列 |
-| `RuntimeShard` | 一组连接、物理资源、协议状态及本地账本的所有权 | 与其他 shard 共同修改同一热队列或连接状态 |
-| `ShardReactor` | 在固定 owner 线程推进 mailbox、CQ、refill、timer、retire | 在 hot poller 内执行阻塞操作或无界用户回调 |
-| `RawBackend` | 能力查询、post、CQE、flush、设备对象生命周期 | 推断业务是否执行或跨连接重放 |
-| `ShmBackend` | runtime-pair ring、共享 slab/lease、eventfd、pair 生命周期 | 把任意进程指针当共享地址，或把同机误当同一信任域 |
-| `LocalRendezvous` | 本地身份和策略校验、会话绑定、FD 交换 | 进入 payload 热路径，或绕过容器隔离与服务授权 |
-| `TraceFacade / TraceRecorder` | 稳定事件、操作关联、非阻塞有界候选记录；尾部保留决定、预算/丢失统计；adapter 注入 RPC 上下文 | 解析业务 payload、阻塞数据面等待日志写盘、把尾采样误作事后补录或零埋点成本 |
-| `LanePool` | 物理 SQ 调度、AttemptLedger、故障隔离范围 | “当前借用 socket”式唯一归属 |
-| `ReceiveDomain` | 共享 JFR、接收槽和 credits | 给每个空闲连接预留固定大窗口 |
-| `MemoryManager` | 注册内存、slice、lease、grant 安全回收 | 将普通裸指针隐式视作可异步 zero-copy |
-| `HealthRegistry` | 故障分类、抑制、有限探测、新连接准入 | 到期自动证明健康或批准释放 DMA 内存 |
+| 目录 / 模块 | 核心类 / 接口 | 职责边界 |
+| :--- | :--- | :--- |
+| `kbsocket/base/` | `log.hpp`, `no_destructor.hpp`, `scope_exit.hpp`, `error.hpp` | 基础工具、统一 `Error` 类型定义、RAII 守卫；严禁依赖上层传输或业务 |
+| `kbsocket/api/` | `kbsocket.h`, `buffer.h`, `execution/` | 对外 C ABI、显式 `BufferLease` 零拷贝接口、C++23 P2300 `sender`/`receiver` 封装 |
+| `kbsocket/memory/` | `storage.hpp`, `registered_slab.hpp`, `buffer_lease.hpp`, `quarantine_ledger.hpp` | 页对齐虚拟内存、多 `UrmaContext` MR 注册、分片空闲池、跨线程无锁归还队列、未终结 DMA 隔离账本 |
+| `kbsocket/transport/raw/` | `urma_api`, `device_catalog`, `urma_context`, `raw_runtime`, `jetty_pool`, `attempt_ledger`, `tx_sender`, `tx_completion_processor`, `rx_buffer_pool` | 裸设备发现、队列池（主动 TX Lane + 被动 RX Endpoint）、逐 WR 账本、全 Signal `SEND`/`WRITE` 提交与完成推进 |
+| `kbsocket/transport/shm/` | `shm_broker.hpp`, `shm_pair.hpp`, `shm_ring.hpp`, `shm_backend.hpp` | 同机身份校验、`memfd` 封印管理、跨进程 Cacheline 对齐 SPSC 环与 `eventfd` 通知 |
+| `kbsocket/transport/tcp/` | `native_tcp_backend.hpp` | 标准非阻塞内核 TCP 封装，提供握手通道及加速不可用时的保底传输 |
+| `kbsocket/control/` | `control_executor.hpp`, `handshake_fsm.hpp`, `endpoint_cache.hpp`, `health_registry.hpp` | 异步 TCP 建链协商、远端 `rjetty`/`rseg` 导入缓存（Single-Flight）、慢控制调用卸载、故障冷却与探测 |
+| `kbsocket/connection/` | `connection.hpp`, `wire_format.hpp`, `reorder_window.hpp`, `credit_account.hpp`, `write_rndv.hpp` | 线协议编解码、32-bit SN 乱序重排、连续可读流交付、`PeerRuntime` 分层流控、单边 `WRITE` RNDV 状态机 |
+| `kbsocket/runtime/` | `kb_runtime.hpp`, `runtime_shard.hpp`, `shard_reactor.hpp`, `mailbox.hpp`, `timer_wheel.hpp` | 进程级实例管理、单线程 Owner 事件循环、跨线程有界提交队列、O(1) 时间轮 |
+| `kbsocket/socket/` | `fd_table.hpp`, `socket_adapter.hpp`, `epoll_mux.hpp` | Hazard Pointer + 代际保护的 FD 表、POSIX `read`/`write`/`writev` 语义、合成与原生 `epoll` 公平复用 |
+| `kbsocket/observability/` | `shard_metrics.hpp`, `usdt_probes.hpp` | `alignas(64)` 分片无锁计数器、`<sys/sdt.h>` USDT 静态探针定义 |
+| `adapters/brpc/` | `brpc_kb_socket.hpp` | 对接 bRPC 的外部适配器（核心库绝不反向包含 bRPC 头文件） |
 
-### 3.2 单 owner 不等于所有调用都多一次线程切换
+### 3.3 并发模型：单 Owner 完整资源闭环
 
-- 调用线程已经是目标 shard owner 时允许直接提交，避免给低延迟场景固定增加 mailbox 跳转。
-- 其他线程使用有界 MPSC；高频注册生产者可使用 SPSC 分片，最终由 owner 合并。
-- 不把 40k 个连接每轮扫描一遍；只调度 active connection、到期 timer、待回收队列。
-- 用户 completion 默认投递到约定 scheduler；只有明确接受执行预算的回调才能在 progress 上内联。
-- 禁用 provider 锁的前提是相关队列的所有 post/poll/refill 真正由同一 owner 操作，而不是只让 TX 单线程。
+在 V1 中，**一个 `RuntimeShard` 绑定一个 `ShardReactor`，固定运行在一个 OS `OwnerThread` 上**。单 Owner 约束覆盖该分片内物理与逻辑状态的完整闭环：
 
-这样优先消除“共享可变状态”，再优化必须跨线程的入口，不把全库宣称为 wait-free。
+1. **物理队列独占**：所属 `JettyPool` 的 `Reserve`/`Commit`/`Cancel`/`Complete`、`TxSender::Send`/`Write`、`TxCompletionProcessor::Poll`/`Flush`，以及所属 `RxBufferPool` 的 `Poll`/`Refill`/`Release` 仅由该 `OwnerThread` 调用，底层队列启用 `lock_free = 1`。
+2. **连接与协议状态独占**：归属该 Shard 的所有 `Connection` 的发送排队、SN 分配、接收 `ReorderWindow`、可读边界推进、`CreditAccount` 账目及 `WriteRndvEngine` 状态仅由该 `OwnerThread` 修改。
+3. **跨线程零锁交接**：
+   - 当调用线程即为目标 `OwnerThread` 时，可在状态一致且不重入 post/poll/账本更新的边界内联执行；来自完成回调的重入请求先进入有界待办队列；
+   - 当外部业务线程（如 bRPC worker）发起 `write`/`read`/`close` 或归还 `BufferLease` 时，将预分配的操作描述符推入目标 Shard 的有界 `alignas(64)` MPSC `Mailbox` 或 `LeaseReturnQueue`，由 `OwnerThread` 批量消费。
+4. **慢控制调用剥离（`ControlExecutor`）**：`urma_import_jetty`、`urma_unimport_jetty`、`urma_register_seg`、`CreateJetty`/`DeleteJetty` 等可能阻塞的控制面 API 交由有界 `ControlExecutor` 执行，完成后通过 `Mailbox` 将结果交回 `OwnerThread` 发布。创建/注册只处理尚未发布的资源；销毁前由 Owner 冻结目标、结束数据面访问并建立第 5 节的终结屏障，控制任务持有其 context、队列、MR 等依赖。执行器不并发修改活动队列和 owner 账本；关闭或代际变化后返回的结果只能清理，不能重新发布。`lock_free=1` 仅适用于单 Owner 的队列操作，不取消共享 context 对象表或 provider 控制面的同步要求。
+5. **4 CPU 容器的默认分片配置**：
+   - **基线配置（1 I/O Shard + 3 业务 CPU）**：1 个 `RuntimeShard` 统一管理 4 个 `UrmaContext`（共 4 个 `JettyPool` / `ReceiveDomain`），适合 1000 QPS 稀疏控制与常规吞吐；
+   - **高吞吐配置（2 I/O Shards + 2 业务 CPU）**：2 个 `RuntimeShard` 各独占 2 个 `UrmaContext`（按 IOdie/NUMA 亲和分配），不跨 Shard 共享任何 `JFR`/`JFC`。
+   - 建链时按 `PeerRuntimeId` 一致性哈希将同一远端实例的所有 Socket 固定路由到同一个本地 `RuntimeShard`，从而在分片内零锁共享同一份 `PeerRuntime` 授信与导入句柄。
 
-### 3.3 Runtime、shard、reactor 与线程
+---
 
-本文采用以下术语，避免把通信端点身份与本地线程数量混为一谈：
+## 4. 分层身份体系、FD 安全与双轨生命周期
 
-| 术语 | 含义 | V1 关系 |
-|---|---|---|
-| `KbRuntime / RuntimeInstance` | 一个通信库实例，通常每进程一个；拥有独立 incarnation 和生命周期 | 包含 N 个 shard；同进程若创建多个实例，身份与预算仍需显式区分 |
-| `Shard / RuntimeShard` | 连接、队列、buffer 和协议状态的所有权分区，回答“哪些状态归谁” | 一个 shard 有一个 reactor |
-| `ShardReactor` | 事件循环与本地调度器，回答“如何推进工作” | 固定运行于一个 owner 线程 |
-| `OwnerThread` | 执行该 reactor 的 OS 线程，回答“谁实际执行” | V1 不迁移 reactor，不允许其他线程同时代跑 |
-| CPU core | 线程获得执行时间的硬件资源 | 可按 NUMA/CPU 预算绑核；线程绑定与独占 CPU 配额不是同一保证 |
+### 4.1 分层防 ABA 身份契约
 
-因此，用户提出的“一 shard、一线程、一个本地 runtime”在本文表述为 **一个 shard、一个 reactor、一个固定 owner thread**。三者在 V1 一一对应，但概念不同；实现可以由一个 `RuntimeShard` 对象聚合这些成员，不必人为增加多层抽象。
+针对历史 `ubsocket` 中因 FD 复用、槽位循环复用和队列重建引发的 ABA 错乱，V1 严格区分以下身份（热路径聚合存储，不增加多余间接寻址）：
 
-`peer runtime`、授信关系中的 runtime instance、SHM runtime-pair 和 tracing 的 `runtime_instance_id` 均指 `KbRuntime` 实例身份，不指每线程 reactor。增加 shard 不自动增加远端 peer 数、基础窗口或 SHM pair。进程级身份/配置不要求热路径集中执行：队列、额度子账和内存缓存仍由 shard 本地持有。
+| 身份标识 | 位宽与结构 | 作用域与防 ABA 职责 |
+| :--- | :--- | :--- |
+| `RuntimeInstanceId` | `uint64_t`（节点标识 + 启动时间戳/随机数） | 唯一标识一个 `KbRuntime` 进程实例；握手、流控总账与 SHM 配对的根身份 |
+| `ContextIncarnation` / `PoolEpoch` | context / 池每次创建或重新打开时递增的实例代次 | 区分同一对象地址、context 索引或池槽位的先后生命周期；导入缓存、MR、Lane 和账本均绑定所属实例 |
+| `FdBindingId` | `int32_t fd` + `uint32_t binding_gen` | 区分同一整数 `fd` 的先后绑定，防止迟到的 `epoll` 就绪或异步回调命中复用后的新连接 |
+| `SessionId` (`ConnId`) | `uint32_t conn_slot` + `uint32_t conn_gen` | 在所属 `RuntimeShard` 内唯一定位一条逻辑连接；每次新建连接递增 `conn_gen`，断链重连必为新 `SessionId` |
+| `ReceiveDomainId` | `uint16_t ctx_idx` + `uint16_t domain_id` + `uint32_t domain_gen` | 标识共享 `JFR` 与被动接收端点 `rx_target_jetty`；远端据此绑定 `CreditAccount` |
+| `JettyLaneId` | `const JettyPool*` + `PoolEpoch` + `uint32_t lane_idx` + `uint64_t lane_gen` | 标识池内单条主动发送 SQ；**单条故障 Lane 重建仅递增该槽位的 `lane_gen`**，不使池内其他健康 Lane 的票据失效 |
+| `AttemptId` (`user_ctx`) | `uint64_t`（账本生命周期内单调递增，0 无效，取模定位槽位） | 在所属完成域/账本中 O(1) 定位单次物理提交；必须校验完整 ID、池代次与 Lane 代次，取模位置本身不是身份 |
+| `OpId` | `uint32_t op_slot` + `uint32_t op_gen` | 定位单次异步读写或 RNDV 操作状态机（Operation State） |
+| `BufferLeaseId` | `const Pool*` + `PoolEpoch` + `uint64_t lease_id`（按容量步进递增） | 唯一标识一次 DMA/共享内存切片借用；拒绝迟到 CQE 或应用重复 `Release` |
+| `GrantId` | `uint32_t grant_slot` + `uint32_t grant_gen` | 标识 `WRITE RNDV` 暴露给远端写入的目标内存区间授权周期 |
 
-V1 在建链/绑定阶段选择稳定 owner，优先让同一 peer runtime 的相关连接归属同一 shard，以复用授信和 SHM pair。owner 选择需检查实际资源与准入预算，不假定哈希必然均匀；活跃连接不做动态迁移。热点需要跨 shard 扩展时，必须显式增加资源域、子额度或 pair lane，不能直接搬动仍有在途操作的连接。
+所有有限位宽的身份计数都必须有耗尽策略：在仍可能存在旧 CQE、回调、远端授权或归还请求时禁止回绕复用；达到上限时停止对应槽位准入，只有完成旧实例的全部终结与事件屏障后才建立新实例。软件对象地址或硬件 ID 相同均不能代替实例身份；SN 的耗尽策略另见第 6 节。
 
-### 3.4 执行模型的取舍与完整所有权
+### 4.2 FD 路由表与 Hazard Pointer 读者保护
 
-高性能框架没有唯一线程模型。以下是架构参考，不是 kbsocket 已获得同等性能的证据：
+应用线程通过整数 `fd` 调用 `read`/`write`/`close` 时，不能直接锁全局表或裸读指针后再加引用计数（存在 TOCTOU 竞态）：
 
-| 模型 | 收益与代价 | 对 kbsocket 的选择 |
-|---|---|---|
-| 全栈按核分片 | 网络、协议和业务尽量同核，减少交接；业务必须非阻塞、可分片并协作让出 CPU | 保留受控同 owner 直通能力，不要求已有 brpc 业务整体改造 |
-| I/O shard + 独立业务执行器 | 通信进度不被普通业务回调拖住，易接入现有 RPC 框架；需要提交/完成交接 | V1 默认：reactor 管通信，业务回到约定 scheduler |
-| 按接收、处理、发送阶段划分流水线 | 可独立配置阶段吞吐，但增加 ring、排队、同步与缓存迁移 | 作为未来有测量依据的对照，不默认拆成 TX/RX 两线程 |
+1. `FdTable` 为预分配的平铺数组（支持到 `RLIMIT_NOFILE`，默认按块惰性映射），每个槽位原子发布不可变的 `FdBinding` 指针。
+2. 任意应用线程查询 `fd` 时，使用线程本地 **Hazard Pointer** 保护加载出的指针并重检槽位一致性；在成功校验 `binding_gen` 并将请求推入目标 Shard 的 `Mailbox`（或取得受控操作句柄）后，立即退出 Hazard 保护，**绝不跨阻塞等待长期持有 Hazard 指针**。
+3. `close(fd)` 解绑槽位后，旧连接对象进入所属 `RuntimeShard` 的本地退休队列（`RetireQueue`），由 `ShardReactor` 在满足双轨回收条件后批量释放，彻底消除全局 `deferred_mutex`。
 
-Seastar 使用按核分片、协作式任务调度与显式跨核消息；SPDK 强调状态由单一执行上下文拥有，通过消息请求 owner 操作，并把逻辑执行上下文与底层 OS 线程框架解耦；DPDK 同时描述同核 run-to-completion 和跨核 pipeline。这些机制提供取舍依据，不要求引入其库依赖。[Seastar](https://docs.seastar.io/master/tutorial.html#_seastar)、[SPDK](https://spdk.io/doc/concurrency.html)、[DPDK](https://doc.dpdk.org/guides/prog_guide/ethdev/ethdev.html)
+### 4.3 CPU 生命周期与硬件 DMA 生命周期严格分离
 
-对每个 shard，单 owner 必须覆盖完整资源闭环，而不是仅限制 `poll_jfc()`：
-
-- SQ 的 post、TX CQ 消费、AttemptLedger、错误/flush 和退休协调属于同一 owner。
-- JFR 的 RX CQ 消费、refill、已投递数量和授信总账属于同一 owner。
-- Connection 的 RNDV、接收重组、连续可读边界与控制消息由该 owner 修改；应用领取 slice 不成为协议状态的第二个修改者。
-- 其他线程经有界 mailbox 提交请求，buffer 归还也有明确通道。V1 不让 timer/reaper 线程通过 try-lock 临时协助 poll 同一 CQ，不让通用线程池偷取 owner-affine 操作。
-- 可阻塞的创建、导入、注册等控制操作进入有界控制执行器；半成品完成后交回 owner 发布，不并发修改活动队列。销毁仍遵守第 12.3 节的物理终结顺序。
-- 单线程可管理大量异步在途操作，不阻塞等待单个 READ/WRITE；协程或 sender/receiver 不改变 owner 约束。状态在挂起/回调重入前必须一致，单线程不消除取消、重入和生命周期问题。
-
-这个模型降低共享状态竞争，但不自动解决热连接不公平、物理 SQ 的 HOL、设备带宽上限或 owner 被 OS/cgroup 延迟调度。它必须与第 12 节的有界公平推进配套，也不能仅凭“每 shard 一线程”就关闭共享 context 对象表、MR 注册或 provider 全局状态的同步。
-
-## 4. FD 查询、ABA 与生命周期
-
-### 4.1 ArraySet 的问题不是只换一个无锁 deferred 队列
-
-现有 [ArraySet](ubs-comm/src/ubsocket/csrc/common/ubsocket_set.h) 的核心风险是：读线程原子加载对象指针后，再增加引用计数；两者之间，写线程可能已移除对象。额外引用和 deferred 队列只有在真正覆盖所有旧读者之后才能安全释放。单纯“延迟一点再减引用”没有建立这个证明。
-
-V1 建议：
-
-- fd 表槽位发布不可变 `FdBinding`，读侧使用成熟的 hazard-pointer 保护与重检机制；不要手写未经验证的 acquire/release 组合。
-- 安全取得引用或投递到 owner 后尽早退出 hazard 保护；不跨任意用户阻塞长期持有保护。
-- retire 分片到 owner/domain，批量回收；高频查询不访问一个全局 deferred mutex。
-- 明确 idle、线程退出、运行时关闭时的回收推进，不能依赖“未来总有新的网络流量”。
-- 内部完成路径使用稳定 ID/ledger，不再通过 fd 查询连接。
-
-选 hazard pointers 是为了适配任意应用线程和可能阻塞的 socket 调用；受控 owner 内部可以采用更便宜的局部 epoch/QSBR，但必须保证 quiescent point，不能被停顿读者无限拖住整个全局回收域。标准 hazard-pointer 提案提供保护/退休模型，并不自动提供本库所需的及时、可控 shutdown 回收策略。[P2530R3](https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2023/p2530r3.pdf)
-
-### 4.2 身份必须分层
-
-| 身份 | 作用 |
-|---|---|
-| `RuntimeInstanceId / context incarnation` | 区分运行时及 context 生命周期；导入对象和 MR 不跨 context 混用 |
-| `fd + binding_generation` | 区分同一整数 fd 的不同绑定，防止旧 readiness/关闭事件命中新对象 |
-| `ConnId / SessionId` | 每次新连接唯一；重连不是旧 session 的恢复 |
-| `Pool epoch / LaneId + lane generation` | 区分池的打开周期与单条 lane 的替换周期；替换一条 lane 不使健康 lane 的票据失效 |
-| `EndpointId / ReceiveDomain generation` | 远端可见目标、import 路由及授信的身份；不能由本地换 lane 指针隐式更新 |
-| `AttemptId / user_ctx` | 在所属账本生命周期内定位单次物理提交；与连接逻辑顺序号分开 |
-| `OpId + op_generation` | 定位已接受 WR/操作记录，避免槽位循环复用的 ABA |
-| `BufferLeaseId + pool incarnation` | 定位 buffer 的持有/归还周期，拒绝迟到或重复 release |
-| `GrantId + grant_generation` | 区分 RNDV 暴露的内存区间及其授权周期 |
-
-wire demux ID 应在接收域和会话中可校验，关闭后保留必要 tombstone/代际信息；整数 fd 不能作为远端连接身份。代际宽度与回绕策略要明确，不允许带有迟到事件的 ID 被快速重新分配。
-
-这是后续实现的最低身份契约，不要求每种身份都增加一层对象或全部携带在每个 wire 帧中。M0 固定语义，具体位宽、编码与公开 ABI 在相应阶段定义。当前 `JettyLane.epoch` 只覆盖池的打开周期，尚无逐 lane generation；AttemptId 不复用保证限于同一账本对象生命周期，账本中的连接/操作/租约标识也不自动拥有对应资源。
-
-真实 WR 必须先校验所属完成域、账本和代次，再改变 lane 状态。没有可信 user_ctx 的硬件边界不能靠软件 generation 补出旧身份；硬件 ID 复用的发布屏障见第 11.5 节。generation 防止软件误关联，不证明旧 DMA、远端授权或 provider 引用已经结束。
-
-### 4.3 CPU 回收和 DMA 回收是两套条件
-
-```text
-逻辑 close / failure
-  → fd 解绑、拒绝新操作、发布连接错误状态
-  → 已 post 的 AttemptLedger 继续存活
-  → 硬件终结 + 必需 CQ/flush 处理 + 远端 grant 终结
-  → provider 对象 / 注册内存具备释放条件
-  → CPU reader grace 条件也满足后，最终释放软件对象
+```mermaid
+flowchart LR
+    A["逻辑 Close / 连接致命错误"] --> B["1. 解绑 FdTable 槽位<br/>2. 拒绝新提交，唤醒阻塞调用者报错"]
+    B --> C["在途 AttemptLedger / RxBufferPool<br/>与 RNDV Grant 保持存活"]
+    C --> D{"硬件 DMA 终结条件满足？<br/>(逐 WR CQE / DeleteJfr / Grant 结清)"}
+    D -- "是" --> E["退休对应 DMA 引用 / 释放队列票据"]
+    D -- "否 (如 JFC_ERR / 远端失联未撤权)" --> Q["进入 QuarantineLedger 隔离账本<br/>(保留 MR 与物理页至安全边界/进程退出)"]
+    E --> F{"CPU Hazard Reader 宽限期已过<br/>且应用 Lease、Mailbox、回调引用均已结清？"}
+    F -- "是" --> G["回收无剩余使用权的 BufferLease<br/>及 Connection 软件对象"]
 ```
 
-fd 可以先被系统复用，旧 DMA 不可以因此失去归属。现有 raw CQE 解析会解引用 provider 内部 queue 地址；仅给 kbsocket 的 `OpId` 加 generation，无法挽救已经提前释放的 provider queue。[raw CQ 解析](umdk/src/urma/hw/udma/udma_u_jfc.c)
+**核心安全铁律**：
+- 普通 `write()` 若调用者传入非注册临时栈/堆内存，必须在返回前拷入预注册 TX Staging Slice；若通过显式零拷贝 `BufferLease` 接口提交，即使连接中途报错或被取消（`stop_token`），**在未取得对应 TX WR 的终结证据前，绝不能通知上层 `source_reusable`**。
+- **60 秒端口冷却到期、TCP 控制连接断开、软件超时均不是硬件停止 DMA 的证明**，绝不能作为释放或复用在途 DMA 内存的依据。
+- CPU 对象回收还必须等待所有已接受 Mailbox 操作、应用借用及完成回调退出；完成回调可能立即销毁 Operation State，调用后不能继续访问它。隔离账本同时持有 MR、backing、provider/context 等完整依赖，并由有界预算约束；不能只保留内存地址却销毁其所依赖的资源，也不能先停掉唯一进度线程再等待它负责的资源归零。
 
-发布连接错误不等于归还借用内存。借用用户源或目标 buffer 的 I/O，无论以成功、错误还是取消完成，都必须满足接口约定的不再访问条件；不能先完成操作，让用户复用 buffer，再由后台继续 DMA。库自有 staging 可以隔离，用户借用的 buffer 则必须继续持有其有效租约。
+---
 
-物理对象销毁、内存 deregister、buffer 复用必须分别有条件；“对象已从表中移除”“引用计数暂时为零”“冷却 60s 已到”都不是设备不会再访问的证明。
+## 5. Raw URMA 资源池：收发 Jetty 解耦与故障自愈
 
-## 5. 异步建链、P2300 与 TCP 兼容
+### 5.1 关键架构改进：被动接收端点（RX Endpoint）与主动发送通道（TX Lanes）解耦
 
-### 5.1 建链状态机
+在 `RM_CTP` 模式下，如果让同一个 `urma_jetty_t` 既作为本端发送 WR 的主动 SQ，又作为导出给 3000 个远端 Peer 导入（`urma_import_jetty`）的被动接收目标，会面临致命的硬件耦合风险：
+- 一旦该 Jetty 在向某一个异常 Peer 发送时触发芯片缺陷 **`status 9`（`ACK_TIMEOUT`）**，按硬件契约必须执行 `ModifyJetty(ERROR) -> Flush -> DeleteJetty -> CreateJetty`；
+- 如果其余 Peer 也依赖该导出目标，删除会使这些导入关系失效，可能扩大连接故障；具体错误码和影响时序须按完成证据判断，不能保证全部只返回 status 8。
 
-```text
-NEW → TCP_CONTROL_CONNECTED → NEGOTIATING
-                              ├─ 同机、获授权且 SHM 门禁通过
-                              │             → 映射/路由就绪 → 双方 READY → SHM_ACTIVE
-                              ├─ UB 可准入 → endpoint/import 就绪
-                              │             → RX 路由发布 → 双方 READY → UB_ACTIVE
-                              └─ 双方同意 TCP 且 wire 干净 → TCP_ACTIVE
+为此，V1 在每个 `ReceiveDomain`（对应 1 个 `UrmaContext` 下的共享 `JFR` + `RX JFC` + `TX JFC`）内实施**收发 Jetty 物理职责解耦**：
 
-任何阶段失败 / timeout / stop → 恰好一次完成 → 独立资源清理
+```mermaid
+flowchart TB
+    subgraph Context["单 UrmaContext 资源域 (ReceiveDomain + JettyPool)"]
+        JFR["共享 JFR (深度 8192~32768)<br/>绑定 RxBufferPool (4 KiB MR Slabs)"]
+        RXCQ["共享 Recv JFC"]
+        TXCQ["共享 Send JFC<br/>覆盖全部 TX 票据及所有依赖 Jetty 的边界 CQE"]
+
+        subgraph PassiveRX["被动接收端点 (1 个 / 域)"]
+            RXJ["rx_target_jetty<br/>share_jfr=1，永不投递 TX WR<br/>导出 rjetty 供所有远端 Peer 导入"]
+        end
+
+        subgraph ActiveTX["主动发送池 (N_tx 个 TX Lanes)"]
+            TX0["tx_lane[0] (Jetty 0, gen=g0)<br/>仅投递出站 SEND / WRITE WR"]
+            TX1["tx_lane[1] (Jetty 1, gen=g1)<br/>仅投递出站 SEND / WRITE WR"]
+            TXK["tx_lane[k] (故障重建中)<br/>DeleteJetty -> CreateJetty -> ++gen"]
+        end
+
+        RXJ -->|"共享接收"| JFR
+        TX0 -->|"共享接收配置"| JFR
+        TX1 -->|"共享接收配置"| JFR
+        JFR --> RXCQ
+        TX0 --> TXCQ
+        TX1 --> TXCQ
+        TXK --> TXCQ
+    end
+
+    Peer["3000 个远端 PeerRuntime"] ==>|"urma_import_jetty 仅导入 rx_target_jetty<br/>(SEND / WRITE 入站流量)"| RXJ
+    TX0 ==>|"wr.tjetty = 远端 rx_target_jetty"| Peer
+    TX1 ==>|"wr.tjetty = 远端 rx_target_jetty"| Peer
 ```
 
-协商至少携带版本、能力、session、endpoint/接收域信息、协商结果及最大帧/内存限制。不要先对外宣布 READY，再发布 fd/ConnId 到 RX demux 表；历史上这会使第一包落入黑洞。
+**解耦带来的三重核心收益**：
+1. **避免主动 SQ 重建使被动目标失效**：`rx_target_jetty` 从不投递发送 WR，不承担主动发送触发的 `status 9` 重建；其 `jetty_id` 在健康 `ReceiveDomain` 生命周期内保持不变。这不保证共享故障 Lane 上的其他连接不受影响，也不隔离 JFC/context 级错误。
+2. **健康接收域内的 TX Lane 本地替换**：主动 `tx_lane[i]` 遭遇 `status 9` 时，完成排空、旧事件终结及删除屏障后重建并递增 `slot.generation`，无需远端重新导入未改变的 `rx_target_jetty`；旧连接仍显式失败，替换不恢复旧会话或重放请求。
+3. **远端导入规模降低 $J$ 倍**：每个对端 `PeerRuntime` 在每个可用 `ReceiveDomain` 上只需调用 **1 次** `urma_import_jetty`（而非池内每个 Jetty 导入一次），大幅降低 40k 连接下的内核/驱动 CTP 导入表开销与建链时延。
 
-SHM 是同一协商边界内的新增候选，不是在发送业务字节后再探测升级。可信本地 rendezvous 可以承载已部署的能力发现/控制；初版仍兼容已有 TCP 控制入口。确认同机但 SHM 不可用时，默认候选为 NativeTCP，不为该本机连接强制初始化 UB 资源；细化选择规则见第 18.3 节。
+容量预算必须包含新增被动 Jetty 的资源：TX CQ 至少覆盖所有主动 Lane 的软件票据上限与所有依赖 Jetty 可能产生的边界 CQE，不能遗漏被动端点；RX CQ 覆盖该域可在途 RQE 的最坏完成量及所需事件余量。按实际创建配置校验，不能用 provider 偶然多接受的容量扩大软件准入。
 
-### 5.2 sender/receiver 的正确角色
+### 5.2 发送完成处理与逐 WR 错误作用域（M2 核心规范）
 
-用 P2300 风格描述 `async_connect / async_accept / async_read / async_write / async_close` 的异步组合、scheduler 与停止请求。C ABI 和 socket 兼容层不暴露模板实现细节，也不要求所有用户工具链已经提供可用的标准库实现。
+`TxCompletionProcessor` 在消费 `Send JFC` 时，必须严格遵守**先验明正身、再变更状态**的次序，并按硬件实测证据精确划分错误作用域：
 
-`KbRuntime` 组织各 shard 的 reactor，后者负责所属 nonblocking TCP、epoll/JFCE、timer 和 UB progress。无法非阻塞化的 URMA 导入/控制调用进入有界控制线程池；不能因为包装成 sender 就在 poller 里执行阻塞调用。
+```mermaid
+stateDiagram-v2
+    [*] --> kReady: Open / 在线重建成功 (++lane_gen)
+    kReady --> kReady: URMA_CR_SUCCESS / status 8 (REM_ACCESS_ABORT) / status 10 (RNR)\n[仅退休该 WR 并通知所属 Connection，Lane 保持 kReady]
+    kReady --> kFaulted: 已验明身份的 WR 报 status 9 (ACK_TIMEOUT) / 本地错误\n或 Post 返回不可信 bad_wr
+    kFaulted --> kError: ModifyJetty(ERROR) 成功
+    kFaulted --> kFaulted: ModifyJetty 失败 (保留隔离，允许重试)
+    kError --> kError: 消费逐 WR 完成 (含 WR_FLUSH_ERR)
+    kError --> kFlushReady: 消费该 Lane 的 WR_FLUSH_ERR_DONE 边界
+    kFlushReady --> kFlushReady: FlushJetty 返回 WR_UNHANDLED (逐条校验退休)
+    kFlushReady --> kDrained: FlushJetty 返回 0 且 slot.used == 0
+    kDrained --> kRebuilding: 旧完成/通知/async 引用全部终结\n提交 ControlExecutor 执行 DeleteJetty + CreateJetty
+    kRebuilding --> kReady: 替换成功，发布新句柄并递增 lane_gen
+```
 
-关键约束：
+**关键实现不变量**：
+1. **身份校验优先于通道状态变更**：
+   - 对于普通 WR 完成事件（非 `FLUSH_ERR_DONE`/`SUSPEND_DONE`），必须先校验 TX 方向和所属完成域，通过 `ledger_.Lookup(cr.user_ctx)` 找到完整 `AttemptRecord`，再校验 pool epoch、lane index/generation 及提交状态，**通过后才允许根据错误码触发 `BeginDrain`**。不能由取模槽位或 `local_id` 单独确认真实 WR 身份。
+2. **边界事件的硬件 ID 复用屏障**：
+   - `WR_FLUSH_ERR_DONE` / `SUSPEND_DONE` 的 `user_ctx` 无效，不能按普通 WR 查账或释放票据。除校验所属完成域、`local_id` 和允许接收该边界的状态外，替换前还必须证明旧边界、flush、JFCE/async 通知及其软件引用均已终结，或取得 provider 销毁会清理旧事件的明确保证；**仅按 `Drained -> DeleteJetty -> CreateJetty` 顺序执行不能自动证明硬件 ID 复用安全**。无法建立屏障时保留旧映射/隔离状态，不开放同 ID 新对象。
+3. **`status 8` 与 `status 10`（RNR）不排空共享 SQ**：
+   - `URMA_CR_REM_ACCESS_ABORT_ERR`（8）与 `URMA_CR_RNR_RETRY_CNT_EXC_ERR`（10）均只调用 `ledger_.Complete(cr.user_ctx)` 归还 SQ 票据，并将错误连同 `AttemptRecord` 交由上层终止对应 `Connection`，`JettyLaneState` 保持 `kReady`。
+4. **适用边界**：上图仅用于健康 JFC 上的主动 ERROR/flush；`WR_FLUSH_ERR` 是该排空过程的逐 WR 终结，不重复启动排空。`JFC_ERR` 导致完成证明不全时转入依赖域隔离，不能套用 `FlushJetty == 0` 或软件计数清零推断安全。当前生产已支持 status 8 逐 WR 退休；status 10 策略调整、身份校验前移和在线替换属于 M2 待实现项。
 
-- 操作启动后，正常、错误、超时、取消竞争只能产生一次 completion。
-- receiver completion 可能立即销毁 operation state；调用 completion 后不能继续访问该 state。
-- stop 是请求，不等于已经取消硬件访问；已提交 DMA 的内存终结仍走后台安全回收。
-- 需要返回给用户源或目标内存复用权的操作，不能仅为快速响应 stop/error 而提前结束借用生命周期；这也覆盖 async_read、READ 本地目标和原生 WRITE 接收目标。
+### 5.3 接收域安全关闭状态机（M1 核心规范）
 
-这些约束与 P2300 的 operation-state/异步完成模型一致；网络后端和具体取消协议仍需自行实现。[P2300R10](https://www9.open-std.org/JTC1/SC22/WG21/docs/papers/2024/p2300r10.html)
+针对整个 `ReceiveDomain` 关闭时共享 `JFR` 内仍有未消费 `Posted` RX WR 的问题，基于已确认的 `DeleteJfr` 硬件契约，执行以下依赖顺序。单连接关闭和单 TX Lane 重建不删除共享 JFR。图示为 Owner 协调的逻辑顺序，可能阻塞的 provider 销毁/注销调用按 §3.3 交给控制执行器完成后再推进下一阶段。
 
-### 5.3 达到 40k/s 的建设重点
+```mermaid
+sequenceDiagram
+    participant Owner as ShardReactor (Owner)
+    participant RxPool as RxBufferPool
+    participant JPool as JettyPool
+    participant URMA as UrmaApi (Provider)
 
-- 启动或扩容时预建有界 lane、共享接收域、注册 slab，不在每个 connect 上创建整套物理资源。
-- 同 peer endpoint import 使用缓存和 single-flight；引用与淘汰跟随 endpoint generation。
-- endpoint 交换与互不依赖的本地准备并行；保留最终双方一致的 READY/降级结果。
-- 准入有界，timeout 使用 timer wheel/堆等 owner 定时器，不每连接一线程。
-- listener、native TCP 和 synthetic readiness 都有公平预算，避免内部事件压住内核 accept。
+    Note over Owner,URMA: 停止新准入/提交，协调并确认远端停止向该域发送\n保持 CQ、事件与退休推进；失联或空 CQ 不等于静默证明
+    Owner->>RxPool: 1. Stop() 阻断新 Refill
+    Owner->>JPool: 2. 排空所有 TX Lanes (used == 0 且无 kError/kFlushReady)
+    Owner->>RxPool: 3. 有界 Poll() 解析剩余 RX CQE\n确认 JFCE/async 事件及软件引用已结清，建立销毁屏障
+    Owner->>JPool: 4. CloseQueues(): 逆序 DeleteJetty(所有 tx_lanes 及 rx_target_jetty)
+    JPool->>URMA: DeleteJetty(...) -> URMA_SUCCESS
+    JPool->>URMA: DeleteJfr(jfr_) -> URMA_SUCCESS (硬件终止全部残留 RX DMA)
+    JPool->>RxPool: 5. OnJfrDeleted(): 将残留 kPosted 槽位转为 kFree (posted_ = 0)
+    Note over Owner,RxPool: 等待上层应用归还所有 Held Lease (held_ == 0)
+    Owner->>RxPool: 6. Close(): UnregisterSeg(segment_) + free(memory_) + 解绑
+    Owner->>JPool: 7. DeleteJfc(recv_jfc_) + DeleteJfc(send_jfc_)
+```
 
-### 5.4 降级只能发生在清晰的协商边界
+- **剩余完成与授权**：销毁前在 provider 对象仍有效时解析相关 CQE，并取得通知/async 的确认屏障；销毁竞态中的剩余完成必须有明确的 provider 清理或安全解析契约覆盖，无法证明则保留依赖。不得先删除对象再通过它解析迟到 CQE。`DeleteJfr` 成功只终结残留 Posted RX，不伪造成功 CQE、不撤销 Held Lease，也不终结独立 RMA Grant；MR 注销/内存释放还须等待这些条件结清。
+- **失败可重试**：若任一 `DeleteJetty`、`DeleteJfr` 或 `UnregisterSeg` 返回非零错误，保留当前阶段状态与底层依赖（绝不提前 `free(memory_)`），允许后续重试从断点继续推进。正常关闭门槛无法满足或 JFC 已故障时采用隔离；该流程不能把软件超时当作 DMA 终结证明。
 
-V1 每条连接 backend 在建立成功后固定。旧 UB/SHM 断开后，上层建立一条新连接；重新检查同机授权、SHM 资源及 raw 路径健康，再选择 SHM、UB 或 TCP。已处于 TCP 的连接不随健康恢复自动升级；SHM 也不在故障后原地转为 TCP。
-
-不能向未知的纯 TCP 应用随意写入私有 UB 探测字节，再声称“透明降级”：对方可能已经把它当业务数据。部署需明确协商入口/能力发现与旧协议兼容策略。若握手失败导致 TCP wire 不再干净，应关闭并按协议重新建连，不能把残留协商字节交给应用。
-
-兼容层必须用测试矩阵声明支持范围：至少覆盖 read/write/readv/writev、nonblocking connect、accept、close/shutdown、SO_ERROR、epoll LT/ET/ONESHOT，以及原生 TCP 不受拦截逻辑干扰。其他 socket 选项、dup/fork 等行为必须明确支持或限制，不能默认全 POSIX 等价。
+---
 
 ## 6. 连接内顺序：保留薄适配，不构建重放协议
 
-用户于 2026-10-23 明确确认：当前 RM_CTP 默认同一个 SQ 向同一目标提交的 SEND 不保证接收顺序。固定连接到同一 SQ、按序 post 或观察到若干次顺序完成，都不能替代软件保序。JFS 的 fence order 可用于约束顺序，但用户说明性能代价较大，V1 默认采用按连接 SN/字节位置重排。接收端还可能遇到“大包 RNDV 尚未完成，后续 eager 小包已到达”，各路径须使用共同的逻辑顺序空间。该结论作为现场契约记录在 [硬件观测记录](../hardware-observations.md#2026-10-23-人工确认的硬件契约)，不记作新增硬件测试 PASS。
-
-建议每连接使用单调逻辑字节区间，或能无歧义映射到字节区间的 frame sequence。每帧的协议元信息至少表达或关联到会话/demux、类型、长度与顺序，可由 IMM、完成长度及按需扩展头共同承担，不要求全部重复放入 payload 头；RNDV 控制另带 transfer/grant 身份。具体字段压缩留待 wire-format 设计与测量，不先承诺固定头长。
-
-- 顺序到达的快路径：比较期望位置，挂入 slice 队列，推进连续可读边界。
-- 乱序慢路径：有界保存缺口后的 frame/已完成区间，不向用户越洞交付。
-- RNDV 在预留的逻辑区间完成后才能推进可读边界；后续 eager 不能穿过它。
-- 缺口持续超过策略期限或底层报告致命错误时，连接失败；V1 不发起软件 ARQ。
-- FIN 携带最终顺序位置，只有前缀连续完整才成为干净 EOF。传输错误不能伪装成正常 FIN。
-
-乱序缓存保存 slice/描述符，不必再复制全部 payload；其内存仍必须计入接收预算。事件通知基于“连续可读字节”，不是“来了一个 RX CQE”。
-
-### 6.1 字节流保序与完整消息交付
-
-本节记录接收协议的设计取舍，尚未冻结 IMM 位布局或扩展头格式。当前 TxSender 已支持 SEND_WITH_IMM 原语，但尚未实现本节描述的分片或接收重组。
-
-socket/bRPC 兼容路径恢复连续字节流，不保留每次 write/writev 的调用边界，也不要求一次写入的全部字节到齐才允许 read 返回。若后续提供“整条消息收齐后一次性交付”的消息接口，则另外需要消息边界及完整性判断。不能将消息接口的整包等待强加给字节流接口。
-
-连接内连续 SN 能确定帧顺序，但不能单独确定消息边界。例如 SN 为 B 至 B+4 的五帧，可能属于一个五片消息，也可能属于两个相邻消息。若只提供字节流，可以交付连续前缀；若要求完整消息交付，还必须有首尾标志、消息长度或其他明确的边界信息。
-
-这里按当前目标环境单个 SEND 的接收数据上限为 4096 字节讨论。超过上限的 eager 数据仍须由发送端拆成多个 WR；将 SN 放入 IMM 不会让 URMA 自动完成应用层拆包和重组。实际创建与投递还必须满足设备报告的能力限制。
-
-### 6.2 IMM 与分片头的取舍
-
-| 方案                               | 能力                                              | 约束与成本                             |
-|------------------------------------|---------------------------------------------------|----------------------------------------|
-| IMM 携带连接身份和帧 SN            | 恢复连接内顺序，交付连续字节流                    | 完整消息边界需要其他信息               |
-| 每片携带消息 ID、位置及描述信息    | 支持独立消息重组，允许同连接消息分片交错          | 占用 SEND 数据空间，增加元数据处理     |
-| IMM 携带连接身份、SN 与 FIRST/LAST | 同时表达顺序和消息边界，小消息无需 payload 扩展头 | 同一消息必须占据该连接内连续的 SN 区间 |
-
-当前倾向采用紧凑公共元信息加按需扩展头：socket 主路径使用连接内 SN 做薄保序；需要完整消息语义时，优先评估 FIRST/LAST；只有确实需要消息交错、显式位置或更多描述信息时，才增加消息分片头。此选择需要在 wire-format 冻结前明确，不能让发送与接收端自行猜测格式。
-
-URMA 的 `send.imm_data` 为 64 位，接收 CR 另有 `completion_len` 和 `remote_id`。IMM 不占接收 payload buffer 的头部空间，但仍是传输元信息，不能等同于没有线路或处理开销。旧 ubsocket 使用的 24 位用户 SN 空间来自 UMQ 的字段划分，raw 路径无需照搬该划分。[URMA API：发送 WR 与完成记录](https://docs.openeuler.org/zh/docs/24.03_LTS_SP3/unifiedbus/unifiedbus/urma/URMA%20API%20Guide.ch.html)
-
-当前多个逻辑连接共享 jetty/JFR，remote_id 只能标识远端物理端点，不能唯一标识逻辑连接。因此公共元信息需表达或关联到：
-
-- 接收端连接标识及代次，避免迟到数据命中复用后的连接。
-- 数据/控制帧类型，以及按需使用的首尾标志。
-- 连接内的帧 SN，或能无歧义确定逻辑字节范围的顺序信息。
-
-这些字段可以由 IMM 与扩展头共同承担；具体位宽、编码和协商方式待定，不能先把完整 64 位全部分给 SN。网络 SN 属于逻辑连接，不能直接复用 AttemptId 或物理 SQ 的提交序号。
-
-### 6.3 连续 SN 加首尾标志的消息方案
-
-如果同一连接内不交错发送不同消息的分片，可以采用如下逻辑表示：
-
-| 分片 | SN | 标志 |
-|---|---|---|
-| 0 | B | FIRST |
-| 1 | B+1 | — |
-| 2 | B+2 | — |
-| 3 | B+3 | — |
-| 4 | B+4 | LAST |
-
-收到顺序即使是 4、3、2、1、0，也只暂存各片的 buffer lease 与描述符；确认 FIRST 至 LAST 的 SN 全部连续后，再交付完整消息。实际长度来自各片 completion_len，可按顺序组织 slice 列表，不必额外复制成连续内存，也不必在每片重复总长度、offset 和总片数。1 KiB 小消息可直接使用 FIRST|LAST，无需 payload 扩展头。
-
-这一约束只针对同一逻辑连接的消息编号；不同连接仍可共享 SQ 并交错提交。同一消息也不必在一次 post 中提交完，未提交后缀可以在获得额度后继续提交。若同连接需要交错 A、B 两个消息的分片，则须引入每片可识别的 message_id 与 fragment_index/offset，不能仅靠 FIRST/LAST 配对。
-
-没有预先声明总长度时，接收端仍必须限制单消息字节数、片数和缺口等待时间，不能无限等待 LAST。对有序消息接口，即使后续消息已完整，也不能越过前面的未完成消息交付；字节流路径仍按连续可读前缀推进。
-
-### 6.4 扩展头与小包成本
-
-需要完整分片头时，应避免存储可推导的重复字段。例如固定分片规则下，message_id 加 fragment_index 可以推导 offset；使用 message_id 加 offset 时，每片长度可以来自完成长度。消息总大小可放首片描述头，但接收端必须有界保存先于首片到达的分片，并在描述到达后校验覆盖范围、重复及重叠。
-
-只有部分帧带扩展头时，须通过明确的帧类型或标志区分，不能扫描 payload 内容猜测是否含头。统一固定头实现较简单，也可以作为基线进行测量；是否为小包省略扩展头，应在同一套明确协议内决定。
-
-头部成本不仅是额外字节，还可能增加 WR 数量。例如每片 16 字节头使应用 payload 上限降到 4080 字节，16 KiB 数据由 4 个无 payload 头的分片变成 5 个分片，增加对应 WR、RQE 和完成处理。对 1 KiB 数据，16 字节相当于 payload 的约 1.56%；CPU 成本还取决于复制、分配和查找方式，不能只凭头长判断。
-
-若设备支持且配置允许，可用发送 SGE 分别引用头部与 payload，避免为拼接头部复制整片数据；二者合计仍受 4096 字节限制，相关注册内存必须保持到 TX 终结。接收端可以保存有序 slice，不要求物理连续重组。更大的数据优先评估第 8.3–8.5 节的 RNDV READ/WRITE；16 KiB 等边界消息是否进入 RNDV，应测量握手、注册、复制和 WR 成本后确定，不在此固定阈值。
-
-### 6.5 接收分层与协议冻结前的检查
-
-接收实现保持三层职责：RX buffer 池负责注册内存、投递及归还；连接重排层负责身份校验、SN 窗口和连续可读边界；可选消息重组层负责消息边界与完整消息交付。它们由同一 owner 推进，避免把所有状态塞进物理 JFR 或 JettyPool。
-
-冻结协议前还需明确：
-
-- SN 位宽、回绕及旧会话隔离；有限序号空间的比较必须有明确窗口约束，不能仅按取模槽位识别帧。
-- 部分 post 成功时保留未提交后缀的顺序身份，避免产生永久编号空洞；接受范围不可信时走失败语义，不重放可能已经接受的数据。
-- 重排窗口、单消息上限和总接收预算，覆盖已投递 buffer、乱序暂存以及上层持有的 lease。收到 CQE 不等于同一 buffer 已可重新投递。
-- 控制帧、FIN 和 RNDV 如何映射到共同的逻辑顺序空间；后续 eager 不能绕过尚未完成的 RNDV 字节区间。
-- 验证连续与逆序到达、首片/末片最后到达、短尾片、重复/越窗帧、旧连接数据、额度耗尽、部分投递和应用延迟归还；缺口不能通过跳过数据伪装成成功。
-
-## 7. Raw 资源池、multi-rail 与故障隔离
-
-### 7.1 一个 jetty 可以服务多个 socket 和多个目标
-
-本地 raw provider 非 RC 路径逐 WR 使用 `wr->tjetty`，表明 RM 物理发送队列具备逐 WR 选择远端目标的接口基础。现有“一个 jetty 借给某 socket，直到它的 CQE 收干净才换人”的做法不是必须保留的抽象。[逐 WR 目标选择](umdk/src/urma/hw/udma/udma_u_jfs.c)
-
-V1 以 `AttemptLedger` 记录每个被 provider 接受的 WR：lane epoch、逻辑 WR 提交序号、OpId、ConnId、目标、opcode、buffer/grant 租约、signal 状态。批量 post 部分成功时，仅已接受的前缀进入在途集合；未接受后缀仍是待提交操作。
-
-逻辑连接关闭只撤销该连接的新提交与未提交工作，不销毁共享 jetty/JFR。已 post 的记录直到满足完成/终结条件才退休，不需要让 lane 一直“归关闭的 socket 借用”。
-
-### 7.2 JFC/JFR 的共享边界
-
-同一 raw context 内，可以给多个 jetty 配置已有 TX JFC 和共享 JFR；共享 JFR 的 trans_mode/order_type 等参数必须一致。创建对象最终使用所属 context 的设备句柄，RX CQE 查找也使用该 context 的对象表。[共享配置](umdk/src/urma/lib/urma/core/urma_cp_api.c)、[对象创建](umdk/src/urma/lib/urma/core/urma_cmd.c)
-
-因此采用：
-
-- 每个 `{raw context, owner shard, pool}` 少量 TX JFC，优先一池一个 TX JFC。
-- 每个接收域一个共享 JFR，配套 RX JFC；TX/RX CQ 分开便于不同预算和故障处理，但仍由同一个所属 shard reactor 推进，不代表拆成两个线程。
-- 不同 raw 设备/context 各自有物理 JFC，可由一个 owner 软件聚合轮询，不宣称跨四个设备共用一个硬件 CQ。
-- 同一共享 JFR 的所有 RX completion 与 refill 归同一 owner。V1 在不同 owner 间分配独立接收域，可分配已有域或另建域，不让多个 worker 共同消费原 JFR，也不以共享 mutex 作为常规数据面扩展方式。
-
-一个巨大 CQ 可以减少对象数，却增加竞争、错误风暴和单 owner 工作量。池大小按实际 SQ 利用率、CPU 预算、CQ 安全容量和故障隔离测量，不继承固定 `pool=100`。
-
-#### 7.2.1 三元组表示共享边界，不是三层线程
-
-| 维度 | 含义 | 不能作出的推论 |
-|---|---|---|
-| `raw context` | 裸设备相关的 URMA 对象上下文，限定队列/CQ 所属硬件上下文 | 一个线程管理四个 context，不等于它们能共用一个硬件 JFC；context 也不是端口编号 |
-| `owner shard` | post、poll、协议账本与回收的唯一修改者 | 两个 shard 使用同一 context，不等于可以共同消费其中同一个 CQ |
-| `pool` | 同 context、同 owner 下的一组 jetty/SQ，用于调度和资源分组 | pool 不是额外线程，也不天然保证硬件故障完全隔离 |
-
-若 pool 已记录唯一的 context 和 owner，实现中不必再重复维护三层目录。每 pool 一个 TX JFC 是首版策略，不是硬件强制的一一对应关系；同 context、同 owner 的多个软件 pool 可在能力允许时评估共享 TX JFC，CQ 容量或调度压力也可能要求拆分。任何共享都保持唯一消费者，故障影响仍按第 7.5 节验证。
-
-TX pool 与 `ReceiveDomain` 分开：前者组织 SQ/TX 完成，后者组织 JFR/RX 完成及接收授信。同 context、同 owner 且参数兼容的多个 pool 可以共享一个接收域，不机械地“一新增 pool 就新增 JFR”。context 句柄是否跨 shard 共用另行核验 provider 契约；即便共用，队列仍各有 owner，注册/导入/对象表生命周期也不能因此省略同步。
-
-#### 7.2.2 四个 raw context 的布局示例
-
-以下假设每个实际使用的 `{context, shard}` 配置一个 pool、一个 TX JFC、一个 JFR 和一个 RX JFC；仅作数量推导，不承诺设备或容器允许任意复制对象：
-
-| 布局 | Owner 线程 | Pool | TX JFC | JFR | RX JFC | 取舍 |
-|---|---:|---:|---:|---:|---:|---|
-| 1 shard 管四个 context | 1 | 4 | 4 | 4 | 4 | 首版基线，同线程聚合多组 CQ |
-| 2 shards，各管两个 context | 2 | 4 | 4 | 4 | 4 | 不复制接收域，但各 shard 可直接使用的路径受分配约束 |
-| 2 shards，每个都使用四个 context | 2 | 8 | 8 | 8 | 8 | 各 shard 路径选择更灵活，队列、内存及轮询成本增加 |
-
-若每个 pool 含 J 个 jetty，三种布局分别需要 4J、4J、8J 个 jetty；不是按逻辑 socket 数建立 pool。各 shard 使用的本地路径还须与建链协商出的远端接收域可达性一致，不能只按本地设备数推导可用路径。
-
-按每 JFR 深度 8192、每 RQE 配 4 KiB buffer，四域的已投递接收 buffer 容量为 128 MiB，复制到八域为 256 MiB；这是 buffer 容量而非扣除协议头后的净 payload，均未计 CQ/SQ、备用 slab、应用持有 RX buffer 和 RNDV 内存。单 JFR 最大 32768 不证明设备总资源无限。第 9 节原有容量表继续按四个实际接收域计算，新增 shard 时必须重新按实际域数/深度、能力与总预算核算，不能复制原表中的可用额度。
-
-### 7.3 Raw 替代 bonding 的收益与失去的能力
-
-现有 bonding 的正常发送路径保存 WR shadow 并进行引用/锁操作。`BOND_ENABLE_FAILOVER=false` 主要关闭故障后的重发动作，不等于绕过正常 shadow 管理；STANDALONE 才有不同的无 store 路径。因而“关闭 failover 后 send_lat 基本不变”与代码结构相符。[bond datapath](umdk/src/urma/lib/urma/bond/bondp_datapath.c)、[bond jetty 创建](umdk/src/urma/lib/urma/bond/bondp_cp_jetty.c)
-
-bonding 当前按单条完成回收 shadow 的假设，也解释了不能只在旧 bonding 路径上把大量 `complete_enable` 清零。直接 raw 给 selective signaling 留出空间，但还需通过第 10 节的完成语义门禁。
-
-同时失去 bonding 的路径选择、逐 WR 恢复、部分软 RNR 通知/重试以及虚拟字段转换。V1 显式实现资源准入和错误分类，不照搬 bonding 私有状态码。raw 选择也不保证 URMA provider 初始化时完全不创建 bonding 后台线程，需要部署时单独确认。
-
-### 7.4 multi-rail 的当前决策
-
-当前同 EID 两进程已取得约 1.85 倍于单进程的 read_bw；不同 EID 不是这次扩展的必要条件。EID 不是物理 port 编号，尚无两端物理计数器证明每个测试用了哪些 rail。因此：
-
-1. 先实现同路径多 owner/多队列扩展，确认 CPU、doorbell 和队列瓶颈。
-2. 保留明确的 `Rail/Path` 描述：raw context、实际端口/EID 映射、NUMA/IOdie、远端 endpoint、健康与额度。
-3. 对第 2.4 节负载，先让一个 peer runtime 稳定归属一个远端 ReceiveDomain/JFR，其多个 socket 共用授信；不同 peer 分散到健康接收域。不要求一端口一个 worker，也不让每个小包跨 rail 调度。后续若一个 peer 使用多个接收域，必须分别授权、分别扣账，不能把基础窗口复制四份。
-4. 单 RNDV transfer 的跨 rail striping 延后，需先证明带宽收益，再承担跨 lane 可见性、重排与 grant 终结复杂度。
-
-这不等于放弃第二个 port：只是把“利用两端口”与“增加进程/队列”分开验证，不把未经确认的拓扑当性能解释。
-
-### 7.5 共享 lane 的隔离边界
-
-per-connection 配额可以隔离软件排队和内存占用，但故障范围必须按具体证据判断。已实测同一 SQ 上的 RNR、`REM_ACCESS_ABORT_ERR`（status 8）可与健康目标的成功发送共存；status 8 的生产 `TxCompletionProcessor` 集成也已通过。不能仅因这两类 WR 结果隔离整个共享 SQ，不能把 READY 查询单独当成继续可用的证明。另一方面，status 9 后旧 jetty 已确认不可复用，即使硬件仍查询为 READY；该 lane 上其他连接也可能受影响。
-
-V1 目标是按受影响 Attempt/连接传播失败，让上层决定重连；不自动重放已接受的 WR。status 8 只退休并上报对应 WR，由连接层决定关联操作/连接的终止，不调用整 SQ 的 `BeginDrain`。RNR 的目标同样是逐 WR/连接处理，但**当前生产实现仍主动排空该 lane**；调整这一策略属于 M2 的独立实现和回归工作，M0 不将硬件观测误写成已完成的软件能力。status 9 与 JFC 自身错误的作用域和终结条件见第 11 节。
-
-隔离要求高、长时间 RNR 或不稳定 peer 可以分配独立 lane/子池。共享 SQ 的收益不代表普遍无 HOL，也不证明其他故障类型的隔离。实测与限制见 [同 SQ 隔离记录](../hardware-observations.md#status-8-与同-sq-健康目标共存)及 [RNR 后继续发送](../hardware-observations.md#rnr-后同一条-sq-能否继续发送)。
-
-## 8. Buffer、注册内存池、inline 与 RNDV
-
-### 8.1 内存模型
-
-拆分四层：`Storage` 管理实际分配，`Slice` 描述区间，`Registration` 管理设备注册，`Lease/Grant` 管理使用权与远端访问权。brpc 的 Block/BlockCache 只存在于适配器，不能成为核心 ABI。
-
-`Storage` 增加 SHM backing 类型，设备 `Registration` 对它不是必需项；SHM 使用 region/offset 和跨进程 lease，不伪造 URMA grant/CQE。以下 8.2–8.5 主要描述 UB 数据路径，SHM-copy/lease 的复制次数与内存语义另见第 18 节。
-
-- 按 NUMA/context 建 registered slab，避免热路径临时注册和大范围跨 NUMA 访问。
-- 明确 payload、协议头、allocator 元信息布局及对齐；例如 4096 字节加 32 字节头不能无意落入 64 KiB size class。
-- 本地 freelist、跨线程归还、TLS 退出和 runtime 退出均有明确所有者与容量上限。
-- 分配失败时反压/报错，不能退回未经注册的 malloc buffer 后仍发给设备。
-- RX 可将完成 buffer 交给 slice 队列并用备用 slab refill；credit 计算同时覆盖槽位和实际保留内存。
-
-### 8.2 三条数据路径
-
-落地顺序固定为：M4/M5 先用全 signal、预注册 TX staging 和分片 copy eager 建立普通 socket 的生命周期与顺序基线；M7 在 lease/grant、完成账本与通知协议就绪后启用 WRITE RNDV。WRITE 可见性已确认，不等待新的硬件结论；仍需验证实现是否正确收集完成和发布通知。READ 仅作显式可选/实验路径，不默认启用，也不在 WRITE 失败后自动切到 READ。当前没有足以保证 READ 安全的并发阈值，降低窗口不是已确认的修复。
-
-| 路径 | 使用条件 | 生命周期 |
-|---|---|---|
-| inline eager | wire 长度满足真实设备 inline 能力，且测量有益 | 以 provider 的 inline 源复制契约为准 |
-| copy eager | 小包不适合 inline，或调用者只有普通临时 buffer | 拷入已注册 buffer；本地 DMA 完成后回收 |
-| RNDV READ/WRITE | 大包、已注册 lease，或 copy 成本高于协议成本 | grant、数据完成与远端访问终结决定复用时机 |
-
-在当前目标环境中，4 KiB 是一次 SEND 接收的数据总量限制，不是默认应用 payload：若 payload 内协议头长为 H，单 eager 应用数据至多 `4096-H`。IMM 与按需扩展头的取舍见第 6.2–6.4 节。可把同连接连续小写入合并成一个帧来提高利用率，但合并有等待与拷贝成本，必须设置字节和时间预算。
-
-普通 POSIX `writev` 返回已接受字节后，调用者可以复用源内存；库若还需要异步读取它，就必须先复制，或等到安全后再返回。真正异步 zero-copy 需要显式 `BufferLease` API，将借用保持到 `source_reusable`。不能用“没有追求无损切换”取消这个要求。
-
-### 8.3 接收端 READ RNDV（显式可选）
-
-本节保留协议结构与历史需求，不作为生产首选大包路径。已知 status 9 会使原 jetty 不可继续使用，READ 高并发更容易触发；启用 READ 需显式策略并遵守第 11 节隔离与重建，不能因为一次正常 READ 压测通过就取消该约束。
-
-```text
-发送端保留源 lease / 暴露 grant
-  → RTS(source grant, logical range)
-  → 接收端准入并 READ 一个或多个 chunk
-  → 接收端确认数据完整且可交付，推进顺序区间
-  → DONE / grant 终结通知
-  → 发送端在满足远端访问终结条件后释放源 lease
+### 6.1 64-Bit `IMM` 紧凑线协议与完整身份扩展
+
+`RM_CTP SEND` 的单 WR 硬件上限为 **4096 字节（含 payload 内头部）**。每帧前置协议头会使 4096 B 独立写入需要分片；这增加 WR/CQE 数量，但吞吐影响仍须测量，不能直接推导为减半。紧凑编码是优化，完整身份校验优先。
+
+`kbsocket` 利用 `URMA_OPC_SEND_IMM` 提供的 **64 位带外立即数（`imm_data`，不占用 4096 B 载荷空间）** 与接收 CQE 的 `cr.completion_len`（实际字节数），在满足紧凑身份条件且无捎带头时实现 **0 字节 payload 头部开销**：
+
+| IMM 位段 | 字段 | 含义 |
+| --- | --- | --- |
+| 63..60 | `FrameType`（4 位） | 数据、捎带授信或控制类型 |
+| 59..56 | `Flags`（4 位） | 类型相关标志；bit 3 固定为 `kExtendedIdentity` |
+| 55..48 | `ConnGenShort`（8 位） | 仅允许完整 `conn_gen` 在 1..255 时直接编码，**禁止截取高代际低位复用** |
+| 47..32 | `DstConnSlot`（16 位） | 单 Shard 至多 65536 个紧凑连接槽，覆盖 40k 目标 |
+| 31..0 | `FrameSeq / SN`（32 位） | 连接方向内逻辑序号 |
+
+连接完整身份仍为 32-bit slot + 32-bit generation。slot 超出 16 位或 generation 超出 255 时，**所有帧类型**设置 `kExtendedIdentity`，payload 首先携带 8 B `ExtConnHeader`（完整 slot/gen），再跟类型相关头和数据；完整代际溢出前停用槽位，不允许回绕。紧凑 `(slot, gen)` 在同一接收域 incarnation 内不得重新分配；不能依赖软件超时证明旧帧已消失。接收域重建也须遵守 §4–5 的身份和事件终结屏障。
+
+握手绑定 runtime 实例、接收域代际、wire 版本和完整 Session；RX 解复用先校验所属域及已协商的来源，再校验完整或无歧义紧凑身份。旧连接 tombstone 保留授信归属，迟到帧不进入新连接。M4 冻结字节序、各类型长度及标志组合，逐字段编解码，禁止直接发送宿主 C++ 结构体布局。
+
+- **`FrameType` (Bits 63..60)**：
+  - `0x0` (`kDataEager`)：普通 Eager 数据帧。无扩展身份时可承载 4096 B 业务数据；有扩展身份时最多 4088 B，数据长度由 `cr.completion_len` 扣除头部后得到。
+  - `0x1` (`kDataWithPiggybackCredit`)：携带捎带授信的 Eager 数据帧。payload 前置 8 字节紧凑 `CreditHeader`，后跟最多 4088 B 业务数据。
+  - `0x2` (`kControl`)：纯控制帧（`CREDIT_UPDATE`、`RNDV_RTS`、`RNDV_GRANT`、`RNDV_DONE`、`FIN`、`RST`）。`Flags` 低 3 位指定子类型，控制头携带相应 epoch、transfer/grant 等完整身份；长度按冻结格式校验，不预先承诺所有 MR 描述符都能塞入 64 B。
+- **`Flags` (Bits 59..56)**：
+  - 对于数据帧：`bit 0 = kFlagFirst`（消息首片），`bit 1 = kFlagLast`（消息末片），`bit 2 = kFlagUrgent/Solicited`。
+  - 对于 `kControl` 帧低 3 位编码具体控制指令码；所有帧 bit 3 均为扩展身份标志。扩展头可由独立注册 SGE 拼接，但计入 4096 B 上限，带扩展身份的捎带授信帧最多承载 4080 B 业务数据。
+- **`FrameSeq / SN` (Bits 31..0)**：
+  - 每个逻辑连接每个方向独立维护序号：每个 Eager WR 占 1 个 SN，RNDV 在开始时预占 1 个 SN，DONE 完成该占位，FIN 占 1 个终结 SN。纯 CREDIT/RTS/GRANT 等控制不额外消耗数据顺序空间，其幂等由控制 epoch/事务身份维护。
+  - SN 在 provider 调用前确定并入账；明确未接受后缀保留原 SN，禁止后续数据绕过该后缀形成永久空洞；已接受失败或接受范围未知则显式失败，不重放。
+  - V1 在 32-bit SN 耗尽前停止接受新数据，保留终结 SN 并有序关闭，由上层建立新 Session；不允许在同一 Session 内静默绕回。以后若支持模序号，须另行定义小于半序号空间的窗口与旧帧寿命约束。
+
+### 6.2 接收乱序重排窗口（`ReorderWindow`）与连续流交付
+
+由于同 SQ 同目标的 `RM_CTP SEND` 可能乱序到达，接收端每个 `Connection` 维护固定容量的环状重排窗口（基线 $W = 64$，协商可调，预分配描述符，零堆分配）。发送方须同时满足接收端发布的独占上界 `sn < max_frame_seq` 与驻留字节上限，接收端保证 `max_frame_seq <= rcv_nxt + W`；不得仅凭 PeerRuntime credits 或本地 TX CQE 越过对端重排窗口。该流控进度不确认业务执行，也不用于重放。延迟 RNDV 占位同样计入 W，防止后续 Eager 在合法发送下把窗口冲破。
+
+```mermaid
+flowchart LR
+    RX["RxBufferPool::Poll<br/>取得 (cr, RxBufferLease, payload)"] --> DEMUX["解析 cr.imm_data<br/>校验 DstConnSlot + ConnGen"]
+    DEMUX -- "代际不匹配 / 已关闭" --> DROP["立即 Release(lease)<br/>并归账物理 RQE 消耗"]
+    DEMUX -- "合法纯控制 CREDIT/RTS/GRANT 等" --> CTRL["按控制 epoch/事务身份幂等处理<br/>归还 RX lease，不占数据 SN 窗口"]
+    DEMUX -- "合法 Eager/DONE/FIN" --> WIN{"比较 sn 与 rcv_nxt"}
+    WIN -- "sn == rcv_nxt (顺序快路径)" --> DELIVER["挂入可读 Slice 队列<br/>推进 rcv_nxt 及连续连片槽位<br/>触发 EPOLLIN / 唤醒读等待"]
+    WIN -- "rcv_nxt < sn < rcv_nxt + W (乱序慢路径)" --> HOLD["暂存 RxBufferLease 描述符于槽位 sn % W<br/>(零 payload 拷贝，计入连接驻留预算)"]
+    WIN -- "已交付或已占槽的重复 SN" --> DUP["归还重复 lease 并归账物理消耗<br/>不覆盖原槽、不重复交付"]
+    WIN -- "sn >= rcv_nxt + W" --> ERR["Release(lease)<br/>越窗判协议错误并断链"]
 ```
 
-RTS 的 SEND CQE 不是远端 READ 已结束的证据。连接失败时，远端仍可能持有有效访问能力；源内存不能仅凭本地控制 SEND 终结就复用。
+- **RNDV 与 Eager 统一保序**：当 `WRITE RNDV` 完成后，发送端发出的 `CTRL_RNDV_DONE` 通知帧同样携带其在发送顺序流中分配的 `sn`。只有当 `rcv_nxt` 推进到该 `sn` 且 `WRITE` 所有 Chunk 校验完成时，该大包对应的目标 `BufferLease` 才并入连续可读队列，确保后续 Eager 绝不越过未完成的 RNDV。
+- **FIN 与异常边界**：`CTRL_FIN` 携带最终 `fin_sn`。仅当前缀无缺口且应用已读尽此前字节后，才报告干净 `EOF`（`read` 返回 0）；对端 FIN 仅关闭对应读方向。乱序缺口超时或 CQE 错误必须显式置错，已验证的连续前缀可先读出，但不能跳过缺口伪造成功。
 
-READ 也说明硬件 TX/RX 方向不能直接用作业务所有权边界：
+---
 
-| 接收端动作 | 本地资源 | 所属 reactor 推进的状态 |
-|---|---|---|
-| 收到 RTS/OFFER | JFR / RX JFC | 校验 grant、建立并准入接收 transfer |
-| 提交 READ | 本地 SQ | 记录 OpId、源/目标 lease 和在途 attempt |
-| 收到 READ completion | **本地 TX JFC** | 更新接收 transfer；全部必要 chunk 成功后提交完整逻辑区间，按连续前缀发布可读 |
-| 提交 DONE/终结通知 | 本地 SQ | 按协议结束对端源 grant 的使用，控制发送也计入账本 |
+## 7. 注册内存管理与单边 `WRITE` RNDV 大包协议
 
-上述动作由接收连接所在 shard 的同一个 reactor 处理，不为 TX CQ 到接收重组再增加固定线程交接。CQE 按 `OpKind/OpId + generation` 归类，而不是把 TX CQ 一律解释成“发送 buffer 回收”。内部协议推进完成后，再把应用完成通知投递到约定 scheduler；不在此路径执行无界 RPC decode 或业务回调。
+### 7.1 四层内存模型与零分配快路径
 
-### 8.4 发送端主动 WRITE RNDV
+`kbsocket` 将内存管理拆分为四个正交层次，彻底解耦 bRPC `Block`：
 
-```text
-发送端 RTS(length, logical range)
-  → 接收端准入、分配连续目标区间并返回 grant
-  → 发送端本地多 SGE，WRITE 到一个远端目标区间
-  → 等待相关 WRITE 成功完成，再发送 SEND/IMM 完成通知
-  → 接收端确认 transfer 完整后发布可读区间
-  → grant 终结与回收
+1. **`Storage`**：页对齐底层物理内存分配（大块虚拟映射 / Hugepage / THP 预触页，或同机 `memfd` 共享映射）。
+2. **`Registration`**：地址区间在所属 `UrmaContext` 实例下的 MR 注册句柄（`urma_target_seg_t*`，按路径配置所需权限）。同一 `Storage` 可按需在最多 4 个 `UrmaContext` 下注册，但各 context 的句柄不能混用；跨 context 注册失败时保留尚未安全撤销的依赖，不发布半成品。
+3. **`Slice`**：从预注册 Slab 中切出的定长内存块（如 4 KiB Eager 块、64 KiB / 1 MiB RNDV 大块），归属特定 `RuntimeShard`。
+4. **`BufferLease` / `Grant`**：
+   - `BufferLease` 跟踪本地 CPU 持有与本地 TX/RX DMA 生命周期；
+   - `Grant` 跟踪暴露给远端执行单边 `WRITE` 的访问授权生命周期。
+   - **跨线程归还**：当业务线程在不同于 `OwnerThread` 的核上消费完 `BufferLease` 时，将 `BufferLeaseId` 推入该 Shard 预分配的有界无锁 `LeaseReturnQueue`（容量 $\ge$ 最大可借出 Lease 数，杜绝满溢丢弃或动态分配），由 `OwnerThread` 批量回收到本地 Freelist。
+
+映射、预触页和注册均在初始化/控制路径完成，池内借还只更新预分配元数据。扩容先预留容器预算，由控制执行器准备后交 Owner 发布；空池时部分接受、反压或报错，不在收发/poll 路径同步扩容，也不使用未注册 heap 内存绕过限制。活动、Held、扩容中及隔离资源都计入内存上限；同一 backing 多 context 注册时物理字节只计一次。
+
+### 7.2 三条数据路径与阈值策略
+
+| 数据路径 | 适用条件 | 内存与完成生命周期 |
+| :--- | :--- | :--- |
+| **1. Copy Eager (`SEND_WITH_IMM`)** | 普通 `write`/`writev`，先以 $16\text{ KiB}$ 作为候选切换阈值；按实际协议头和能力拆成总长 $\le 4096\text{ B}$ 的 WR | `write()` 返回前将已接受前缀拷入预注册 TX Slice，返回字节数只包含已复制数据；TX CQE 退休后回收 TX Slice。RNDV 未启用时，大写入同样以有界分片 copy eager、部分写和反压推进 |
+| **2. Zero-Copy Lease Eager (`SEND_WITH_IMM`)** | 调用方通过 `kb_write_lease()` 传入已注册 `BufferLease` 且总长 $\le 16\text{ KiB}$ | 支持多 SGE 直接引用调用方 `BufferLease`，零内存拷贝；必须等待全部关联 TX WR CQE 终结后才触发 `source_reusable` |
+| **3. 单边 `WRITE` RNDV** | M6 启用后，对大写入（候选阈值 $> 16\text{ KiB}$）按复制/握手成本测量选择 | 接收端有界准入并分配连续目标注册内存（`max_rsge=1`）；源为有效注册 Lease 时可直接多 SGE `WRITE`。普通 `write`/`writev` 必须先把已接受前缀复制进库持有的注册 staging，不能返回后继续借用调用者内存。全部相关 `WRITE` CQE 成功后才发送 `CTRL_RNDV_DONE` |
+
+阈值是待 benchmark 校准的策略参数，不是硬件能力边界；多 SGE 总长度及数量仍须满足设备限制。应用大于当前 staging/接收预算的写入允许分次接受，不要求一次性保留整个任意大请求。
+
+### 7.3 为什么剔除 `READ RNDV` 并唯一采用 `WRITE RNDV`
+
+基于第 2.1 节 **H4** 与 **H5**：
+1. 用户确认大并发 `READ` 容易触发 `status 9`（`ACK_TIMEOUT`），而大并发 `WRITE` 未观察到这一触发模式；选择 WRITE 可避开已知 READ 风险。**这不保证 WRITE 不会报 status 9**：WF2 首次健康基线 WRITE 就曾返回该错误，原因尚未定位，所有 opcode 均须遵守 Lane 隔离与重建契约。
+2. 硬件团队已明确确认 `WRITE` 完成可见性与 `READ` 完全一致。
+3. 剔除 `READ RNDV` 后，接收端无需在本地 `Send JFC` 上处理入站数据的 `READ` 完成并回跳接收状态机，收发数据流向在硬件队列上完全正交。
+
+### 7.4 `WRITE RNDV` 完整状态机与安全终结
+
+```mermaid
+sequenceDiagram
+    participant S as 发送端 ShardReactor
+    participant R as 接收端 ShardReactor
+
+    Note over S: 应用提交已注册 Lease，或先复制普通写入的已接受前缀\n保留源 BufferLease，并预留此事务唯一 SN
+    S->>R: 1. SEND_WITH_IMM [kControl: CTRL_RNDV_RTS]\n(conn_id, transfer_id, total_len, sn_placeholder)
+    Note over R: 2. 放入有界 RTS 等待队列；在满足 RNDV 内存与并发预算时准入\n分配连续目标注册区间 (max_rsge=1)，生成 GrantId + grant_gen
+    R->>S: 3. SEND_WITH_IMM [kControl: CTRL_RNDV_GRANT]\n(transfer_id, grant_id, grant_gen, dst_va, rseg_descriptor, max_chunk)
+    Note over S: 4. 导入/命中缓存的 target_seg，按 chunk (如 128 KiB~1 MiB) 公平调度\n提交 1..K 条 URMA_OPC_WRITE WR (本地支持多 SGE，远端 1 RSGE)
+    S->>R: 5. 硬件单边 RDMA WRITE 写入目标内存
+    Note over S: 6. TxCompletionProcessor 集齐全部 K 条 WRITE 的 URMA_CR_SUCCESS CQE\n(此时源内存 DMA 已结束，可安全释放源 BufferLease)
+    S->>R: 7. SEND_WITH_IMM [kControl: CTRL_RNDV_DONE]\n(imm.sn = sn_placeholder, transfer_id, grant_id, grant_gen)
+    Note over R: 8. 校验 session / transfer / grant 完整身份、长度与 SN\n按协议结清 Grant，将目标 BufferLease 填入 ReorderWindow[sn]\n推进连续可读前缀并通知应用
 ```
 
-本地类型和 provider 编码确认 READ 远端 source、WRITE 远端 destination 分别只能使用一个远端 SGE；WRITE 可编码多个本地源 SGE，符合 writev 的形状。具体本地 SGE 数量仍受设备能力限制。[WR 类型](umdk/src/urma/lib/urma/core/include/urma_types.h)、[WRITE 编码](umdk/src/urma/hw/udma/udma_u_jfs.c)
+**`Grant` 安全隔离铁律（防迟到 `WRITE` 覆写新数据）**：
+- RTS、GRANT、DONE 均绑定完整 runtime/session/transfer/grant 代次及授权区间；RTS 先预留逻辑 SN，后续 Eager 不能占用它。GRANT 的延迟/重复不允许重复提交，DONE 必须代表**已禁止该 Grant 后续新 WRITE，且授权区间所需的全部 Chunk 成功终结**；只看到最后一条 CQE 不足以发 DONE。部分 post 的明确未接受后缀可重试，全部 Chunk 成功后才能发 DONE；任一已接受 WR 失败或接受范围未知则不能发送成功 DONE，也不重放已接受部分。
+- 若在步骤 3（发出 `CTRL_RNDV_GRANT`）之后、步骤 7（收到合法 `CTRL_RNDV_DONE`）之前，连接发生超时、取消或断开，**接收端绝不能立即将该目标内存块放回空闲池复用**！因为发送端可能仍有在途 `WRITE` WR 正在向该物理地址 DMA。
+- 只有在满足以下任一安全终结条件时，方可回收目标内存：
+  1. 收到发送端经可信通道、匹配完整 session/transfer/grant 代次的终结确认：发送 Owner 已封禁该 Grant 的全部后续提交，处理完尚在 Mailbox/排队中的操作，并证明所有已接受 `WRITE` 均已退休/排空。一次本地计数为零或单独的 SQ flush 不代表远端授权已结清；
+  2. 或有已验证的硬件契约证明独立 MR 撤权同时阻止后续访问并终结全部在途 DMA。**当前记录没有提供将 `UnregisterSeg` 返回成功直接用作这一证明的契约**，不能据此提前复用。共享 Slab 中的 Slice 也不能单独注销 MR，整段注销前必须结清其他 Lease/Grant。
+- 在满足上述条件前，该内存块及其注册/context 依赖记入 `QuarantineLedger` 并计入容器隔离内存硬上限；达上限时限制或拒绝新 RNDV。现有加速连接报错并由上层决定重连，只有新连接可重新选择 NativeTCP，不跨 TCP 搬运旧事务。
 
-200 MiB 的单操作能力不是调度 chunk 的默认值。大 chunk 减少 WR，却加大占用时间、取消粒度及共享 lane 的不公平；应按吞吐、尾延迟和活跃连接数确定 chunk 上限。
+---
 
-### 8.5 READ/WRITE 完成可见性与通知协议
+## 8. 分层流控：守恒总账、长期暖窗口与大包准入
 
-2026-10-28 用户明确确认：当前目标硬件上 WRITE 的可见性与 READ 一致。该说明作为[人工确认的硬件契约](../hardware-observations.md#2026-10-28-人工确认的-write-可见性)用于设计，WRITE 完成后的数据可见性不再是待确认能力，也不因尚无 WN1–WN4 日志而阻塞软件实现。
+### 8.1 五类独立资源额度
 
-本设计采用先完成、后通知的流程：READ 发起端在相应成功完成后使用本地目的数据；WRITE 发起端取得相关 WRITE 的成功完成后，再发送 SEND/IMM 通知远端使用目的数据。多 chunk 使用逐 WR 完成账本和完整性 bitmap/计数，不能由最后一个 CQE 代替其他 chunk 的成功证据；接收端校验 transfer/session/代次，并按连接连续前缀交付。
+| 额度类别 | 保护对象 | 耗尽时的行为 |
+| :--- | :--- | :--- |
+| **1. 本地发送缓存配额** | 单连接待发送字节上限（如 256 KiB） | 非阻塞 `write` 返回部分写或 `EAGAIN`，待数据发出回收后触发 `EPOLLOUT` |
+| **2. 物理 SQ 票据（`JettyTicket`）** | 物理 JFS 队列深度（`tx_depth`）与 `Send JFC` 容量 | 挂入 Shard 内活跃连接发送队列，等待 `TxCompletionProcessor` 退休释放票据 |
+| **3. 远端接收槽位（`JFR Credits`）** | 对端共享 `JFR` 的已投递 4 KiB 接收槽位 | 暂停投递该对端域的双边 `SEND_WITH_IMM` 数据帧（从源头预防硬件 RNR） |
+| **4. 远端连接驻留字节窗口** | 对端单连接未读数据 + `ReorderWindow` 乱序驻留上限 | 暂停该连接的 `max_frame_seq`、驻留字节额度及 Grant 扩展，物理 RQE credits 仍按 PeerRuntime 共账 |
+| **5. RNDV 内存与并发 DMA 预算** | 容器级大包目标内存池（如 128 MiB）与并发 `WRITE` 流数 | `CTRL_RNDV_RTS` 描述符在接收端有界排队，按公平策略逐个发放 `CTRL_RNDV_GRANT` |
 
-WN1–WN4 保留为完成收集、通知身份、目的数据校验和跨轮复用的实现回归，尚未执行的组不记作硬件 PASS。未等待完成的 WRITE/SEND 链式提交、跨 SQ 隐式顺序及 WRITE_IMM 的具体语义不由该契约扩展；当前完成后通知方案不依赖这些机制。类型中的 `fence` 注释针对先前 READ/atomic，不作为该方案的 WRITE 发布依据。
+### 8.2 接收域守恒方程与 `PeerRuntime` 暖窗口（针对 3000 Peer 稀疏负载）
 
-错误重连不消除这项风险：旧连接的迟到 WRITE 若命中新连接复用的 buffer，仍会破坏新数据。旧 grant/slab 必须隔离到撤销与 DMA 终结得到证明；本地 SQ flush 不自动撤销远端授权。隔离内存达到上限时应限流或拒绝新 RNDV，不能用固定等待时间冒险释放。
+吸收历史 `ubsocket` 每连接 2-credit 导致 10 KiB 首请求（需 3 个 WR）卡顿的教训，同时受限于单 `JFR` 最大 32,768 槽（不能给 40k 空闲连接各发大窗口），V1 以 **`{PeerRuntimeId, ReceiveDomainId}`** 为粒度建立严格守恒账本：
 
-### 8.6 注册内存池的职责与分配器边界
+对于接收域 $j$，设 `RxBufferPool` 实际容量与 `JFR` 深度为 $P_j$，控制帧专用保留槽位为 $C_j$（如 512），则普通数据可授信总额度为 $B_j = P_j - C_j$。任何时刻严格满足守恒不变量：
 
-V1 使用专门的 registered slab 管理通信 payload；普通管理对象可在初始化/控制路径使用常规 allocator。收发、poll、CQE 和归还路径不调用系统堆分配、不隐式扩容容器，也不执行映射、触页或注册。池内借还只改变预分配元数据与所有权。
+$$F_{\text{elastic}, j} + \sum_{i} \underbrace{(F_{\text{base}, ij} + G_{\text{base}, ij} + U_{\text{base}, ij})}_{q_{\text{base}} = 8} + \sum_{i} G_{\text{elastic}, ij} + U_{\text{elastic}, j} = B_j$$
 
-jemalloc 等分配器解决通用对象分配、碎片和并发缓存问题；kbsocket 仍需自己管理 NUMA、设备/context 注册、DMA 租约与远端授权。一次大对象分配可能复用已有映射，不能把一次 `malloc(1 GiB)` 等同于一次 `mmap`，也不能把分配成功等同于内存已可供设备使用。
+- **$q_{\text{base}} = 8$（长期基础暖窗口）**：每个已准入的对端 `PeerRuntime` $i$ 在其归属接收域 $j$ 享有 8 个基础 Credits（可覆盖 8 个 1 KiB 请求或 2 个完整的 10 KiB 请求，单次 10 KiB 请求仅需 3 个 4096 B WR）。该额度在**对端实例的所有逻辑 Socket 间本地共享**，新建逻辑连接无需再走网络申请即可立即发出首请求！
+- **状态流转守恒**：
+  1. **初始/补投**：只有 `RxBufferPool::Refill` **实际被硬件接受（Accepted）** 的 RQE 才能将 $U$（未补投槽位）转化为 $F$（可授出额度）；
+  2. **发放授信**：向对端发布 $n$ 个 Credit 前，先执行 $F \gets F - n,\; G \gets G + n$；
+  3. **收包扣减**：成功归属到对应授信关系的消耗 RQE 的 CQE（含乱序或旧 Session 帧），执行 $G \gets G - 1,\; U \gets U + 1$。无法归属的错误或畸形 CQE 也须扣除物理可用容量并隔离核账，不能猜测所属 Peer 或无条件增发信用。Held/乱序驻留内存仍不可补投，直到 Release 且实际 refill 成功才恢复 F。
+- **3000 Peer 容量核算（4 个 `ReceiveDomain`）**：
+  - 3000 个对端均匀归属 4 个接收域（每域 750 个 Peer）：
+  - **紧凑配置（每 `JFR` 深度 8192，4 域合计 128 MiB RX Buffer）**：每域 $C_j = 512$，$B_j = 7680$；750 个 Peer 基础承诺 $750 \times 8 = 6000$，剩余 $1680$（四域合计 $6720$）作为公共弹性池 $F_{\text{elastic}}$ 按活跃排队需求动态批授。
+  - **宽裕配置（每 `JFR` 深度 32768，4 域合计 512 MiB RX Buffer）**：在上述 Peer 数和均匀归属下可支持 $q_{\text{base}} = 16\sim 32$；RX 本身已占 512 MiB，不能再要求总注册内存低于 512 MiB。
+  - 哈希不保证均匀。建链必须检查每域实际剩余额度；紧凑配置每域最多承诺 960 个基础窗口，若需保留弹性容量，准入上限应更低。目标域不足时在建链期另选有容量的域或返回反压，不给已有 Peer 在多个域复制同一份额度。
+- **捎带更新（Piggyback）与控制保活**：
+  - 等长请求/响应场景下，接收端在完成 `Release` + `Refill` 后，直接在反向数据帧（`FrameType = kDataWithPiggybackCredit`）中携带单调递增的累计授信上限（`max_credit_seq`），零额外控制 WR 开销且天然幂等防丢包/乱序；
+  - 单向流或无反向数据时，累计释放达阈值（如 $\ge 4$）或超时通过独立 `CTRL_CREDIT` 帧返还。
+  - 通过 UB 发送的控制帧（CREDIT、GRANT、DONE、FIN 等）使用预留的 $C_j$ 预算，**仍须有可兑现的逐域控制授权和本地 SQ 配额**；共享 JFR 不会硬件隔离这些槽，512 个保留槽不能允许 3000 个 Peer 无限制各发一条。RTS 是普通入口需求，扣数据 credits，不能挤占全部保活额度。
 
-| 层次 | 管理内容 | 关键边界 |
-|---|---|---|
-| `Storage` | 虚拟映射、实际 backing、NUMA 放置、页面准备 | 内存字节按实际 backing 计一次；SHM 另遵守第 18 节授权与映射契约 |
-| `Registration` | 地址区间在指定设备/context 下的注册句柄及权限 | 同一 Storage 可有多个注册；不能把一个 context 的句柄直接交给另一个使用 |
-| `Slice` | slab 内区间、size class、所属 owner | 映射、注册、分配三种粒度不必相同；发布的 slice 必须具备目标路径需要的有效注册 |
-| `Lease/Grant` | 应用持有、本地 DMA 和远端访问权 | CPU 引用归零不代替设备与远端授权的终结证明 |
+**控制进度与旧授信终结**：
+- 基线保留有界、非阻塞 TCP 控制通道作为信用更新/撤销和关闭的逃生路径，Reactor 公平推进；UB 控制帧无可用额度时不盲发。RNDV 准入须同时预留 GRANT/DONE 的控制额度；DONE 按已确认的 WRITE 完成后 SEND/IMM 规则提交，不能未经验证改成另一种通知语义。TCP 仅传协议控制，不重放已接受的业务数据。
+- 累计授信更新绑定 `{PeerRuntimeInstanceId, ReceiveDomainId, credit_epoch}` 并单调去重；同一 Peer 的所有 socket 共账。发送端预留信用后再 post，只归还明确未接受的后缀；TX 完成、超时或逻辑 close 不直接增加远端可授额度。
+- socket 关闭不能回收其 Peer 的共享窗口。终止整个授信关系时，保留旧 epoch/tombstone 和未结清承诺；只有停止该 epoch 新提交、确认实际接受集合并结清在途消耗或取得已验证的终结屏障后，才可重新授予。Peer 失联或 TTL 到期不是撤销证明，未结清承诺须计入硬上限。
+- 连接的序号窗口、驻留字节额度与 PeerRuntime 的物理 RQE credits 分开更新。否则某条慢读连接仍可耗尽同 Peer 其他 socket 的全部资源。
 
-实现参考以机制为主，不在 V1 引入新的通信框架依赖：
+---
 
-| 参考 | 借鉴内容 | 适用边界 |
-|---|---|---|
-| UMQ qbuf | 大块注册后分块复用、批量取还、多档位、扩缩容滞回及分阶段耗时 | 不照搬热路径同步扩容、heap escape 或任意线程无限缓存；参考工作区 `umdk/src/urpc/umq/qbuf/umq_qbuf_pool.c` 的 slot 初始化与回收 |
-| [UCX 内存 API](https://openucx.github.io/ucx/api/latest/html/group___u_c_p___m_e_m.html) / [registration cache](https://github.com/openucx/ucx/blob/master/src/ucs/memory/rcache.h) | 大区域注册、子区域使用、注册缓存失效管理 | 不能据此假定当前 URMA 后端可直接接入 |
-| [DPDK mempool](https://doc.dpdk.org/guides/prog_guide/mempool_lib.html) / [SPDK DMA 内存](https://spdk.io/doc/memory.html) | 固定块池、本地缓存、批量操作及预备 DMA 内存 | mempool 分配本身不代替 URMA 注册 |
-| [jemalloc extent hooks](https://jemalloc.net/jemalloc.3.html#arena.i.extent_hooks) | 自定义 backing 与变长对象分配 | 接入还需处理 purge/decommit/split/merge 与注册生命周期；V1 少数通信档位先用简单 freelist |
+## 9. 统一进度器（`ShardReactor`）：Busy-Poll 与事件模式
 
-外部用户 buffer 的 zero-copy 采用显式注册句柄与 lease。V1 不透明接管任意 `malloc/free`；后续若增加注册缓存，必须覆盖 unmap、地址复用、权限与 context 生命周期，不能只以地址和长度命中旧注册。
+### 9.1 单轮有界公平推进（Bounded Fair Progress）
 
-### 8.7 Owner 分片、跨线程归还与容量预算
+每个 `ShardReactor` 在其固定 `OwnerThread` 上运行同一套核心状态机（Busy-Poll 与 Event 模式仅在“整轮无工作时的等待策略”上不同）：
 
-小块池按 NUMA 和 owner 分片，注册关系按实际设备/context 维护。owner 使用本地 freelist，跨线程释放通过预分配的有界归还队列批量交回所属 owner；仅当调用线程与 owner 相同才直接修改本地空闲表。归还描述符必须随 lease 保留到交接成功，队列容量按可能归还的 lease 数证明足够，或保留有界重试机制；队列满不能丢弃归还、临时 malloc 节点或阻塞唯一 progress owner。
-
-不默认给每个业务线程、每个 size class 配置固定的大量 TLS 块。若测量证明需要 producer cache，按字节限额并明确线程退出与 runtime 退出时的归还协议；缓存容量上界为 `Σ线程 Σ档位(缓存块数 × 实际块大小)`，大档位不能只限制块数。不同 owner 间的批量调剂走有界控制路径，先排除局部囤积再决定扩容。
-
-size class 根据消息分布、协议头、对齐和实际块大小确定，元信息与 payload 分别计账。RX 常驻接收块、短期 TX staging、大包 lease 按生命周期分池，故障隔离内存单独记账，减少一个长寿命 slice 阻止整 slab 回收的情况。控制消息与 RX refill 所需保留容量遵守第 9.3 节，不能被普通 TX 或大包耗尽。
-
-| 预算/统计 | 口径 |
-|---|---|
-| 初始容量、当前 backing、容量上限 | 区分启动保留与当前实际分配；包括数据、头部、对齐空隙和独立管理结构，注明统计范围 |
-| 当前扩容占用、剩余扩容额度 | 已有扩容 slab 占用不等于业务使用量；初始容量加当前扩容也不直接等于 RSS |
-| 注册字节、注册对象数 | 按设备/context 统计；同一 backing 多次注册不重复计入物理内存预算，但分别消耗注册资源 |
-| owner/cache 空闲、应用持有、DMA 在途、隔离容量 | ownership 状态与应用/DMA 引用维度分开，存在重叠的计数不能直接相加 |
-| 可整 slab 回收容量 | 与总空闲字节分开，暴露长 lease、局部缓存和碎片导致的滞留 |
-
-准入同时限制 backing 字节、设备注册资源和隔离容量。注册数上限可能先于字节上限耗尽；SPDK 的 RDMA 文档记录了动态小区域注册遇到 NIC MR 数量限制的情况，但具体限值不能搬到 UB。[注册资源限制](https://spdk.io/doc/nvmf.html)
-
-### 8.8 大区域准备、后台扩容与安全缩容
-
-对计划预备的 1 GiB 通信池，控制路径依次完成地址空间分配、NUMA 策略与页面准备、设备注册、池元数据初始化，再把 ready slab 发布给 owner。记录这些阶段及完整 `T_ready`，不能只测 allocator 返回时间；provider 可能把部分页面准备推迟到注册阶段。触页方式必须覆盖实际 backing 粒度，不假定每个大页跨度写一次就已准备所有基础页。
-
-映射粒度、注册粒度、池内块大小独立选择。长期稳定使用的大注册区域可减少注册对象；多个独立区域便于分批准备和整区回收。`1 × 1 GiB` 与 `16 × 64 MiB` 可作为等总容量实验候选，后者增加注册与管理工作；64 MiB 不是生产默认值，也不能假定一块区域在任意设备/context 下都只需一个注册对象。
-
-1 GiB 区域不要求使用 1 GiB hugepage。普通页、THP 和显式 hugepage 分开验证；`MADV_HUGEPAGE` 是策略提示，不能作为已经获得大页的证明，NUMA 放置与容器内存约束也需核验。[Linux THP 文档](https://docs.kernel.org/admin-guide/mm/transhuge.html) ODP 属于后续能力候选，未证明当前 UB/provider 支持及尾延迟收益前，不进入 V1 基线。[RDMA ODP 接口](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_reg_mr.3)
-
-扩容采用低水位提前触发、同一池单次在途扩容、预先预留预算、后台准备、成功发布的流程。多 context 部分注册失败时撤销已成功注册，再释放 backing 并退还预算；任何步骤未终结则继续保留资源和预算，不能发布半成品。发布前若 runtime 已进入关闭，交由控制路径安全回收。低水位由净消耗速率、补充耗时及突发余量确定；空池时按 API 语义反压、排队或报错，不同步执行准备工作，也不通过未注册 heap escape 绕过上限。
-
-保留稳定基础容量；弹性 slab 经滞回与空闲观察后才进入退休。缩容先停止向新 lease 分配该 slab，收拢本地缓存并排空归还交接；应用租约、本地 DMA、远端 grants 全部满足终结条件后，依次注销相关注册并释放 backing。禁止搬移仍在使用的 DMA buffer 来压缩碎片。软件 generation 只能识别旧描述符，不能阻止硬件使用仍有效的旧访问权写入复用地址；超时也不能代替安全条件。关闭与故障隔离沿用第 4.3、8.5、12.3 节。
-
-若 1 GiB 指单次应用请求而非池总容量，则走第 9.8 节大包准入。有限在途 chunk 只能限制 staging/DMA 窗口，不能据此提前归还仍被协议访问的整个应用源/目标 lease；第 8.4 节每个远端 SGE 的连续区间约束仍需满足。
-
-## 9. 分层流控：基础预授信、弹性窗口与 RNDV 准入
-
-本节吸收了后续讨论的三项修正：旧 per-socket 小窗口曾明显拖慢首请求；接收容量应按四个实际 JFR 分别计算；full-mesh 的 QD=10 是每客户端进程总量，且每对通信很稀疏。当前默认方向是**长期小基础窗口＋少量弹性额度＋大包字节/DMA 准入**，不是每个 idle socket 在首个 write 时重新向远端申请。
-
-### 9.1 必须分开的五类额度
-
-| 资源 | 耗尽时的含义 | 处理 |
-|---|---|---|
-| 本地应用提交缓存 | 库不能继续接受更多字节 | 部分 write / EAGAIN / 等待可写 |
-| 物理 SQ/WQEBB | 设备提交队列没有空间 | 等 CQ 推进；不能因此判对端不可用 |
-| 对端 JFR credits | 没有获准使用的接收槽 | 不 post 双边数据；等待授信 |
-| 对端内存/字节窗口 | 应用、乱序缓存或 staging 保留过多数据 | 接收侧背压，限制新 grants/credits |
-| RNDV grant / 在途 chunk | 大包注册内存、操作数或 DMA 预算耗尽 | 公平排队，限制并发 transfer |
-
-设备能力查询值、创建时请求的 SQ 深度、provider 实际接受数量和库的软件配额是四个不同量。当前 provider 边界实验中，请求 `tx_depth=64/128/256` 分别接受 `128/256/512` 条 WR；这只是该版本与测试条件下的观测，不能固化成两倍深度的通用公式。库按显式软件配额控制 outstanding，并据全部相关 SQ 的配额及错误/flush 最坏完成量预算 CQ；provider 额外容量不自动扩大准入。
-
-本次容量耗尽由 `JFS overflow` 和 `ENOMEM(12)` 报告，不能只把 provider `EAGAIN` 当作队列容量拒绝，也不能把所有 `ENOMEM` 都解释成 SQ full。同步 post 失败可能已经接受前缀：按有效 `bad_wr` 和调用契约确定接受范围、逐 WR 入账，只允许明确未接受的后缀在资源恢复后重试。接受范围未知时保留相关记录与 DMA 依赖并停止不安全提交，不能整批 repost。provider 原始错误、软件配额拒绝与 socket 层 `EAGAIN` 分别报告；socket 可写恢复仍取决于第 12.2 节的应用准入预算。
-
-RNR 表示接收侧暂时不能接受，并不等于本地 SQ full，也不等于物理 port DOWN。V1 默认严格模式使用主动预授信；credits 只能来自实际成功 post 的 RX、可用内存与第 9.5 节的守恒账本，不能由期望深度、TX 完成或水线通知直接增加。接收 credits 也不是完整的 fabric 拥塞控制替代品。
-
-当前 `rnr_retry`、`min_rnr_timer` 的实际效果及重试窗口仍未确认，不假设设备会等待远端补投，不由请求配置推算有效的有界重试时间。RNR-only 按第 9.9 节作为条件受限的实验对照，不承担默认可靠性。已经接受的 WR 最终报 RNR 超限/ACK_TIMEOUT 时，V1 不做软件 repost；对应操作失败，连接与 lane 的处理按第 11 节区分，尤其 ACK_TIMEOUT 必须停用原 jetty。明确未被 provider 接受的 WR 重试不属于已接受数据重放。
-
-### 9.2 单 JFR、四 JFR 与 40k 连接的不同边界
-
-`32768 × 4096 = 134217728 bytes = 128 MiB`。40k 个连接即使每个仅预留一个接收 WR，也已超过单 JFR 的槽位数。
-
-但四个满深度 JFR 合计是 131072 RQE，不能继续沿用单池结论判断所有启动授信都不可能：40k 条连接各发一个约 10 KiB 请求，按每请求 3 个 WR 估算，共需 120000 个 RQE 承诺。在无其他占用、均匀落域时，总量可以容纳，余 11072；若每域再保留 2048 个槽，普通预算为 122880，仅余 2880，总计而非每域。
-
-总量够仍不保证每域够；某域集中承接过多请求、已有在途授权、补槽滞后、实际分包超过 3 个 WR，都可能改变结论。RQE 会 refill 周转，131072 是并发接收容量，不是整个运行期只能收这么多包。
-
-建议：
-
-- 不给每个 idle socket 单独保留窗口；已准入的 peer runtime 可以在其接收域长期持有有界基础配额，多个 socket 本地共享。零私有额度不等于首发零可用额度。
-- 接收域维护所有 peer 的共同总账，按需求分配弹性额度；创建更多 socket 不应自动获得更多接收承诺。
-- 已发放但未消费的 credits 也计入承诺量；不能 TTL 一到就重复授予其他发送者，否则迟到发送会超卖同一槽位。
-- 必须先有真实可用的 posted receive 与内存预算，再授予对应额度。
-- 应用保留的 RX slice、乱序和 RNDV staging 都计入字节预算，避免“refill 了所以可以无限授信”。
-
-逻辑 close/重连不能直接回收尚未结清的授信。一个 socket 的 SessionId 与更长寿命的 runtime grant epoch 必须分开：关闭一个 socket 不终止其他 socket 共用的 runtime 配额；旧连接已提交的 WR 仍保留归属。迟到 SEND 即使因旧 SessionId 被丢弃，也已经消耗物理 JFR 槽。终止整个 runtime 授信关系时，旧承诺进入 retired-grant 账目，直到安全撤销/终结或实际收包归账后才能释放。
-
-例如四域各 8192 个 4 KiB 槽的数据 buffer 总量为 128 MiB，而非每域都分配 128 MiB；满配四域才是约 512 MiB。这些容量都不包括描述符、备用 slab、应用保留和 RNDV 内存。
-
-### 9.3 控制消息必须能前进
-
-credit return、grant、DONE、FIN 和错误控制需要保留独立预算，不能被普通数据吃光。仅预留 RX 槽还不够：共享 SQ 的 RNR/HOL 也可能堵住控制，应考虑有界控制 lane 或明确的 TCP 控制逃生路径。
-
-控制逃生仅推进协议和终结，不承担旧 UB 数据的业务重放。所有控制帧也必须做 session/grant 校验、长度上限和速率限制。
-
-RTS 是普通入口需求，应按实际消耗 RQE 的 WR 数扣普通 credits；不能把 3000 个同时到来的 RNDV RTS 全部挤入很小的保活预算。grant、DONE、COMMIT/WRITE_IMM 等也必须计账，并在传输准入时安排好后续通知的进度条件。控制保留是软件容量预算，不自动成为硬件隔离，不能允许任意数量控制消息绕过总账。
-
-### 9.4 旧流控首请求变慢的经验与源码边界
-
-用户补充的实际经历：曾打开 `UBSOCKET_FLOW_CONTROL_ENABLE=true`，当时每 socket 实际可用初始额度约 2 个，每 credit 对应一个可发送包。约 10 KiB 请求需要继续申请 credits 才能发送完，首请求时延明显增加，后来关闭显式流控、采用 RNR 反压。这里保留的是定性现场结论，没有补造增加了多少 µs。
-
-在 4 KiB 双边限制下，约 10 KiB eager 请求通常至少需要 3 个 SEND WR，实际受头部与 SGE 打包影响。有效窗口只有 2 时，前缀可能已发出，剩余部分等待补额。因此需要区分“首个物理包发出时间”和“首个完整请求到达/RPC 完成时间”；受损的不一定是前者。
-
-当前源码已有握手预授和低水位提前申请，不能把问题归结为完全没有预取。小窗口即使提前申请，也可能不足以覆盖授信 RTT、对端处理和唤醒延迟。[授信检查](ubs-comm/src/hcom/umq/src/umq_ub/core/flow_control/umq_ub_flow_control.h)、[WR 前缀截断](ubs-comm/src/hcom/umq/src/umq_ub/core/private/umq_pro_ub.c)
-
-会话核验的版本中，[配置](ubs-comm/src/ubsocket/csrc/core/umq/umq_setting.cpp) 默认请求额度为 16、minimum reserved 为 2、流控默认关闭；[bind TLV](ubs-comm/src/hcom/umq/src/umq_ub/core/private/umq_ub.c) 从池中尝试预授最多 16，实际可能更少甚至为 0。配置中的请求初始量、握手真正授予量、某次发送时可用余额是三个不同量，不能据当前默认值否定历史现场的有效 2-credit 现象。
-
-补充的历史演进如下；不将基线自身或更早提交误计为第 13 节区间内的新修复：
-
-| 提交 | 核验到的变化 | 启示 |
-|---|---|---|
-| `991f1250` | 默认请求额度 1024→16，最大请求额度 1024→256 | 降低逐连接保留有扩展收益，但窗口需匹配实际首请求 |
-| `b5cfb3dc` | 显式流控默认 true→false | 默认值变化可由源码确认；关闭的现场性能原因采用用户补充事实 |
-| `5dfb3ae6` | 握手预授常量 0→16 | 在既有握手中携带首发资格已有先例，不应另加必经授信往返 |
-| `c0ee5750` | 修复请求量缩放/取整可能卡在 2，并调整空闲返还逻辑 | 小窗口增长和 idle 回收可能制造额外等待；不能认定它就是用户现场唯一原因 |
-
-对 V1 的修正不是简单把 2 调成 8，而是把额度从 socket 私有小窗口提升为 runtime/接收域公共窗口，并让基础容量可长期兑现。已有公共余额的新 socket 不需要一次新的网络申请；新 runtime 的 bootstrap 可以放入已有握手，但不能无限等待额度后才宣布 READY，从而把首请求延迟隐藏到建链里。
-
-### 9.5 多客户端共享 JFR：逐域总账和基础子账
-
-授信关系至少由 `{sender RuntimeInstanceId/epoch, remote ReceiveDomain/JFR generation}` 定位，不按单个整数 fd，也不只按远端 IP/EID。这里的 runtime 是第 3.3 节的 `KbRuntime` 实例，不是每线程 reactor；新增 shard_id 不自动创建一份基础授信。一个 runtime 的多个 socket 可本地共享；不同客户端实例得到的是不同的、已经记入服务端总账的授权。
-
-V1 优先让同一 peer 的相关连接归属一个本地 shard，向约定远端接收域发送并使用同一份本地余额。确需多个发送 shard 时，一个逻辑 `GrantAccount` 由指定 owner 管理总授权，各 shard 领取互不重叠的子额度；子额度发放/返还走控制路径，不让每包争抢一个全局计数器。未分配余额、子额度和已消耗/在途承诺必须守恒；不能把同一 grant 复制进两个本地缓存后分别扣减。
-
-远端 ReceiveDomain/JFR generation 改变时需要新的路由与授信，旧在途账保持原归属直至安全终结；不能把旧余额直接搬到新 JFR。以第 9.6 节候选基础窗口 8 为例，3000 个 peer 的基础承诺为 24000，不因两个本地 shard 自动变成 48000，也不在每个接收域再复制一份。
-
-对接收域 j，设实际配置深度为 `P_j`，受控保留预算为 `C_j`，普通预算为 `B_j=P_j-C_j`。维护：
-
-- `F_j`：已具备接收条件、尚未授出的普通额度。
-- `G_ij`：已授给 runtime i、尚未完成接收归账的额度，包含未发送、已在途及尚未 poll 到 CQE 的部分。
-- `U_j`：不可授信槽位，包括已消费未成功 refill，以及初始化时尚未成功 post 的部分。
-
-```text
-F_j + sum_i(G_ij) + U_j = B_j
-
-publish grant n:       F_j -= n; G_ij += n
-account received n:    G_ij -= n; U_j += n
-successful refill n:   U_j -= n; F_j += n
+```mermaid
+flowchart TD
+    START(["ShardReactor 单轮迭代开始"]) --> P1["1. 消费跨线程 Mailbox & LeaseReturnQueue<br/>(批量上限: 64 项)"]
+    P1 --> P2["2. 轮询各 Context 的 TX JFC (TxCompletionProcessor::Poll)<br/>退休已完成 WR，推进 kFlushReady 通道的 Flush<br/>(每 Context 预算: 64 CQE)"]
+    P2 --> P3["3. 轮询各 Context 的 RX JFC (RxBufferPool::Poll)<br/>执行解复用、ReorderWindow 入窗与 Credit 记账<br/>按预算调用 RxBufferPool::Refill 补充接收槽位<br/>(每 Context 预算: 64 CQE)"]
+    P3 --> P4["4. 调度活跃发送队列 (Active Send Connections)<br/>按字节与 WR 配额公平轮转提交 Eager SEND / RNDV WRITE"]
+    P4 --> P5["5. 有界推进 TimerWheel、ControlExecutor 结果与 RetireQueue<br/>非阻塞收割 JFCE/async 通知并 Ack<br/>公平处理 NativeTCP/accept、SHM 和合成就绪事件"]
+    P5 --> CHECK{"本轮是否有进展<br/>或仍有未尽 Runnable 工作？"}
+    CHECK -- "是 (或处于 Busy-Poll 模式)" --> START
+    CHECK -- "否 (Event 模式进入休眠准备)" --> REARM["6. 对所有 JFC 调用 RearmJfc()"]
+    REARM --> RECHECK["7. Recheck: 再次扫描 TX/RX CQ、Mailbox 与 Runnable 队列"]
+    RECHECK -- "发现新工作" --> ACK1["WaitJfc(timeout=0) 收取并 AckJfc 已触发通知"] --> START
+    RECHECK -- "确认全空" --> WAIT["8. epoll_wait(jfce_fds, async_fds, mailbox_eventfd, native_tcp_fds, next_timer_ms)"]
+    WAIT --> WAKE["9. 收集就绪源，交回同一有界推进循环"]
+    WAKE --> START
 ```
 
-grant 发布前先扣账；发送端 TX CQE、grant 消息超时或 socket close 都不能直接增加 `F_j`。每个实际消耗 RQE 的完成必须能归属授信或受控保留预算；未授权、重复或畸形流量按异常处理，不能无条件产生 credit。请求和响应若落在同一个物理 JFR，也必须共享该总账，不能因软件角色不同各发一整份窗口。
+预算覆盖整轮及每个内层操作，耗尽时保存 runnable continuation 并轮换，不能通过 drain-to-empty 让某个 CQ、控制队列或热连接独占 Owner。Busy-Poll 和持续繁忙的 Event 模式都必须执行步骤 5；JFCE/async、原生 TCP 和 SHM 不能只在阻塞等待返回后获得服务。
 
-“长期保留基础 8-credit 配额”还需要子账，不能让所有 refill 都进入可被热点抢占的公共池：
+接收域单独记录 `target_posted`、实际 accepted RQE 和 `refill_debt`；部分 post 只按被接受前缀增加 posted。暂时容量不足或无空闲 Lease 时保留补投责任，由 LeaseReturn/资源恢复通知或本 Owner 的重试 timer 驱动，确保没有新 CQE 时仍可恢复。Mailbox、LeaseReturn、控制完成和 SHM 发布须使用经过验证的发布/通知/recheck 协议唤醒休眠 Owner，不能仅凭一次 empty→nonempty 判断省略通知。
 
-```text
-F_j = F_elastic_j + sum_i(F_base_ij)
-F_base_ij + G_base_ij + U_base_ij = q_base_i
+### 9.2 硬件事件与水线处理的严格规范（M3 核心规范）
+
+1. **JFCE 通知与 CQE 分开记账**：
+   - 硬件契约（**H11**）保证 `RearmJfc` 时若已有 CQE 仍会触发通知，但仍必须保留步骤 7 的 `Recheck`。
+   - 无论因 `epoll_wait` 唤醒还是因 `Recheck` 跳过睡眠，只要 `WaitJfc` 取出了通知计数 $k$，都必须对该 `JFC` 执行 `AckJfc(jfc, k)`，防止未确认通知引用泄漏导致后续销毁失败。
+   - 每个 context 的 async fd 由明确的单 Owner 有界消费。`GetAsyncEvent` 后先校验对象所属 context/代次并复制所需事件语义，再 `AckAsyncEvent`；Ack 后不得继续借用原事件存储。JFCE 通知、async 引用和软件回调均纳入第 5 节的销毁/ID 复用屏障。
+2. **`JFR_LIMIT` 水线事件重使能（基于 H10）**：
+   - 收到并校验 `URMA_EVENT_JFR_LIMIT` 后，复制所属域信息并以 `AckAsyncEvent` 确认事件；
+   - 由于触发后硬件 `rx_threshold` 已自动清零，接收域必须先执行 `RxBufferPool::Refill` 将 `posted()` 补充至高于阈值（如 $> 64$），然后**显式调用 `UrmaApi::ModifyJfr` 重新写入 `rx_threshold = 64`**。若当前因无空闲 Lease 暂无法补过水线，则置位 `refill_debt` 与 `watermark_rearm_pending`，待后续 Lease 归还补槽达标后再重写水线。
+3. **`JFC_ERR` 异步错误处理**：
+   - 一旦捕获并校验 `JFC_ERR`，立即封禁依赖该 JFC 的队列、记录和连接的新预留/投递，按有界批次分发致命错误；将未取得终结证据的 Attempt、RX 内存及其完整资源依赖转入 `QuarantineLedger` 保留至有明确安全边界或进程退出。独立健康 JFC 域可继续推进，不能因为其他 Jetty 查询 READY 就忽略其对故障 CQ 的依赖。此为保守故障门禁，故障 CQ 的完整恢复/回收仍延期，不宣称已具备安全在线重建能力。
+
+---
+
+## 10. 异步建链、故障探测与 POSIX/P2300 接口层
+
+### 10.1 非阻塞建链与能力协商状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> kTcpConnecting: socket() + connect() (非阻塞 TCP)
+    kTcpConnecting --> kNegotiating: TCP 连接建立，交换握手帧 (HelloMsg)
+    kNegotiating --> kShmPreparing: 同宿主机 + 策略授权通过 + SHM 预算充足
+    kNegotiating --> kUbPreparing: 跨机(或无SHM) + UB 健康可准入 + 版本/能力匹配
+    kNegotiating --> kTcpActive: 任一方仅支持/选择 NativeTCP (且 TCP 流干净无残留)
+
+    kShmPreparing --> kShmActive: UDS 交换并校验 memfd/eventfd -> 映射就绪 -> 发布路由 -> 双方 READY
+    kUbPreparing --> kUbActive: ControlExecutor 完成 import_jetty (命中缓存或 Single-Flight)\n+ 分配/确认 PeerRuntime 基础 Credit\n+ 本地发布 SessionId 到 RX Demux 表\n-> 双方交换 READY 帧
+
+    kTcpConnecting --> kFailed: 超时 / 拒绝 / 取消
+    kNegotiating --> kFailed: 协议错误 / 截断 (立即关闭脏 TCP fd)
+    kShmPreparing --> kFailed: 授权/映射失败 (显式报错或清洁重连)
+    kUbPreparing --> kFailed: Import 失败 / 探测超时
 ```
 
-基础额度在这三个状态之间流转，成功 refill 后只回到原 owner 的 `F_base_ij`，再授给原 owner；弹性额度按策略回到公共 `F_elastic_j`。只有公共弹性余额可以自由分给其他 peer。不能先把基础容量借给热点，再无条件补回原 owner。若不实现这种保留子账，8 只能称为目标水位，不能承诺长期基础容量。
+**40k/s 建链吞吐保障机制**：
+1. **物理资源零热建**：`UrmaContext`、`JettyPool`（含被动 `rx_target_jetty` 与主动 `tx_lanes`）、`RxBufferPool` 和基础注册内存均在 `KbRuntime::Initialize` 时预建完毕，单次 `connect`/`accept` **零硬件队列创建、零 MR 注册**。
+2. **`EndpointImportCache` 与 Single-Flight**：缓存键至少包含 `{local_context_incarnation, peer_runtime_instance, peer_eid, rx_jetty_id, domain_gen, transport_mode, authorization_identity}`，禁止跨本地 Context 复用导入句柄，或在远端重启后命中旧 ID。首次导入通过 Single-Flight 合并，后续同身份连接共享受控引用；entry 数、导入并发及等待队列有硬上限。失效条目停止新借用，但在途 WR/控制任务持有的旧句柄须等依赖终结后再 unimport，不能因缓存过期直接销毁。
+3. **路由先于 READY 发布**：接收端必须在将 `SessionId -> Connection*` 写入分片路由表并准备好初始 Credit 后，才能向对端发送最终 `READY` 确认帧，彻底杜绝首包先于路由表到达而被丢弃（吸收 `aa6049a5` 教训）。
 
-这是一份逻辑容量预留，不要求给每个 peer 创建私有硬件 RQ 或永久绑定某几个物理 buffer。
+**协商与降级边界**：NativeTCP 兼容模式不能向任意未识别的普通 TCP 服务发送私有 HELLO 并消耗业务字节；须通过显式配置、独立控制通道或约定的协议入口确认对端能力。握手失败后的脏 TCP fd 必须关闭，只有未污染业务流或新建干净连接时才可选择 NativeTCP。UB/SHM 激活后的连接错误显式失败，不迁移旧字节流；Secondary 路径只用于新连接选择，不恢复旧 Session。
 
-### 9.6 3000-peer 稀疏通信的基础窗口与候选配置
+### 10.2 故障分类、健康注册表（`HealthRegistry`）与有限探测
 
-第一版从每 peer runtime 的单一归属接收域保留 `q_base=8` 开始；每个方向都配置，所有关联 socket 共享。8 个 credits 通常覆盖 8 个 1 KiB 请求或 2 个 10 KiB 请求。对平均每对约 3 秒一次的负载，保留小暖窗口比短 TTL 撤回、下一次再申请更符合低首请求时延目标。
+| 故障信号 | 故障归因作用域 | 健康表与重连决策 |
+| :--- | :--- | :--- |
+| **`status 8` (`REM_ACCESS_ABORT_ERR`)** | 远端特定 `(PeerRuntimeId, ReceiveDomainId)` | 终结当前连接；标记该远端 `EndpointImportCache` 条目需重验，**不拉黑本端物理设备或端口** |
+| **`status 10` (`RNR_RETRY_CNT_EXC_ERR`)** | 当前连接 / 远端接收域瞬时拥塞 | 终结当前连接并告警授信异常；**不拉黑本端 Lane 或物理路径** |
+| **`status 9` (`ACK_TIMEOUT_ERR`)** | 1. 触发错误的本地 `tx_lane`（立即排空重建）；<br>2. 累计记录 `(local_ctx, peer_eid)` 路径异常计数 | 单次 `status 9` 先重建本地 `tx_lane`；若短窗口内向同一 `peer_eid` 或同一 `local_ctx` 连续触发 `status 9`，将该路径转入 `COOLDOWN(60s)` |
+| **`JFC_ERR` / 本地 Context 级硬件错误** | JFC_ERR 影响关联依赖域；Context 级错误影响整个 Context | 关闭受影响资源域准入，独立健康队列按已验证边界继续服务；所有可用 UB 域均不可准入时，新连接选择 NativeTCP |
 
-以下仅为容量推导和实验起点，不是已验证最优参数。假设 3000 个 peer 均匀归属四域，每域约 750 个：
+- **冷却与 Single-Flight 真实数据面探测**：路径进入 `COOLDOWN`（默认初始 60s，支持指数退避与 Jitter）期间，新连接优先选择剩余健康 Context 或直接走 `NativeTCP`。冷却到期后进入 `PROBING` 状态，**仅放行 1 个探测令牌（Single-Flight）**，且必须完成真实 `RM_CTP` 握手与首包收发才恢复为 `HEALTHY`，防止 40k 连接在冷却到期瞬间产生建链风暴。
 
-| 项目 | 紧凑基线 | 宽窗口对照 |
-|---|---:|---:|
-| 每 peer 基础 credits | 8 | 32 |
-| 每 JFR 深度 | 8192 | 32768 |
-| 每域控制/进度保留预算 | 512 | 2048 |
-| 每域普通数据预算 | 7680 | 30720 |
-| 每域基础承诺 | 6000 | 24000 |
-| 四域基础承诺合计 | 24000 | 96000 |
-| 四域普通弹性余量 | 6720 | 26880 |
-| 四域 4 KiB 接收 buffer | 128 MiB | 512 MiB |
+### 10.3 接口分层：C ABI、POSIX 兼容与 C++23 P2300
 
-32-credit 对照通常可覆盖单 peer 连发十个 10 KiB 请求所需的约 30 WR，但当前 QD 是每客户端总量，不要求给所有 peer 永久配置这一最坏窗口。4/8/16/32 的容量、控制开销和时延应做独立对照，不能仅凭“窗口更大”认定更优。
+1. **内部 C++ 核心接口**：遵循 `AGENTS.md` 第 4 节，所有可失败接口统一返回 `std::expected<T, Error>`（无返回值使用 `std::expected<void, Error>`），`Error` 不含 `kOk`，快路径零动态分配。
+2. **显式 C ABI（`kbsocket/api/kbsocket.h`, `buffer.h`）**：提供句柄式非阻塞连接、普通读写及零拷贝 `kb_alloc_lease` / `kb_write_lease` / `kb_read_lease` / `kb_release_lease`。
+3. **POSIX Socket & Epoll 兼容层（`kbsocket/socket/`）**：支持 `socket`/`connect`/`accept`/`read`/`write`/`readv`/`writev`/`close`/`shutdown`/`getsockopt(SO_ERROR)` 及 `epoll`（`EPOLLIN`/`EPOLLOUT`/`EPOLLET`/`EPOLLONESHOT`）。内部合成事件与原生内核 `epoll` 共享公平配额，防止加速连接事件饿死原生 TCP `accept`。
+4. **C++23 项目中的 P2300 风格异步层**：通过适配实现 sender/receiver，不把 P2300 的标准库实现当作 C++23 已有能力。基于 Operation State 封装 `AsyncConnect`/`AsyncRead`/`AsyncWrite`，正常、错误、超时与取消竞争下恰好完成一次；错误通知和 `source_reusable` 分开，DMA 未终结前不归还借用内存。
 
-准入按每域剩余额度检查，不依赖哈希必然均匀；不允许给每个 peer 在四域各复制一份完整窗口。多个本地 SQ 若确实都到达同一个远端 JFR，可以共享该域额度。
+普通读写支持部分完成、`EAGAIN`、双向独立关闭与 `SO_ERROR`。可读 readiness 来自连续可读字节或可报告的 FIN/错误；可写 readiness 由连接状态及本地能否接纳新的写入决定。远端 credit 暂缺限制物理提交，但不应遮蔽仍有 staging 容量可接收的普通复制写。非 owner 线程调用普通 `write` 时，必须在返回前复制已接受字节，或等 owner 完成该复制后返回；不能只把用户指针入 Mailbox 就宣告成功。
 
-40k socket 若来自这 3000 个已准入 runtime，可继续共享基础池；若实际有 40k 个独立 runtime、仅轮流有 3000 个活跃，则需要有界暖集合和安全退额，不能向所有 runtime 永久发 8 个。暖集合切换仍可能产生冷态准入等待，不能继续承诺所有首请求零等待。
+---
 
-### 9.7 基础返还、弹性扩窗与安全归还
+## 11. 同宿主机授权共享内存后端（`ShmBackend`）
 
-等长请求/响应为 piggyback 提供了机会：例如 10 KiB 请求消耗约 3 个 credits，接收端成功补回资源后，可在响应帧中携带累计授信更新。收到响应本身不等于自动返还 3 个 credits；只有实际可兑现的额度才能发布。
+同宿主机容器间通信无需占用宝贵的 UB 硬件队列（`Jetty`/`JFR`）与 NIC 注册内存（MR），亦无需承担设备 Doorbell/CQE 开销。
 
-- 使用带 runtime/domain epoch 的累计上限或等价幂等协议，避免乱序/重复控制帧双加额度；这不是业务交付 ACK，不引入重放缓存。
-- 能搭载反向数据就搭载，不能无限等待业务响应。单向通信、业务处理慢或响应阻塞时有独立、可配置的更新期限。
-- 发送者在基础余额尚未耗尽、有实际排队需求时提前请求扩窗；服务端仅从公共弹性池按需求、公平性和 per-runtime 上限批量授信，例如向 16/32 的候选窗口扩展。
-- 有效旧额度仍允许发送时，补额控制请求的暂时 EAGAIN 不应无条件阻止当前数据；致命错误另行传播。
-- 按活跃需求队列推进，不周期扫描全部连接。低水位与更新周期根据包速率、反馈和 refill 延迟调整，不预设为每连接一份链路 BDP。
-- 有足够额度时可批量预留首 burst；不足时允许受控前缀发送或归还碎片，避免所有发送者各握 2 个、都等第 3 个而全局无剩余额度的 hold-and-wait。
+```mermaid
+flowchart LR
+    subgraph ProcA["客户端容器 KbRuntime A (ShardOwner A)"]
+        RingAB["A->B 数据描述符 Ring (SPSC)\n+ A 可写 Payload Arena"]
+        RelBA["A 对 B 数据的消费进度/Release"]
+    end
 
-eRPC 将每会话窗口和接收队列规模一起约束，说明初始窗口应与资源承诺共同设计；V1 借鉴其容量约束，不照搬逐包返回与重传协议。[eRPC NSDI 2019，§4.3](https://www.usenix.org/system/files/nsdi19-kalia.pdf)
+    subgraph Broker["受控本地 Rendezvous / UDS (仅建链期)"]
+        AUTH["校验凭据 + 容器身份 + 策略\nSCM_RIGHTS 传递 memfd & eventfd"]
+    end
 
-弹性额度可以停止续授并通过协议返还，基础额度通常保留到授信关系结束或明确缩减。安全撤回需先冻结该 grant epoch 的新 post，等待相关 owner 的 post 调用返回，确定 provider 实际接受的集合：未使用部分可以归还；可能在途的部分继续记账。多 shard/部分 post 有编号空洞时，不能拿最大序号当作已接受数量。
+    subgraph ProcB["服务端容器 KbRuntime B (ShardOwner B)"]
+        RingBA["B->A 数据描述符 Ring (SPSC)\n+ B 可写 Payload Arena"]
+        RelAB["B 对 A 数据的消费进度/Release"]
+    end
 
-TTL、60s cooldown 和 peer 失联只能触发停止授信、探测或终结，不能自行解除旧授权。保留无法安全回收的承诺是严格模式的真实代价，需要 retired-grant 上限和新连接准入策略，而非强行清零。
-
-### 9.8 RNDV 的字节准入和 DMA 调度
-
-RNDV 实现并启用后，100 KiB、1 MiB 的请求及等长响应优先采用 WRITE；不能只优化请求而忽略响应的预算。此前的最小版本使用有界分片 copy eager，不宣称达到 RNDV 性能。READ/普通 WRITE 的大数据不按几十、几百个普通 RQE 扣费，但其 RTS、grant、DONE、SEND/IMM 通知按实际接收语义计账；SGE 描述过多导致控制分片时也按真实 WR 数计数。WRITE_IMM 不属于当前默认通知方案。
-
-```text
-RTS received
-  -> bounded descriptor queue
-  -> admit only with memory and DMA budgets
-  -> issue WRITE grant (READ only when explicitly enabled)
-  -> validated completion / visibility
-  -> application delivery
-  -> release each budget at its actual lifetime boundary
+    ProcA -.->|"冷态配对 (SOCK_SEQPACKET)"| Broker
+    ProcB -.->|"冷态配对 (SOCK_SEQPACKET)"| Broker
+    RingAB ==>|"B 只读映射 (F_SEAL_FUTURE_WRITE)"| ProcB
+    RingBA ==>|"A 只读映射 (F_SEAL_FUTURE_WRITE)"| ProcA
 ```
 
-收到 RTS 先保存有界描述符，不立即为所有请求分配完整目标。需同时限制：
+### 11.1 安全与内存隔离设计
 
-- 本容器已准入目标、已完成但应用未释放的数据和其他接收驻留内存。
-- 发送源 lease、已生成待发送响应、对外暴露的 READ 授权；不能只约束发起 READ 的一侧。
-- 在途 DMA 总字节数、操作数和 per-peer 并发，预算覆盖所有相关 lane/rail，而不是每端口各复制一整份容器预算。
+1. **适用门禁**：仅在验证为同一宿主机、通过受保护 Pathname `AF_UNIX`（`SOCK_SEQPACKET`）完成身份与租户策略校验、且 SHM 预算充足时启用。已确认同机但不满足 SHM 条件时按策略使用 NativeTCP，不为该连接单独创建 UB 资源；跨机或尚未确认同机时遵循 §10.1 的 UB/NativeTCP 协商流程。仅提供 SHM/NativeTCP 的 Runtime 可按需启动，不强制初始化 UB。
+2. **`RuntimePair` 复用与单写者封印（File Seals）**：
+   - 资源按 `{LocalRuntimeId, PeerRuntimeId}` 建立单条 `ShmPair`，该对进程间的多条逻辑 Socket 复用同一 `ShmPair`。
+   - 采用 `memfd_create(MFD_CLOEXEC | MFD_ALLOW_SEALING)` 创建定长共享区，设置 `F_SEAL_SHRINK | F_SEAL_GROW`。
+   - **读写分离防篡改**：A 端创建的发送区由 A 建立 `PROT_READ | PROT_WRITE` 映射后，立即施加 **`F_SEAL_FUTURE_WRITE`**，再通过 `SCM_RIGHTS` 将 FD 传给 B 端；B 端仅能建立 `PROT_READ` 只读映射。反向通道对称。
+3. **跨进程无锁 SPSC Ring 与双轨反压**：
+   - 生产者/消费者索引各自独占 `alignas(64)` Cacheline，使用 `std::atomic<uint64_t>`（编译期静态断言 `is_always_lock_free`）配合 `memory_order_release` / `memory_order_acquire` 发布。
+   - **Descriptor 槽位与 Payload Lease 分离计账**：消费者从 Ring 取出描述符仅释放 Ring 槽位；底层共享 Payload 切片必须等接收端应用 `read` 拷贝完成或显式 `Release(lease)` 后，通过反向消费进度归还。
+   - 消费索引/Release 进度写在消费者自己可写的反向控制区，不能写入对端封印后的只读区。先复制描述符到本地再校验代际、offset、length 与整数溢出，禁止重复读取可被对端改写的描述符作寻址；payload 仍可能被其原始写者修改，seals 不构成对恶意生产者的内容不可变保证。不可接受该信任边界时使用 copy 后端或 NativeTCP。
+   - **崩溃与残留映射隔离**：若对端异常崩溃（由控制通道 EOF / `pidfd` 检测），立即废弃旧 `ShmPair`，在本地所有已借出视图释放前保留旧映射（计入隔离预算），重连时创建全新 `memfd` 实例。
 
-一组供实验的起点为：大包接收/驻留预算 128 MiB，在途 DMA 字节预算 4 MiB，chunk 128 KiB，同时 DMA 操作最多 32。四者不是同一个限制，128 MiB 也不代表整个库的内存总额。发送源、待发响应、隔离内存与应用其他分配还需纳入容器级总上限。
+---
 
-100 KiB 通常可用一个数据 chunk，1 MiB 可分块；也要对照整包单 WR。分块改善公平性、占队列时间和取消粒度，却增加 WR/CQE 成本，不能把硬件 200 MiB 单操作能力当默认 chunk，也不能未经测量认定 128 KiB 最优。
+## 12. 低开销可观测性架构（USDT + eBPF + 分片指标）
 
-大包使用按字节计费的公平调度，必要时优先短 transfer，同时保证长 transfer 不饥饿。小包和控制保留提交机会，避免一条大包填满共享 SQ。WRITE 按第 8 节已确认的完成可见性契约发送通知；READ/WRITE grant 的安全终结仍须独立满足生命周期条件。
+遵循 `AGENTS.md` 第 5 节与 [可观测性设计指南](../OBSERVABILITY-DESIGN-GUIDE.md)，V1 摒弃重度侵入数据面的进程内全量文件日志和复杂自定义采集环，采用**三层零分配可观测架构**：
 
-### 9.9 RNR-only 与无授信首发的保留位置
+```mermaid
+flowchart TB
+    subgraph Fastpath["1. kbsocket 数据面热路径 (零分配、受控开销)"]
+        M["Per-Shard Cacheline-Aligned Counters\n(alignas(64) 原子 relaxed 计数与分桶直方图)"]
+        U["USDT 静态探针 (KBS_PROBE / <sys/sdt.h>)\n未挂载探针点为 NOP，完整成本以基准验证"]
+        L["内联活跃 Lease & Quarantine 台账\n(复用 AttemptLedger / MemoryPool 元数据槽)"]
+    end
 
-用户关闭旧 FC 后首请求改善，是必须保留的基线证据，但不能证明 3000-way incast 下 RNR-only 同样最优。默认严格授信与机会型首发是不同策略：后者允许有限未授信 WR，需接受 RNR 终结失败、共享队列进度受影响和最终超时风险。当前不确定设备 RNR 重试参数的实际效果，因此 RNR-only 仅保留为带能力和版本记录的实验对照；不能将其写成原始 WR 必然等待补投并成功的正常传输路径。先前同 SQ 的 RNR 后新消息成功，不代表失败的原始消息恢复，也不能据 CQE 顺序断言是否存在硬件 HOL。
+    subgraph KernelBPF["2. 内核态 eBPF 动态观测引擎 (按需 Attach)"]
+        BPF["BPF_MAP 状态关联 (SessionId / SN / ByteCursor)\n+ 慢请求尾部过滤 (Tail-based Filter: latency >= threshold)\n+ tracepoint:sched:sched_switch Off-CPU 归因"]
+    end
 
-每发送者允许 u 个未授信 WR，最坏超发是 sender 数乘以 u，不是全服务端只有 u；要严格限制总量，就仍需要接收端统筹。Homa 的初始 unscheduled 部分提供了“短消息避免启动 grant RTT”的参考，但不能把其无授权突发和软件重传直接搬入 V1。[Homa 协议说明](https://github.com/PlatformLab/HomaModule/blob/main/protocol.md)
+    subgraph UserCollector["3. 宿主机监控与诊断导出 (进程外)"]
+        PROM["Prometheus / 指标抓取"]
+        TRACE["慢 RPC 因果时间线 / Perfetto / Off-CPU 火焰图"]
+    end
 
-V1 对已接受 WR 最终失败仍不做软件 repost；无授信首发不扩大无损切换/业务重放范围。小包 credits 保护接收容量，大包准入保护内存与 DMA，发送平滑缓解突发；三者不能互相替代，也不能免除物理网络拥塞和应用排队。
-
-## 10. TX CQE、批处理与完成账本
-
-### 10.1 CQE 聚合按物理 SQ，而不是按 socket
-
-这里优先讨论的是 selective signaling：部分 WR 不请求成功 CQE，由有 signal 的 marker 驱动回收；它不同于硬件中断 coalescing，也不同于一次 poll 多取几个 CQE。
-
-raw provider 会用 CQE 的 entry index 推进 SQ consumer，能够跳过没有单独报告的 WQEBB。这支持“减少成功 CQE”的实现基础，但 consumer 前进不是连接级 ACK，也不是所有先前跨目标操作均成功的证明。[SQ consumer 更新](umdk/src/urma/hw/udma/udma_u_jfc.c)
-
-后端能力必须分别表达：
-
-- selective signaling 是否支持；
-- SQ 描述符累计回收范围；
-- 本地源/目标 DMA 完成范围；
-- 对端数据可见性范围；
-- 错误、flush 与未报告 WR 的终结方式。
-
-第一版共享多目标 lane 使用全 signal；在限定 opcode、ordering、target 组合上验证后逐步开放。不能用一个 `ordered=true` 覆盖全部语义。
-
-### 10.2 正确性不变量
-
-- marker 序号属于物理 SQ；一个 CQE 可以对应多个连接的待回收记录，但只能按已证明的完成范围退休。
-- 批量 post 的已接受前缀必须被精确记账，不能把未接受 WR 当作在途，或丢失已接受 WR。
-- SQ 必须预留足够的 signal/终结进度空间，不能全被 unsignaled WR 填满。
-- 空闲尾部、最后一条发送、close 和停止发包时都必须有经过验证的终结路径；不能假设未来一定会再发到第 Q 条。
-- 不通过手工推进 `ci`、归零 outstanding 或重新借出旧对象伪造完成。
-- CQ 容量按错误/flush 最坏情况设计；即使成功时每 Q 条一个 CQE，错误路径也可能产生密集完成。
-
-若需要提交额外 marker，它本身也要满足设备、接收 credit 和顺序语义；在没有安全 marker 方案前，低负载/临近空闲使用全 signal。
-
-### 10.3 为什么低负载 Q=1 可能更快
-
-本地 raw 发送代码只有在 `wr_cnt==1`、DWQE 能力开启且 `pi-ci==1` 等条件满足时走直接 WQE 路径；否则更新普通 SQ doorbell。低在途量、及时收 CQ 的 Q=1 可能持续满足这一条件，Q>1 则可能让 consumer 落后、改变 post 路径。[DWQE 分支](umdk/src/urma/hw/udma/udma_u_jfs.c)
-
-这是新 send_lat 中 Q=1 更快的一个源码支持的解释，尚未用真实分支计数确认。不能误解释为“不 signal 的 WR 要等攒够 Q 条才上网”。
-
-调度策略应按低延迟和饱和负载区分：低 inflight 全 signal；持续高负载采用经过验证的批量 post 与 selective CQE。记录实际 DWQE/普通 doorbell 次数、WQEBB、CQE/WR 比，而不是只记录配置 Q。
-
-## 11. 故障、健康缓存与重新选择传输
-
-### 11.1 旧连接失败与新连接准入是两件事
-
-```text
-具体 WR / lane 故障
-  ├─ 旧连接：停止提交 → 明确失败 → 后台安全终结资源
-  └─ 故障分类器：更新对应 scope 的健康记录
-                         │
-                  上层决定发起新连接
-                         ├─ 健康 UB 路径可准入 → 尝试 UB
-                         └─ 无健康路径 / 被抑制 / 探测无额度 → TCP
+    M --> PROM
+    U -.->|"动态挂载 uprobe/USDT"| BPF
+    L --> PROM
+    BPF -->|"按阈值及采样预算上报，统计丢弃"| TRACE
 ```
 
-对上层暴露错误完成、`SO_ERROR` 和正确的 readiness；不依赖 brpc 将人为 `shutdown(SHUT_RD)` 解释成错误。可以先交付已经确认的连续接收前缀，再在后续 read 暴露终止错误，但绝不越洞，也不能把异常丢包报告为干净 EOF。具体 errno 映射需要兼容性测试固定。
-
-业务请求可能已到达甚至已经执行。上层重试必须自行使用幂等性、请求 ID/去重、重试预算和退避；kbsocket 不宣称 exactly-once，也不自行重放 writev。
-
-### 11.2 当前 60s 机制能学到什么
-
-现有 [cooldown 实现](ubs-comm/src/ubsocket/csrc/common/ubsocket_port_cooldown.cpp) 与 [配置](ubs-comm/src/ubsocket/csrc/common/ubsocket_global_setting.cpp) 的特点：
-
-- 默认 60s，环境变量 `UBSOCKET_PORT_COOLDOWN_SEC`，当前合法范围 1～300s。
-- 进程级 key 只有 chip/die/port，没有 peer、endpoint 或设备实例代际；value 实际是最后标记时间，重复错误刷新起点。
-- 查询在同一 mutex 下扫描删除过期项，过期即重新允许尝试；没有 half-open、探测单飞和恢复验证。
-- 若干 TX 错误路径在 CLOS 下将 socket 的所有 used ports 标记，依赖“bonding 已尝试所有 port”的前提。
-- 建链检查遇到任意 used port 冷却即走降级，而不是过滤坏路径再选剩余健康 raw 路径。
-- 类注释提及 bind 失败冷却，但当前 bind 失败分支并没有统一写入；READ/大包控制路径也不会自然经过同一套 TX 错误回调。
-
-这些行为不能直接复制到 raw：单个 peer 的 ACK_TIMEOUT 不证明本地所有 port 故障，但在当前芯片契约下必须立即停止使用产生 status 9 的本地 jetty；长度/权限错误更可能是 WR 或内存注册问题。故障 jetty 的隔离是必做动作，是否抑制某条路径的新连接则需要独立证据。集中在“错误恰好经过哪个 poller”决定缓存策略，也会造成遗漏和不一致。
-
-### 11.3 健康记录的 scope
-
-| 错误证据 | 优先影响范围 | 处理原则 |
-|---|---|---|
-| 明确本地 link/device down | 本地 port/device 及其 generation | 可抑制经过该物理资源的新连接 |
-| `REM_ACCESS_ABORT_ERR` / status 8 | 对应 WR 及其关联操作、连接/目标 | 逐 WR 退休并保留原始错误；不因该状态排空整个 SQ，也不把它唯一归因为远端进程退出 |
-| `ACK_TIMEOUT_ERR` / status 9 | 整个产生错误的本地 jetty/lane | 立即阻断该 lane 的新提交；READY 查询、冷却到期均不恢复旧对象；正常 JFC 上继续排空后删除并创建新 jetty。状态码本身不证明整个 port/context 故障 |
-| 可达性失败或多条独立路径的故障证据 | 本地 endpoint 到远端 endpoint 的路径，必要时上卷 | 原因可能在任一端或网络；路径抑制与 lane 隔离分别决策，不直接拉黑同 IOdie 所有端口 |
-| `JFC_ERR` | 故障 JFC 及所有依赖它完成证明的队列/记录 | 停止受影响依赖域的新提交并保留未终结依赖；关联的另一 jetty 仍 READY 不能证明安全。独立健康 JFC 域可继续工作；完整故障 CQ 回收/重建延期 |
-| 协议版本/能力不匹配 | peer/服务能力缓存 | 与物理健康分开，按兼容策略选择 TCP |
-| 同步 SQ 容量拒绝、内存不足 | 相应资源预算 | 根据可信的 accepted 前缀记账并反压，不自动判端口 DOWN |
-| RNR 终结错误 | 对应 WR 及关联接收域/连接 | 原 WR 已失败，不自动重放，也不推断 SQ 损坏；目标为逐 WR/连接处理。当前生产仍主动排空，见第 7.5 节 |
-| 长度、访问权限、注册错误 | WR、buffer、grant 或实现问题 | 失败并报警；不能用 60s 网络黑名单掩盖程序错误 |
-
-健康 key 包含本地和远端 endpoint identity/generation，必要时再上卷到物理 port。一个故障 episode 的数千条错误 CQE 只记一次健康状态迁移；旧 lane generation 的迟到错误不能污染新 lane，旧 probe 的成功也不能清除新故障。status 8、RNR、status 9、JFC_ERR 分别保留原始计数和作用对象，不合并为笼统的“端口失败”。
-
-当前 `TxCompletionProcessor` 已实现合法 status 8 逐 WR 退休、status 9 隔离和正常 JFC 上的 ERROR/flush 推进；连接级失败分发、在线 lane 替换及故障 CQ 的完整处理尚未完成。RX/TX JFC overflow 的工具 PASS 只证明指定事件和独立健康流量已观测，不能将缺失 CQE 当作未发送，更不能据此释放未取得终结证明的 buffer。证据见 [硬件观测记录](../hardware-observations.md)。
-
-SHM 的 broker 不可达、授权拒绝、pair 损坏和内存不足单独分类，作用域为本地服务/pair/资源预算；不写入 UB port 黑名单，不套用 UB 的 60s 冷却，更不以冷却到期撤销共享映射。
-
-注册表采用 owner/shard 更新和轻量快照读取，避免每次 connect 扫全局 mutex 表。
-
-### 11.4 60s 是允许再次探测的时间，不是恢复承诺
-
-```text
-UNKNOWN / HEALTHY
-       → COOLDOWN(next_probe_at)
-       → 到期且取得探测令牌 → PROBING
-                              ├─ 真实 UB 数据路径验证成功 → HEALTHY
-                              └─ 失败 → 带退避与 jitter 的 COOLDOWN
-```
-
-到期时只有少量 single-flight 探测可以进入 UB，其余新连接继续选其他健康路径或 TCP；还需要进程级探测预算，避免 40k 重连同时冲击设备。恢复后逐步放开准入，不把全部积压一次释放。这是借鉴 circuit breaker 的有限试探模型，并非引用某个软件默认值作为硬件恢复时间。[CircuitBreaker 状态模型](https://resilience4j.readme.io/docs/circuitbreaker)
-
-V1 可先保留 60s 作为可配置的临时初始策略，明确标为未验证。后续根据故障种类、实际重建时长、首个成功探测时间、误抑制率和探测成本调整；不再拍一个新的固定数字替代旧数字。
-
-probe 必须验证实际 RM_CTP 数据路径，TCP connect 成功、port UP 或 context 创建成功都不充分。探测对象的错误回收本身也必须有预算。status 9 后的探测必须使用新创建的健康 jetty，不能把旧对象查询为 READY 当作重新准入条件。
-
-三个时间概念不得混用：应用建链 deadline、健康抑制/探测时间、硬件与远端 grant 的安全终结条件。**60s 到期绝不能作为释放旧 RNDV 内存或复用旧 jetty 的条件。**
-
-### 11.5 Lane 重建与 flush
-
-raw provider 中，`flush_flag` 尚未就绪时 flush API 也可能返回 0；收到指定 flush-done 状态后，才有后续的软件未处理列表。软件列出的 `WR_UNHANDLED` 不是成功，也不是对端肯定没收到。[jetty flush](umdk/src/urma/hw/udma/udma_u_jetty.c)、[软件未处理 WR](umdk/src/urma/hw/udma/udma_u_jfs.c)
-
-用户已确认 jetty 异常不影响**正常 JFC** 上的排空；status 9 后可以删除旧 jetty 并在原 context 中创建新 jetty，无需仅因这一错误重建 context。M2 的替换流程据此为：
-
-1. 单 owner 阻断该 lane 的 Reserve/post，保留已接受及 accepted-unknown 的记录；按 provider 契约切 ERROR，modify 失败保持隔离并可重试。
-2. 持续消费正常 JFC 的逐 WR 完成，校验本次排空的 `FLUSH_ERR_DONE`，再取得并逐条处理软件未处理记录。边界事件本身不清空账本，一次 flush 返回 0 也不证明排空；没有可信终结证据的记录及其依赖继续保留。
-3. 在旧 WR、相关事件和软件引用达到终结条件后删除旧 jetty，再用同 context 和兼容配置创建新 jetty；复用仍健康的共享 JFR/JFC。单 lane 替换不删除健康 lane 仍依赖的 JFR。
-4. 为新对象分配独立的 `lane generation`，更新提交/完成路由后才恢复本地准入。创建失败保持该槽不可提交，可显式重试；不能增加整个 pool 的 epoch 使其他健康 lane 的 ticket 失效，也不能通过 reset counters 抹掉旧在途状态。
-
-普通 CQE 必须先经保存的 Attempt 身份、lane generation 和所属完成域验证，再改变 lane 状态；硬件 jetty ID 可能复用，不能单凭新旧 ID 识别代次。当前完成器存在先按 local_id 处理错误/边界、后校验真实 WR 身份的路径，M2 发布可替换 lane 前必须调整该顺序并覆盖迟到 CQE 回归。`FLUSH_ERR_DONE` / `SUSPEND_DONE` 等不携可信 Attempt 身份的事件尤其不能仅凭复用的 local_id 绑定到新对象：替换实现必须先证明旧边界、flush 及相关事件已经终结，或取得 provider 销毁会清理旧事件的明确保证；无法证明时保留旧映射/隔离状态，不开放该 ID 对应的新对象。新 lane 与旧 lane 清理并存也必须满足这一身份条件，不能靠一个新 generation 数值自动解决没有代次字段的迟到事件。
-
-如果被替换 jetty 的 ID 也是远端使用的目标标识，新对象必须以新的 endpoint generation 通告并通过新连接协商建立目标映射。仅替换本地指针不能让远端继续使用旧目标，也不能宣称旧 session 已恢复。
-
-生产已有逐 WR 退休和 ERROR/flush 状态机，**上述在线替换仍为 M2 待实现能力**。替换只恢复本地可用资源，不恢复旧连接、不重放旧请求；连接是否重新建立由上层决定。JFC 自身故障不适用这里的正常排空保证，完整故障 CQ 回收/重建保留为延期工作。契约与源码核对见 [人工确认的硬件契约](../hardware-observations.md#2026-10-23-人工确认的硬件契约)，实施顺序见 [roadmap](../roadmap.md)。
-
-## 12. Busy-poll、事件模式与关闭
-
-### 12.1 共用 progress 核心
-
-每个 `ShardReactor` 在固定 owner 线程上，每轮按预算处理：控制/定时器、RX CQ 与 refill、TX CQ、待提交操作、公平调度、退休回收。根据实际压力调整顺序与批量，但 RX 必须及时补槽，TX 必须及时释放 SQ，控制和 timer 不能饥饿。
-
-预算覆盖整轮与内层工作，不仅是单 socket 的 CQ poll 批次：包括 READ 完成后的 chunk/重组、控制 SEND、到期任务和错误/flush 回收。达到次数/字节/时间预算后保留 runnable continuation 并轮换资源类别，不 drain-to-empty 占住线程，不每轮遍历全部连接。每项已接受但未终结的操作必须在 owner 账本中；可推进工作不能在注册、入队、清 active 标记的交接中失去归属。
-
-接收域维护 `target_posted`、`actual_posted` 和 refill debt；只有 provider 实际接受的 RQE 才计入已投递。EAGAIN 后保留欠投递责任，资源恢复通知或本 owner 的重试 timer 必须能在零新 CQE 时推进补槽。timer 是显式待办的驱动/兜底，不是遗漏工作归属的补丁；其他线程不临时代替 owner poll，timer 周期也不等于 CPU 抢占下的时延上界。
-
-启用 SHM 时在同一 owner 的预算内处理就绪 pair、lease release 与本地控制事件，不另起每连接 poller。其事件模式先采用批量发布后必通知的正确性基线；不能未经证明把 JFC rearm 或简单 empty→nonempty 通知规则照搬到跨进程 ring，见第 18.8 节。
-
-busy-poll 模式由固定 owner 持续推进，匹配 NUMA 和 CPU 预算。事件模式先有界处理就绪工作，无 runnable 工作时对需要通知的 **JFC 调用 `RearmJfc`**，再 recheck CQ、mailbox 和待办；只有仍无工作时才经 epoll/poll 等待 JFCE 等唤醒源。JFCE 是通知通道，不能把它与 JFC 的 rearm 混为一个操作。用户已确认 rearm 时已有 CQE 仍会触发通知，但此契约不取消 recheck，也不保证每个 CQE 对应一次 fd 唤醒。
-
-JFCE fd readiness、通过 `WaitJfc` 取得的 JFC 通知、以及 `PollJfc` 消费的 CQE 分别记账；每个取得的通知按所属 JFC 累计并 `AckJfc`。recheck 发现进展而跳过睡眠时，仍须收取并确认待处理通知，不能仅消费 CQE 后遗留通知引用。预算耗尽但仍有 runnable 工作时继续调度，不能为睡眠而无限 drain 到空，也不能遗失剩余工作。唤醒后复用同一 progress 逻辑，而不是维护两套回收状态机。
-
-context 的 URMA async 事件是另一条独立来源，由明确的 context event owner 有界执行 `GetAsyncEvent`、校验事件的 context/对象归属并 `AckAsyncEvent`，再将已复制的事件语义交给相关队列 owner；不能让多个 shard 并发消费同一个 async fd，也不能在 Ack 后继续借用原事件存储。对象 ID 必须连同资源代际与注册表校验，资源注销不能越过待确认事件和软件引用。
-
-`JFR_LIMIT` 在已测配置下触发后 threshold 回读为 0；Ack 与成功 refill 都不等于重新使能。接收 owner 优先补投到高于阈值后显式重写 threshold，再保留正常 poll/refill 与重查路径。低于阈值时重写，已观察到持续收包窗口中的通知并再次清零，但不能据此承诺 Modify 本身立即触发。水线事件仅辅助唤醒和诊断，授信及补投责任始终依据 RX 账本；一次事件不能直接兑换 credits。`PORT_DOWN` 在当前环境明确不可观测，不作为故障检测或退出的必要条件。JFC_ERR 与关联 jetty 错误按第 11 节隔离受影响依赖域；坏 CQ 在线恢复暂缓，不能套用正常 JFC 的排空保证。
-
-当前库提供 raw poll 和通知/async API 封装，完整事件循环主要位于硬件测试工具；本节的统一 owner 进度器、跨资源公平预算和生产事件生命周期由 [roadmap 的 M3](../roadmap.md) 实现，不能把工具通过当作正式 reactor 已完成。
-
-- TX selective signaling 下也要处理 unsignaled 尾部，不能靠下一次中断碰巧解决。
-- 单个共享 JFR 的 RX poll/refill 始终归同一 owner；不同 owner 拆域。
-- 事件模式的 mailbox、timer、listener 都能唤醒 owner；无新 CQE 时仍可推进取消和退休。
-- 自旋后短睡的 adaptive 模式可以后续增加，不改变安全不变量。
-
-### 12.2 Readiness 与 native TCP 公平性
-
-`EPOLLIN` 依据连续可读数据、FIN 或明确错误；`EPOLLOUT` 依据本地可接受字节预算及连接状态，不简单等同于 SQ 有空位。实现 edge/oneshot 时，订阅发布与队列检查需要完整的 recheck 协议。
-
-内部 synthetic ready 队列必须有预算，把执行机会交回 native epoll/accept；不允许一个全局 notification fd 代替所有 listener 的正确归属。native TCP 的 EPOLLOUT 不应因 UB 流控被遮蔽。
-
-### 12.3 Shutdown 是依赖图，不是强行清零
-
-整个接收域停用时，残留的未消费 RX 不会自行产生完成，不能先等待 `posted==0` 再允许删除 JFR。用户已确认：**JFR 删除成功后，残留 RX 不再访问其内存**；这可以作为这些 Posted 记录的 DMA 终结证据，不能伪造对应的成功 CQE。M1 按依赖关系推进：
-
-1. 停止新连接准入、新提交和 RX 补投，发布取消/连接错误，保持完成、事件与退休所需 progress。
-2. 对已有 TX 继续排空；需要 ERROR/flush 时按第 11.5 节处理。连接关闭或空 CQ 都不能代替逐 WR 终结证明。
-3. 在 provider 对象仍有效时完成依赖它的 CQE 解析及通知/async 确认，并建立销毁与剩余完成的安全边界，再删除依赖该 JFR 的所有 jetty，随后删除 JFR。不能先释放 queue 再 poll 可能引用它的 CQE；销毁竞态中的剩余完成必须由明确的 provider 清理/安全解析契约覆盖，无法证明时保留依赖。JFR 删除成功才终结残留 Posted RX 的 DMA 所有权，并一次性更新对应软件记录；删除失败保留尚需的队列、MR、slab、context 和会话，允许 owner 重试。
-4. 处理已安全复制的软件完成记录与引用，等待上层 Held lease 归还；不再通过已删除对象解析遗留 CQE。JFR 删除不撤销上层 CPU 使用权，也不自动终结其他资源上的 RMA grant；独立的远端访问权按协议继续记账。
-5. 各资源的 DMA、lease/grant 与引用条件全部满足后，注销 MR、释放 backing；再关闭不再被依赖的 CQ/事件/context，停止相应 progress。注销或后续删除失败同样保留尚需依赖，并从已完成的阶段继续重试。
-
-这条路径用于**整个接收域关闭**，不是关闭一条连接就删除共享 JFR。单 lane 重建保留其他健康 lane 使用的共享 JFR/JFC；整个 pool 的关闭也不能绕过其绑定 RX 池与上层 lease。当前 `RxBufferPool::Close()` 仍要求 `posted()==0 && held()==0`，上述残留 RX 关闭能力尚未实现，见 [RX 生命周期](../rx-buffer-pool.md)和 [roadmap](../roadmap.md)。
-
-所有后台等待可被关闭打断。不能先停掉唯一 poller，再等待依赖它归零的 outstanding；不能清零引用强制退出。若驱动终结条件迟迟不满足，超时应产生诊断和隔离策略，而不是假装资源已经安全释放。
-
-隔离不等于可释放：未终结对象依赖的注册内存、provider/context 不能随正常 shutdown 一并销毁，仍需要的 progress 也必须保留。进程退出时内核/驱动提供怎样的 DMA 终结保证，需要单独确认，不能用用户态 timeout 替代。
-
-统一不变量是：逻辑连接终止、用户错误通知、授信撤销、借用内存归还与硬件终结是不同事件，任何一个都不能隐式完成其他事件。60s 仅控制新连接路径探测，不改变这些账目。
-
-### 12.4 4 CPU 容器的运行时基线
-
-对第 2.4 节每端点平均约 1000 QPS 的负载，先比较一个 shard/reactor/owner thread 管理四个 raw 接收域、其余 CPU 预算留给应用的配置，再根据实际瓶颈比较两个独立 shard。当前部署与已测拓扑为 **两个裸设备、每设备两个 EID，共四个 context**；单 owner 工具已覆盖持续收发、RX 补投及 JFC/JFCE 通知。四个 context 不等于四个物理设备或四个物理端口，也不意味着必须四个 busy-poll worker；现有结果没有证明多 owner 性能、实际 rail 带宽叠加或跨设备故障隔离。不能从全局 300 万 QPS 推导单容器需要同等处理速率。忙轮询线程需要实际可用的执行预算，4 CPU quota 不自动等于四个独占核心。
-
-低负载可事件等待，活跃期批量推进；极低时延模式可固定一个 owner 忙轮询。增加 owner 时保持共享 JFR 的单所有者约束，扩展 RX、TX、控制和 timer 的公平处理预算，不以破坏生命周期换取并行。
-
-先用全 signal 等已验证配置建立基线。CQE 优化、chunk 和批处理应由单容器实际 WR/CQE 率与尾延迟决定；不要为了减少 CQE 而重新引入首请求等待或 unsignaled 尾部问题。同宿主机多个容器共享 CPU、内存带宽及物理端口，验收还需统计宿主机聚合负载，不能给每容器都假设完整物理带宽。
-
-比较顺序为：单 shard 有界推进；然后是第 7.2.2 节两种双 shard 布局；按 TX/RX 拆线程只作为隔离的实验对照，不作为 V1 的生产所有权模型。对照固定总 CPU、业务执行器、通知策略、工作负载与总内存预算，同时报告资源数量；否则不能把复制 JFR/SQ 带来的收益归因为线程模型。
-
-### 12.5 配置与所有权验收
-
-分别配置资源拓扑（shard 数、context/pool/ReceiveDomain 归属）、等待策略（event/busy-poll）和应用完成执行器，不用相互重叠的 unified/separated 布尔开关决定多条代码路径。初始化时校验配置，输出 runtime incarnation、shard/thread/CPU 映射、context 与队列 owner、RQ/CQ 深度、内存预算、通知和回调策略；配置不可让同一物理队列出现两个活动 owner。
-
-性能报告至少记录 CPU/request、吞吐与尾延迟、上下文切换、跨 owner 交接次数、mailbox 等待、各资源最大服务间隔、posted RQE/refill debt 和 CQ backlog。分开观察 post→CQE 被软件观察、CQE→可读发布、可读发布→通知、通知→业务执行；第一段也包含 poller 调度延迟，不能全部当成网络耗时。正确性门禁见第 15.3 节，跨层关联见第 19 节。
-
-## 13. 历史修复如何改变架构
-
-以下为 `5dfb3ae6..7d62be17` 中选取的修复及其架构含义。提交号属于本地 `ubs-comm` 仓库，可用 `git -C ubs-comm show <commit>` 查看；这是从实际修复提炼的不变量，不是认为这些提交已经证明所有问题彻底解决。
-
-后续补充的 FC 默认值、握手预授和小窗口增长历史单列于第 9.4 节，包含基线自身及更早提交，不混入本节区间口径。
-
-| 提交 | 问题/修复要点 | 对 kbsocket 的影响 |
-|---|---|---|
-| `93c11932` | ArraySet 取指针与增加引用之间的 TOCTOU，引入 deferred 引用 | 回收要有读者保护证明；延时队列不是 RCU/HP 的替代品 |
-| `6bdabb1f` | 全部建链失败时也需驱动 deferred drain；reaper stop 存在 lost wakeup | 回收不能只靠成功数据连接；关闭谓词与等待必须一致同步 |
-| `d9b0ead2` | 销毁逻辑队列时不能强行清零引用/outstanding 并归还有残留 CQE 的 jetty 节点 | 分离逻辑连接和物理 lane 生命周期；AttemptLedger 活过 close |
-| `48d077a5` | CpMsg 长度/magic 校验；旧对象还在槽位时 fd 复用冲突 | wire framing 校验与 fd generation 同时必要；delay-close 不是长期身份方案 |
-| `b9db620d` | fd 复用后 ReinitTxOps 不得销毁他人的数据面条目，并补齐 owner/ops 防护 | 不只加判空，必须给数据面条目和回调目标建立所有权与代际 |
-| `201715d0` | READ 检查到提交之间可能与 unbind/销毁交错 | admission/check/post 与 teardown 统一进入 owner 或同一生命周期协议 |
-| `7601e03c` | 等待协商从反复 yield 转向异步 epoll waiter，但仍带 brpc 依赖 | 自建 I/O runtime；P2300 适配不能只是包装原有阻塞等待 |
-| `b8e654ab` | waiter 被唤醒不表示唤醒方已结束 post/unlock；引入 Claim/Deliver/wake_done | completion 是所有权交接点，不能在 receiver 完成后继续碰 operation state |
-| `aa6049a5` | 握手缩短后，首包先于 fd→socket 映射发布到达 | RX 路由先发布，之后才宣布 READY |
-| `3c8da3ab` | 提前交换 endpoint、并行 bind、最终 ACK 能力协商 | 缩短关键路径可以并行准备，但不能取消双方最终一致性 |
-| `5261f0a8` / `8743e157` | 协商失败的关闭、版本不兼容降级路径 | 新连接降级需要明确 wire 边界与双方同意 |
-| `2bcbbd8b` | RX 数据到达与 epoll 订阅发布交错，造成遗漏通知 | readiness 必须 publish/recheck，不能只“看见数据就通知一次” |
-| `3cf51c0a` | synthetic 事件持续占用，内核 accept 得不到机会；加入处理预算 | 每轮控制/数据/native TCP 公平性属于正确性与建链吞吐设计 |
-| `d04ca88f` | native TCP accept 队列缺少同步，可产生错误/重复 fd 行为 | UB 兼容层不能破坏 native socket 的所有权与队列语义 |
-| `245d3741` | native TCP EPOLLOUT 被 UB 状态处理干扰 | readiness 按 backend 和绑定代际分别处理 |
-| `9550ab2c` | 分配失败后退回未注册 malloc，post 遇 EFAULT | 注册内存是类型/租约约束；内存不足不能绕过它 |
-| `98ae5412` | 4096+32 headroom 落入 64 KiB size class，产生约 16 倍分配放大 | 头部/元信息布局显式建模，测试实际分配大小而非仅 payload |
-| `5e976d15` | generation prefix 移动 payload 起点，破坏 Block 的布局假设 | Storage/metadata/slice 分离，不能靠隐含指针偏移跨模块耦合 |
-| `bf651246` | TLS 退出时空 freelist 仍持有 capacity 等内存 | 线程退出也需完整归还容器和缓存，不只看元素数为零 |
-| `26a31dba` | Start/Stop、poll/destroy 和退出顺序的组合生命周期问题 | 一个可证明的 runtime shutdown 依赖图，保留必要 progress 至安全终结 |
-| `eebb8cda` | shrink 后台长时间 sleep 导致 join 长时间阻塞 | 所有后台等待必须可取消，不把数分钟定时器变成退出延迟 |
-| `8de0a30c` | fd 超过 65536 时隐式注册失败；扩容至受 RLIMIT 限定的 1M、lazy mmap、显式拒绝 | 容量是准入条件，不能给 40k 连接系统留下隐藏 fd 阈值 |
-| `a13d305e` | 从扫描全部连接改为 active-set | 热路径按活跃工作量增长，而不是按常驻连接数增长 |
-| `545af779` | qbuf 释放后继续读取其中元信息 | 完成记录所需字段先保存，或用独立稳定 ledger |
-
-增量复核发现 `e66715c9` 进一步处理了“本地 CpMsg 尚未交付，却发送裸 ACK”的失败路径：此时关闭连接并返回硬错误，避免对端把 ACK 误当长度字段。这强化了第 5.4 节的结论：**降级只允许发生在明确、双方一致的握手边界。**
-
-`61983c1f` 改动了 TX active-set 的同步实现；本文不把旧版 mutex 细节描述成当前状态。ArraySet 和 cooldown 的核心结论在整理时 HEAD 未变化。
-
-还应避免依据提交标题过度归因：例如 `755a1f93` 的相关改动主要是 pool 配置，不应当成完整 shutdown 协议的证据；部分退出顺序代码来自基线之前，也不计作本区间新修复。
-
-这些修复共同说明：问题主要集中在身份、发布顺序、异步完成和资源终结的边界。V1 应把这些边界变成类型、状态机与自动测试，而不是继续追加孤立的判空、延时释放和强制清零。
-
-## 14. 测试记录、关键数据与结论强度
-
-### 14.1 实验分组与参数释义
-
-严格区分三批：
-
-- A：早期、后来被回收的机器；send_lat 使用事件模式，另有 polling read_bw。
-- B：新环境 send_lat，使用 NUMA node 绑定，没有 `-e`，属于 polling 模式。
-- C：后补 read_bw；用户明确指出不能与 B 的 send_lat 直接比较，即使都来自后续环境，也不把它们视为同一受控实验。
-
-所有设备/EID 到物理 port 的映射、双方完整运行环境及二进制 commit 尚不齐全。以下 perftest 释义以本地源码为准；如果测试二进制不同，需要重新核对：
-
-| 参数/输出 | 本地实现含义 | 容易误读的地方 |
-|---|---|---|
-| `-p 0 --ctp` | RM 传输模式加 CTP | `-p 0` 不是物理 port0 |
-| `--eid_idx N` | context 使用的 EID 表索引 | N 不是物理 port 编号；相同 EID 也不能单凭名称证明只走一条物理路径 |
-| `-P 8899` | 管理/协商 TCP 端口 | 不改变 UB 数据端口或 rail |
-| `-O 4` | priority | 不是接收保序或排序等级 |
-| `-I 208` | inline 大小配置 | 不能证明 4096 字节测试实际走 inline |
-| `-T` | JFS/SQ 深度；LAT 默认 1，BW 默认 128 | 对 Q 生效值和在途提交有影响 |
-| `-R` | JFR 深度 | 不是 READ 的在途操作窗口 |
-| `-Q` | CQ moderation 配置 | 会截断到 JFS 深度；需记录实际值 |
-| `-e` | 事件等待模式 | 没有 `-e` 的 B 不是“绑 NUMA 后的中断测试” |
-| `-D30` | duration 模式；当前实现中间约 15s 参与 BW 统计 | 不能把 iterations 除以 30s 解释速率 |
-| `BW peak = 0.00` | duration 设置不计算 peak | 不表示带宽失败或没有峰值流量 |
-| `MB/sec` | 本地计算使用 2^20 字节，实际为 MiB/s | 换算链路线速前要先修正单位 |
-| `MsgRate[Mpps]` | 每秒百万次逻辑操作 | 不是每秒百万 TX CQE |
-| `numactl -N 0 -m 0` | 允许在 node0 的 CPU 集合执行，并在 node0 分配内存 | 不是指定某个独占物理核；不保证线程不迁移，也不证明设备 NUMA 本地 |
-
-参数依据见 [perftest_parameters.h](umdk/src/urma/tools/urma_perftest/perftest_parameters.h)、[参数校验](umdk/src/urma/tools/urma_perftest/perftest_parameters.c)、[测试与统计实现](umdk/src/urma/tools/urma_perftest/perftest_run_test.c)。
-
-### 14.2 A：旧机器 send_lat，事件模式
-
-用户给出的命令模板如下，运行中替换 `-d`、`--eid_idx`、`-Q`。不同测试的完整双方命令未保存，不能补造 raw 与 bonding 的精确 endpoint 映射。
-
-```sh
-urma_perftest send_lat -d udmac0d1e4 --eid_idx 62 -I 208 -p 0 -a -e -O 4 --ctp --bond_mode active_backup -Q64 -R 32768
-```
-
-以下都是 4096 bytes、10000 iterations。时延单位为 µs，列顺序保留用户原始输出。
-
-| 配置标签 | min | max | median | average | stddev | p99 | p99.9 | p99.99 | p99.999 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| bonding，Q1 | 4.25 | 24.05 | 4.70 | 4.72 | 0.46 | 4.95 | 11.98 | 24.05 | 24.05 |
-| bonding，Q1，`BOND_ENABLE_FAILOVER=false` | 4.30 | 24.15 | 4.75 | 4.77 | 0.44 | 4.96 | 11.12 | 24.15 | 24.15 |
-| raw，Q1 | 2.66 | 15.57 | 3.95 | 4.02 | 0.29 | 4.36 | 9.72 | 15.57 | 15.57 |
-| raw，Q8 | 2.65 | 15.85 | 4.27 | 4.33 | 0.35 | 4.78 | 8.93 | 15.85 | 15.85 |
-| raw，Q16 | 2.64 | 15.11 | 4.27 | 4.30 | 0.36 | 4.64 | 10.57 | 15.11 | 15.11 |
-| raw，Q32 | 2.66 | 17.24 | 4.28 | 4.31 | 0.39 | 4.68 | 10.43 | 17.24 | 17.24 |
-| raw，Q64 | 2.67 | 15.26 | 4.22 | 4.24 | 0.37 | 4.73 | 10.04 | 15.26 | 15.26 |
-
-可观察到 raw Q1 相对 bonding Q1：median 低约 15.96%，average 低约 14.83%，p99 低约 11.92%，p99.9 低约 18.86%。这支持 raw 路径值得投入，但缺少严格环境控制，不能把差值全部分解成 bonding 的某一把锁或某一次复制。
-
-`BOND_ENABLE_FAILOVER=false` 几乎没有改善，符合它没有移除正常 WR shadow 路径的源码行为。
-
-最重要的校正：这些命令未设置 `-T`。如果二进制匹配本地实现，LAT 默认 `T=1`，所有请求的 `Q8/16/32/64` 都会截断为实际 `Q1`。因此这批数据不能用于证明 selective signaling 的效果。`-R32768` 不会扩大 TX 深度；10000 次、默认一个 jetty 的 SEND 测试还会把请求的 JFR 深度限制到总迭代数，实际硬件分配另受 provider 取整影响。
-
-### 14.3 A：旧机器 read_bw，polling 模式
-
-最初命令记录不完整：
-
-```sh
-urma_perftest read_bw -d udmac0d1e4 --eid_idx 62 -p 0 --ctp -Q64 -R 32768
-```
-
-后续补充的完整命令为：
-
-```sh
-urma_perftest read_bw -d udmac0d1e4 --eid_idx 57 -I 208 -p 0 --ctp -Q64 -R 32768 -s 4096 -D30
-```
-
-用户补充文本中的 `reaad_bw` 视为拼写笔误，以上规范为 `read_bw`；补充命令 EID 从 62 变为 57，不能据此恢复每个进程的完整映射。用户称两行分别为 port0、port1 上的进程，此处保留标签，但物理路径未由计数器核验。
-
-| 用户标签 | bytes | iterations | peak | average，MiB/s | MsgRate，Mpps |
-|---|---:|---:|---:|---:|---:|
-| port0 进程 | 4096 | 62,329,600 | 0.00 | 16,231.68 | 4.155310 |
-| port1 进程 | 4096 | 68,873,792 | 0.00 | 17,935.87 | 4.591584 |
-
-聚合为 34,167.55 MiB/s，即 33.3667 GiB/s，约 286.62 Gbit/s 的 payload 速率；独立报告相加要求测量窗口充分重叠。
-
-用户另报告同一 EID 两进程约为 18,196 和 16,321 MB/sec，未提供完整行及精度，按本地单位解释合计约 34,517 MiB/s。与上面处于同一量级，差异约 1%，没有重复测量可判断显著性。
-
-这批缺少对应的单进程基线，不能判断单流到双流的增益，更不能据同 EID/异 EID 名称直接确认两个物理 port 的贡献。此前 `send_bw` 无法运行，但没有具体报错，本会话未定位原因。
-
-### 14.4 B：新环境 send_lat，NUMA node 绑定、polling
-
-用户提供的命令：
-
-```sh
-numactl -N 0 -m 0 urma_perftest send_lat -d bonding_dev_70 -p 0 -O 4 --ctp --bond_mode active_backup -Q1 -R 32768 -a
-numactl -N 0 -m 0 urma_perftest send_lat -d udmac0d1e4 --eid_idx 61 -p 0 -O 4 --ctp -Q1 -R 32768 -a -T 128
-numactl -N 0 -m 0 urma_perftest send_lat -d udmac0d1e4 --eid_idx 61 -p 0 -O 4 --ctp -R 32768 -a -T 128 -Q4
-numactl -N 0 -m 0 urma_perftest send_lat -d udmac0d1e4 --eid_idx 61 -p 0 -O 4 --ctp -R 32768 -a -T 128 -Q8
-numactl -N 0 -m 0 urma_perftest send_lat -d udmac0d1e4 --eid_idx 61 -p 0 -O 4 --ctp -R 32768 -a -T 128 -Q16
-numactl -N 0 -m 0 urma_perftest send_lat -d udmac0d1e4 --eid_idx 61 -p 0 -O 4 --ctp -R 32768 -a -T 128 -Q32
-numactl -N 0 -m 0 urma_perftest send_lat -d udmac0d1e4 --eid_idx 61 -p 0 -O 4 --ctp -R 32768 -a -T 128 -Q64
-```
-
-均为 4096 bytes、10000 iterations，单位 µs：
-
-| 配置 | min | max | median | average | stddev | p99 | p99.9 | p99.99 | p99.999 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| bonding Q1，默认 T | 2.94 | 24.48 | 3.02 | 3.71 | 2.43 | 16.38 | 22.58 | 24.48 | 24.48 |
-| raw Q1，T128 | 2.67 | 24.57 | 2.75 | 3.38 | 2.29 | 15.14 | 20.95 | 24.57 | 24.57 |
-| raw Q4，T128 | 2.84 | 24.77 | 2.94 | 3.61 | 2.38 | 15.96 | 21.72 | 24.77 | 24.77 |
-| raw Q8，T128 | 2.87 | 24.00 | 2.95 | 3.60 | 2.34 | 15.79 | 21.62 | 24.00 | 24.00 |
-| raw Q16，T128 | 2.86 | 24.50 | 3.00 | 3.66 | 2.43 | 16.23 | 22.98 | 24.50 | 24.50 |
-| raw Q32，T128 | 2.88 | 22.12 | 2.98 | 3.62 | 2.31 | 15.97 | 18.20 | 22.12 | 22.12 |
-| raw Q64，T128 | 2.90 | 24.36 | 3.04 | 3.73 | 2.44 | 15.65 | 22.07 | 24.36 | 24.36 |
-
-本批 raw 明确 `T128`，Q4～Q64 不会因为默认 `T1` 被截断；它与 A 有本质区别。但是 bonding 默认 T 与 raw T128 不同，不能把 raw/bonding 差异视为严格单变量实验。
-
-观察与边界：
-
-- raw Q1 相对 bonding Q1：median 低约 8.94%，average 低约 8.89%，p99 低约 7.57%，p99.9 低约 7.22%。
-- raw Q4～Q64 的 median 比 raw Q1 增加 0.19～0.29 µs；Q64 高约 10.55%。不支持“增大 Q 必然降低小包时延”。
-- raw/bonding 都有 median 约 3 µs、p99 约 15～16 µs 的长尾。它可能来自共同的软件/系统/硬件因素，但当前没有证据归因给 NUMA、调度、中断或某个固定硬件 timer。
-- `-N0 -m0` 是 node 级约束，不是固定且独占 CPU；双方绑核、设备 NUMA 距离和容器 CPU throttling 尚未给出。
-- 按 `2 × average × 10000` 估算，保留样本对应的累计 RTT 约 68～75 ms；average 已截尾，无法恢复被排除的停顿，真实子测试耗时需要独立计时。现有数据不足以证明长期尾延迟稳定性。
-- 不把 A 与 B 的差异归因于“事件改 polling”或“绑 NUMA”，因为机器、配置和运行条件同时变化。
-
-### 14.5 send_lat 的统计与等待逻辑限制
-
-本地实现有两个需要在正式基准前修正/核实的点。
-
-**统计不是 10000 个独立单向硬件时延样本。** SEND LAT 使用相邻发送时间戳间隔，按 RTT/2 换算。默认 post-list=1、10000 次时先产生 9999 个 delta，排序后将 `measure_cnt` 再减 2；平均和方差只使用下标 0～9996，而报告 max 使用 `delta[9997]`。p99.99 和 p99.999 也恰好落在 9997，因此与报告 max 相同，原始最大值 9998 没有显示。
-
-所以这些列不能支撑“五个九”的可靠结论。应保留未截尾直方图，明确 warmup 和异常样本规则；增大到百万级乃至更长测量并重复运行，才有足够尾部样本。不能通过删除最大值美化尾延迟。
-
-**Q>1 改变等待行为。** `poll_jfc_until_expected_cqe()` 用整数 `jfs_post_list / cq_mod` 计算期望 CQE 数；默认 post-list=1、Q>1 时为 0，polling 模式下单次 poll 即使返回 0 也可能退出。Q1 则会等到目标 CQE。发送循环还没有为最后不足 Q 条的尾部提供强制 signal 和明确最终 drain：10000 对 Q32/Q64 都余 16。
-
-因此 B 的 Q 曲线混合了 CQE 数、等待逻辑和潜在 DWQE/doorbell 路径变化，不是单纯 CQE 数量的受控比较。源码仍会设置 selective flag；这里不是说 Q 没生效，也不能据此断言测试一定挂死。
-
-ARM 时间读取在本地使用 `cntvct_el0`；不能简单用 CPU DVFS/TSC 猜测来解释所有长尾。后续应同时测量调度/IRQ 停顿和真实 post/poll 分支，先找相关证据。
-
-### 14.6 C：read_bw 单跑、不同 EID 并发、相同 EID 并发
-
-不同 EID 的命令如下，分别用于“一起跑”和“分开跑”：
-
-```sh
-numactl -N 0 -m 0 urma_perftest read_bw -d udmac0d1e2 --eid_idx 33 -p 0 --ctp -Q64 -R32768 -s 4096 -D30
-numactl -N 0 -m 0 urma_perftest read_bw -d udmac0d1e2 --eid_idx 66 -p 0 --ctp -Q64 -R32768 -s 4096 -D30 -P 8899
-```
-
-之后同 EID33 两进程同时运行，用户提供命令如下；第二个进程的管理端口完整命令未提供，不在此补造：
-
-```sh
-numactl -N 0 -m 0 urma_perftest read_bw -d udmac0d1e2 --eid_idx 33 -p 0 --ctp -Q64 -R32768 -s 4096 -D30
-```
-
-原始结果：
-
-| 场景 | EID | bytes | iterations | peak | average，MiB/s | MsgRate，Mpps |
-|---|---:|---:|---:|---:|---:|---:|
-| 不同 EID，同时运行，进程 1 | 33 | 4096 | 41,897,216 | 0.00 | 10,910.75 | 2.793153 |
-| 不同 EID，同时运行，进程 2 | 66 | 4096 | 41,675,136 | 0.00 | 10,852.93 | 2.778350 |
-| 单独运行 | 33 | 4096 | 46,697,728 | 0.00 | 12,160.91 | 3.113193 |
-| 单独运行 | 66 | 4096 | 44,242,112 | 0.00 | 11,521.47 | 2.949498 |
-| 相同 EID，同时运行，进程 1 | 33 | 4096 | 43,140,864 | 0.00 | 11,234.65 | 2.876071 |
-| 相同 EID，同时运行，进程 2 | 33 | 4096 | 43,173,248 | 0.00 | 11,242.99 | 2.878205 |
-
-派生结果：
-
-| 指标 | 计算 | 结果 |
-|---|---|---:|
-| 两个独立运行结果之和，仅作对照分母 | 12160.91 + 11521.47 | 23,682.38 MiB/s |
-| 不同 EID 并发聚合 | 10910.75 + 10852.93 | 21,763.68 MiB/s = 21.2536 GiB/s |
-| 不同 EID 并发效率 | 21763.68 / 23682.38 | 91.90% |
-| 不同 EID 聚合 / 较快单跑 | 21763.68 / 12160.91 | 1.7896× |
-| EID33 并发相对其单跑下降 | 1 - 10910.75 / 12160.91 | 10.28% |
-| EID66 并发相对其单跑下降 | 1 - 10852.93 / 11521.47 | 5.80% |
-| 同 EID 并发聚合 | 11234.65 + 11242.99 | 22,477.64 MiB/s = 21.9508 GiB/s |
-| 同 EID 聚合 / EID33 单跑 | 22477.64 / 12160.91 | 1.8484× |
-| 同 EID 并发效率 | 22477.64 / (2 × 12160.91) | 92.42% |
-| 同 EID 相对不同 EID 聚合差异 | 22477.64 / 21763.68 - 1 | +3.28% |
-
-同 EID 聚合约为 188.56 Gbit/s payload、5.754276 Mops/s。这里的 Gbit/s 不是含链路协议开销的物理线速。
-
-最强结论是：**同 EID 多进程也能得到约 1.85 倍吞吐，因此不同 EID 不是本次扩展的必要条件。** 两进程还增加了提交线程、context、SQ/CQ，无法直接定位收益来自 CPU、队列、设备还是物理链路。
-
-同 EID 比不同 EID 高 3.28% 不足以证明它更优：没有重复试验和方差，而且两倍 EID33 单跑的理想对照本来就比 EID33+66 高约 2.70%。
-
-### 14.7 read_bw 能说明与不能说明的事
-
-- 当前未显式设置 `-T` 的 BW 默认 TX 深度 128，Q64 不因该默认值截断；默认 post-list=1。`-R32768` 不把 READ 并发窗口提高到 32768。
-- READ 的大数据方向是远端 TX→本端 RX；排查带宽时要看正确方向的两端计数。
-- 本地实现的 buffer 和地址轮转策略，在 4 KiB 页、4 KiB 操作及默认布局下会反复访问很小的区间。它不是大工作集连续 DRAM 流式带宽测试。
-- iterations / Mpps 约为 15s，与本地 `-D30` 的有效统计窗口一致。两个进程的窗口必须充分重叠，才能把平均值相加作为并发近似。
-- `numactl -N0` 不保证两个进程绑定不同物理核。必须记录明确 CPU、SMT、迁移、抢占、配额、NUMA 与设备拓扑，才能进一步归因。
-- read_bw 不验证 SEND 的共享 JFR 承载、RNR、RNDV 控制消息、40k/s 建链或故障清理。
-- A 的约 33.4～33.7 GiB/s 与 C 的约 21.3～22.0 GiB/s 不能跨机器直接比较，更不能用来选择某个统一 pool/Q 参数。
-
-## 15. 验证计划与分阶段落地
-
-### 15.1 先修正基准可信度
-
-每次记录双方硬件、容器 CPU 配额、内核、驱动/固件、umdk/二进制 commit、设备能力、完整命令和运行时实际配置。打印生效 T/R/Q、post-list、inline、opcode/SGE、ordering、raw context 和端口映射，避免“命令写了但被截断”。
-
-send_lat 对照需统一双方 CPU、T、设备路径、消息大小和 warmup，再独立切换 raw/bonding、event/polling、Q。修正/核实统计截尾、Q>1 等待和尾部 drain 后保存未截尾直方图；不能拿当前 p99.999 作为发布门槛。
-
-测试 Q64 与 post-list 组合时，本地参数要求 post-list>1 时满足与 Q 的大小/整除约束，不能随意使用 `Q64 + post-list16`。先用合法组合并记录实际接受值。
-
-### 15.2 multi-rail 实验矩阵
-
-在同一环境、相同总 CPU 预算下比较：
-
-1. 单进程、单 worker、单队列。
-2. 同路径、不同固定 CPU 的双 worker/双进程、双队列。
-3. 不同 EID 但经运行时映射确认的相同/不同物理 port。
-4. 两个已确认物理 port 同时运行，与相同工作线程数的单物理 port 对照。
-5. 同 IOdie 与跨 IOdie；4 KiB 热 buffer 与大工作集；READ/WRITE/SEND 分开。
-
-需要两端、各物理 port 的字节/包/错误计数变化，验证真实数据路径；检查 READ 的远端发送方向。同步测量窗口，重复多轮并随机化顺序，报告总吞吐、单流吞吐、CPU cycles/op、doorbell、CQE 率和尾延迟。
-
-`streaming_test` 已在单进程内覆盖两裸设备×两 EID 的四 context 持续收发、补投和通知，这是功能证据。它不证明正式多 owner 调度器、跨物理 port 带宽叠加或性能收益；两个 perftest 进程也只是容量探针。后续性能验收使用同预算的专用 microbenchmark，并保留已有功能验证结论。
-
-### 15.3 正确性与故障注入门禁
-
-| 测试 | 必须成立的不变量 |
-|---|---|
-| close 后快速复用 fd，旧 CQE/epoll 迟到 | 不命中新连接，不访问已释放 provider 对象 |
-| 旧 session 未花完 credit 就断链，新 session 立即建连 | 迟到 SEND 的物理槽消耗仍被计账，不把旧授信直接重复发放 |
-| post-list 部分成功、最后不足 Q 条、空闲/取消/退出 | 已接受 WR 不丢账，尾部可终结，不伪造 consumer |
-| 同 SQ 多目标，其中一个 status 8 或 RNR | 失败 WR/逻辑连接不触发无条件整 SQ 排空；同 SQ 健康目标继续推进；不重放失败数据 |
-| status 9 但 query 仍为 READY | 立即关闭该 lane 新提交门禁，按正常 JFC 排空后删除/创建；不原地继续使用 |
-| 单 lane 替换、硬件 ID 复用、迟到真实/无身份边界 CQE | 先验证身份再改变状态；旧边界不能解锁新 lane，未建立复用屏障时保留隔离 |
-| JFR 有残留 Posted RX、应用仍持有 Held lease，删除/注销失败 | 成功 DeleteJfr 才终结残留 RX DMA；Held 归还与 CQ 引用条件另计，重试不双重释放 |
-| 无 CQE 但对端已收到；有本地 CQE 随后故障 | 不依据 CQE 推断业务 exactly-once，不自动重放 |
-| READ source grant 在 close 后仍被远端访问 | 内存不提前复用/注销 |
-| WRITE 迟到、接收端重连并申请同 size class | 旧 grant 不得覆盖新连接的数据 |
-| 多 chunk 完成乱序、eager 越过 RNDV | 只发布完整连续逻辑前缀 |
-| SQ/JFR/注册内存耗尽、控制消息高负载 | 有界反压，控制可前进，无 credit 超卖 |
-| 40k 个重连同时遇到 cooldown 到期 | 探测 single-flight/预算生效，不出现周期性 UB 建链风暴 |
-| 旧 epoch 错误/旧 probe 成功迟到 | 不刷新或清除新一轮健康状态 |
-| CpMsg 半发、版本不兼容、取消与 READY 竞争 | 恰好一次完成，不把协商残留作为 TCP 应用数据 |
-| RX 与 epoll 注册/arm 同时发生，LT/ET/ONESHOT | 不丢唤醒，不让 synthetic 事件饿死 native accept |
-| 没有任何成功连接、线程退出、故障退出 | retire 仍推进；关闭无依赖环、不强制归零 |
-| 内存池空、跨线程归还队列满、owner/runtime 退出 | 归还不丢失，所有权明确，数据路径不触发系统堆分配或阻塞 progress |
-| 仅接收 READ、没有本地业务 write；eager 与 READ 交错 | 同一 owner 推进 RX 与 TX CQ，READ completion 正确更新接收状态，不越过逻辑缺口 |
-| 持续 TX completion、热连接或错误/flush 风暴 | 单批和整轮有界，RX/refill、控制、timer 与其他连接的服务不饥饿 |
-| 首次 post 与注册/ready-set 交接竞争，arm/recheck 与通知竞争 | 已接受操作始终有账本，runnable 工作不丢失、不依赖下一次业务流量偶然唤醒 |
-| refill EAGAIN 后停止新 CQE，再恢复可用资源 | refill debt 独立推进，实际成功补槽后才恢复可授信容量 |
-| 同 peer 多 socket/多发送 shard，额度转移与关闭竞争 | 一个 runtime 身份的授信不复制，子额度守恒，旧在途归属不被迁移覆盖 |
-| shard 数变化的不同启动配置、同 peer 并发 SHM connect | 每个队列唯一 owner；同 runtime-pair 不按线程数重复创建 pair 或基础窗口 |
-| 后台扩容与关闭竞争、多 context 注册部分失败 | 半成品不发布；按注销和 DMA 安全条件回滚资源与预算 |
-| 长 lease、空闲块分散、缩容与迟到 DMA/grant 终结竞争 | 不按总空闲量提前释放整 slab，不搬移在途 buffer，隔离仍受预算约束 |
-
-用模型化状态机/可控假 backend 覆盖竞态，已有真机与人工契约作为输入；恢复真机条件后补实现回归。真实断端口维持低优先级，不依赖不可观测的 PORT_DOWN。ASan/TSan 只能检查部分 CPU 错误，不能证明 DMA 终结或远端可见性。
-
-### 15.4 分阶段交付
-
-| 阶段 | 范围 | 退出条件 |
-|---|---|---|
-| M0：契约与设计修订 | 证据等级、错误作用域、身份、所有权、关闭及 WRITE 优先策略 | 契约与现有实现分开，后续阶段有可执行验收条件 |
-| M1：接收域安全关闭 | 残留 RX、DeleteJfr 终结、Held lease、失败重试 | 无需对端继续发包即可安全关闭；没有提前释放或依赖环 |
-| M2：故障 lane 替换 | status 9 隔离/重建、逐 lane generation、迟到事件门禁；RNR 策略修正 | 健康共享资源可继续使用，旧事件不影响新对象，不重放 |
-| M3：统一 owner 进度器 | RuntimeShard/ShardReactor、有界公平推进、最小控制执行器、JFC 通知和 context async | poll/event 共用状态机，无业务流量仍能补投、取消和回收；阻塞控制调用离开 progress owner |
-| M4：有界有序数据路径 | 注册 TX staging、session/demux、分片/重排、FIN、严格基础 credits | 普通源内存可安全复用，部分 post 有账，慢读不突破预算 |
-| M5：最小连接与 API | 协商/READY、connect/accept/read/write/close、NativeTCP | 双端有序流、错误/取消/EOF、部分读写与 readiness 闭环 |
-| M6：规模与兼容 | 多 shard、import single-flight、弹性额度、FD/epoll、brpc/P2300 适配 | 40k 常驻与 40k/s 分口径验收，额度不复制，冷暖路径分报 |
-| M7：WRITE RNDV 与优化 | grant/chunk/完成后通知先行，再做 MR 扩展、batch/inline/selective signaling/multi-rail | 逐项实现及性能门禁通过；不默认启用 READ |
-| L1→L2：同机支线 | M5 接口稳定后，授权 SHM-copy，再做显式 shared lease、NUMA 和通知优化 | 第 18 节双进程生命周期及反压通过，再与 NativeTCP 比较 |
-| O1→O4：贯穿式观测 | M1 起有身份、状态、账本与预算 counters；第 19 节完整 tracing 逐步接入 | 不把大型观测平台作为基础传输依赖，不以缺少后续 trace 阻塞最小闭环 |
-
-阶段状态、依赖与具体测试以 [实施 roadmap](../roadmap.md) 为准，取代旧的 0–4 编号。M1→M5 为最小闭环主线；M7 的 WRITE 正确性部分在 M4/M5 基础具备后可与 M6 并行，不必等待规模或性能优化，也不再等待可见性确认。全过程保持显式失败与禁止重放的契约。
-
-### 15.5 最小可观测性
-
-本节 counters 是日常概览；第 19 节给出从零入门的概念、事件/身份规范、埋点位置、Perfetto 采集配置、教学时间线、SQL 与工程验收。两者互补，函数耗时聚合不能代替逐 RPC 追踪。
-
-按 owner/物理资源聚合轻量 counters，异常采样详细日志，避免每 CQE 打日志：
-
-- 逻辑连接数、建链各阶段耗时、首包时延、降级原因、每秒 READY/失败/关闭数。
-- 每 lane 的 posted/accepted/retired、inflight WQEBB、CQE/WR 比、DWQE/普通 doorbell 计数。
-- RX 已 post 槽、已授未消费 credits、refill 缺口、RNR、SQ full、pending bytes、reorder bytes。
-- 注册/借出/隔离内存、grant 数、未终结最老年龄、CPU retire backlog。
-- 第 8.7 节 backing/注册/owner-cache/可回收容量分别计账；扩容请求与失败、预算拒绝、归还积压，以及映射、触页、注册、ready 总耗时。
-- 按 status/opcode/path/epoch 分类的错误；lane 故障影响多少逻辑连接。
-- cooldown/probe 状态、实际恢复时长、探测成功率、重连风暴抑制数。
-- 每端口实际字节与错误计数、CPU 使用和尾部直方图。
-
-### 15.6 Full-mesh 的突发、流控对照与压测口径
-
-第 2.4 节的长期均匀平均不能作为突发上界。3000 个客户端若按同序服务端列表、相近相位轮询，可能在同一波次访问同一个服务端，再一起转向下一个。线程调度会打散一部分流量，但不能凭平均 QPS 排除这种旋转 incast。
-
-按每客户端同轮向同一服务端发一个请求计算：
-
-| 请求大小 | 同一服务端接收 3000 请求的 payload | 入口资源含义 |
-|---|---:|---|
-| 1 KiB | 2.9297 MiB | 通常约 3000 个 SEND WR |
-| 10 KiB | 29.2969 MiB | 通常约 9000 个 SEND WR |
-| 100 KiB | 292.9688 MiB | RTS 入队，数据需 RNDV 字节/DMA 准入 |
-| 1 MiB | 3000 MiB = 2.9297 GiB | 不能收到全部 RTS 就自动分配全部目标 |
-
-QD=10 不能让这一轮自动变成 30000 个同目标请求。30000 是客户端全局在途总上限，或跨时间积压/更强集中模型的边界，不是既定每秒每目标一次模式的单轮数据量。等长响应还会产生对应发送工作与源 lease；接收 credits 不能消除物理串行化和应用处理时间。
-
-一、区分压测调度与传输库职责。
-
-- 压测/上层可用不同客户端的 peer 排列或起始偏移、错开的启动相位平滑 full-mesh；kbsocket 不擅自改变应用指定的目标或请求顺序。
-- QPS pacer 需要有界 burst，避免积累大量未消费令牌后补发。稳态请求、建链、首 RPC 应分别准入，不能只限稳态。
-- 同时保留故意同相位、同目标的 incast 用例；随机化是常态效率措施，不是掩盖过载或授信超卖的手段。
-- 统计应包含计划发送/进入队列到响应完成的总延迟，并另报库内、RPC 内部时延及实际达成 QPS；不能通过把等待挪到开始计时之前改善分位数。
-
-二、当前压测源码的已核验限制。
-
-以下只针对第 2.2 节 `brpc` 快照，不断言现场一定使用它：
-
-- [client.cpp](brpc/example/ub_test/client.cpp) 的稳态 `SendPump` 使用进程共享在途许可和令牌，QD/QPS 均是进程级。许可还可能被等待令牌或随机延迟的任务占用，真正已发出的 RPC 可以少于 QD。
-- `GenerateToken` 的实际休眠为 `token_tick_us × token_interval_period`；默认 `1000 µs × 10 = 10 ms`，1000 QPS 时约每周期补 10 个令牌，不是严格每毫秒一个。调度晚会补累计差额，未消费令牌没有独立容量上限。
-- 当前脚本把 `initial_tokens` 设为 0，只消除现成启动令牌，不消除后续周期批发。默认逐请求随机等待可达约 5 ms，发生在实际 RPC 调用之前；它不等于独立随机化 peer 起点。
-- 首次连接的 `Init → stub.Test` 绕过稳态 `SendPump`，首 RPC 并发受建链 worker/batch 配置控制，默认 `thread_pool_size=8`。不能用稳态 QD=10、QPS=1000 推断 full-mesh 建链首发已平滑。
-- [run_ub_test.sh](brpc/run_ub_test.sh) 本身不是 3000×3000 的编排器；现场还需确认完整 peer 列表、连接数、建链并发、大小字节数和所有限速参数。[工具说明](brpc/example/ub_test/README.md)
-
-三、首轮对照矩阵。
-
-| 配置 | 目的 |
-|---|---|
-| RNR-only | 保留用户旧 FC 关闭后的性能基线，测量其突发、HOL 和错误代价 |
-| 基础窗口 8＋弹性池，四个 8192 深度 JFR | 验证较低内存下，暖 peer 的 1/10 KiB 请求是否基本不等待授信 |
-| 基础窗口 32，四个 32768 深度 JFR | 比较更宽承诺对 burst/控制开销的收益与资源成本 |
-
-上述组合用于初筛；归因时必须补充相同 JFR 深度、相同 CPU 模式下的 FC/RNR-only 对照，再分别改变窗口和深度，避免把容量增加误当算法收益。4/8/16/32 窗口都按真实接收预算准入，不能超卖后仍标为严格模式。
-
-四种大小分别测、响应等长。覆盖错相均匀流量、同步建链、同序轮询 incast、长 idle 后恢复、服务端应用变慢、refill 延迟和客户端退出；另加混合大小回归，检验大包不会饿死小包/控制，但混合结果不冒充用户指定的分别压测。
-
-关键指标除 QPS、首请求时延和 p99/p99.9 外，还包括：
-
-- 首请求/后续请求发生 credit stall 的比例、等待时间与实际初始授予值。
-- 基础/弹性授信、未结清承诺、grant 返还次数、控制 WR/CQE、RNR 与受影响连接数。
-- 每域 refill backlog、基础保留子账和公共弹性余量，不能只报四域总和。
-- RNDV 排队、目标与源 lease 驻留、在途 DMA 字节/操作、已交付未释放内存和隔离峰值。
-- CPU、实际 post/poll 分支、数据 copy 成本，以及宿主机聚合端口负载。
-
-选择标准是在达到目标 QPS 与明确尾延迟约束后，CPU、内存和控制消息成本最低的配置；本会话尚未给出足以证明某组参数最优的 full-mesh 实测。
-
-### 15.7 注册内存池的核验实验
-
-先用可控假 backend 验证预算、所有权和第 15.3 节失败路径，再在实际 UB 设备验证注册成本与 DMA 安全；普通 allocator microbench 不能代替通信池验收。
-
-| 对照 | 固定条件与观测 |
-|---|---|
-| 冷态准备与暖态池内借还 | 分别报告映射、页面准备、注册、元数据初始化和完整 ready 延迟；冷态请求计时包含等待，不隐藏准备成本 |
-| 单大区域与多个独立区域 | 相同总容量，对照 `1 × 1 GiB` / `16 × 64 MiB` 等候选，测注册对象数、准备延迟、可回收字节及低负载驻留 |
-| 普通页、THP、显式 hugepage | 核验实际页粒度、缺页、NUMA 放置、RSS/PSS/cgroup charge；记录注册与注销耗时，不只记录配置开关 |
-| owner 本地取还、跨线程归还、可选 producer cache | 相同消息分布与 CPU 配额，测吞吐、请求 p99/p99.9、归还积压和缓存囤积；核验 fastpath 无系统堆分配 |
-| 稳态、突发耗尽、长 lease 与故障隔离 | 测控制/RX 进度、预算拒绝、完整扩容等待、不可回收容量；空池不触发同步注册，超时不触发不安全释放 |
-
-从单 owner/context、预注册固定容量建立基线，再增加后台扩容、整 slab 回收和多 context 注册。size class、slab 大小、缓存字节上限、扩缩容水位与观察时间由上述结果决定；不预设 1 GiB 常驻容量，也不承诺未经测量的注册耗时或尾延迟收益。
-
-## 16. 原始需求对应关系与未决问题
-
-### 16.1 十二项需求追踪
-
-| 原始需求 | V1 落点 |
-|---|---|
-| 1. 高频 ArraySet 查询无锁、deferred mutex | 第 4 节：安全读者保护、分片 retire、内部 ID 化，不把无锁队列误当安全回收 |
-| 2. 脱离 brpc 的异步建链与 P2300 | 第 5 节：独立 runtime、组合接口、恰好一次 completion 与取消边界 |
-| 3. BlockCache/Block 解耦、inline/copy/zero-copy | 第 8 节：Storage/Slice/Registration/Lease 分层 |
-| 4. fd 复用与 CQE ABA | 第 4 节：多层身份、CPU 与 DMA 独立生命周期 |
-| 5. RM_CTP、共享 JFR、jetty pool、共享 JFC | 第 7 节：同 context 的 owner 池化，多连接多目标，承认物理故障范围 |
-| 6. 接收乱序、ACK_TIMEOUT、重建 | 第 6、11 节：薄保序、失败旧连接、新 epoch lane 与健康探测 |
-| 7. READ RNDV 和主动 WRITE/writev | 第 8 节：WRITE 优先、READ 显式可选，单远端 SGE、本地多 SGE、完成后通知与 grant 生命周期 |
-| 8. CQE 风暴与多 socket 共享 SQ | 第 10 节：物理 SQ ledger、按负载 signal、尾部和错误完成预算 |
-| 9. 无感 TCP 切换/未 CQE WR 重发 | 第 1、11 节：记录为被撤回方案，V1 明确不实施 |
-| 10. 自主反压与 RNR | 第 9 节：基础/弹性授信与字节/DMA 预算分离，RNR-only 保留对照 |
-| 11. 32k JFR/128 MiB 与 40k 突发 | 第 9 节：四域独立总账、runtime 长期小基础窗口、冷态准入与控制保留 |
-| 12. busy-poll/中断模式下 RX/TX | 第 12 节：共用 progress、单 owner 接收域、arm/recheck、关闭推进 |
-| 后续补充：同机 TCP 与共享内存 | 第 18 节：Linux 6.16 路径核验、授权/FD 交换、SHM-copy/lease、独立容量与性能门禁 |
-| 后续补充：跨层慢 RPC 诊断 | 第 19 节：从事件到 timeline 的完整操作路径；RPC/字节区间/WR/bthread/sched 关联，采集质量与开销门禁 |
-
-### 16.2 后续功能的采用门禁与待定参数
-
-以下分别约束其对应功能，不作为 M0 或最小 copy eager 路径的共同阻塞项。status 8/RNR 的已测同 SQ 隔离、status 9 后 jetty 不可用及删除重建、正常 JFC 排空、DeleteJfr 终结残留 RX、默认 SEND 无序、已有 CQE 的 rearm 通知，以及 WRITE 完成可见性已有日志或人工契约，不再泛列为未知。其生产集成仍须通过各阶段的软件回归。
-
-- 测试设备、EID、物理 port、IOdie 与 NUMA 的真实映射，以及 raw 多 port 是否带来独立瓶颈容量。
-- RNR retry/timer 的实际效果、共享 SQ 的硬件 HOL/时延影响，以及未覆盖 opcode/错误组合；不从正常 SEND/WRITE 的隔离结果推广到 READ 或 status 9。
-- 故障 JFC 丢失完成后的完整终结/回收证明，以及无身份边界 CQE 与硬件 ID 重用的 provider 屏障。前者延期；后者在 M2 无法证明时保持隔离，不冒险发布新映射。
-- selective signaling 与 SEND/READ/WRITE 混合、ordering 配置、remote target 变化的合法组合。
-- WRITE 完成后通知及多 chunk/多 lane 完整性跟踪的实现正确性，以及远端 grant 撤销能力；WRITE 与 READ 一致的完成可见性已由用户确认。未等完成的链式发布和 WRITE_IMM 语义仍须另行确认后才能采用。
-- 设备 inline/SGE/队列深度等尚未确认的能力与组合约束；RM_CTP SEND 的 4096 字节和单边 READ/WRITE 的 200 MiB 上限已由用户确认，见第 2.1 节。
-- eager/RNDV 阈值、WRITE chunk、lane 数、CQ 深度、RX 池和 credit 批量；全部通过目标负载确定。
-- 注册内存池的映射/注册/slab 粒度、size class、缓存字节预算、基础容量、扩缩容水位与观察时间，以及设备/context 注册数量限制；按第 15.7 节验证，ODP 与显式 hugepage 不作为已具备能力。
-- 第 2.4 节 full-mesh 的请求/响应实际字节数、短时 peer 分布及宿主机容器密度；第 9.6/9.8 节候选窗口和内存/DMA 参数仍需第 15.6 节验证，不能写成已达标默认值。
-- cooldown 初始值、按错误分类的退避、最大探测数与恢复准入速度；60s 仍是临时值。
-- socket ABI、native TCP 协商入口及历史协议共存策略；不能靠未说明的透明探测假设实现替换。
-- 上层允许的失败和重试语义，尤其是非幂等 RPC；库不代替应用做执行结果判断。
-- 同机真实网络路径、本地信任/网络策略、共享挂载或 broker 部署、跨进程原子 ABI、SHM 内存/FD/cgroup 记账及相对本机 TCP 的收益；第 18 节是待实现 spec，不是已上线能力。
-- tracing 的部署版本、事件 schema、上下文传播、接收端解帧前历史保留、时钟/容器 TID 映射及采集开销；先通过第 19 节单机闭环，再做跨机单向时延归因。
-
-按功能逐项满足门禁后启用，保留现有证据适用范围；不提前承诺最大吞吐、全局无锁或零故障影响。
-
-## 17. 关键源码索引
-
-路径相对本工作区；符号比行号更稳定，精确版本见第 2.2 节。
-
-| 主题 | 入口 |
-|---|---|
-| fd 表与 deferred | [ubsocket_set.h](ubs-comm/src/ubsocket/csrc/common/ubsocket_set.h)：`GetItem`、`DrainDeferredRelease`、`EnqueueDeferred` |
-| cooldown key/状态 | [ubsocket_port_cooldown.h](ubs-comm/src/ubsocket/csrc/common/ubsocket_port_cooldown.h)、[ubsocket_port_cooldown.cpp](ubs-comm/src/ubsocket/csrc/common/ubsocket_port_cooldown.cpp) |
-| cooldown 配置 | [ubsocket_global_setting.cpp](ubs-comm/src/ubsocket/csrc/common/ubsocket_global_setting.cpp)：`UBS_PORT_COOLDOWN_SEC` |
-| 建链与降级 | [umq_socket_connector.cpp](ubs-comm/src/ubsocket/csrc/core/umq/umq_socket_connector.cpp)、[umq_socket_acceptor.cpp](ubs-comm/src/ubsocket/csrc/core/umq/umq_socket_acceptor.cpp) |
-| TX/RNR 错误处理 | [umq_data_tx_ops.cpp](ubs-comm/src/ubsocket/csrc/core/umq/umq_data_tx_ops.cpp)、[umq_tx_helper.cpp](ubs-comm/src/ubsocket/csrc/core/umq/umq_tx_helper.cpp) |
-| CQ/退役推进 | [ubsocket_tx_cqe_poller.cpp](ubs-comm/src/ubsocket/csrc/core/ubsocket_tx_cqe_poller.cpp) |
-| 当前 READ 大包协议 | [ubsocket_bigdata.cpp](ubs-comm/src/ubsocket/csrc/core/ubsocket_bigdata.cpp) |
-| 旧 FC 配置/握手预授 | [umq_setting.cpp](ubs-comm/src/ubsocket/csrc/core/umq/umq_setting.cpp)、[umq_ub.c](ubs-comm/src/hcom/umq/src/umq_ub/core/private/umq_ub.c) |
-| 旧 FC 申请/返还与小窗口 | [umq_ub_flow_control.h](ubs-comm/src/hcom/umq/src/umq_ub/core/flow_control/umq_ub_flow_control.h)、[umq_ub_flow_control.c](ubs-comm/src/hcom/umq/src/umq_ub/core/flow_control/umq_ub_flow_control.c) |
-| 旧 FC 按 WR 截断 | [umq_pro_ub.c](ubs-comm/src/hcom/umq/src/umq_ub/core/private/umq_pro_ub.c) |
-| 现有公开降级范围 | [ubsocket.h](ubs-comm/src/ubsocket/include/ubsocket.h) |
-| bonding shadow/故障重发 | [bondp_datapath.c](umdk/src/urma/lib/urma/bond/bondp_datapath.c)、[bondp_types.h](umdk/src/urma/lib/urma/bond/bondp_types.h)、[bondp_cp_jetty.c](umdk/src/urma/lib/urma/bond/bondp_cp_jetty.c) |
-| raw 逐 WR 目标、WRITE、DWQE | [udma_u_jfs.c](umdk/src/urma/hw/udma/udma_u_jfs.c)、[udma_u_jfs.h](umdk/src/urma/hw/udma/udma_u_jfs.h) |
-| raw CQ、累计 consumer、共享 JFR | [udma_u_jfc.c](umdk/src/urma/hw/udma/udma_u_jfc.c) |
-| raw flush/reset | [udma_u_jetty.c](umdk/src/urma/hw/udma/udma_u_jetty.c) |
-| ordering/fence/SGE 定义 | [urma_types.h](umdk/src/urma/lib/urma/core/include/urma_types.h) |
-| 共享对象与 context 边界 | [urma_cp_api.c](umdk/src/urma/lib/urma/core/urma_cp_api.c)、[urma_cmd.c](umdk/src/urma/lib/urma/core/urma_cmd.c) |
-| perftest 默认/校验 | [perftest_parameters.h](umdk/src/urma/tools/urma_perftest/perftest_parameters.h)、[perftest_parameters.c](umdk/src/urma/tools/urma_perftest/perftest_parameters.c) |
-| perftest LAT/BW/时间窗 | [perftest_run_test.c](umdk/src/urma/tools/urma_perftest/perftest_run_test.c)：`print_lat_report`、`poll_jfc_until_expected_cqe` 及 READ BW 循环 |
-| perftest buffer/context | [perftest_resources.c](umdk/src/urma/tools/urma_perftest/perftest_resources.c) |
-| full-mesh 压测口径 | [client.cpp](brpc/example/ub_test/client.cpp)：`SendPump`、`GenerateToken`、`Init`；[README](brpc/example/ub_test/README.md)、[启动脚本](brpc/run_ub_test.sh) |
-| 函数统计与阶段 trace | [ubsocket_prof.h](ubs-comm/src/ubsocket/csrc/profiling/ubsocket_prof.h)、[ubsocket_trace.cpp](ubs-comm/src/ubsocket/csrc/profiling/trace/ubsocket_trace.cpp) |
-| packet 与 RPC 关联 | [ubs_pkt_trace.h](ubs-comm/src/ubsocket/csrc/profiling/trace/ubs_pkt_trace.h)、[rpc_link_trace.h](brpc/src/brpc/rpc_link_trace.h)、[join_rpc_trace.py](ubs-comm/tools/trace/join_rpc_trace.py)、[gen_flowchart.py](ubs-comm/tools/trace/gen_flowchart.py) |
-| bthread 与解帧边界 | [task_group.cpp](brpc/src/bthread/task_group.cpp)、[input_messenger.cpp](brpc/src/brpc/input_messenger.cpp)、[baidu_rpc_protocol.cpp](brpc/src/brpc/policy/baidu_rpc_protocol.cpp) |
-
-## 18. Linux 6.16 同机 TCP 核验与 SHM transport spec
-
-本节是新增设计要求，不修改第 14 节实测记录。核验对象为上游 Linux **v6.16**，不是泛称“当前最新内核”。本次工作环境的 `uname -r` 为 `7.2.4-arch1-2`，未在用户的 6.16 测试机上抓包、跟踪内核或运行性能实验；发行版补丁、CNI、BPF、代理和设备内部路径仍需现场确认。以下用“必须/不得”表达实现约束，用“候选”表达尚未调优的参数。
-
-### 18.1 核验结论：常见场景成立，但不是无条件保证
-
-用户关于“同机普通 TCP 在 CPU/内存中完成转交，无须物理网卡”的判断，在本地路由、veth/软件 bridge 等常见容器路径下成立。需要修正三个表述：接收对象是 socket 接收队列和用户提供的缓冲区，不是 fd 自身；两容器不一定走 `lo`；同机 TCP 比 UB 快是需验证的性能结论，不是内核语义保证。
-
-| 核验点 | Linux v6.16 依据 | 可以得出的结论 |
-|---|---|---|
-| 普通发送 | `tcp_sendmsg_locked()` 的普通 copy 分支调用 `skb_copy_to_page_nocache()` | 用户 payload 复制到内核管理的 skb 数据页；不应理解为整条数据都放在 skb 结构体中 |
-| 普通接收 | `tcp_recvmsg_locked()` 调用 `skb_copy_datagram_msg()`，继而进入 datagram iterator copy | 内核接收数据复制到调用者传入的用户 buffer |
-| 软件回送/跨 netns 转交 | `dev.c` 的 `dev_loopback_xmit()` 直接交给 `netif_rx()`；`dev_forward_skb()` 支持接收设备在另一 netns | 内核具有无需物理 NIC 的软件接收路径；不能据此宣称逐行审阅了 loopback 驱动 |
-| veth | `veth_xmit()` 找到 peer，`veth_forward_skb()` 将 skb 交给 peer 的软件 RX/NAPI 路径 | 跨 network namespace 不等于跨物理网卡 |
-| 出口选择 | `__ip_queue_xmit()` 根据 route 处理发送，`ip_output()` 使用路由目的设备 | 最终出口取决于路由及后续配置，不能仅凭共宿主机下结论 |
-
-已取得并核验的版本固定证据见 [v6.16 tcp.c](https://github.com/torvalds/linux/blob/v6.16/net/ipv4/tcp.c)、[skb copy helper](https://github.com/torvalds/linux/blob/v6.16/include/linux/skbuff.h)、[veth.c](https://github.com/torvalds/linux/blob/v6.16/drivers/net/veth.c)、[dev.c](https://github.com/torvalds/linux/blob/v6.16/net/core/dev.c)、[ip_output.c](https://github.com/torvalds/linux/blob/v6.16/net/ipv4/ip_output.c)。本次未成功取得 tagged `loopback.c`、`br_forward.c/br_input.c` 和 `datagram.c` 的正文，不将它们写成已逐行核验；软件 bridge 出口为本机 veth 的说明属于结合虚拟设备语义的拓扑推导，仍需现场路径验证。
-
-典型普通 TCP 数据路径可概括为：
-
-```text
-发送进程 user buffer
-  → payload copy → 内核 skb 数据页
-  → TCP/IP → 本地路由/lo，或 veth→本机转发→peer veth
-  → 接收 TCP socket 的队列
-  → payload copy → 接收进程 user buffer
-```
-
-这是两次主要 payload copy 的概括，不是每种配置恒定恰好两次：skb clone/引用传递不必复制整个 payload，分段、线性化、过滤、加解密、代理和特殊 API 又可能改变实际成本。仍有系统调用、TCP 状态/确认、协议处理、调度唤醒、内存带宽与缓存一致性成本；不能写成“内核只做两次 memcpy”。
-
-例外和边界：
-
-- 同一 netns 与不同 netns 必须区分；每个 netns 有自己的网络设备和协议栈状态，两个独立容器的 `127.0.0.1` 默认不是同一个 loopback。[network_namespaces(7)](https://man7.org/linux/man-pages/man7/network_namespaces.7.html)
-- CNI 路由、外部代理/LB、SR-IOV、硬件转发或外绕拓扑可能使同机端点的流量进入设备或离开宿主机；“同宿主机”不能单独证明软件直达。BPF 重定向等也可能缩短常规路径，须记录实际配置。
-- `sendfile/splice`、`MSG_ZEROCOPY`、显式 `TCP_ZEROCOPY_RECEIVE` 等不能套用普通 read/write 的固定复制模型。尤其 v6.16 文档明确说明，本地 TCP/UDP 的 `MSG_ZEROCOPY` 存在 deferred copy，跨 netns 的本机 veth 测试不能据此指望消除 copy；“加一个 ZEROCOPY flag”不是本机 SHM 的等价替代。[Linux 6.16 MSG_ZEROCOPY](https://docs.kernel.org/6.16/networking/msg_zerocopy.html)
-- 当前已审阅的 raw/bonding provider 没有同机 CPU shared-memory 数据面旁路：`udma_u_post_sq_wr()` 仍写 SQE、执行设备 barrier，再提交 direct-WQE/doorbell；接收完成仍解析设备 CQE。[raw SQ](umdk/src/urma/hw/udma/udma_u_jfs.c)、[raw CQ](umdk/src/urma/hw/udma/udma_u_jfc.c)
-- 这只能确认 UB 仍承担设备路径，不能证明 payload 一定出物理端口。设备可能有内部 loopback；当前 API 还有 TP loopback 标志，但它不证明此 RM_CTP 配置使用了该功能。[URMA 类型](umdk/src/urma/lib/urma/core/include/urma_types.h)
-
-因此，设计依据是“增加显式同机 CPU 数据通路，并与本机 TCP 比较”，而不是“已证明所有同机 UB 都输给 TCP”。
-
-### 18.2 目标、非目标与复制语义
-
-目标：不占 UB jetty/JFR/JFC 和注册内存，复用 Connection、顺序、SocketAdapter、owner 调度与 BufferLease 抽象；普通 socket 调用者先获得同机低开销路径，愿意适配内存 API 的调用者再获得 payload copy avoidance。
-
-| 路径/API | 典型额外 payload copy | 关键条件 |
-|---|---:|---|
-| 本机普通 TCP write + read | 两次主要 copy | 具体网络/内核路径仍需确认 |
-| SHM-copy：普通 write/writev + read/readv | 两次：用户源→共享区→接收用户目标 | 主要消除网络协议/设备处理，不宣称天然零拷贝 |
-| 普通 write + `recv_lease` | 通常一次：用户源→共享区 | 接收方借用共享 view，并显式 release |
-| `alloc_shared` 后直接构造 + `send_lease` + `recv_lease` | 可以不增加 transport payload copy | 数据原本就在获授权共享区；序列化/业务 copy、缓存一致性和同步仍有成本 |
-
-普通 `write()` 返回已接受前缀后，源内存必须可立即复用；SHM-copy 因而在返回前完成对应复制。将任意 malloc 指针塞进 descriptor 不会使它变成另一进程可访问的地址；CMA、`process_vm_readv`、ptrace、额外内核模块或透明重映射用户页均不属于 V1。
-
-SHM 不受 RM_CTP 的 4 KiB SEND 上限约束。10 KiB 请求可用一个足够大的 shared slice/descriptor，100 KiB 和 1 MiB 使用共享 slab/lease；是否分块由公平性和内存预算决定，不必仿造几十/几百个 UB SEND，也不需要实际 URMA READ/WRITE。
-
-### 18.3 Backend 选择、身份与容器部署
-
-新增 `ShmBackend`，每条已建立逻辑连接固定 backend。自动选择的目标策略是：
-
-| 条件 | 新连接选择 |
-|---|---|
-| 本机身份已验证、策略允许、SHM 实现门禁通过且资源可准入 | 优先 SHM；灰度期由显式开关或经过测试的策略启用 |
-| 已确认本机，但 SHM 未启用、不被授权、ABI 不兼容或资源不足 | NativeTCP；不能因 SHM 拒绝而绕过同机隔离策略 |
-| 未证明本机或确定跨机 | 按原 UB 健康/能力协商，不能使用 SHM；UB 不可用时 TCP |
-
-初版未验收前保留本机 TCP 默认；不能仅凭理论少一层协议就强制 SHM。诊断配置至少支持 `shm=off/auto/required` 和强制 TCP/RawUB 对照；`required` 不满足条件时明确失败，任何强制开关都不得绕过授权。业务字节发出后不能改 backend；SHM 失败仍遵循第 11 节旧连接失败、上层重连的契约。
-
-本地 rendezvous 采用显式部署的 pathname AF_UNIX 入口，推荐由节点 broker 为获准的两个 runtime 配对并转交 FD。broker 只处理身份、策略和冷态配对，不转发 payload，不进入逐包热路径。独立进程并非算法必需：同一受控部署也可直接共享受保护的 pathname UDS，但必须实现等价授权。
-
-认证入口可采用带有界长度前缀的 AF_UNIX stream；broker 配对后的控制通道采用 AF_UNIX `SOCK_SEQPACKET` 保留控制记录边界。能力/FD 清单过大时拆成有上限的记录，拒绝 `MSG_TRUNC/MSG_CTRUNC`；不把 fd 的整数值写入 TCP 就当作完成了 FD 传递。
-
-必须满足：
-
-- 地址发现可使用节点标识/服务信息；hostname、IP、EID、boot ID、明文 cookie 只能作 hint，不能独立授权。真实绑定包含受信任节点/broker incarnation、两个 runtime incarnation、服务身份与本次会话 nonce/协商 transcript。
-- AF_UNIX 凭据由 broker 结合 user namespace 映射及编排身份解释；容器内 UID=0 相同不代表同一主体。broker 创建并转交的 socketpair，其创建时 peer credentials 可能指向 broker，接收者不能把它误当远端 runtime 身份，必须校验 broker 配对凭据。
-- 默认只允许已配置的可信同租户/应用信任域；同租户标签本身也须由策略确认。SHM 绕过 CNI/sidecar 的数据路径，需要显式落实原本的服务授权、审计和网络策略要求；不能把一次本地连接当作绕过策略或 TLS 要求的许可。
-- pathname UDS 需在两个容器可访问的位置显式挂载并限制目录/连接权限；abstract UDS 受 netns 隔离，不能默认跨容器可达。无需共享整个 `/dev/shm`、PID namespace 或 IPC namespace；FD 经 `SCM_RIGHTS` 传入后即可映射，但仍须通过 mount/LSM/seccomp/编排策略允许的入口。
-
-UDS、凭据与 FD 传递机制参见 [unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html)。不支持本地协商的旧应用仍遵循第 5.4 节纯 TCP 协议兼容边界，不能直接注入探测字节。
-
-### 18.4 建链状态、FD 与 region 安全
-
-资源键为 `{local runtime incarnation, peer runtime incarnation, owner lane, pair epoch}`。其中两端 runtime incarnation 指第 3.3 节的 `KbRuntime` 实例身份，不是 reactor/thread ID。初版每 runtime-pair 一条 owner lane，多 socket 复用；本地通过 peer-affinity 让相关连接与该 pair 归属同一 shard，对端也独立选择自己的唯一 owner。增加本地 shard 不为相同实例对复制 pair；确需多 lane 时须重新定义资源/授权预算和协议交接，不让多个 owner 直接访问同一 SPSC ring。single-flight 防止并发 connect 重复创建相同 pair。一个已有 pair 只为新 socket 创建逻辑 BIND/READY，不重做 memfd/事件对象和全量映射；授权缓存仍绑定具体服务范围。
-
-```text
-DISCOVER → LOCAL_AUTH → PAIR_PREPARE
-  → exchange/validate FDs → map/init → PAIR_READY
-  → SESSION_BIND + RX route published → both SESSION_READY → SHM_ACTIVE
-```
-
-初始化、FD 交换、缺页预热和大块内存准备不得在热 poller 无界阻塞；纳入原有异步建链 deadline 和有界控制执行器。SHM 尚未 ACTIVE 时可按协商一致的结果选择 TCP；状态不一致、控制记录截断或 wire 不干净时终止这次建链，不能一端发送 SHM、另一端等待 TCP。
-
-region 使用 `memfd_create(MFD_CLOEXEC | MFD_ALLOW_SEALING)`、定长 backing 和 `MAP_SHARED`。固定大小后至少设置 `F_SEAL_SHRINK | F_SEAL_GROW`，禁止截断/扩容改变已校验边界；需要扩容时创建新 region，不改活跃映射长度。以非执行映射使用，结合部署能力限制可执行权限。`memfd` 无需在共享目录创建数据文件。[memfd_create(2)](https://man7.org/linux/man-pages/man2/memfd_create.2.html)
-
-初版采用 owner-write 分离：A 创建 A-owned region，A 可写、B 只读；B-owned region 反向对称。A 对 B 数据的消费进度/release 也写进 A-owned region，由 B 读取。可在 owner 的 RW 映射建立后加入 `F_SEAL_FUTURE_WRITE`，再向 peer 传 FD，防止 peer 新建 writable mapping 或直接写文件；保留 owner 的现存 RW 映射。seal 顺序与 owner 后续重映射限制必须测试。不能对活跃可写区直接要求 `F_SEAL_WRITE`，也不能把 FUTURE_WRITE 当作撤销既有 RW mapping 的操作。[file seals](https://man7.org/linux/man-pages/man2/F_GET_SEALS.2const.html)
-
-接收 FD 时必须检查辅助数据截断、FD 个数、CLOEXEC、对象类型/大小/seals、版本、用途和总映射额度；多余/拒绝的 FD 立即关闭。只映射经认证对端为本 pair 提供的 region；共享文件中不得放可直接调用的函数指针、C++ 容器或进程私有锁。
-
-只读 peer 映射仍可读取整个映射范围，owner 也仍能修改其写区。因此这是减少意外破坏面的机制，不是恶意 peer 的完整沙箱。不得把全局 arena 暴露给所有 peer，再声称 offset/cookie 能隔离数据；默认按 pair 隔离 backing，不为不可信跨租户开放直接 SHM。
-
-### 18.5 Ring、描述符与跨进程内存模型
-
-每个方向使用单 producer、单 consumer 的数据描述符 ring，另设有界 release/control 通路；应用多线程先进入已有本地 mailbox，由 owner 合并。一个连接初版固定在一个 pair lane 上，避免为同一连接新增跨 lane 重排。资源分为：
-
-- pair/region 不可变身份头、ABI 版本、容量和协商结果。
-- 数据发布序号、反向消费进度、release/control 发布序号；不同 writer 的热字段分开 cache line，间隔按目标平台确认，不盲写死所有硬件均为 64 bytes。
-- 数据 descriptor：会话/代际、逻辑字节位置、类型、region ID/generation、offset、length、lease ID；本 pair 的映射表将 offset 转成本地地址。
-- payload arena：小块和 bulk slab，不把大 payload 嵌入每个 ring slot。可对极小数据做 descriptor-inline，但它和 UB inline 是不同能力。
-
-必须先校验类型、会话、lease 归属、长度与加法溢出，再验证 `offset/length` 落在实际 region 内。共享元数据先读入受控本地记录再使用；不能重复读取可变字段而依赖它一直不变。
-
-发布协议：producer 完成 payload 和 descriptor 写入后 release 发布 producer sequence；consumer acquire 观察到该序号后才能读取。consumer 取走 descriptor 并记入本地有界 pending/view 队列后，可以发布 ring slot 已消费；**payload 是否可复用另由 lease release 决定**，不能把“descriptor 已出队”当作“应用已读完”。producer acquire 观察正确代际的 release 后才复用对应 payload。
-
-使用自然对齐的 64 位单调序号，ring 容量为 2 的幂；约束未消费距离不超过容量、代际和序号接近回绕时受控重建，禁止带迟到记录的快速 ID 复用。部署 ABI 必须验证 x86-64/目标 AArch64 等平台的跨进程 lock-free 原子和内存顺序，不能依赖可能退回进程私有锁的任意 `std::atomic<T>`，也不能用 `volatile` 代替同步。
-
-同一流的 descriptor 顺序、bulk 分块和 FIN 均映射到第 6 节的逻辑顺序空间。SHM 不需要网络 ARQ，但仍不能让后续小写入越过尚未就绪的大块。ring 正确性、可见性和回收必须有独立的双进程测试；进程内 TSan 测试不是跨进程内存模型证明。
-
-### 18.6 Socket-copy 与显式 lease API
-
-以下为语义级接口 spec，沿用 C ABI/可选 sender-receiver 封装，名称可在 ABI 定稿时调整：
-
-| 操作 | 语义与完成点 |
-|---|---|
-| `write/writev` | 对已接受前缀先复制到库拥有的 SHM slice；返回后原始用户源可复用；预算不足允许部分写/EAGAIN |
-| `read/readv` | 从连续可读的 SHM slice 复制到调用者目标，支持部分读取；最后一个引用结束后发布 release |
-| `alloc_shared(peer, size)` | 从该 pair 授权且有预算的 region 返回可写 lease；不能保证任意 peer 通用 |
-| `send_lease(conn, lease, range)` | 发布后应用不得改写/释放已交出的范围；显式返回发布/接受状态与 `source_reusable` 生命周期事件，后者不能提前于所有约定访问结束 |
-| `recv_lease(conn, max_bytes)` | 返回只读、有界、按流顺序的借用 view；不承诺一次返回完整 RPC，不复制为普通用户 buffer |
-| `release(lease)` | 结束借用并归还实际 payload 额度；重复/旧 generation release 不得双重回收 |
-
-提交成功、源可复用、对端流可读、对端应用执行业务是不同完成点；最后一项不由库保证。失败/取消时仍需兑现借用 buffer 契约。共享 view 也不意味着允许跨对端任意转发：转给第三个 runtime 要有新的映射授权，或走 copy/其他后端。
-
-100 KiB/1 MiB 可直接引用已准入 slab，或按例如 128 KiB 的候选 chunk 公平调度；比较整块和分块，不把 UB 的 200 MiB 能力或 RNDV 门槛硬套到 SHM。新增 slab 的 FD 交换和页面准备属于冷路径，应通过有界预热降低首请求成本，不能靠把冷态等待移出计时来制造收益。
-
-### 18.7 SHM 反压：descriptor 与 payload 分开计账
-
-SHM 没有 JFR/RQE，也没有 RNR。第 9 节“资源确实可用才授信”的原则复用，但不继承每 4 KiB WR 一个 credit 的计价：
-
-1. `descriptor slots` 限制 ring 中尚未取出的发布记录；consumer 推进已消费位置后可归还。
-2. `payload bytes/leases` 限制尚被传输、慢读应用和 view 持有的共享数据；最后一个有效引用释放后才归还。
-3. 本地 pending、每 socket、每 pair、runtime 总内存及 retired region 分别有上限；看见 descriptor 空位不能继续无限分配 payload。
-
-暖 pair 的小包窗口应一次覆盖完整首个 10 KiB 请求及必要元数据，已有容量时不额外做一次远端 grant RTT。小包 copy 由发送方可写的 pair arena 支撑，但双方在 PAIR_READY 前必须同意接收预算，不能靠 sender 自行扩 arena 强迫 receiver 持有更多数据。
-
-用按字节计费的 active-connection 轮转和 per-socket pending 上限限制热点；某个慢读 socket 达到配额后停止给它分配新的 payload。descriptor 出队后仍须有界存储 lease 元信息，否则只是把无界排队移到了接收堆中。基础小包容量、bulk 和应用持有 view 一起纳入真实预算；第 2.4 节客户端全局 QD=10 仍不构成服务端聚合入站的硬上限。
-
-release/消费进度不得依赖普通 data ring 剩余空间。可通过反向独立 release ring、有界累计消费位置和本地 pending-release 表推进；release 数量受在途 lease 上限约束，容量/批量必须相容。控制拥塞时保留 drain/release 机会，必要时使用有界 UDS 控制记录；不得出现双方 payload 满后连归还额度都无法发送的循环等待。
-
-### 18.8 事件模式、busy-poll 与 readiness
-
-初版每 pair 每方向一个 `eventfd(EFD_NONBLOCK | EFD_CLOEXEC)`，一个接收 owner 消费本方向通知；同 pair 内所有 socket 共用，不每 socket 创建事件 FD。eventfd 仅表示“可能有进展”，其计数不是消息数或 credits。[eventfd(2)](https://man7.org/linux/man-pages/man2/eventfd.2.html)
-
-事件模式的正确性基线：
-
-- 每次批量发布 data、release 或 FIN/控制进度后，无条件写一次目标 eventfd；低负载立即发布，不为凑批无限等待。
-- consumer drain eventfd 后，按预算 drain 对应 rings/共享进度。预算耗尽而仍有工作时保留本地 runnable pair，不能清了通知又直接睡眠；入睡前检查 runnable/mailbox/control。
-- 处理 EINTR；非阻塞 eventfd 写因计数饱和返回 EAGAIN 时已存在可读通知，不把它当作丢弃数据的许可。其他错误进入 pair 错误路径。FD 生命周期必须覆盖所有可能写通知的操作。
-- 不只在 producer 主观观察 empty→nonempty 时发通知；不能未经证明就使用简单 armed 位和 acquire/release 组合替代上述基线。通知抑制需单独的无失唤醒协议、弱内存模型审阅和竞态门禁。
-
-性能模式可协商静态 busy-poll：接收 owner 持续轮询，数据路径不需要常规 eventfd syscall；对应 owner 不能随后偷偷睡眠。所有已建立且允许 peer 发布的 pair 都必须有有限扫描间隔，active-set 只用于提高活跃 pair 的服务频率，不能让 idle/cold pair 永久不再被检查；若要彻底移出扫描集合，必须先实现 inactive→active 的可靠发现通知。BUSY→EVENT 的动态切换必须在双方确认新的通知责任后才能睡眠，初版可先不支持动态切换。不能认为 eventfd 本身能可靠指示对端退出；pair 控制通道、可验证的进程生命周期与定时健康检查单独推进。
-
-复用现有一个或少量 progress owner，按预算公平服务 SHM、UB CQ、native epoll、timer 与 listener。不得为每个 pair 开忙轮询线程；本机 peer 多时需按活跃集合调度，空闲扫描 CPU 也必须测量。对应用的 EPOLLIN/OUT/ET/ONESHOT 仍由 SocketAdapter 按连续字节和本地接受能力合成，不能把 eventfd 的边沿直接当逻辑 socket 的边沿。
-
-### 18.9 Close、崩溃、ABA 与映射回收
-
-逻辑 socket close 只停止该 session 的新发布和回调，不能重置多个 socket 共用的 pair ring。FIN 携带最终逻辑位置，完整前缀后才能成为干净 EOF；控制通道断开、对端异常退出或协议损坏不是干净 FIN。pair 级损坏影响该 pair 中所有无法独立证明安全的连接，不波及其他 backing/pair。
-
-```text
-ACTIVE → DRAINING / FAILED
-  → 停止新发布、解绑 session、错误/取消按契约完成
-  → 本地操作/回调与应用 lease 退出
-  → 协作终结或退休整个旧 pair/region
-  → 所有实际引用结束后由内核回收 backing
-```
-
-必须区分：
-
-- 共享 ring、lease release、readiness 都使用 session/pair/region/lease generation，防止 fd 或 slot 复用误命中新对象；**generation 只能阻止守约代码误用，不能撤销旧 CPU mapping**。
-- 本地 `close(memfd)` 不会使现有 mmap 消失；本地 `munmap()` 也不会撤销另一个进程的映射。timeout、60s cooldown、控制 socket EOF 都不是对端已停止访问所有共享页的证明。[mmap(2)](https://man7.org/linux/man-pages/man2/mmap.2.html)
-- 发生不确定终结时，新 pair 使用新 backing/epoch；不把旧对象中的页或 region capability 再交给新 peer/另一租户。保留整个旧 backing 的隔离记账，直到能证明不再有约定访问或释放全部引用。内核在旧引用消失后回收物理页是正常回收，不等同于库在仍暴露的旧 region 内复用 offset。
-- 应用已获得的本地 borrowed view 必须有效至 release；错误完成不得提前 unmap。对端仍存活却停止协作时，信任域内的 lease 契约也可能无法按时完成，要停止新 SHM 准入并报告资源压力，不能无限建立新隔离域。
-- producer 写 descriptor 前后、发布后通知前、consumer 取 descriptor 后 release 前都可能退出；只处理已完成发布且校验通过的记录，未发布半成品不能被消费。进程死亡可辅助使用可获取的 pidfd，但 PID namespace/权限、FD 继承与残留 mapping 仍需单独处理。[pidfd_open(2)](https://man7.org/linux/man-pages/man2/pidfd_open.2.html)
-
-V1 不支持继承活跃 SHM runtime 后在 fork 子进程继续直接使用；要求 exec/新建 runtime，明确处理 atfork、CLOEXEC 与可行的 DONTFORK 策略。不能用 fork 出来的幸存 mapping 或转交第三方 FD 打破回收假设后，仍宣称一定有界回收。非合作 peer 可保留 backing 是直接共享的真实资源风险，需节点/租户配额治理；不可信 peer 默认走 TCP。
-
-### 18.10 容器资源预算、NUMA 与候选参数
-
-SHM 按**实际同宿主机 runtime-pair 数**计费，不按 full-mesh 3000 peers 全部预分配，更不按 40k sockets 复制。一个 pair 多 lane 会放大 ring/FD 数，初版先复用单 owner。
-
-候选布局：每方向 64 个、每个 64 bytes 的数据 descriptor 为 4 KiB；再用约 4 KiB release/control 记录和约 4 KiB 头/进度页，合计约 12 KiB/方向、24 KiB/pair。这只是容量样例，最终 ABI 对齐、entry 大小和 header 数须实算。
-
-| 容量例子 | 计算与含义 |
-|---|---|
-| 256 个本机 pair 的上述固定元数据 | 6 MiB；不含 payload、额外映射页表及私有状态 |
-| 3000 个本机 pair 的上述固定元数据 | 70.3125 MiB；说明不能忽略本机 peer 数 |
-| 每 pair 双方向各暖 64 KiB payload，256 pairs | 32 MiB；可覆盖基础小请求，bulk 另需准入 |
-| 同样暖容量，3000 pairs / 40k distinct pairs | 375 MiB / 5000 MiB（约 4.88 GiB）；均不含元数据和隔离内存 |
-
-若每 pair 保留两 memfd、两 eventfd 和一条控制连接，每端至少约 5 个额外 FD；3000 pairs 约 15000 FD，bulk region 会更多，公开 socket/其他内核 FD 还需另算。可在不再需要传递/管理 FD 后关闭部分 memfd FD，但 mapping 仍存活；不得把 FD 数下降当作内存释放。RLIMIT_NOFILE、VMA/页表、epoll 项和冷态 FD 交换吞吐都属于验收目标。
-
-4 CPU/16G 容器可从 **SHM 总受控承诺容量 256 MiB、首批暖 pair 上限 256、每方向 64 KiB 暖 payload** 的候选组合起测，计入 TX/RX backing、应用持有 lease、元数据、待释放和 retired backing；bulk 从同一总预算弹性分配，不是每 pair 再永久保留十个 1 MiB。预算不足时新连接可选 TCP，既有 SHM 连接反压或明确失败，不原地迁移。256 不是本机 peer 必须只有 256 的硬件结论，需按真实部署密度调整并对照惰性分配的冷态延迟。
-
-这里按已承诺 backing 容量做准入，不只看当前 RSS：已授权映射但尚未触页的容量也预先扣账，仍可能被旧 peer 访问的 retired backing 不因本地 unmap/RSS 下降而返还预算。应在同一 runtime 内按 region 去重计容量；跨 runtime 的实际物理/cgroup 开销另行观测，不能用共享页看起来省了一份 RSS 为同一预算重复准入。
-
-同一物理共享页只占一份 backing，但两个进程的 RSS/PSS、VMA 和 cgroup charge 不能简单相加或假定对半。按 region 记录创建者、触页者、逻辑归属及共享引用，核验 `memory.current`、`memory.stat` 的 shmem、OOM 和退出后的残留；不要让 broker 预触全部数据页、把所有 payload 成本意外记到 broker 身上。[Linux 6.16 cgroup v2](https://docs.kernel.org/6.16/admin-guide/cgroup-v2.html)
-
-普通 memfd 不是自动锁页/hugepage；内存压力、缺页和 swap 可能影响尾延迟。hugepage、mlock/预触碰均作为有预算的部署选项，不默认绕过容器限制。比较同 NUMA 和跨 NUMA：owner 放置、first-touch、LLC/cache-line 往返和内存带宽可能主导结果，不能因为不走 NIC 就忽略它们；本机多个容器的 CPU quota/throttling 和宿主机总内存带宽必须一起报告。
-
-### 18.11 核验实验、实现顺序与退出条件
-
-先确认真实 TCP/UB 拓扑，以下检查必须针对用户的测试节点和两个容器，而不是拿本次工作环境代替：
-
-1. 记录 `uname -r`、发行版补丁/内核配置、CNI/代理/BPF、容器的 netns 标识和 CPU/内存配额；分别在两个容器与宿主机检查到 peer 的 route、接口类型、veth peer 和 bridge FDB。`ip route get` 单项结果不足以证明全程路径。
-2. 以隔离测试流量对照 veth、bridge/lo 与物理 NIC 的计数变化，必要时抓包/跟踪 `tcp_sendmsg_locked`、`tcp_recvmsg_locked`、`veth_xmit`、`loopback_xmit` 等实际路径；BPF/offload 下单个软件抓包点“没看到”不构成不经过物理端口的证明。
-3. UB 同机对照记录实际 raw SQ/CQ、EID/port 及设备/物理端口计数，确认是否设备内部 loopback。跟踪工具只用于诊断轮次，干净性能轮次撤去抓包/探针开销。
-
-性能矩阵必须使用同一内核/主机、CPU 绑定、容器配额和应用语义：
-
-| 对照 | 目的 |
-|---|---|
-| 本机 NativeTCP | 必须包含用户真实容器网络路径；有条件再拆 host-network/local-route 与 veth/bridge |
-| 本机 raw UB | 验证设备路径的实际代价，而非预设其必然较慢 |
-| AF_UNIX stream（可选） | 区分省 TCP/IP 栈与省内核数据通路的收益，不等于已实现 SHM backend |
-| SHM-copy + event / static busy | 与普通 socket 调用者公平比较 |
-| SHM-lease + event / static busy | 应用直接共享分配/借用；单列 API 适配收益，不冒充无修改 socket 的成绩 |
-
-沿用 1 KiB、10 KiB、100 KiB、1 MiB **分别**压测、等长响应、每客户端全局 QD=10/QPS=1000，覆盖同 NUMA/跨 NUMA、冷建 pair/暖 pair、稀疏/突发、多本机 peer、慢读/持有 lease。另测饱和吞吐和多容器宿主机聚合压力；40k 常驻和 40k/s 要区分同一暖 pair 的逻辑建链与不同 pair 的冷态授权/映射。
-
-指标包括首请求与稳态 p50/p99/p99.9、实际 QPS、CPU 时间/请求、copy bytes、发布/release 等待、eventfd syscall/唤醒、空闲 busy CPU、缺页/NUMA、RSS/PSS/cgroup charge、FD/VMA、arena 内外碎片、最长 lease 和 retired 峰值。开始计时必须覆盖提交排队；冷态测量包括授权、FD 交换、映射/预触碰，不隐藏启动成本。
-
-正确性门禁至少包含：
-
-- 双方多线程提交/读写、短读写、readv/writev、FIN/half-close、ET/ONESHOT、fd 复用与旧 release 迟到。
-- ring wrap/full、双方反压、慢读长期持有 lease、release/control 塞满、owner 调度停顿以及发布/通知/入睡每个竞态点。
-- producer/consumer SIGKILL、OOM、fork/exec、broker 退出/重启、pair incarnation 变化；无数据流量时也能完成可完成的清理。
-- 越界/溢出 offset、伪造 session/region、错误 seals/FD、FD 截断、重复 release、缺失权限；不可信对端被拒绝而不是落入未保护 SHM。
-- backing 长度不可变、取消/错误后 borrowed view 仍有效、旧 mapping 不与新 peer 复用；统计非合作映射留存的预算代价。
-
-落地顺序：先完成 L1 的同机身份与 SHM-copy/事件正确性；再做 L2 的 shared BufferLease、NUMA 和资源优化；最后才做通知抑制、动态 wait-mode、多 lane 或更复杂跨 pair 池化。与 NativeTCP 相比的收益需按消息大小和 CPU 配额可复现，确认资源/隔离/尾延迟不退化后，再启用面向该部署的 SHM 优先策略。不设未经测量的固定提速倍数。
-
-## 19. 跨层 tracing：从一条慢 RPC 到可核验的时间线
-
-本章不仅规定“增加 tracing”，还规定记录什么、在哪里记录、怎样关联、怎样采集和怎样解释。它是**待实现的设计与操作教程，不是已经交付的 tracing 系统**。现有 ubsocket/brpc 工具见 19.9；可以手工打开的合成示例见 19.10；接入 SDK 后的正式采集流程见 19.11；实施验收见 19.16；“主要保留慢请求”的尾采样机制见 19.17；CQE 硬件盲区与测量等级见 19.18；自动调度采集、lease 审计及专项验收见 19.19–19.21。先读 19.1–19.2，再做 19.10，最后回到实现细节，适合尚未使用过 tracing 的读者。
-
-### 19.1 首先理解：timeline 究竟比函数打点多了什么
-
-假设 `ubs_post()` 的统计是平均 3 us、p99 8 us，而某条 RPC 耗时 500 us。函数统计无法告诉我们：这条 RPC 是否调用过那次慢 `ubs_post()`，是否在调用前等了 200 us，是否收到响应后又等了 150 us 才运行 callback。tracing 要保留的是**同一次操作的身份、事件发生时间和先后依赖**。
-
-| 名称 | 初学者可以怎样理解 | 本设计中的例子 |
-|---|---|---|
-| Event，事件 | 在某个时刻记下一件事 | owner 在 120 us 看见 WR 完成 |
-| Span / slice，区间 | 有起点和终点的一段操作 | RPC 开始到 callback 结束；其中可能多数时间没有执行 CPU 指令 |
-| Track，轨道 | 时间线上的一行 | 一个真实 OS 线程，或一个逻辑 RPC；二者不能混为一谈 |
-| Flow，因果连接 | 两条轨道上的操作怎样交接 | worker 提交 operation，IO owner 取出同一个 operation |
-| Counter，计数曲线 | 某项资源随时间变化 | 可用 credit、SQ 在途量、JFR 已 post RQE 数 |
-| Trace context，上下文 | 跟着操作传递的身份 | RPC / attempt / operation 的 ID 与采样决定 |
-| Collector / exporter | 收集记录、保存文件、转换格式 | 热路径只写内存；后台生成 Perfetto 可读文件 |
-| Metrics / profiling | 看整体分布 / 看 CPU 在执行什么 | p99、吞吐；调用栈、cycles、cache miss，不等同于单条 RPC 因果时间线 |
-
-Perfetto 并非只能显示 ftrace。应用可以使用 TrackEvent 记录区间、计数和 flow；ftrace 提供内核调度信息；UI 将它们放到同一时间轴。**Perfetto 负责呈现和查询，RPC 与 WR 的关联仍须由我们提供**。[TrackEvent 官方说明](https://perfetto.dev/docs/instrumentation/track-events)、[CPU scheduling 数据源](https://perfetto.dev/docs/data-sources/cpu-scheduling)
-
-应同时提供两种视角：
-
-- RPC 视角：这一次为什么慢？等待发生在哪一步，下一步依赖谁？
-- 资源视角：IO owner 是否被调度走，哪个共享池耗尽，是否大量任务同时排队？
-
-函数级 PROF 保留，用于低成本发现整体热点；tracing 负责把热点、等待和上层调用联系起来；必要时再用 CPU sampling / PMU 解释正在运行的代码。不能承诺一张时间线自动指出哪条指令慢。
-
-### 19.2 用 245 us 的教学例子，区分三种“等待”
-
-下表是**合成数据，不是当前测试结果**，只解释客户端收到响应后的本机尾段，不包含请求发送及网络往返。为方便算账，假设目标 bthread 已明确分配给唯一可运行它的 worker W，没有 work stealing；W 从 145 us 到 245 us 持续在 CPU 上，目标 bthread 从 175 us 起连续执行。
-
-| 相对时间 | 必须实际记录到的证据 | 此时知道什么 |
-|---:|---|---|
-| 0 us | `cq.observed` | 软件看到 RX 完成；不是网卡收到数据的时间 |
-| 10 us | `rx.notify` | 发出通知；不保证任务已入队 |
-| 20 us | `task.ready(task=T, worker=W)` | 任务具备执行条件，进入运行时队列 |
-| 25 us | W 的唤醒完成事件，例如 `sched_wakeup` | W 已成为 runnable；不代表已经获得 CPU |
-| 145 us | `sched_switch(..., next=W)` | W 获得 CPU |
-| 175 us | `task.run(task=T, tid=W)` | W 真正开始执行目标 bthread |
-| 205 us | `rpc.decode.end` | 该响应解码结束 |
-| 245 us | `rpc.callback.end` | callback 结束 |
-
-对应的互不重叠分解：
-
-```text
-RX 处理             通知/入队     唤醒待完成       W 等 CPU           W 执行其他工作      decode   callback
-0 -------- 10 -------- 20 --- 25 ------------------ 145 ------------ 175 ------ 205 -------- 245 us
-    10 us       10 us       5 us          120 us               30 us           30 us      40 us
-```
-
-这里 `task.ready → task.run = 155 us`，已经包含 `5 + 120 + 30 us`。因此不能把“bthread 排队 155 us”和“内核调度等待 120 us”相加。该窗口总账是 `10+10+5+120+30+30+40=245 us`。
-
-这张图能指引下一步排查：120 us 是已确认 worker 的 runnable 等待，应查 CPU 竞争、亲和性、配额和优先级；30 us 是 worker 已在运行却没有运行目标 bthread，应查其他 task、批处理和运行时调度。它仍不能仅凭 runnable 就断言“容器被 throttle”，需要 cgroup 配额与节流证据。
-
-实际 brpc 会 work stealing，不能照搬例子的归属假设。没有 worker assignment / steal / handoff 证据时，155 us 只能标为 `runtime_ready_wait`，旁边某个 worker 的 runnable 延迟只是相关现象。只采 `sched_waking` 时，起点是发起唤醒，wake-to-run 区间还可能包含唤醒过程；不能无条件称为精确的“已 runnable 等待”。
-
-### 19.3 总体实现：一套事件语义，两个采集后端
-
-```text
-应用 / brpc adapter：RPC、attempt、序列化、bthread、callback
-                    │ 显式传递 TraceContext / 绑定字节范围
-kbsocket：operation、wait reason、owner、WR/CQ、buffer 生命周期
-                    │ 固定事件 schema，不依赖 brpc 类型
-              TraceFacade（关闭时快速返回）
-                    ├─ 验证后端：Perfetto SDK → 同机 traced
-                    └─ 常驻后端：有界候选 recorder → 尾部选择 → exporter
-                                               │
-宿主机授权 collector：ftrace sched + 进程/线程元数据 ─┤
-                                               ▼
-                         trace 文件 + manifest + loss/coverage 报告
-                                               ▼
-                     Perfetto UI / SQL / 慢 RPC 归因报告
-```
-
-先用 SDK 后端验证“跨层可关联”是否成立，再优化常驻 recorder；不要在证明事件语义正确前自研整套采集服务。两个后端是可选实现，不默认把每个事件双写。离线 recorder 要与内核 trace 联合显示，必须按 19.8 提供 clock / thread 映射并实现受支持的合并流程；不能把两个文件直接拼接就当作同一条时间线。
-
-19.11 的 SDK 示例是在选定窗口录制应用事件，不自带 19.17 的逐 RPC 尾部选择。生产尾采样将 recording 与 export 分开，由本机有界 recorder/选择器先保存必要候选，再导出选中请求及相关上下文；不能把最终 keep 比例误称为热路径记录比例。
-
-核心边界：`TraceFacade` 不解析 RPC payload、不引用 brpc Controller/bthread 类；brpc adapter 负责这些身份和生命周期。NativeTCP、raw UB、SHM 都使用相同的 RPC / operation / wait 上层事件，backend 只补自己的底层事件。没有 brpc 的使用者可以只看 transport，或自行接入 RPC adapter。
-
-在事件模式记录 poll、arm、notify、睡眠与唤醒交接；busy-poll 模式按 poll batch 和周期计数记录 empty poll、processed CQE、repost 数，**不在每次空轮询循环记一条事件**。这样才能公平比较两种模式，不让 tracing 把 busy-poll 本身拖慢。
-
-19.19 的 `kb-observer` 是对此处宿主机 collector、部署配方与分析器的产品化封装，不是第三套热路径后端；19.20 补齐 buffer 生命周期语义，不要求所有事件同时写 SDK、recorder 和 BPF。
-
-### 19.4 第一版到底埋哪些点：12 组必需事件
-
-下表是新 schema 的分组。当前代码“有相近点”不代表已经具备完整字段。位置用于指导 brpc adapter 与 ubsocket 迁移，不要求新库保留旧类结构。
-
-| 事件组 | 起止语义 / 最少字段 | 当前代码参考与需要补充的内容 |
-|---|---|---|
-| `rpc.call` | 调用开始、响应交付、callback 结束；`logical_call_id, method_id, result` | `brpc/src/brpc/channel.cpp:468`、`controller.cpp:976`。区分应用可见 RPC 与 callback 自身耗时 |
-| `rpc.serialize` | 序列化进入/退出，字节数 | `channel.cpp:603`。现有 PROF 补上 RPC 身份 |
-| `rpc.attempt` | 单次发送尝试开始/结束；`attempt_id, retry_reason` | `controller.cpp:1067`。一个 logical call 可有重试/backup，不能把 wire cid 当整个调用 |
-| `socket.submit/result` | 提交字节范围、排队结果、实际 accepted 范围 | `socket.cpp:1895,2400,2441`。分清调用者提交、库接收、设备接受 |
-| `transport.wait` | `wait_id, begin/end, reason, resource_id, required, available` | `socket.cpp:2169`、`ubsocket_bigdata.cpp:2591`。由真正资源判定层报告原因 |
-| `wr.post/result` | post 调用前后、opcode、WR 集合、部分成功、错误码 | `ubsocket_bigdata.cpp:1802,2615`。不能只记全成功返回 |
-| `cq.observed` | poll batch、status、WR / retirement 范围、lane generation | `umq_tx_helper.cpp:91,135`、`umq_share_jfr_epoll_runner_ops.cpp:700`。名称明确为软件观测 |
-| `rx.notify` | 数据可用、通知入队、实际 flush/唤醒交接 | `umq_share_jfr_epoll_runner_ops.cpp:335`。NOSIGNAL 入队不等于通知已经生效 |
-| `rx.deliver` | 向上层交付的 `[byte_begin, byte_end)`、session、方向 | `ubsocket_data.cpp:289`。一个交付批次可能含多个 RPC |
-| `rpc.decode` | 分开记录 `frame.complete`、反序列化开始/结束、字节范围绑定 | `input_messenger.cpp:276,319` 负责 framing；`baidu_rpc_protocol.cpp:968,1175` 负责请求/响应反序列化。已有 `received_us` 不是逐 RPC 解码结束时间 |
-| `rpc.handler` | server service 开始、业务 done、响应提交 | `baidu_rpc_protocol.cpp:985,998`、`SendRpcResponse`。异步 handler 返回不等于业务完成 |
-| `task.ready/run/suspend/end` | `task_id, generation, continuation_id, OS_tid`；必要时 worker/steal | `input_messenger.cpp:218`、`task_group.cpp:703,755,815,839`。覆盖首次运行及每次 yield/resume |
-
-表中 ubsocket 文件在 `ubs-comm/src/ubsocket/csrc` 下；完整文件入口见第 17 章。另有一组不必逐 RPC 重复的 resource counter：`SQ outstanding / SQ limit`、`posted RQE / pending repost`、credit 可用量、RNDV 在途字节、owner queue 长度、SHM slot/lease 占用及 trace drops。资源上限改变必须记录；高频变化可按时间窗口汇总 min/max/last，并标明窗口，不能把稀疏采样值当作任意时刻的精确余额。
-
-上述 12 组是 RPC/transport 基础事件；poll 服务阶段的细化契约见 19.19.1，独立于 RPC 结束的 BufferLease/allocator 审计事件见 19.20.1，两者复用同一 TraceFacade 和有界记录预算。
-
-`transport.wait.reason` 第一版固定枚举：`owner_queue, sq_capacity, remote_credit, rndv_grant, local_memory, jetty_resource, shm_space, application_consume, unknown`。等待必须有 begin/end 和解除原因，如 `resource_available / timeout / cancel / connection_error`。EAGAIN 只说明暂不能继续，若上层看不到真正原因，应填 unknown，不能一律写成 credit。
-
-异步生命周期规则必须写进 adapter 测试：
-
-- 同步 `Channel::CallMethod` 在 Join 完成后记录返回；异步版本不能在 CallMethod 返回时结束 RPC。响应可交付和用户 callback 结束分别记录，避免把耗时 callback 全算网络慢。
-- 服务端 `svc->CallMethod` 返回可能只是挂起业务；逻辑 handler 到 done 被调用才结束。执行 CPU 的片段另放到真实线程轨道。
-- `done->Run()` 可能释放 Controller；callback 后的埋点只能访问提前保留的独立 trace context。
-- RAII scope 适合不跨协程切换的同步函数。跨 bthread / sender continuation 的 begin/end 必须使用显式逻辑 span；每次真正执行另记 task slice。
-
-### 19.5 如何把 RPC、socket、WR 和 CQE 关联起来
-
-**第一层：稳定身份，不能只用 fd、指针或线程号。**
-
-| 对象 | 身份设计 | 原因 |
-|---|---|---|
-| 一次 capture / 进程实例 | `capture_id + host_boot_id + runtime_instance_id` | 文件名 PID、时间范围都不足以跨重启区分 |
-| RPC | `trace_id + logical_call_id + attempt_id` | 一个 RPC 可能重试、并发 backup；对端身份须通过协议或确定的 wire cid 关系关联 |
-| Socket/session | `session_id + session_generation + direction` | fd 复用、关闭后旧 CQE 迟到、TCP 降级后的新连接 |
-| 操作 / task | `operation_id / task_id + generation` | 操作跨线程、共享 batch、多次挂起与恢复 |
-| 硬件资源 | `device/lane/jetty_generation + wr_id`，CQ 事件另带 `jfc_id + generation` | jetty/CQ 被共享或重建后，旧完成不能关联新工作 |
-| 内存资源 | `lease_id + generation`、`buffer_id + generation`、所属 region/pool | 同一 buffer 可有多个 lease；RPC 结束、lease 释放、最后引用归零与池可复用并不等价，见 19.20 |
-| 线程 | 进程实例、线程创建实例、容器与宿主机 TID 映射 | TID 会复用，容器内 TID 与 ftrace 中的 TID 不一定相同 |
-
-全局 ID 可以较长，但热事件只存本进程的短 `object_id`，完整身份放有界字典。跨进程 flow 要由 exporter 在校验双方身份后分配；不能把一个进程内部递增整数直接当全局 flow ID。
-
-短 object_id 在 capture 内不复用，或必须带 generation。operation 结束不等于历史 trace 已过期：仍被历史页/冻结 snapshot 引用的身份和 bind 关系不能被字典淘汰。每个可独立导出的 chunk/snapshot 需要关联元数据 checkpoint，或保留映射直到引用释放；达到预算时停止增加相关细节并报告 unresolved，不能猜测关联。
-
-**第二层：显式传递上下文，不依赖 TLS 猜关联。** adapter 在 RPC 入口生成上下文，传给序列化输出、socket submit、operation 和 continuation；跨 owner 队列时把上下文或稳定句柄放在队列项里。bthread 切换时保存/恢复其上下文，TLS 仅缓存“当前正在执行的上下文”。不能让异步任务稍后从提交线程 TLS 取值。
-
-**第三层：字节范围关联，解决多对多关系。** 不修改应用协议的兼容路径，以同 session、同方向的已序列化字节位置作为桥梁。以下是教学值，4000 B 只是示意的 payload 分片，真实大小须扣除传输头：
-
-```text
-RPC A = [0, 2500)          RPC B = [2500, 7500)
-WR 1  = [0, 4000)          WR 2  = [4000, 7500)
-
-A ↔ WR1: 2500 B
-B ↔ WR1: 1500 B           B ↔ WR2: 3500 B
-```
-
-WR1 同时承载 A、B；B 又跨两个 WR，因此不能只在 WR1 上写一个 rpc_id。RX 一次交付多个 frame 也一样。范围必须明确包含哪些协议字节、何时推进，局部 post 失败时记录真实 accepted 集合：只接受 WR1 就只推进到 4000，剩余 `[4000,7500)` 才能重试；不能把整批 7500 B 记成已提交。
-
-RNDV 不要求数据再次模拟成可重传 TCP 字节流。它记录 `transfer_id → RPC range`，以及第 8 章定义的 RTS、grant、READ/WRITE、DONE、经验证的发布通知、grant 终结与 buffer release 依赖；不另加数据 ACK 协议。多 SGE 的位置可用逻辑 payload offset 表示，不记录内存内容。上述 byte cursor 仅是已有 socket 兼容语义下的观测桥梁，不改变第 11 章“故障断链、由上层重连”的选择。
-
-**CQE 聚合与共享 jetty 的特别规则：** 一个 signaled CQE 若按已验证的设备顺序规则可 retire 一批 WR，记录 `retire_batch_id + covered WR range/set`，再展开到各 operation。被覆盖的 unsignaled WR 只有“资源至此可回收”的上界，不能伪造其各自的精确完成时间。没有设备保证就不能推导覆盖关系；一个 socket 的错误也不能自动归到同池全部 socket。
-
-**接收端尚未解帧时怎么办？** 此时可能根本不知道 RPC ID。先以 session / RX batch / byte range 记录低层事件，解帧后产生 `bind(range, rpc)` 元数据，离线回连到原时间戳。若只在识别出被采样 RPC 后才开始记录，之前的 RX/CQ 细节不会凭空恢复。可选做法是有界保留所有低频 RX batch 关联，或按连接/短窗口采集；不能在不改 wire、不保留历史的前提下承诺“任意 RPC 的完整早期 packet trace”。
-
-### 19.6 事件格式与接口：足够具体，但不把诊断变成数据路径负担
-
-下面是**候选内部记录布局**，不是可跨版本直接读写的 C++ ABI。序列化必须固定端序、schema version 与字段解释，并对长度做校验。64 B 不是硬件最优值，只是便于预算的起点。
-
-```cpp
-struct TraceRecordV1 {
-  uint64_t ts_ns;          // clock_id is declared in chunk metadata
-  uint64_t local_seq;      // increments on every attempted emission
-  uint64_t object_id;      // span / operation / resource dictionary key
-  uint64_t parent_id;      // optional causal parent, 0 means none
-  uint64_t arg0;           // meaning fixed by event_type
-  uint64_t arg1;
-  uint32_t writer_id;      // maps to a thread instance, not simply gettid()
-  uint16_t event_type;
-  uint16_t flags;          // phase, recording level, approximate, etc.
-  uint64_t aux;
-};
-static_assert(sizeof(TraceRecordV1) == 64);
-```
-
-每个 chunk 携带 schema、capture/runtime、clock、writer 字典及有效时间范围。`event_type` 固定说明参数含义，例如 wait 的资源、需求与余额，result 的状态/accepted bytes；复杂多对多关系用单独的 `bind` 记录，不能把任意指针塞进 aux。名称按稳定 method/resource ID intern，字典满则降级为数字 ID 并记 loss，不在热路径无限扩容。
-
-门面接口可以是稳定 C ABI，C++ scope/operation helper 在外层提供易用性。调用原则如下，函数名是拟议接口：
-
-```cpp
-if (kb_trace_enabled(KB_TRACE_IO) && trace_context.recording_enabled) {
-  // Only now read the clock and construct a fixed-size event.
-  kb_trace_emit(KB_OP_ENQUEUE, operation_id, parent_span_id, queue_id, bytes);
-}
-```
-
-`recording_enabled` 表示该上下文已获候选记录预算，不表示最终会导出。`export_decision={pending, keep, drop}` 是独立的尾部决定，不能以“尚未 keep”为由跳过前置事件；上下文在异步边界必须稳定、安全发布。公共资源、共享 batch 和解帧前的关联事件按独立公共预算记录，不能仅受某个 RPC 的开关控制。详细生命周期见 19.17。
-
-关闭检查应早于读时钟、参数格式化和大对象求值；首次线程注册/内存准备放控制路径。不能只在 `emit()` 内检查，调用者已执行昂贵参数表达式就失去意义。ID 生成、generation 检查和数据路径必需的 operation metadata 不应为了 tracing 关闭而失效。
-
-BEGIN/END 必须关联同一 span 实例；多次等待、yield/resume 产生新 segment，不覆盖同一个 start/end 槽。导出时 RPC 放逻辑轨道，真正的执行 segment 放真实线程轨道，用 flow 连接。一个逻辑轨道不能用普通栈式 B/E 表达任意交叉重叠的 RPC；可对抽样 RPC 分轨，或使用支持其语义的异步事件，且限制轨道/元数据数量。
-
-### 19.7 有界 recorder 与 flight recorder：不能把日志本身做成竞态源
-
-第一层是每个 OS writer 到 collector 的固定容量 SPSC staging ring：
-
-1. producer 独占 head，检查空位后写 payload，再以 release 发布 head；collector 以 acquire 获取可读范围，复制完后以 release 推进 tail。
-2. producer 以 acquire 观察 tail，**从不修改 consumer 的 tail，也不覆盖尚未消费的槽**。满时 drop-new，业务线程不等待、不落盘、不申请更大的 ring。
-3. `local_seq` 对每次尝试递增；另维护累计 drop counter，即使最后几条全部丢失也能报告。主动未录制、正常 tail drop、预算拒绝和意外 overflow 分开统计。
-4. collector 定期批量消费，不为每个事件发一次 eventfd，不在 owner 每轮 poll 调用 printf。停止采集要完成 writer 停用/确认、最终 drain、字典与 drops 输出；不是设置一个标志就假设所有线程停止写入。
-5. 线程退出后 ring 先进入 retired 状态，等 collector 与 writer 生命周期握手后回收。固定等待 2 ms/10 ms 不是 C++ 内存安全保证；信号处理器也不能复用被中断线程的 SPSC producer，第一版不支持从 signal handler 记这类事件。
-
-第二层才是“飞行记录器”：collector 把已接收事件写进有上限的历史页池，只淘汰无有效候选引用且未被导出占用的旧历史。页状态为 `FREE → WRITING → SEALED → PINNED → FREE`；trigger 时由唯一 writer 封口并冻结选中历史页，把只读 handles 交给 exporter，收到释放确认后才能重用。候选引用本身也有预算与期限，不能让慢请求无限 pin 住整个池；空间耗尽时截断/拒绝并报告，不阻塞业务。导出中的冻结页绝不被覆盖，重型 snapshot 的第二次 trigger 合并或拒绝，不能无限扩张。
-
-这一区分很重要：staging overflow 是非预期丢记录，影响可信度；历史窗口正常滚动只是按策略遗忘旧数据，要记录最早保留时刻。不能在同一个“满了就直接覆盖”的 producer ring 上同时承担这两种职责。
-
-触发来源可包括 RPC 超时/超过阈值、ACK_TIMEOUT、JFR 低水位、长时间 SQ 满或人工请求。阈值按方法/消息大小配置；“最多一个导出任务、冷却 30 s”等仅是重型 snapshot/detail 升级的实验参数，不能作为逐 RPC tail keep 的冷却门禁。单个 exporter 可批量处理多个 keep，请求因实际预算被拒绝时单独计数。触发前保留低频关联与状态，触发后允许短时提高细节级别；**触发后才开启的 per-WR 细节无法解释触发前已经过去的过程**。
-
-### 19.8 时间、容器和跨机器：先把坐标系对齐
-
-同一台机器上的“都写 ns”并不足以证明时间可比较。每个源必须声明 clock ID、时间原点和校准方式；native Perfetto 可以用 ClockSnapshot 映射不同 clock domain。第一版优先 SDK + 同机采集服务统一处理应用/内核时间，再支持自定义 recorder 时钟映射。[Perfetto clock sync](https://perfetto.dev/docs/concepts/clock-sync)
-
-- 旧 per-packet trace 使用 `CLOCK_MONOTONIC`；brpc 当前非内部构建的相应时间路径也基于 monotonic，但部分接收打点先取 `received_us` 再乘 1000，其分辨率仍是 us。
-- PROF 若启用原始 CPU counter，必须保留频率/校准；连接 LINKTRACE 相对首事件计时也须补原点。不能把这些值直接当作绝对 monotonic ns。
-- time namespace、容器 PID namespace 和宿主机 ftrace 身份要验证。manifest 记录 host boot、runtime、容器标识、进程/线程启动身份，以及容器 TID 到 host TID 的映射；无法解析时显示独立应用轨道，不能凑一个相同数字强行 join。
-- NTP/PTP 的存在不等于任意两机时钟已经达到亚微秒精度。跨机 flow 可说明因果关系，但计算单向 network time 还需要偏差/漂移及误差界。第一阶段分别解释客户端和服务端的本地时间，优先使用不依赖固定偏移的往返区间。
-
-跨机采集后续可评估 Perfetto 的多机 relay/同步架构，但仍须报告时钟不确定度；如果误差 ±20 us，就不应声称测到了 3 us 的单向差异。[多机架构](https://perfetto.dev/docs/deployment/multi-machine-architecture)
-
-### 19.9 现在就能做什么：复用仓库已有日志工具
-
-这一节使用的脚本和开关**目前已存在**，但它们输出分解表和静态 SVG，并不是完整 Perfetto timeline，也没有 OS 调度信息。只在具备 UB 运行环境、对应 brpc `BRPC_WITH_URMA` 构建并实际走 UB-active 路径的程序上使用。它们尚非 TCP/SHM 通用方案。
-
-**步骤 A：在隔离测试轮次开日志。** 双端分别启动受测程序时设置如下开关；`./your_binary` 和目录是占位符，替换成真实程序与已存在的可写目录，保留原业务/网络参数：
-
-```bash
-UBS_PKT_TRACE_ENABLE=1 ./your_binary \
-  -rpc_link_trace_enable=true \
-  -rpc_link_trace_dir=/existing/writable/trace-dir
-```
-
-brpc 写 `rpc_trace_<pid>.log`，目录默认 `/tmp/brpc`，记录器不负责创建该目录；packet 文件在 `/tmp/ubsocket/ubs_pkt_trace_<pid>.log`。两者使用 append，要隔离 capture，记录文件起止位置和进程实例，不能把 PID 复用后的旧日志混进本轮。不要为清理日志删除不属于本轮的数据。当前 packet 全量采集可能明显扰动性能，先做短时低并发验证，再开单独的性能对照轮次。
-
-**步骤 B：收集本轮双端四个文件。** 以下名称是人工整理后的输入文件名；先选一个客户端与一个服务端，避免全网同名 cid 错配：
-
-```bash
-python3 ubs-comm/tools/trace/join_rpc_trace.py \
-  --client rpc_trace_client.log \
-  --server rpc_trace_server.log \
-  --client-pkt ubs_pkt_trace_client.log \
-  --server-pkt ubs_pkt_trace_server.log \
-  --top 20 \
-  --csv rpc-breakdown.csv
-```
-
-**步骤 C：生成已有静态汇总图。**
-
-```bash
-python3 ubs-comm/tools/trace/gen_flowchart.py \
-  --client-rpc rpc_trace_client.log \
-  --server-rpc rpc_trace_server.log \
-  --client-pkt ubs_pkt_trace_client.log \
-  --server-pkt ubs_pkt_trace_server.log \
-  --output rpc-latency-flowchart.svg
-```
-
-真实命令入口见 [join_rpc_trace.py](ubs-comm/tools/trace/join_rpc_trace.py)、[gen_flowchart.py](ubs-comm/tools/trace/gen_flowchart.py)。后者没有“导出 Perfetto”或“选单条 cid 时间线”的现成参数，不能把 SVG 汇总当作这些功能已经实现。
-
-当前四点的语义大致是客户端 socket 提交 T1、服务端接收 T3、服务端 socket 提交响应 T4、客户端接收 T2。`T2−T1` 不含 T1 前的全部序列化，也未覆盖最终 callback；它不是完整应用调用时延。`(T2−T1)−(T4−T3)` 可抵消两机固定时钟偏移，但仍受漂移、打点口径和未覆盖区间影响，不能直接叫“纯网络 RTT”。工具的 `--split-fabric` 基于对称假设，只能输出近似拆分。
-
-旧文件不含 schema/run/host/session generation，packet 文件也没有真实 TID，因此转换器不能补造线程调度归因。旧 byte-cursor bridge 存在范围/重用推测，先作为迁移桥梁，并报告未匹配、重复、歧义，而不是拿旧 join 规则直接支撑 3000×3000 full-mesh。
-
-### 19.10 不写 SDK，先亲手打开一个 timeline
-
-以下是**完整的合成 Chrome Trace Event JSON**，可手工保存为 `kbtrace-demo.json`，在 [Perfetto UI](https://ui.perfetto.dev/) 选择 Open trace file。它展示“worker 提交 → owner 执行”的两行、flow 箭头和 counter，不是 19.2 的实测复现，也不包含内核调度。此 JSON 文件未随本文自动创建。
-
-```json
-{
-  "traceEvents": [
-    {"name":"process_name","ph":"M","pid":100,"tid":0,
-     "args":{"name":"kbsocket-demo-synthetic"}},
-    {"name":"thread_name","ph":"M","pid":100,"tid":11,
-     "args":{"name":"rpc-worker-demo"}},
-    {"name":"thread_name","ph":"M","pid":100,"tid":12,
-     "args":{"name":"io-owner-demo"}},
-    {"name":"owner_queue_depth","cat":"kb.io","ph":"C",
-     "pid":100,"tid":12,"ts":1000,"args":{"queued":1}},
-    {"name":"rpc.enqueue","cat":"kb.rpc","ph":"X",
-     "pid":100,"tid":11,"ts":1000,"dur":20,
-     "args":{"rpc_id":"demo-rpc-1","op_id":"demo-op-1"}},
-    {"name":"handoff","cat":"kb.io","ph":"s",
-     "pid":100,"tid":11,"ts":1010,"id":1},
-    {"name":"kb.post","cat":"kb.io","ph":"X",
-     "pid":100,"tid":12,"ts":1030,"dur":15,
-     "args":{"rpc_id":"demo-rpc-1","op_id":"demo-op-1"}},
-    {"name":"handoff","cat":"kb.io","ph":"f","bp":"e",
-     "pid":100,"tid":12,"ts":1031,"id":1},
-    {"name":"owner_queue_depth","cat":"kb.io","ph":"C",
-     "pid":100,"tid":12,"ts":1030,"args":{"queued":0}}
-  ]
-}
-```
-
-打开后选中 `rpc.enqueue` 和 `kb.post`，看起止时间、参数中相同的 op_id，以及连接两者的 flow。这里箭头只说明交接；它不能告诉我们 owner 为什么到 1030 us 才执行，更不能仅凭这个交接间隔判定内核调度慢。真实原因需要追加资源/任务事件和 sched。
-
-阅读与生成格式时注意：
-
-- `ph:"X"` 是完整区间，`M` 是轨道元数据，`C` 是 counter，`s/f` 是同一 flow 的起止。示例 flow 端点位于相应区间内，使用相同的 name/category/id。
-- Chrome JSON 的 `ts`、`dur` 单位是 **us**，native Perfetto/SQL 通常是 ns；即使设置 `displayTimeUnit` 也不能把 ns 数字原样塞进这些 JSON 字段。
-- 示例 pid/tid 只是展示标识，不能与真实 ftrace 按数字合并。长 ID 用字符串，避免 JSON 消费者的 53-bit 整数精度问题；flow 的短 ID 由 exporter 在 capture 内唯一分配。
-- 同一线程轨道上的区间须正确嵌套，跨线程逻辑 span 另建轨道。缺失 END 不要编造正常结束；输出 incomplete 标志。
-
-格式能力与限制参考 [Perfetto 支持的外部格式](https://perfetto.dev/docs/getting-started/other-formats)。JSON 适合验证和小规模离线桥接；正式高频采集优先 native protobuf/SDK，避免热路径格式化 JSON。
-
-### 19.11 正式最小闭环：应用 SDK 与内核 sched 联合录制
-
-#### 19.11.1 先接一处同步调用，验证数据确实进入采集服务
-
-下面是**集成示例，不是仓库已有实现，也不是独立程序**。固定兼容版本的 Perfetto SDK/工具，编译链接其 SDK（amalgamated 版本为 `perfetto.h`、`perfetto.cc`，C++17 与线程库），由应用初始化调用一次 `InitKbTrace()`；真正执行受测调用才能产生事件。
-
-```cpp
-#include <cstdint>
-#include <perfetto.h>
-
-PERFETTO_DEFINE_CATEGORIES(
-    perfetto::Category("kb.rpc"),
-    perfetto::Category("kb.io"),
-    perfetto::Category("kb.task"),
-    perfetto::Category("kb.resource"),
-    perfetto::Category("kb.detail"));
-PERFETTO_TRACK_EVENT_STATIC_STORAGE();
-
-void InitKbTrace() {
-  perfetto::TracingInitArgs args;
-  args.backends = perfetto::kSystemBackend;
-  perfetto::Tracing::Initialize(args);
-  perfetto::TrackEvent::Register();
-}
-
-void ExampleSynchronousPost(uint64_t operation_id) {
-  TRACE_EVENT("kb.io", "kb.post", "operation_id", operation_id);
-  // Put the real synchronous post call here. Do not yield a bthread here.
-}
-```
-
-这是作用域 slice，只描述同步 post 调用的 wall time，不包含之后等待 CQE 的时间。跨 `.cc` 使用公共分类声明，static storage 只定义一次；多个 DSO 应统一 SDK/注册所有权，避免各自带一套互不相通的 recorder。第一版用 system backend，应用是 producer，外部 consumer 控制录制；不要另开 in-process session 后就期待它与外部 sched 自动合并。[应用 tracing](https://perfetto.dev/docs/getting-started/in-app-tracing)、[SDK 集成](https://perfetto.dev/docs/instrumentation/tracing-sdk)
-
-跑通这个最小 slice 后，再由 TraceFacade 映射 19.4 的事件、逻辑 track 和 flow；不建议初学者第一次就接完整 bthread switch 路径。
-
-#### 19.11.2 准备采集服务与权限
-
-由管理员在**目标宿主机**部署兼容版本的 `traced`、`traced_probes` 和 `perfetto`，遵守现有服务管理方式，不重复启动抢占 socket。`traced_probes` 需要 tracefs 和进程元数据访问权限；应用不需要为了埋点而以 root 运行。容器只获得经授权的 producer socket，consumer 权限留在受控 collector，不能把全机 tracing 接口开放给所有租户。
-
-确认应用、probes、consumer 连接同一个 tracing service，并验证容器到宿主机的线程身份；基础 sched 方案不启用 PMU，故不需要为了它修改 `perf_event_paranoid`。先查询：
-
-```bash
-perfetto --query
-```
-
-应能发现 `track_event`、`linux.ftrace`、`linux.process_stats` 数据源；同时检查应用已连接，不能只因 probes 存在就认为应用事件也有了。部署细节见 [traced 服务](https://perfetto.dev/docs/reference/traced)、[traced_probes](https://perfetto.dev/docs/reference/traced_probes)。本次文档更新不启动或修改这些服务。
-
-#### 19.11.3 一份 10 秒采集配置
-
-以下内容保存为 `kbsocket-minimal.pbtxt` 后再运行命令。它是单宿主机短时验证起点：应用中心 buffer 16 MiB，内核/进程元数据中心 buffer 32 MiB；这些不是生产容量承诺，也不包含各 producer、内核 ftrace ring 和 UI 的内存。
-
-```textproto
-duration_ms: 10000
-
-buffers {
-  size_kb: 16384
-  fill_policy: DISCARD
-}
-buffers {
-  size_kb: 32768
-  fill_policy: DISCARD
-}
-
-data_sources {
-  config {
-    name: "track_event"
-    target_buffer: 0
-    track_event_config {
-      disabled_categories: "*"
-      enabled_categories: "kb.rpc"
-      enabled_categories: "kb.io"
-      enabled_categories: "kb.task"
-      enabled_categories: "kb.resource"
-    }
-  }
-}
-
-data_sources {
-  config {
-    name: "linux.ftrace"
-    target_buffer: 1
-    ftrace_config {
-      ftrace_events: "sched/sched_switch"
-      ftrace_events: "sched/sched_waking"
-      ftrace_events: "sched/sched_wakeup"
-    }
-  }
-}
-
-data_sources {
-  config {
-    name: "linux.process_stats"
-    target_buffer: 1
-    process_stats_config {
-      scan_all_processes_on_start: true
-      record_thread_names: true
-    }
-  }
-}
-```
-
-`target_buffer` 是从 0 开始的中心 buffer 索引。分开是为了避免应用记录直接挤占 sched 的中心存储，不代表 CPU 或内核 ring 隔离。`DISCARD` 满后丢新数据，方便初始验证保留开头，但必须检查有效覆盖时段；需要滚动保留最近历史时可选 `RING_BUFFER`，同时接受开头截断和不完整 span。两种策略都不保证 10 秒全量留存。[配置说明](https://perfetto.dev/docs/concepts/config)、[缓冲区模型](https://perfetto.dev/docs/concepts/buffers)
-
-目标内核必须确实提供所选 tracepoint；若只支持/只采集 waking，按照 19.2 降低唤醒区间归因精度。这里未默认启用高容量的 `kb.detail`，也没有采集调用栈或 payload。全机 sched 采集量可能远大于一个容器的应用事件，不能用容器 4 CPU 推算宿主机总量。
-
-额外采集 `sched_wakeup` 也不代表标准 `thread_state` 表自动改成从它起算。当前 Perfetto 的 waking 解析会据此建立 R 状态；wakeup 可用于原始事件校验和自定义派生，是否修正标准区间须按固定工具版本验证。因此 SQL 的 R 类重建区间可能包含唤醒过程，不等同于 19.2 教学假设下精确的 120 us。[ftrace parser](https://github.com/google/perfetto/blob/main/src/trace_processor/importers/ftrace/ftrace_parser.cc)、[thread state tracker](https://github.com/google/perfetto/blob/main/src/trace_processor/importers/common/thread_state_tracker.cc)
-
-使用有 consumer 权限且能写输出目录的账号录制，在这 10 秒内运行受测 RPC：
-
-```bash
-perfetto --txt -c kbsocket-minimal.pbtxt -o kbsocket-minimal.pftrace
-```
-
-命令结束后，文件应同时含应用区间和调度信息。只看到 sched：检查 SDK backend、分类和连接；只看到应用：检查 probes 权限、tracepoint 和配置；两者都有但线程对不上：检查 namespace / clock / track 元数据，而不是手工拖动到“看起来对齐”。[采集 CLI](https://perfetto.dev/docs/reference/perfetto-cli)
-
-### 19.12 如何读图，以及第一批可使用的 SQL
-
-#### 19.12.1 看图顺序：先确认记录可信，再解释慢在哪里
-
-在 UI 打开 `.pftrace` 后，不要先找最长的 `post→CQE` 就下结论：
-
-1. 看本轮 capture 时间、采样策略、丢记录、进程/线程与 clock 映射。未覆盖完整生命周期的 RPC 标为 partial，不纳入完整时延分布。
-2. 搜索目标 `logical_call_id` 或 `kb.rpc` slice，选中一条慢调用；展开它的 attempt，确认有没有重试/backup，以及使用 UB/TCP/SHM 哪个 backend。
-3. 沿 flow 找 serialize、operation enqueue、owner dequeue、实际 post、接收交付、decode、callback。缺失的区间标 unknown，而不是用相邻事件补全协议。
-4. 对最长的等待，检查同一资源 ID 的 counter 和 wait reason。对真实 task 执行片段，检查对应 OS 线程的 Running/runnable/sleeping。
-5. 最后才决定需要 CPU profile、更多 WR 细节、设备计数还是调度/配额实验，避免同时打开所有高成本探针。
-
-下面查询使用 Perfetto 自带表，不假设仓库已存在自定义 `rpc_breakdown` 数据表。native SQL 的 `ts/dur` 单位通常是 ns，因此 `/1000.0` 转成 us。[SQL 表参考](https://perfetto.dev/docs/analysis/sql-tables)
-
-#### 19.12.2 找应用 slice 与真实线程
-
-只接入 19.11 的最小示例时，查询 `kb.post`；接入完整 adapter 后才会出现 `kb.rpc`：
-
-```sql
-SELECT s.id, s.name, s.ts, s.dur / 1000.0 AS duration_us,
-       t.name AS track_name
-FROM slice s
-JOIN track t ON t.id = s.track_id
-WHERE s.name IN ('kb.rpc', 'kb.post') AND s.dur >= 0
-ORDER BY s.dur DESC
-LIMIT 20;
-```
-
-查看线程身份：
-
-```sql
-SELECT t.utid, t.tid, t.name AS thread_name,
-       p.upid, p.pid, p.name AS process_name
-FROM thread t
-LEFT JOIN process p ON p.upid = t.upid
-ORDER BY p.pid, t.tid;
-```
-
-`utid/upid` 是 Trace Processor 内部的线程/进程身份，不是 Linux 的 tid/pid。SDK 示例的 `operation_id` 通常可在 slice 参数中找到；若使用 `EXTRACT_ARG`，先在 `args` 核对实际 key，不要假定所有导入格式都使用 SDK 的 `debug.*` 前缀。
-
-#### 19.12.3 把一个真实线程 slice 与调度状态求交
-
-把下方 `456` 替换成选中的**真实线程轨道**上的 slice.id，例如一个同步 post 或一次 task 执行片段。它不是整条跨线程 RPC 的 ID：
-
-```sql
-WITH selected AS (
-  SELECT s.ts, s.dur, tt.utid
-  FROM slice s
-  JOIN thread_track tt ON tt.id = s.track_id
-  WHERE s.id = 456 AND s.dur > 0
-),
-overlaps AS (
-  SELECT st.state,
-         MIN(st.ts + st.dur, x.ts + x.dur)
-           - MAX(st.ts, x.ts) AS overlap_ns
-  FROM selected x
-  JOIN thread_state st ON st.utid = x.utid
-  WHERE st.dur > 0
-    AND st.ts < x.ts + x.dur
-    AND st.ts + st.dur > x.ts
-)
-SELECT state, SUM(overlap_ns) / 1000.0 AS duration_us
-FROM overlaps
-GROUP BY state
-ORDER BY duration_us DESC;
-```
-
-`Running` 是线程获得 CPU 的状态；`R/R+` 是 runnable 类重建状态，其中基于 waking 的区间可能含唤醒过程，见 19.11；`S` 只说明睡眠，不能单凭它确定在等 credit 或网络。精确指令执行时间还可能受 IRQ 等影响，普通调度交集不等于 PMU 周期计数。某些 Android 才有的 blocked-reason 事件不能假定在 upstream Linux 6.16 上可用。[调度分析](https://perfetto.dev/docs/data-sources/cpu-scheduling)、[Linux 采集限制](https://perfetto.dev/docs/getting-started/linux-cookbook)
-
-结果之和若少于所选 slice 时长，剩余是未覆盖/未知，不能自动算作 Running；若大于，则检查重复区间、时钟和 join。跨线程 RPC 必须先拆成已知 task segments，再分别与其 OS 线程求交。不能把任意 worker 在整条 RPC 窗口中的 CPU 时间全算给该 RPC。
-
-#### 19.12.4 每次分析先检查 loss
-
-```sql
-SELECT name, idx, value, severity
-FROM stats
-WHERE severity = 'data_loss' AND value != 0;
-```
-
-这能发现 Perfetto 已统计的 loss，但不能替代自定义 recorder 的 drop/字典丢失/缺少 END 报告。“此查询无行”不是“业务链路肯定完整”。正式 exporter 须额外输出 `events_attempted/emitted/dropped`、关联成功/歧义数、完整 RPC 数、截断窗口、clock error 与采样政策；尾采样的正常丢弃、预算拒绝和意外 loss 分开统计，见 19.17.8。[Perfetto 丢记录检查](https://perfetto.dev/docs/concepts/buffers)
-
-### 19.13 从图到原因：证据门槛与自动归因算法
-
-**第一版必须允许回答 unknown。** 观察到一个长区间，只能证明两端事件相隔较久；准确命名原因需要额外证据。
-
-| 想判定的原因 | 至少需要的证据 | 不能使用的捷径 |
-|---|---|---|
-| 序列化/拷贝执行开销 | 同一 RPC 的函数区间、task/线程调度交集；必要时栈样本 | 函数 wall time 全算 CPU time |
-| 用户态运行队列拥塞 | task ready/run、owner enqueue/dequeue、期间处理的任务/批次 | 只看 epoll 返回到 handler 的间隔 |
-| 内核 runnable 延迟 | 已确定执行归属的 worker、wakeup/switch 和 handoff 信息 | 任意 worker 的 sched 间隔归给目标 RPC |
-| CPU quota 节流 | 对应 cgroup 的配额、节流时间/计数与同窗口调度证据；逐 RPC 定量还需可关联的节流区间 | 看到 4 CPU 容器或长 runnable 就断言 throttle，或将累计统计增量分配给单条 RPC |
-| credit / RNDV grant 等待 | 判定层的 wait begin/end、资源 ID、所需量/余额、grant 事件 | 把 EAGAIN、SQ 满和 RNR 混为同一种反压 |
-| SQ 容量等待 | 实际 accepted/retired、SQ limit、容量不足分支 | post 调用耗时长就认定设备队列满 |
-| RNR / ACK_TIMEOUT | 可取得的设备状态、错误完成、重试/错误计数及其作用域 | `post→cq.observed` 很长就声称发生 RNR |
-| CQ 处理/通知延迟 | poll batch、owner 调度、notify queued/flushed、task ready | 软件 CQE 时间冒充硬件收包/完成时刻 |
-| CQE 硬件完成后的观察延迟 | 明确语义的硬件时间戳、对应 CQE 身份及主机时钟映射/误差；无硬件时按 19.18 降级 | 把全部 off-CPU 时间视为 CQE 等待，或从 post→observed 减掉调度时间得到“网络耗时” |
-| SHM 慢 | publish/consume/release、slot/lease、缺页/NUMA/通知证据 | 不经过 NIC 就断言没有等待或拷贝开销 |
-
-`post→cq.observed` 同时可能包含设备排队、传输、对端资源等待、软件轮询不及时和聚合完成观察延迟。无法取得硬件细分时，统一命名 `transport_completion_observation`，不命名为 fabric latency。设备共享计数若不能按 WR/session 拆分，只作为相关资源证据，不伪造成单条 RPC 的精确重试次数。
-
-自动报告按以下算法实现：
-
-1. 用稳定 ID 构建 RPC → attempt → operation / task / WR 的有向依赖图，保留分叉/并行关系；先拒绝跨 generation、重复绑定或不可能的顺序。
-2. 用 enqueue、wait、ready、run、yield、complete 及相关 sched 事件，把分析窗口切成互不重叠的小区间。每段只有一个主类别，同时保留逻辑状态、线程状态和证据来源。
-3. 明确的逻辑等待先标对应资源；ready→run 仅在 worker 归属可证实时细分为 wake pending、kernel runnable、worker other work。归属不明保留 runtime ready wait。
-4. task 已在执行时，再与该线程状态求交；同步父函数、整个 RPC 等 inclusive span 只做展开视图，汇总不重复相加。
-5. 并行子操作按实际 join 依赖找关键路径，不能把并行 READ、多个 owner 的 CPU 时间串行相加。CPU 工作量与 RPC wall-time 分别输出，前者可能大于后者。
-6. 每个已选窗口校验 `Σ互斥叶区间 = window duration`，未知也占一类；校验失败输出 accounting error。错误、取消和未完成 span 不伪造成正常结束。
-
-建议报告每行包含 `rpc/attempt/backend, duration, category, evidence_ids, confidence, unknown_us, completeness`。可信度至少区分 `measured`（直接事件）、`derived`（按已验证关系推导）、`approximate`（含时钟/设备/采样假设）、`unknown`。采集断档的结果不能与完整样本混入同一精确分位数。
-
-### 19.14 从现有 PROF、SplitTrace 和 per-packet trace 吸收什么
-
-以下基于第 2 章记录的本地源码版本，不是对所有历史版本的笼统判断。
-
-| 现有机制 | 值得保留 | 不能直接照搬的部分 / 对新架构的影响 |
-|---|---|---|
-| `PROF_START/END` | 固定枚举、TLS 聚合、count/total/min/max、可开关；适合低成本找热点 | 主要是函数 wall time，缺调用身份/依赖；首次 TLS/注册存在分配与锁，关闭不等于绝对零成本。1024 个扩展样本不能稳定估计极端 p99.99；不同函数的 p99 不能相加成 RPC p99 |
-| `SplitTrace` | 用分阶段模型解释一次收发、可采样；比完全独立的函数统计更接近因果 | 当前数据路径无有效 STRACE 调用，默认 drain 的 now=0 与 DONE 延迟检查不匹配，结束时间也存在置 0 路径，不能声称已经形成可用闭环。单个 phase 只有一对时间戳，无法表示多次 wait/resume；新设计用不可变事件序列 |
-| per-packet trace | SN 范围、post/READ/CQ/notify/deliver 阶段和 byte cursor，是 RPC→transport 桥梁的基础 | 当前 full post 成功才记部分范围锚点；缺 run/session generation/TID。不能靠 fd 和时间邻近解决 ABA，也不能凭旧记录补造 sched 关联 |
-| brpc RPC 四点 + join | 用 RPC 边界和字节累计把库内阶段向上关联；已有 CSV/静态图工具，适合作为迁移入口 | 尚非完整应用 RPC；部分接收时间来自批量 `received_us`。多 RPC/WR、多客户端 cid、部分 post、时钟误差需要新 schema 明确表达 |
-| bthread TaskTracer / LINKTRACE | 前者有运行时状态/栈的知识，后者已有连接阶段思路 | 状态快照不等于历史时间线；LINKTRACE 相对起点时间不等于统一时钟。复用挂点知识，不复用错误的时间/身份假设 |
-
-具体并发经验不能忽略：当前 packet recorder 每线程 65536×32 B，约 2 MiB；首次创建会分配/注册，后台周期格式化写文件。其覆盖处理会由 producer 推进 tail，并与 consumer 读取/推进交错，不能当作已经证明安全的无锁覆盖队列；停止后台线程也不能只依赖 detached + flag 保证最后 drain。新 recorder 必须遵守 19.7 的所有权与回收协议，必要时宁可丢诊断记录，也不能引入数据竞争影响业务。
-
-可直接定位的入口：[PROF 定义](ubs-comm/src/ubsocket/csrc/profiling/ubsocket_prof.h)、[SplitTrace 实现](ubs-comm/src/ubsocket/csrc/profiling/trace/ubsocket_trace.cpp)、[packet recorder](ubs-comm/src/ubsocket/csrc/profiling/trace/ubs_pkt_trace.cpp)、[RPC recorder](brpc/src/brpc/rpc_link_trace.cpp)。将这些旧机制转换到统一 schema 是迁移工作，本文未修改其代码或声称已经修复。
-
-### 19.15 4 CPU / 16 GiB 下的采样和预算
-
-采用三档，避免把 3000×3000 full-mesh 的所有包常驻全量记录。因果诊断启用时，默认选择有界轻量候选加尾采样；随机 head sampling 仅作为降低前置成本的备选，不承诺捕获任意慢请求，见 19.17。
-
-| 档位 | 记录内容 | 使用方式 |
-|---|---|---|
-| 常驻 metrics | 请求/错误/等待计数、资源水位、延迟直方图、trace 自身 drops | 有界低频聚合，不依赖是否采到目标 RPC |
-| 尾采样 causal trace | 所有 RPC 在预算内先留轻量候选及必要公共历史；按逻辑 RPC 汇合其 attempt/task/operation | 慢/错优先导出，正常请求默认不导出或只留少量对照；候选记录资格与 keep 决定分开，不在各层独立抽样 |
-| 限时 detail | 选 peer/session/资源池/短窗口的 WR、RNDV、CQ batch，必要时 sched 与 CPU profile | 人工或阈值触发，设置时长、字节数、并发导出和冷却上限 |
-
-以**单个端点进程** 1000 RPC/s、每 RPC 40 条、每条 64 B 为算术例子：全请求轻量候选的事件体写入量 `1000×40×64=2,560,000 B/s`，10 s 累计产生 25.6 MB，但不要求同时保留全部。若尾部最终选中 1%，其 RPC 私有事件导出量约 25.6 kB/s，**前置写入量仍是 2.56 MB/s，埋点 CPU 开销没有变成 1%**。原来的 head sampling 1% 才是在起点不记录其余请求，代价是无法事后找回它们的慢请求历史。
-
-以上未计入元数据、共享资源事件、sched、编码开销和后台 CPU，不是实际性能结果。40 条也不是硬上限：多 SGE、RNDV、重试、批处理会改变数量；双端都采时分别预算。最终选中的慢请求往往事件更多，导出量也未必与选中请求比例严格线性。
-
-候选自定义 recorder 预算如下，与 19.11 的 SDK 中心 buffer 属于不同部署，不应当作同一份内存：
-
-| 项目 | 候选硬上限 |
-|---|---:|
-| 16 个 OS writer，每个 4096×64 B staging ring | 4 MiB |
-| 活跃/完成待判候选与近期公共历史，共享页池 | 8 MiB |
-| 最多一个冻结 snapshot | 8 MiB |
-| 字典、控制状态、导出 workspace | 4 MiB |
-| 合计 | 24 MiB |
-
-容器 4 CPU 不代表只有 4 个线程；超出 writer 数上限要拒绝新增 writer 记录并记原因，而不是无界分配；这也会影响该 writer 上的轻量候选，相关 trace 必须标记不完整，不能只说 detail 被关闭。8 MiB 历史在 100k events/s、64 B/event 下理论上只保留约 1.31 s，1M events/s 时约 131 ms，还没扣元数据。因此配置应声明字节预算并报告实际保留时长，不能承诺无条件保存最近 10 s。
-
-常驻历史不必按每个 fd 分配 ring：40k 常驻连接多数不活跃，应按 OS writer/owner 分片，按活跃操作保留有界身份。候选 RPC 的上下文可以存于 operation，但不能因诊断而无限延长大包 BufferLease 或 DMA 资源生命周期；保存稳定 ID/必要元数据，不保存裸指针等待以后解引用。尾采样的 active、完成后暂存、keep 待导出都计入上述预算，不再暗加一份无界 per-RPC 缓存。
-
-慢调用触发有选择偏差：触发窗口中的 p99 不能当作全流量 p99。head sampling 不保证拿到每次罕见超时；tail trigger 不保证此前所有细节被保留。报告必须显示采样策略与观察窗口，全流量分位数来自独立 metrics。
-
-需要分析指令、cache miss 或内核栈时，可对选定线程/短窗口增加 Perfetto `linux.perf` 或独立 perf 采样。采样周期、PMU multiplex、权限、符号与探针扰动都要记录；少量 RPC 的 instruction 数不能由稀疏栈样本精确反推。[CPU profiling](https://perfetto.dev/docs/getting-started/cpu-profiling)
-
-### 19.16 实施任务、交付物和验收：怎样确认不是“只画了一张图”
-
-下面名称是**拟新增模块/产物**，不是当前已有命令；实现 PR 应据实际目录布局确定路径。
-
-| 阶段 | 具体交付 | 完成标准 |
-|---|---|---|
-| O0：理解格式 | 教学 JSON fixture、事件字典、身份/时钟说明 | 能解释 scope/flow/counter 与 sched 的差别；示例和实测明显区分 |
-| O1：迁移桥梁 | legacy log reader、byte-range join、离线 Perfetto exporter | 单 client/server 可从 RPC 点到现有阶段；无法关联的事件明确保留 unknown，不伪造 TID/网络时间 |
-| O2：真实跨层闭环 | `TraceFacade`、brpc adapter、SDK backend、`kb-observer` 最小宿主机配方与身份映射 | 同一真实 RPC 能关联 task→operation→completion→callback，并与真实 worker 的 sched 对齐；UB/TCP/SHM 上层事件语义一致 |
-| O3：生产有界采集 | recorder、本机尾部选择、候选上下文传播、history/trigger、lease 台账快照与 loss/coverage 报告 | 慢/错与普通请求的保留规则可测；故障、迟到、停止与满环均安全；内存/导出有硬预算，见 19.19–19.21 |
-| O4：高级诊断 | 自动关键路径报告、跨机同步与事后保留协调、限时 CPU/PMU 联合采样、可选硬件时间戳 adapter | 双端完整度、误差界与证据可查；硬件能力独立门禁，不阻塞软件侧交付，不以残差冒充硬件时间 |
-
-每次 capture 至少输出一个 bundle：
-
-```text
-capture-<id>/
-  manifest.json        # schema/commits/kernel/device/container/clock/sampling/config
-  application.pftrace  # or one combined capture.pftrace for the system backend
-  kernel.pftrace       # only when separately recorded, with explicit merge metadata
-  quality.json         # drops, truncation, mapping coverage, clock uncertainty
-  rpc-summary.csv      # measured/derived/approximate/unknown and evidence IDs
-```
-
-分开记录的文件不是自动可合并；bundle 必须说明是否已对齐、使用了什么映射及工具版本。导出器流式读取冻结页，不先在内存构造无界 JSON。默认不采 payload、token/key、原始 buffer 地址或敏感 RPC 参数；method/peer 等元数据按部署需要脱敏，trace 文件设置访问权限和保留期，不默认上传外部服务。
-
-正确性测试必须包含：
-
-- 无 UB 硬件的合成 fixture：19.2 的 245 us 总账、ready wait 不重复计时；已知 clock offset、缺失 END、丢记录和截断窗口应输出 partial/unknown。
-- 一次 post 部分成功、一个 WR 多 RPC、一个 RPC 多 WR、CQE 聚合、多个 socket 共享 jetty、fd/jetty/task generation 复用，均不串联错误身份。
-- bthread 首次运行/yield/resume/steal、异步 done、callback 删除 Controller、retry/backup、取消和故障重连，逻辑 span 与线程 slice 均符合真实生命周期。
-- producer/consumer 满环、线程退出、停止时仍有 writer、连续 trigger、collector/exporter 暂停与磁盘满；业务前进与内存安全不依赖日志导出成功。使用并发压力测试/TSan 检查，不以固定延时规避竞态。
-- 测试环境注入分别可控的 owner 队列延迟、credit/grant 等待、worker 调度竞争、CPU 计算和 CQ poll 停顿；报告应把它们分到不同原因。没有设备细分证据的停顿仍须保留 observation/unknown，不能“为了通过测试”强标 RNR。
-- 尾采样专项：普通成功、结束时判慢、在途超阈值/永不结束、快速错误、callback 单独变慢；迟到 CQE、END 比其他 writer 更早被消费、DROP_PENDING 升级、已封口后到达均不串 ID。慢请求共享快请求的 WR/资源上下文仍能正确导出。
-- 故障期间全部请求变慢、collector/exporter 停顿、磁盘满与连续 keep；重型 snapshot 冷却不应误拒绝其他轻量 keep，预算拒绝/数据丢失明确可见。后续跨端协调还须覆盖服务端历史已过期、KEEP 通知迟到/重复/丢失及越权请求。
-
-性能验收沿用同机同 NUMA/CPU 配额、1 KiB/10 KiB/100 KiB/1 MiB 分别压测、等长响应、每客户端全局 QD=10、1000 QPS 及目标组网。分别对比：编译关闭、运行时关闭、metrics、1% head sampling 备选、全请求轻量候选加 tail selection、限时 detail；尾采样分别测低命中率与全部请求被判慢的压力情形。记录实际 QPS、CPU 时间/请求、p50/p99/p99.9、上下文切换、内存峰值、前置事件速率、导出速率、预算拒绝、drops、导出 CPU/I/O。采集宿主机 sched 的诊断轮次与干净基线分开，明确是否相同负载/覆盖。
-
-先测出热路径 emit 成本和目标负载回归，再确定可接受阈值；本文不承诺未经测量的“零开销”或固定百分比。交付门槛是：一条指定慢 RPC 有完整身份和可审计的证据链；不完整时能如实说明缺哪段；分析工具自身不能成为新的锁竞争、竞态、内存增长或 CQE 风暴来源。
-
-### 19.17 Tail-based sampling：主要保留慢请求，而不是全量导出 RPC
-
-#### 19.17.1 决策及与原方案的关系
-
-根据“通常只需要慢请求”的需求，启用因果诊断时的默认策略调整为：**所有 RPC 在明确预算内暂存轻量候选事件；尾部优先保留慢/错请求，可选少量正常对照；高成本 packet、sched、栈与 PMU 采用独立预算。** 这取代“入口随机选 1%”作为慢请求定位的主策略，不意味着取消 tracing 总开关或要求日常全量写文件。
-
-这里必须区分“临时记录”和“最终保留”：
-
-| 方式 | 何时决定 | 能省去什么 | 不能保证什么 |
-|---|---|---|---|
-| Head sampling | 请求开始时按 ID/概率等选择 | 未选请求的大部分详细记录与后续成本 | 不知道未来是否慢，可能遗漏关键慢/错请求 |
-| Tail sampling | 得到耗时/结果等足够信息后选择 | 未选请求的后续导出、长期存储与查询成本 | 无法恢复此前未记录、已淘汰的事件，前置埋点并非零成本 |
-| 慢后才启用 detail | 运行中超阈值/异常后升级 | 触发前不付高成本 detail 开销 | 只能增加后续细节，不能回补触发前的 packet/sched |
-
-Tail sampling 的通用含义是基于一条 trace 的更多信息进行选择，常见条件包括耗时、错误和属性；并不要求必须等到所有异步工作永久结束才做 keep 决定。[OpenTelemetry Sampling](https://opentelemetry.io/docs/concepts/sampling/)
-
-**不能先在入口丢掉 99%，再宣称尾部能选出所有慢请求。** 组合 head+tail 可以进一步限制成本，但覆盖范围只能是入口已录制的候选，必须公开这个限制。只记录每条 RPC 的起止时间也能筛出“哪条慢”，却不能解释内部慢在哪一步；选择多少前置因果事件是需要实测的成本取舍。
-
-#### 19.17.2 为什么优先本机筛选，而不是全量上送再筛选
-
-传统 Collector 尾采样需要先接收并暂存候选 spans，再判断是否向后端导出；同一 trace 的 spans 需要到达同一个尾采样实例，并处理决策等待窗口、缓存容量及迟到数据。因此在 Collector 才丢弃，通常不能省去应用到 Collector 的候选传输。[OpenTelemetry Collector tail sampling](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/tailsamplingprocessor/README.md)
-
-kbsocket 首版选择本机有界二进制候选，由后台选择器处理，理由是 4 CPU 容器需要限制编码/上送开销，而且本地 adapter 已知道 RPC 的开始、结束、错误和 task 关系。热路径不需要创建完整 OTel span 对象或直接编码 Perfetto 文件；未来需要接入已有 OTel 系统时再提供导出适配。
-
-19.9 的旧日志开关和 19.11 的 SDK 窗口采集都**没有因此自动获得尾采样功能**。需实现 recorder/选择器并通过 19.16 的验收，才能声称具备本章能力。
-
-#### 19.17.3 哪些请求算慢，何时判定
-
-慢阈值按 `method + request/response size class + cold/warm` 配置，backend 可作为附加诊断分类。1 KiB 与 1 MiB 不套同一个无依据阈值；保留固定业务 SLO 对照，不只依赖随负载一起恶化的动态分位数阈值。
-
-首先固定起止口径：`call begin → response ready`、同步返回、callback 完成分别有事件。记录配置究竟按哪一条判慢，callback 自身超时可独立触发；异步 CallMethod 返回不是请求结束。一个 logical call 的 retry/backup attempts 一起参与关联，不因某次 attempt 很快而丢失外层慢调用。
-
-以下阈值 1 ms 仅用于教学，不是建议配置：
-
-| 请求结果 | 候选处理 |
-|---|---|
-| 成功，80 us | 默认不导出；若配置正常对照，则按固定概率选择 |
-| 成功，8 ms | 满足慢阈值，申请 keep 预算，保留已有事件及有限诊断尾部 |
-| 100 us 即连接错误 | 错误策略独立于耗时，优先申请 keep |
-| 尚未结束，已运行 1 ms | 在途计时器触发 keep，不必等待 END |
-| 始终无 END / 长期卡住 | 在有界窗口输出 unfinished/partial 快照，不能永远等结束才产生文件 |
-
-正常样本概率允许为 0；少量正常对照有利于比较相同方法/大小下的正常路径，但不强制保存。它应按 logical call 一致选择，不能在各层分别随机。候选的阈值/策略版本在开始时记录，配置更新不应悄悄改变同一请求的判定口径。
-
-在途阈值由 collector 的活动候选计时结构推进，不在每次 post/poll 扫描 40k 连接；记录实际检测延迟。若 collector 自身被饿死或进程崩溃，纯内存 recorder 无法保证已产生日志，不能将“有计时器”写成故障场景绝对不漏。
-
-#### 19.17.4 候选生命周期与迟到事件
-
-记录资格和保留决定使用两个维度：`recording_enabled` 决定是否写必要候选；`export_decision={pending, keep, drop}` 决定是否最终输出。候选和决策控制状态由 collector 分片单 owner 管理；业务线程仍按 19.7 写自己的 SPSC ring，避免为一条跨线程 RPC 引入所有 writer 共写的锁保护 vector。
-
-| 生命周期 | export_decision | 行为 |
-|---|---|---|
-| ACTIVE | pending | 暂存必要事件，等待完成或在途阈值 |
-| DROP_PENDING | pending | 快速成功后进入可选短期保留窗口；尚可接收迟到信息/后续授权保留请求 |
-| KEPT | keep | 已通过选择与预算准入，保存必要片段，继续接收有界事件；允许分段输出 |
-| SEALED | keep | 本次输出窗口已封口；明确 complete/partial，不再原地修改已提交文件 |
-| DROPPED | drop | 因正常政策或预算拒绝结束保留；保留有界决策摘要，不保留完整事件体 |
-
-ACTIVE 可在完成判慢、错误或在途超阈值时进入 KEPT；快成功若命中正常对照策略并通过预算，则进入 `KEPT(reason=normal_control)`，其余进入 DROP_PENDING，窗口到期才最终丢弃。DROP_PENDING 期间可因已记录的迟到异常或合法对端 KEEP 请求升级；实际是否启用对端请求取决于 19.17.7。KEPT 不会因为请求后来成功而被改写成“正常未选”；若导出失败、预算耗尽或事件截断，保留原选择原因并报告结果，不能静默改成正常 drop。
-
-**RPC 结束、事件消费完、资源回收完是三件事。** 需要处理：
-
-1. END 在一个 writer 上，较早的 post/task 事件仍在其他 writer ring 中。不能因为 collector 先看见 END 就立即删掉关联表。按稳定因果身份和有关 writer 的 drain watermark/终止握手判断已消费范围；无法确认的部分标 partial。简单等待固定毫秒数不能证明所有 writer 已写完。
-2. root 结束后，CQE、buffer release、错误清理可能继续发生。诊断尾部有时间、事件数、字节数上限；到上限仍未结束，输出 `tail_truncated / pending_operations`，不能为了 trace 延长真实 DMA/BufferLease 生命周期。
-3. 封口后到来的记录沿旧 operation/session generation 归类为 `late_after_seal`，可形成有界补充片段或仅保留计数；不能接到复用 ID 的新请求上。
-4. 快请求已最终丢弃后才发现资源异常，不能承诺找回完整请求历史。此时可生成资源异常 trace，并明确只覆盖尚保留的窗口。
-
-DROP_PENDING、决策摘要缓存和迟到窗口都是**保留策略，不是并发回收协议**。trace context、字典与页的安全回收仍须满足 19.5–19.7 的引用/generation/握手约束。若自身事件丢失导致无法安全判定正常，应记 unresolved/partial，而不是把缺失误报成快请求。
-
-#### 19.17.5 如何保留共享证据，又不全量导出其他请求
-
-慢 RPC 可能与快 RPC 共用 WR/CQ batch，或者因 worker 在执行其他快请求而排队。只筛选 `rpc_id == slow_id` 会丢掉关键解释。因此输出分为三类：
-
-- `selected_rpc`：被选中慢/错请求、正常对照及其 attempts 的私有事件，分别标明选择原因。
-- `shared_context`：它关联到的 WR/CQ batch、资源水位、owner 队列和已有的相关调度窗口，公共事件去重保留一次。
-- `related_stub`：解释占用/依赖所需的其他 task/RPC 的最小身份、时间和工作类别，不导出对方完整业务 trace 或 payload。
-
-沿用 19.5 的例子，若只有 RPC B 慢，仍需保留同时承载 A/B 的 WR1 完成及 B 的范围边；无需保存 A 的全部私有事件，也不能宣称整个 WR1 专属于 B。若部署要求不允许导出其他请求的任何标识，则用匿名工作类别表示，并接受部分 HOL/调度原因只能解释成“其他工作/未知”。
-
-接收端解帧前还没有 RPC ID，仍需保留有界 session/range/RX batch 关联，解帧后再绑定。尾采样不能跳过这些前置桥梁。公共事件走独立预算，也不能因为某个快 RPC 决定 drop，就删除另一个慢 RPC 仍依赖的唯一字典/关联记录。
-
-packet、sched、CPU profile 的采集开销与 RPC 导出选择独立。若此前没有记录 sched，慢后启动只能看到之后的调度；若希望解释本次慢请求过去的内核等待，必须此前就有受控的同机历史，并且仍在保留窗口内。不能把“只导出慢请求”理解成内核也只为尚未被识别的慢请求产生事件。
-
-#### 19.17.6 内存、长调用与故障风暴的硬边界
-
-19.15 的 24 MiB 是候选预算示例，不增加新的无界 per-RPC 缓存。页池覆盖 active 候选、完成后短期保留与公共历史；控制预算覆盖索引、字典和决策摘要；冻结快照/导出队列受各自上限约束。共享页仍按页所有权回收，快请求被政策丢弃不代表其所在物理页可立即覆盖；导出时只选择获准记录及必要公共上下文。
-
-沿用 `40 条 × 64 B = 2560 B/RPC` 的算术假设：
-
-- 客户端 QD=10 只使 10 条未完成 RPC 的事件体约为 `25,600 B = 25 KiB`。
-- 若 1000 RPC/s 完成后保留 100 ms，稳态平均约再保留 100 条；加上 10 条在途，事件体约 `281,600 B = 275 KiB`。
-- 100 ms 只是示例，不是安全 grace 或建议默认值；突发、重试、多段 RNDV、公共事件和元数据还会增加占用。服务端也没有单客户端 QD=10 的总上限。
-
-对保留窗口可用 `平均完成候选数 ≈ 完成速率 × 保留时间` 做容量估算，但硬上限必须独立设置，不能把平均数当 worst case。19.15 的 2.56 MB/s 前置事件量与最终 25.6 kB/s 私有导出量是不同指标；尾采样不会把前者及对应读时钟/写 ring 成本变成后者。
-
-长调用可能超过滚动历史窗口。候选在独立额度内保留必要前缀/状态，超阈值后尽早保护已记录片段或分段导出；不能等一分钟后才到几秒的 ring 中查完整历史。每请求达到上限时，可以有明确标记地降级为阶段摘要、保留首尾/关键状态并记录省略计数；不得把摘要伪装成逐事件完整 trace。候选前缀若已淘汰，最终 keep 仍只能得到 partial。
-
-实施时至少暴露下列配置维度，名称是拟议设计而非当前可用 CLI：
-
-| 配置维度 | 约束目标 |
-|---|---|
-| 慢阈值/起止口径、错误策略、正常对照概率 | 定义选择原因，不把不同请求类别混算 |
-| 活动候选数、单候选最大事件/字节、总候选页池 | 不因 40k 连接或卡住请求无界分配 |
-| 完成后保留窗口、诊断尾部上限、决策摘要上限 | 迟到和 DROP_PENDING 不形成额外无界历史 |
-| keep 在途/等待导出上限、冻结字节、导出速率与文件保留额度 | 故障时即使全部请求慢，内存/CPU/I/O 仍有边界 |
-| 公共上下文预算、detail 窗口/冷却与并发快照数 | 控制共享证据与昂贵细节，不覆盖逐 RPC 的轻量选择规则 |
-
-错误、超时和异常慢请求可设优先级/预留额度，但固定资源下不能承诺任何故障强度都“全部完整保存”。超限时合并重复异常上下文、按策略拒绝/截断并计数，不让业务等待日志资源。重型快照冷却不应成为轻量 keep 的默认丢弃理由；一个 exporter 可以在有界队列中批量处理多条 keep。
-
-#### 19.17.7 双端完整 trace 是后续能力，不是本机尾采样自动附带
-
-客户端慢、服务端本地快是正常情形，例如服务端处理 50 us，但客户端响应交付后等了 5 ms 才执行 callback。双方各自按本地阈值选择时，服务端可能已经丢弃对应候选。
-
-第一版先交付本机尾采样。后续如果需要双端完整解释，可选本机候选缓存加事后保留协调：
-
-1. 双端记录可验证的 trace/attempt/session incarnation 关联，并各自有界保留近期候选。
-2. 客户端 keep 后，通过独立且受授权/限速的诊断通道向相关服务端请求 KEEP；不阻塞业务完成，也不复用 kbsocket 的业务重放或可靠数据 ACK 机制。
-3. 服务端只有在身份匹配、候选仍存在且有预算时才升级，返回 `retained / expired / not_recorded / budget_rejected` 等结果。请求要幂等，并防止跨租户索取 trace；未收到应答记为 unknown，不能当作成功保留。
-4. 合并时报告每一端的完整度和时钟误差。服务端历史已过期、通知丢失、对端退出或从未记录时，不伪造全链路完整 trace。
-
-这个后续设计需要预算来覆盖客户端判定耗时、诊断传输和调度延迟；不是简单设一个固定 100 ms 就能保证所有慢请求。也可与已有集中式 trace 系统协调，但仍须支付其候选上送、路由与暂存成本。未经验证，不在 V1 宣称跨机“所有慢请求必有完整双端记录”。
-
-#### 19.17.8 质量指标、验收与不可误读的统计
-
-除了 19.12 的一般 trace loss，尾采样报告至少分开统计：
-
-- `candidate_admitted / candidate_rejected_by_budget`、writer 未注册导致的缺口、event overflow 与字典丢失。
-- `normal_dropped_by_policy / normal_controls_kept`，这是正常选择，不与意外 loss 混算。
-- `slow_detected / slow_kept / slow_dropped_by_budget` 和对应错误请求计数；慢且错误可同时打标签，不能把两组相加当不同请求总数。
-- `keep_exported / export_failed`、`history_truncated / tail_truncated / late_after_seal`、完整/部分 trace 数及公共证据覆盖。
-- 前置事件体字节、实际候选/冻结内存峰值、导出字节与 CPU/I/O、策略版本与实际保留时间。
-
-`slow_kept` 表示选择/准入成功，不自动代表已成功导出完整文件，须与 exported/complete 计数区分。对于因预算未准入的 RPC，也应尽可能由独立的低成本调用耗时/错误 metrics 统计其结果；报告不能把“未记录”藏进正常 drop，造成看似全覆盖。
-
-验收使用 19.16 的尾采样专项，重点确认：快成功可不落盘；慢/错在预算内保留；卡住请求不等 END 也可输出；先到 END、迟到 CQE、共享 WR 和长于历史窗口都不误关联；100% 请求变慢时业务不被采集阻塞。性能对照要单列“候选开启但几乎不导出”，以测出尾采样无法消除的前置开销。
-
-全流量 p99、错误率和吞吐仍来自独立 metrics。慢请求集合、错误优先样本和触发窗口都有选择偏差，不能直接用于计算全流量分位数；正常对照也不能与过采样的慢请求无权重混算。最终目标是**有界地保存最有诊断价值的证据，并让没保存到的部分可见**，而不是在有限成本下承诺无条件保存每个慢请求的全部细节。
-
-### 19.18 CQE 硬件盲区：测量值、区间与推断必须分开
-
-#### 19.18.1 当前源码能提供什么
-
-按第 2.2 节的两次源码核验，当前 raw UDMA provider 和公共 URMA API **未暴露逐 CQE 的硬件完成时间戳**：
-
-| 源码入口 | 核验结论 |
-|---|---|
-| [udma_u_jfc.h](../../../umdk/src/urma/hw/udma/udma_u_jfc.h) 的 `udma_u_jfc_cqe` | 当前定义包含 owner、状态、索引、长度、标识及 inline 数据等，无 timestamp 字段 |
-| [urma_types.h](../../../umdk/src/urma/lib/urma/core/include/urma_types.h) 的 `urma_cr_t` | 公共完成结果无硬件时间戳；所检查的 device capability / JFC 配置也未提供对应时钟能力 |
-| [udma_u_jfc.c](../../../umdk/src/urma/hw/udma/udma_u_jfc.c) 的 `get_next_cqe`、`udma_u_poll_one`、`udma_u_poll_jfc` | 检查 owner bit、执行 device barrier 并解析；在此增加软件打点仍只能记录 CPU 观察时刻 |
-| [urma_cmd.h](../../../umdk/src/urma/lib/urma/core/include/urma_cmd.h) 的 `urma_cmd_jfce_wait_t` | 输出 event count 和 event data，没有通知产生时间，也不是逐 CQE 时间记录 |
-| [urma_perf.c](../../../umdk/src/urma/lib/urma/core/urma_perf.c) 的 `urma_get_perf_timestamp` | 读取 CPU 的 CNTVCT 或 `CLOCK_MONOTONIC`，不是 NIC 时钟 |
-
-这不是“所有 UB 硬件都不支持”的结论。实际 CQE stride 由 context 创建结果提供，不能从当前结构体排除其他固件/扩展格式。后续需向设备方确认能力；不能自行解释保留位，也不能用 BPF 推算一个从未被硬件或驱动记录的时间。
-
-#### 19.18.2 时间定义与证据等级
-
-| 时间 | 定义 | 与相邻时间的区别 |
-|---|---|---|
-| `T_arrive` | 相关包到达 NIC | 一次 WR 可能涉及多包；包到达不等于操作完成 |
-| `T_hw` | 设备在明确的硬件阶段生成 CQE | SEND、RX、READ、WRITE 的完成含义须分别确认 |
-| `T_visible` | 对应 CQE 按 provider 可见性和顺序规则可被 CPU 消费 | 不能假定等于 NIC 生成时刻，仍可能有写回/可见性间隔 |
-| `T_observed` | owner 实际在 poll 中观察到该 CQE | 应用只在批量 poll 返回处打点时，还包含 provider 内部处理，须标注为 batch return 观测/上界 |
-| `T_handled` | 对应协议处理完成 | poll 返回与 READ_DONE 处理、状态推进或资源释放之间仍可能排队 |
-
-`T_observed - T_hw` 命名为 `completion_observation_delay`，不是纯 OS 调度时延。它可能包含 CQE 写回、通知、等待 CPU 和 owner 服务其他工作；只有可验证的时间/因果关系才能进一步拆分。沿用 19.13 的 `measured / derived / approximate / unknown`，并增加 `measurement_point, clock_id/epoch, error_bound, lower/upper_bound, evidence_ids` 等解释字段；未取得值不能填 0。
-
-| 可用证据 | 允许输出 | 禁止推导 |
-|---|---|---|
-| 硬件完成时间戳、匹配身份、主机时钟映射 | `T_observed - T_hw`，附时间语义与校准误差 | 把它全部算成调度，或把 NIC 完成等同远端应用消费 |
-| 同一 CQ/generation 曾确证为空，之后观察到可消费 CQE | 满足下述条件时，对软件可消费时刻及观察延迟给保守区间 | 以该区间约束 NIC 生成时刻或包到达时刻 |
-| sched 与 owner 阶段事件 | owner 哪段没运行、等待 CPU、运行时在处理什么 | 断言目标 CQE 在整个 off-CPU 区间都已就绪 |
-| 仅 post 与 poll | `transport_completion_observation` 总区间 | 标成精确设备/网络耗时 |
-
-教学反例：owner 在 10–200 us 没有运行，205 us 观察到 CQE。CQE 可能在 20 us 生成，也可能在 200 us 生成；同一软件 trace 无法区分 185 us 与 5 us 的观察延迟。因此不能把 190 us off-CPU 全算成 CQE 等待，也不能从 post→observed 中机械减去 off-CPU 得到“网络耗时”。设备执行和主机未运行可以重叠，19.13 的互斥总账不能靠这种相减强行补齐。
-
-空 CQ 区间法仅适用于已验证的队列可见性/消费顺序、同一 generation、单 owner 且没有遗留 backlog 的观测：设 `E` 为最近一次确证为空的 poll **进入时间**，`O` 为后续包含目标完成的 poll 返回时间，可对相应软件可消费时间给出保守窗口 `[E, O]`，软件可消费至观测的延迟 `T_observed - T_visible` 至多为 `O-E`，下界仍可能为 0。若仅在 API 边界计时，不能用空 poll 的返回时间代替 `E`：CQE 可能在内部空检查之后、返回之前出现。batch 取满不能证明 CQ 已空，错误返回、记录缺失、CQ 重建或已有 backlog 时不套此公式；该方法不为硬件完成后的 `T_observed - T_hw` 提供同类上界。
-
-#### 19.18.3 可选硬件能力与行业参考
-
-Azure RDMA Estats 使用主机 WQE post、NIC CQE generation、主机 CQE polling 等测量点，并处理 NIC/主机时钟同步成本；这是区分“设备尚未完成”与“设备完成后软件观察不及时”的参考，而不是当前 UB 已有能力。[《Empowering Azure Storage with RDMA》§5](https://www.microsoft.com/en-us/research/wp-content/uploads/2023/03/RDMA_Experience_Paper_TR-1.pdf)
-
-rdma-core 扩展 CQ 提供可选 completion timestamp / wallclock timestamp 接口，也说明该能力需要显式申请及设备支持；不能直接将 libibverbs 接口套到 URMA。[ibv_create_cq_ex](https://man7.org/linux/man-pages/man3/ibv_create_cq_ex.3.html)
-
-为硬件 timestamp adapter 预留以下契约，满足后才启用：
-
-1. 运行时查询支持的 opcode、成功/错误完成及 timestamp 有效条件；明确记录点是包接收、操作完成还是 CQE 生成。
-2. 保存原始 tick、位宽/频率、有效标记、device clock ID/epoch、主机映射和误差；处理回绕、reset 与映射失效，不能把负差值直接截为 0。
-3. 四个 raw 设备按实际时钟域校准，不假定同 IOdie 或同宿主机就共用时钟。校准尽量放控制路径，不为每个 CQE 同步读取设备寄存器；映射过期时降级报告。
-4. 通过 provider 的受支持扩展导出，不越过 CQ 单 owner 协议，不增加另一个线程抢 poll。ClockSnapshot 只承载已建立的映射，不能凭空生成硬件对时能力。[Perfetto clock sync](https://perfetto.dev/docs/concepts/clock-sync)
-5. 独立验证启用后的 CQE 布局、吞吐、CPU、尾延迟及与 selective signaling 的兼容性。聚合完成只为实际报告的完成提供时间锚点；无独立 CQE 的 WR 仍遵守 19.5 的覆盖/回收上界，不能伪造逐 WR 完成时间。
-
-硬件能力缺失不阻塞软件可观测性和库功能交付；软件报告明确保留硬件盲区。
-
-### 19.19 Owner 服务间隔与自动宿主机 observer
-
-#### 19.19.1 两种 progress 模式的事件契约
-
-以 `{runtime_instance, shard, raw_context, jfc_id, generation}` 绑定 CQ 服务记录，以 batch/operation 关联完成；不能只用 fd、设备名或时间邻近关系匹配。
-
-| 事件组 | 必需语义与字段 | 用途 |
-|---|---|---|
-| `cq.poll` | enter/return、请求/返回 CQE 数、错误、是否取满、batch ID、可验证的 empty 锚点 | 区分 poll 本身慢、没有完成、批次受限；batch 时间不伪装成逐 CQE 时间 |
-| `reactor.phase` | TX/RX/control/repost/continuation 的起止、处理量、预算超限及让出原因 | 解释 owner 在运行却没服务目标 CQ 的时间 |
-| `cq.observed` / `completion.handled` | WR 或合法 retirement 集合、处理开始/结束、continuation ID | 拆开取得完成和执行后续协议；异步处理不在 poll 返回时提前记 handled |
-| `reactor.wait` | arm、recheck、wait enter/return、返回原因、通知源及重检结果 | 解释事件模式的睡眠/唤醒交接，覆盖防丢唤醒协议 |
-
-busy-poll 模式关注**同一 JFC 的服务间隔**，不仅是 reactor 整轮频率：owner 可能持续运行，却因 READ completions 或控制续体消耗过多时间而长期没有访问 RX CQ。记录 wall time 与调度交集，分别展示预算超限、runnable 等 CPU、正在执行其他阶段。`sched` 显示 Running 也不等于一直执行用户指令；IRQ/softirq、内核执行和 CPU/cache 停顿需对应额外证据，不能一律归成库内计算。
-
-空 poll 不逐次写记录。复用 per-owner 预分配状态保存必要时间锚点与累计量，按 batch/窗口汇总，长 service gap 或诊断窗口内增加细节；读时钟也受门禁/预算控制。稀疏锚点只能给较粗分辨率或较宽上界，manifest 记录采样方式，不能声称未采样间隙也被逐次测量。
-
-事件模式按实际因果关系关联设备通知、waking/wakeup、switch-in、wait return 与 poll，分开报告唤醒路径、等待 CPU 和恢复后的分派。保留 19.11 对 waking/wakeup 和 Perfetto 重建区间的限制。IRQ/CEQ 不是逐 CQE 时间戳：共享向量和通知合并时，只有设备/驱动提供足够 JFC 身份才能提高关联强度；否则作为相关 CPU/设备背景，不画确定的 IRQ→目标 CQE 因果边。采集 JFC `moderate_count/period` 等配置，但其硬件作用阶段仍需文档/实验确认，不能仅凭字段名认定只延迟 IRQ。
-
-#### 19.19.2 `kb-observer` 的交付边界
-
-`kb-observer` 是**拟议的宿主机受控采集与分析组件**，不是当前命令，也不要求用户逐次编写 bpftrace。它复用 19.3 的 collector、19.11 的 Perfetto 配方以及 19.17 的有界历史；优先使用 Perfetto 直接采集 `linux.ftrace` 调度事件。[Perfetto CPU scheduling](https://perfetto.dev/docs/data-sources/cpu-scheduling)
-
-用户输入为目标 runtime/容器、阈值/触发条件、窗口和资源预算，组件负责：
-
-1. 发现 runtime/shard 与宿主机 TID、进程/线程 incarnation、cgroup 的映射，并绑定 device/context/JFC 元数据；不能只按容器内 PID join。JFC→IRQ 映射不可取得时声明缺失。
-2. 校验可用的数据源、权限、时钟和必要事件，固化 sched 配方；IRQ/softirq、调用栈、PMU 和驱动专用探针按问题限时升级，不默认全部常驻。
-3. 后台采集 affinity、CPU 配额、相关父 cgroup 限制、`cpu.stat`、PSI 等窗口信息，不在 post/poll 热路径读 procfs/sysfs。采集量按宿主机实际范围估算，不能用“容器只有 4 CPU”替代预算。
-4. 将慢 RPC、长 lease、内存压力和 poll service gap 接入同一 trigger/预算机制，冻结尚存历史，关联共享资源上下文；应用和内核可能保留不同长度，分别报告有效覆盖区间。
-5. 输出 19.16 的 bundle、可展开 `.pftrace` 及摘要；标明 measurement point、证据 ID、时钟误差、上下文覆盖、丢失/截断和 unknown。源码/固件版本与采集配置随文件保存。
-
-系统侧权限留在宿主机受控 collector；业务容器不因 tracing 获得 root 或全机 consumer 权限。沿用 19.11 的授权边界；过滤时核验事件语义，例如只按 `common_pid` 筛选 wakeup 可能保留的是唤醒者而漏掉目标线程。USDT/eBPF 优先用于需要的动态扩展诊断，不要求每个 CQE 常驻触发用户态动态探针，也不承诺未经测量的固定纳秒成本。
-
-明确提供两种配置档：**有预算的常驻历史**用于回溯；**限时诊断**用于复现/深挖。若事前没有采 sched，慢后开启不能补齐过去；权限不足或元数据映射失败时保留应用 trace 并降级报告，不阻塞业务，也不谎称全链路完整。
-
-#### 19.19.3 自动归因的措辞与计账
-
-`cpu.stat` 的 `nr_throttled/throttled_usec`、PSI、线程运行/等待累计值是窗口证据。可以报告“同窗口发生节流且 owner 等待 CPU”，不能把窗口增量全部分配给某个 RPC；逐 RPC 精确节流时长需要额外的、可验证关联的区间事件。父 cgroup 也可能施加限制。[Linux 6.16 cgroup v2](https://docs.kernel.org/6.16/admin-guide/cgroup-v2.html)
-
-一个合格的无硬件时间戳摘要应写成：“目标 CQ 在该窗口未被服务；owner 有一段等待 CPU，另有一段处理 TX completion；目标 CQE 的硬件生成时间不可用，无法精确给出它在队列中等待多久。”不能自动改写成“网卡早已收到，全部慢在调度”。有硬件时间戳后才按 19.18 细分，仍避免与 RPC 父区间和并行 READ 重复计账。
-
-### 19.20 BufferLease 生命周期审计：RPC 结束不等于内存可复用
-
-#### 19.20.1 身份与事件
-
-以 `lease_id + generation` 关联 operation/RNDV group/逻辑字节范围，以独立 `buffer_id + generation` 关联真实存储及 region/pool。一个 buffer 可被多个 lease/RPC 引用，一次 release 也可覆盖多个 lease；使用显式范围/集合绑定，不只靠指针、fd 或“最近一次 RPC”。
-
-| 事件 | 记录点与解释 |
-|---|---|
-| `lease.acquire` | 实际取得引用/承诺资源，记录 owner、字节范围及用途 |
-| `lease.publish` | 远端访问描述符/授权发布，记录 session/transfer/group 与部分成功范围；不等同远端已收到 |
-| `lease.access_end` | 协议层取得已验证的访问终结证明，记录 completion/通知/撤销证据；不是以超时猜测完成 |
-| `lease.release_request` | 存在异步释放交接时，记录请求释放/入队及原因；申请取消或释放不等于已终止 DMA 或解除持有 |
-| `lease.release` | 该 lease 的持有关系确实解除，记录正常、取消、错误或未发布回滚等原因 |
-| `buffer.last_ref_drop` | 底层 buffer 最后一个真实引用消失，不把任意一次 DecRef 当作此事件 |
-| `buffer.return_queued` / `buffer.reusable` | 分别记录交给回收队列和进入对应分配域可用状态；跨 owner/缓存归还须保留目标 pool |
-| `region.deregister` / `pages.unpin` | 和逻辑 lease 分开，声明 API 请求、返回或已验证的内核实际回收观测点；无接口/内核证据时，不能用注销返回伪造物理页解除 pin 的精确时刻 |
-
-这些是状态转换语义，不强迫所有路径经过同一串事件：未发布回滚可直接 release；READ 源 lease、WRITE 源/目标 lease、SHM borrowed view 的终结证明不同。错误关闭后尚不能证明 DMA/远端访问停止的资源要记为 retired/quarantined 或对应真实状态，不能伪装成 reusable。注册池常驻时，普通 lease 释放通常也不意味着 MR 注销或 OS unpin。
-
-READ 路径还需关联接收端 READ 完成、DONE 创建/入队/实际 post，以及源端 DONE observed/handled，才能区分远端未结束、释放通知积压与本地处理积压。只有源端证据时，未观察到 DONE 不能证明远端尚未发出。跨端身份按 19.5/19.17.7 关联，无可靠对时只输出各端本地耗时，不直接相减；这里的诊断关联不新增业务数据 ACK/重放协议。
-
-#### 19.20.2 活跃台账与历史记录分离
-
-**活跃 lease 台账回答“现在谁持有、在等什么”，flight recorder 回答“此前怎么走到这里”。** 台账应复用真实 owner 的生命周期元数据，在既有 operation/lease 池中预分配，避免独立全局 pin map/mutex。最少保存身份、状态、持有范围、创建/最近转换时间（注明采集口径）、待满足条件与对应 operation/group；未知的应用外部引用不能编造持有者。
-
-台账容量随实际可准入 lease/operation 上限计费，不因 40k 连接各建无界历史。真实资源准入与安全记账即使 tracing 关闭仍成立；可选历史/导出预算不足只丢诊断细节并计数，不阻塞业务、不延长真实 lease，也不提前复用仍在 DMA 中的内存。
-
-快照通过有界控制请求交给原 owner 分批生成，collector 不直接遍历 owner 可变容器；跨 shard 快照记录各自时间/代际，不伪装成全局同一瞬间。启用 tracing 时若已有存活 lease，可生成当前状态 checkpoint，并标记 `history_before_capture_missing`；不能补造此前的 acquire/publish 事件。trace 自身冻结页的引用与业务 BufferLease 严格分开。
-
-同时统计逻辑 leased bytes、按 buffer/region 去重的 backing 容量、注册容量、待归还及可分配容量。多个 lease 引用同一存储时不能把 leased bytes 相加当作物理 pinned 内存。buffer 已进入某线程缓存，也不自动意味着另一个 shard 的池已经可分配。
-
-#### 19.20.3 尾采样与资源异常
-
-RPC 结束后仍按 lease/operation 身份保留有界诊断尾部；长 lease、池压力、release 通知积压可以独立触发资源快照，无需等某个 RPC 判慢。若 RPC 历史已过期，输出资源身份、当前依赖和剩余历史，明确 partial，不能因缺少 acquire/release 事件就直接判断泄漏。疑似泄漏需要与真实台账、引用和回收状态交叉验证。
-
-“所有事件可回溯”的承诺限定为：**在声明的采集范围、保留窗口和预算内，关键状态转换可回溯；缺失、截断与 unknown 可见。** 沿用 19.17 的候选/公共证据预算，不另建无限资源日志；总体 RPC 分位数仍由独立 metrics 统计，尾采样 trace 用于解释原因。
-
-### 19.21 CQE 与资源审计专项验收
-
-以下补充 19.16；优先使用无硬件的 mock provider/时钟/调度 fixture 验证分析语义，再在真实 UB 环境测量。测试值是注入值，不代表线上已观察到同样原因。
-
-| 场景 | 验收要求 |
-|---|---|
-| 相同 sched/poll trace，分别模拟 CQE 很早和很晚生成 | 无硬件时间戳时不能输出两个不同的“精确硬件等待”；有合法时间戳时能正确区分并附误差 |
-| 空检查后、poll 返回前出现 CQE；batch 取满、backlog、CQ generation 更换 | 空 CQ 区间不使用错误的返回下界；条件不满足时拒绝推导 |
-| owner 被抢占 vs owner 持续处理 READ CQE/continuation | 报告区分等待 CPU 与 owner 服务偏斜，observed/handled 分离；不把二者全部标为网络慢 |
-| IRQ 合并/共享、丢失 wakeup、缺少设备到 IRQ 映射 | 保留不确定因果，不将 IRQ 时间复制给所有 CQE；校验时钟、线程身份和记录缺口 |
-| 时间戳回绕、设备 reset、四设备不同钟、映射过期、聚合完成 | epoch/误差有效，失败时降级；不为 unsignaled WR 虚构精确完成时间 |
-| DONE 延迟、lease 已释放但仍有其他引用、跨 owner 延迟归还 | 能分别解释访问终结等待、引用持有和 allocator 可用性；不混用 unpin/release/reusable |
-| 多 RPC/lease 共用 buffer、RPC 超时后 lease 存活、捕获开始前已有 lease | 去重容量正确；资源诊断不依赖 RPC 仍活跃，checkpoint 不伪造完整历史 |
-| 无宿主机权限、采样溢出、exporter 停顿、内存压力和故障风暴 | 应用前进/内存安全不依赖采集成功；台账/快照/导出有界，partial 与实际保留窗口可见 |
-
-性能对照在 19.16 的负载矩阵外增加双向 8 MiB bulk 与 1 KiB/控制报文混合诊断场景，观察 READ CQE 压力下的 RX 服务间隔、DONE observed→handled、lease 年龄及池可用容量。分别测 tracing 关闭、应用轻量记录、增加 sched 历史、限时深度诊断、启用硬件时间戳的增量成本；不以诊断轮次替代干净基线，也不承诺固定百分比开销。
-
-落地顺序为：先完成软件侧 poll/phase、lease 台账与事件语义；再完成自动宿主机采集、身份/时钟关联和有界保留；最后在设备能力门禁后接入硬件时间戳。第一阶段解释“为什么没有及时推进”，硬件阶段才补齐“设备何时已经完成”的直接证据。
+### 12.1 第一层：常驻分片轻量指标（`ShardMetrics`）
+
+每个 `RuntimeShard` 维护独立的 `alignas(64) ShardMetrics` 结构（单写者 `memory_order_relaxed` 更新，监控线程只读快照聚合）：
+- **连接与握手**：活跃连接数、每秒 `UB_ACTIVE`/`SHM_ACTIVE`/`TCP_ACTIVE` 建链数、握手失败分类、`EndpointImportCache` 命中率。
+- **队列与吞吐**：每 Lane 的 `reserved`/`committed`/`retired` WR 数、`partial_post` 次数、CQE 批次均值。
+- **错误与自愈**：逐状态码 CQE 计数（`status 8`、`status 9`、`status 10`、`WR_FLUSH_ERR`、`WR_UNHANDLED`）、`tx_lane` 在线重建次数、`JFC_ERR` 域隔离次数、`HealthRegistry` 冷却/探测计数。
+- **流控与内存**：各接收域 `posted()`/`held()`/`available()`、`refill_debt`、基础/弹性 Credit 余额、credit 停顿次数、RNDV 在途字节，以及 **`QuarantineLedger` 隔离内存字节数与条目数**。
+
+### 12.2 第二层：USDT 静态探针与字节游标桥梁（Byte-Cursor Bridge）
+
+在关键阶段埋设 `<sys/sdt.h>` 静态探针。参数只传现成标量，不在探针参数中格式化、分配或做昂贵计算；分别验证未启用、启用过滤及高负载状态的开销，不把探针点的 NOP 等同于整段代码绝对零成本：
+- `KBS_PROBE(kbsocket, tx_submit, conn_id, byte_begin, byte_end, flags)`
+- `KBS_PROBE(kbsocket, wr_post, lane_id, lane_gen, first_attempt_id, count, accepted, status)`
+- `KBS_PROBE(kbsocket, cq_tx_observed, lane_id, attempt_id, opcode, status)`
+- `KBS_PROBE(kbsocket, cq_rx_observed, domain_id, conn_id, sn, len, status)`
+- `KBS_PROBE(kbsocket, rx_deliver, conn_id, byte_begin, byte_end)`
+- `KBS_PROBE(kbsocket, wait_begin, conn_id, wait_reason, required, available)` / `wait_end`
+- `KBS_PROBE(kbsocket, lane_rebuild, pool_id, lane_idx, old_gen, new_gen, status)`
+
+**跨层关联与硬件盲区界定**：
+- 上层 RPC（如 bRPC `correlation_id`）与底层 UB 分片（`sn`）通过连接级单调递增的**累计字节游标（`byte_cursor`）**无侵入关联，无需修改线协议塞入业务 `rpc_id`。
+- 鉴于当前 UB 硬件 CQE 无时间戳（**H11**），严禁将 `wr_post -> cq_tx_observed` 直接命名为纯网络耗时；统一结合 `sched_switch` 与空 CQ 锚点拆分为“线程 Off-CPU 调度等待”、“Reactor 服务其他阶段间隔”与“传输完成观察窗口（`transport_completion_observation`）”。
+- 尾部过滤只能对此前已启用采集并保留在有界 BPF 状态中的事件做关联；错误发生后才 attach 不能恢复历史。Map 容量、采样率、超时淘汰和丢事件须可观测，慢请求比例也不能预设小于 1%。配套指南中的固定耗时数字须经目标平台基准验证后才能成为验收依据。
+
+---
+
+## 13. 正确性与故障注入验收门禁
+
+所有核心模块在合入前必须通过无硬件依赖的 `gMock` 确定性单元测试（模拟任意 `UrmaApi` 返回码、部分接受、乱序/迟到/伪造 CQE）及双进程集成测试：
+
+| 门禁编号 | 验证场景 | 必须成立的系统不变量 |
+| :--- | :--- | :--- |
+| **G1** | **残留 RX 的接收域安全关闭** | 建立远端静默与对象销毁屏障，在 provider 对象有效时解析 CQE/事件；删除所有关联 Jetty 后成功 DeleteJfr 才终结残留 Posted。Held、CPU、通知/async 引用未结清前不释放其依赖；任一步骤失败可安全重试，无双重释放 |
+| **G2** | **共享 SQ 上 `status 8` 与 `status 10`（RNR）隔离** | 合法 status 8/10 不新触发整 SQ 排空；已故障 Lane 也不能因此恢复 Ready。验证受控故障注入下同 SQ 健康目标仍可推进；RNR 隔离证据来自 SEND，不虚构 WRITE 的 RNR 测试覆盖 |
+| **G3** | **芯片 `status 9`（`ACK_TIMEOUT`）隔离与在线重建** | 已验明身份的 WR 报 status 9 后立即封禁 Lane，经 ERROR/边界/flush 与旧事件终结屏障后替换；仅主动 Lane 故障且共享 JFR/JFC 健康时验证被动端点保持不变。已有失败 Session 不因换 Lane 恢复，重建失败须保留依赖并可重试 |
+| **G4** | **迟到/伪造 CQE 与代际门禁** | 旧 `lane_gen` 的迟到错误 CQE 或无有效 `user_ctx` 的异常边界事件，绝不能触发已重建新 Lane 的 `BeginDrain` 或释放新票据 |
+| **G5** | **批量 Post 部分接受（`ENOMEM` + `bad_wr`）** | SN 在调用前确定，只有实际接受前缀标记已提交；明确未接受后缀取消本次票据并保留原 SN，后续数据不越过它；非法 bad_wr/接受未知时封禁通道并保留 DMA 依赖，不重放已接受部分 |
+| **G6** | **同 SQ `SEND` 乱序与 Eager/RNDV 交错** | 乱序、重复、延迟 RNDV 占位下按连续前缀交付；发送窗口不得超过协商的 W。分别验证紧凑 4096 B 单 WR 与扩展身份/捎带头分片，40k 槽位、短代际耗尽切换及完整代际/SN 耗尽均不复用旧身份 |
+| **G7** | **`WRITE RNDV` 两阶段通知与异常 `Grant` 隔离** | 全部 WRITE CQE 成功前不发送 DONE；异常 Grant 只有封禁后续写并终结全部已接受写，或取得已验证的撤权及 DMA 终结屏障后才可复用；时间、普通 UnregisterSeg 返回及本地账本归零均不得冒充该证明 |
+| **G8** | **`JFR_LIMIT` 水线清零重配与守恒授信** | 水线触发后回读为 0，在补槽高于水线后显式 `ModifyJfr` 恢复通知；3000 Peer 总授信严格遵守 $F + G + U = B$ 守恒，无超卖、无控制帧死锁 |
+| **G9** | **FD 快速复用与异步取消（P2300 / Socket）** | `close(fd)` 后立即复用相同整数 `fd`，旧 CQE/`epoll` 事件因 `binding_gen`/`conn_gen` 不匹配被安全丢弃；取消在途零拷贝操作时，源 `BufferLease` 保持至硬件终结后才可复用 |
+| **G10** | **同机 `ShmBackend` 封印与对端崩溃** | 对端无法写入本端 `F_SEAL_FUTURE_WRITE` 共享区；对端 `SIGKILL` 崩溃后，本端检测并安全隔离旧映射，在途借用视图在 `Release` 前不发生 `SIGBUS`/Use-After-Unmap |
+| **G11** | **事件公平性与补投债务** | Busy-Poll、持续热 TX、空唤醒、recheck 跳过睡眠时仍处理 async/JFCE 和 native readiness；已取得通知全部 Ack；refill 暂败且无新 CQE 时仍能重试，无进度类永久饥饿 |
+| **G12** | **旧授信、控制耗尽与慢读** | close/重连不重发旧信用，旧 Session 消耗仍可归账；3000 Peer 控制突发不绕过 C 预算，双向满数据窗仍可通过控制路径推进；慢读同时受驻留字节与序号窗口限制 |
