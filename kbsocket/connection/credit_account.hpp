@@ -93,6 +93,7 @@ private:
 };
 
 class ReceiveCreditDomain;
+class EagerReceiveDomain;
 struct CreditPeerHandle {
     const ReceiveCreditDomain* domain = nullptr;
     std::uint32_t slot = 0;
@@ -152,7 +153,7 @@ public:
     /// 同一对象再次打开必须使用更大的 receive_domain incarnation，避免旧身份重入。
     std::expected<void, CreditError> Open(const CreditDomainConfig& config) noexcept;
     /// 只关闭授信元数据，不终结真实 Posted RQE/DMA；M1 域关闭仍由宿主推进。
-    /// 当前没有 DeleteJfr 后清退未补投 receipt 的接口，已有 receipt 必须按正常 refill 路径结账。
+    /// 冻结 receipt 的整域清退仅由 EagerReceiveDomain 验证真实物理域关闭后执行。
     std::expected<void, CreditError> Close() noexcept;
     std::expected<void, CreditError> RecordInitialPosted(CreditClass kind, std::uint32_t accepted) noexcept;
     std::expected<CreditPeerHandle, CreditError> Admit(CreditIdentity identity) noexcept;
@@ -176,9 +177,18 @@ public:
     std::expected<void, CreditError> FreezePeer(CreditPeerHandle peer) noexcept;
     std::expected<void, CreditError> RetirePeer(CreditPeerHandle peer, CreditRetireProof proof) noexcept;
     CreditDomainStats stats() const noexcept;
+    /// 当前打开的域 incarnation；关闭后为 0，重开必须严格递增。
+    std::uint64_t receive_domain() const noexcept;
     std::expected<CreditPeerStats, CreditError> PeerStats(CreditPeerHandle peer) const noexcept;
 
 private:
+    friend class EagerReceiveDomain;
+    // 仅接收桥接器在核对 M1 Closed 及绑定代次后使用；不提供可手工置真的删除证明。
+    std::expected<void, CreditError> BindReceive(const EagerReceiveDomain& owner) noexcept;
+    std::expected<void, CreditError> UnbindReceive(const EagerReceiveDomain& owner) noexcept;
+    std::expected<void, CreditError> ValidateReleasedForClose(RxCreditReceipt receipt) const noexcept;
+    std::expected<void, CreditError> CloseDestroyed(const EagerReceiveDomain& owner, std::uint64_t receive_domain,
+                                                    std::size_t released_receipts) noexcept;
     struct State;
     std::expected<std::uint32_t, CreditError> Find(CreditPeerHandle peer) const noexcept;
     std::expected<std::uint32_t, CreditError> Find(RxCreditReceipt receipt) const noexcept;

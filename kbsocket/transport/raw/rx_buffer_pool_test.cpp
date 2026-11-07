@@ -390,7 +390,10 @@ TEST_F(RxBufferPoolTest, StopAndPollFailurePreserveOutstandingBuffers) {
 }
 
 TEST_F(RxBufferPoolTest, RegisterFailureRollsBackAndUnregisterFailureRetainsBinding) {
+    const auto incarnation = buffers_.incarnation();
+    ASSERT_NE(incarnation, 0u);
     ASSERT_TRUE(buffers_.Close());
+    EXPECT_EQ(buffers_.incarnation(), incarnation);
     EXPECT_CALL(*this, Register(&ctx_, _))
         .WillOnce([](auto*, auto*) {
             errno = 0;
@@ -402,7 +405,9 @@ TEST_F(RxBufferPoolTest, RegisterFailureRollsBackAndUnregisterFailureRetainsBind
     EXPECT_EQ(opened.error().code, RxBufferErrorCode::kRegisterFailed);
     EXPECT_EQ(opened.error().provider_error, EIO);
     EXPECT_EQ(buffers_.capacity(), 0u);
+    EXPECT_EQ(buffers_.incarnation(), incarnation);
     ASSERT_TRUE(buffers_.Open(pool_, 5));
+    EXPECT_EQ(buffers_.incarnation(), incarnation + 1);
     RxBufferPool other;
     EXPECT_FALSE(other.Open(pool_)); // 一个共享 JFR 只能有一个内存池 owner。
     EXPECT_CALL(*this, Unregister(&segment_)).WillOnce(Return(URMA_EAGAIN)).RetiresOnSaturation();
@@ -410,9 +415,11 @@ TEST_F(RxBufferPoolTest, RegisterFailureRollsBackAndUnregisterFailureRetainsBind
     ASSERT_FALSE(closed);
     EXPECT_EQ(closed.error().code, RxBufferErrorCode::kUnregisterFailed);
     EXPECT_EQ(buffers_.capacity(), 5u);
+    EXPECT_EQ(buffers_.incarnation(), incarnation + 1);
     EXPECT_FALSE(buffers_.Refill());
     EXPECT_FALSE(pool_.Close());
     EXPECT_TRUE(buffers_.Close()); // 重试成功后才解绑并允许父队列销毁。
+    EXPECT_EQ(buffers_.incarnation(), incarnation + 1);
 }
 
 TEST_F(RxBufferPoolTest, FixedBatchLimitAndPollBudget) {

@@ -34,6 +34,7 @@ enum class RxBufferErrorCode : std::uint8_t {
     kInvalidLease,
     kReceiveFailed,
     kRetained,
+    kSequenceExhausted,
 };
 
 struct RxBufferError {
@@ -93,6 +94,10 @@ public:
     std::size_t capacity() const noexcept {
         return entries_.size();
     }
+    /// 每次成功 Open 独立递增；无投递也换代，失败 Open/Close 不改变它，用于匹配整域关闭证据。
+    std::uint64_t incarnation() const noexcept {
+        return incarnation_;
+    }
     /// 借用绑定的队列池，供同 owner 校验接收域归属；成功关闭后返回 nullptr。
     JettyPool* pool() const noexcept {
         return pool_;
@@ -143,6 +148,7 @@ private:
     std::size_t posted_ = 0;
     std::size_t held_ = 0;
     std::size_t retired_on_delete_ = 0;
+    std::uint64_t incarnation_ = 0;
     // id = 本次 block 起点 + 槽位；block 每次递增 capacity，Close/Open 不重置高水位，防 ABA。
     std::uint64_t next_id_ = 1;
     std::uint64_t base_id_ = 1;

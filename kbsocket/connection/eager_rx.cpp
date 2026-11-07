@@ -8,6 +8,8 @@
 #include <new>
 #include <optional>
 
+#include "kbsocket/transport/raw/receive_domain_closer.hpp"
+
 namespace kbsocket {
 namespace connection {
 namespace {
@@ -34,12 +36,18 @@ struct EagerReceiveDomain::State {
     std::unique_ptr<std::uint32_t[]> queue;
     std::unique_ptr<std::uint64_t[]> seen;
     std::size_t capacity = 0, held = 0, queued = 0, queue_head = 0;
+    std::uint64_t buffer_incarnation = 0, credit_incarnation = 0;
     std::uint32_t free = kEnd;
     bool frozen = false, dispatching = false;
 };
 
 EagerReceiveDomain::EagerReceiveDomain() noexcept = default;
-EagerReceiveDomain::~EagerReceiveDomain() = default;
+EagerReceiveDomain::~EagerReceiveDomain() {
+    if (!Close()) {
+        // 未结清的 Lease/receipt 与独占 Credit 绑定必须保留；宿主仍须保留全部借用依赖。
+        (void)state_.release();
+    }
+}
 
 std::expected<void, EagerRxError> EagerReceiveDomain::Open(raw::RxBufferPool& buffers, ReceiveCreditDomain& credits,
                                                            ConnectionTable& routes) noexcept {
@@ -53,7 +61,7 @@ std::expected<void, EagerRxError> EagerReceiveDomain::Open(raw::RxBufferPool& bu
     if (!buffers.pool() || buffers.stopped() || buffers.held() || !capacity || stats.frozen || stats.held ||
         stats.released || stats.unattributed || stats.physical_posted != capacity || buffers.posted() != capacity ||
         buffers.pool()->rx_depth() != capacity || !routes.domain().runtime_instance ||
-        !routes.domain().receive_domain) {
+        !routes.domain().receive_domain || credits.receive_domain() != routes.domain().receive_domain) {
         return Error(EagerRxErrorCode::kInvalidArgument);
     }
     auto state = std::unique_ptr<State>(new (std::nothrow) State);
@@ -74,6 +82,11 @@ std::expected<void, EagerRxError> EagerReceiveDomain::Open(raw::RxBufferPool& bu
     state->buffers = &buffers;
     state->credits = &credits;
     state->routes = &routes;
+    state->buffer_incarnation = buffers.incarnation();
+    state->credit_incarnation = credits.receive_domain();
+    if (!credits.BindReceive(*this)) {
+        return Error(EagerRxErrorCode::kInUse);
+    }
     state_ = std::move(state);
     return {};
 }
@@ -295,6 +308,49 @@ std::expected<void, EagerRxError> EagerReceiveDomain::Close() noexcept {
     }
     if (held() || pending_refill() || state_->credits->stats().unattributed || state_->dispatching) {
         return Error(EagerRxErrorCode::kRetained);
+    }
+    if (!state_->credits->UnbindReceive(*this)) {
+        return Error(EagerRxErrorCode::kCreditFailed);
+    }
+    state_.reset();
+    return {};
+}
+std::expected<void, EagerRxError> EagerReceiveDomain::CloseDestroyed(const raw::ReceiveDomainCloser& closer) noexcept {
+    if (!state_) {
+        return {};
+    }
+    auto& s = *state_;
+    if (s.dispatching || s.held) {
+        return Error(EagerRxErrorCode::kRetained);
+    }
+    if (!closer.ClosedDomain(*s.buffers, s.buffer_incarnation)) {
+        return Error(EagerRxErrorCode::kProofRequired);
+    }
+    if (s.credits->receive_domain() != s.credit_incarnation) {
+        return Error(EagerRxErrorCode::kCreditFailed);
+    }
+    // 单 owner 控制路径先检查整份借用：任一失效 receipt 均不能留下部分清退结果。
+    // 每次 Dispatch 分配唯一 receipt；遍历唯一 Entry，避免依赖可环绕的 refill 队列位置。
+    std::size_t released = 0;
+    for (std::size_t i = 0; i < s.capacity; ++i) {
+        const auto& entry = s.entries[i];
+        if (entry.phase == State::Phase::kFree) {
+            continue;
+        }
+        if (entry.phase != State::Phase::kQueued) {
+            return Error(EagerRxErrorCode::kRetained);
+        }
+        if (!s.credits->ValidateReleasedForClose(entry.receipt)) {
+            return Error(EagerRxErrorCode::kCreditFailed);
+        }
+        ++released;
+    }
+    if (released != s.queued) {
+        return Error(EagerRxErrorCode::kRetained);
+    }
+    const auto closed = s.credits->CloseDestroyed(*this, s.credit_incarnation, released);
+    if (!closed) {
+        return Error(EagerRxErrorCode::kCreditFailed);
     }
     state_.reset();
     return {};

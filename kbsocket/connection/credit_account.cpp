@@ -139,6 +139,7 @@ struct ReceiveCreditDomain::State {
     std::array<std::uint64_t, 2> initial_unposted{};
     std::unique_ptr<Peer[]> peers;
     std::unique_ptr<Receipt[]> receipts;
+    const EagerReceiveDomain* receive_owner = nullptr;
     std::uint32_t peer_slots = 0, free_receipt = 0;
 };
 
@@ -184,6 +185,9 @@ std::expected<void, CreditError> ReceiveCreditDomain::Close() noexcept {
         return {};
     }
     state_->stats.frozen = true;
+    if (state_->receive_owner) {
+        return Error(CreditErrorCode::kInUse);
+    }
     if (state_->stats.unattributed) {
         return Error(CreditErrorCode::kRetained);
     }
@@ -201,6 +205,53 @@ CreditDomainStats ReceiveCreditDomain::stats() const noexcept {
     const auto accounted_posted = stats.data.free + stats.data.granted + stats.control.free + stats.control.granted;
     stats.physical_posted = accounted_posted - stats.unattributed;
     return stats;
+}
+std::uint64_t ReceiveCreditDomain::receive_domain() const noexcept {
+    return state_ ? state_->config.receive_domain : 0;
+}
+std::expected<void, CreditError> ReceiveCreditDomain::BindReceive(const EagerReceiveDomain& owner) noexcept {
+    if (!state_) {
+        return Error(CreditErrorCode::kNotReady);
+    }
+    if (state_->receive_owner) {
+        return Error(CreditErrorCode::kInUse);
+    }
+    state_->receive_owner = &owner;
+    return {};
+}
+std::expected<void, CreditError> ReceiveCreditDomain::UnbindReceive(const EagerReceiveDomain& owner) noexcept {
+    if (!state_ || state_->receive_owner != &owner) {
+        return Error(CreditErrorCode::kWrongIdentity);
+    }
+    state_->receive_owner = nullptr;
+    return {};
+}
+std::expected<void, CreditError> ReceiveCreditDomain::ValidateReleasedForClose(RxCreditReceipt receipt) const noexcept {
+    const auto index = Find(receipt);
+    if (!index) {
+        return std::unexpected(index.error());
+    }
+    if (!state_->receipts[*index].released) {
+        return Error(CreditErrorCode::kInUse);
+    }
+    return {};
+}
+std::expected<void, CreditError> ReceiveCreditDomain::CloseDestroyed(const EagerReceiveDomain& owner,
+                                                                     std::uint64_t receive_domain,
+                                                                     std::size_t released_receipts) noexcept {
+    if (!state_) {
+        return Error(CreditErrorCode::kNotReady);
+    }
+    if (state_->receive_owner != &owner || state_->config.receive_domain != receive_domain) {
+        return Error(CreditErrorCode::kWrongIdentity);
+    }
+    if (state_->stats.held || state_->stats.released != released_receipts) {
+        return Error(CreditErrorCode::kRetained);
+    }
+    // 物理域已永久销毁，且桥接器已核验全部 receipt；整体终结元数据，不做 U->F 或重新授信。
+    // 未归属的旧 RQE 无需猜测其 Peer/类别，不能把本路径用于仍存活的接收域。
+    state_.reset();
+    return {};
 }
 std::expected<void, CreditError> ReceiveCreditDomain::RecordInitialPosted(CreditClass kind,
                                                                           std::uint32_t accepted) noexcept {

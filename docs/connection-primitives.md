@@ -104,7 +104,11 @@ F 是可授出的已 post 槽，G 是已经授出的承诺，U 是尚未初始 p
 
 `RetirePeer` 要求宿主同时证明发送端已停止、真实接受集合已结清、未使用授权已撤销，并等待该 Peer 所有接收 receipt 正常 refill 结账；失联、TTL 或空 CQ 不构成证明。退休后保留 tombstone 到域关闭，不复用原表项和旧 epoch。相同 Peer 重新准入要求更高 epoch，且旧关系已经退休。Sender 重开也要求同 Peer/域且 epoch 严格增加，这不代替 Receiver 的终结证明。
 
-接收授信域 `Close` 只关闭元数据，不销毁真实 JFR，不终结 Posted DMA，也不替代 [M1 接收域关闭](design/kbsocket-design-v1.md#53-接收域安全关闭状态机m1-核心规范)。当前没有 `DeleteJfr` 后直接清退未补投 receipt 的桥接接口；已有 receipt 仍须走正常归还和实际 refill 结账，未归属责任保持隔离。对象重开必须使用更大的接收域 incarnation，不能用于重置旧域的承诺。
+接收授信域与 `EagerReceiveDomain` 采用唯一绑定，同一 Credit 域不能同时被第二个 Eager 域接管。绑定期间直接调用 Credit `Close` 返回 InUse，沿用原 Close 的冻结授信行为。须先成功关闭 Eager，或走下述整域核销入口，避免一份物理关闭证据清掉另一接收域仍在使用的账本。普通 Credit `Close` 只关闭元数据，不销毁真实 JFR，不终结 Posted DMA，也不替代 [M1 接收域关闭](design/kbsocket-design-v1.md#53-接收域安全关闭状态机m1-核心规范)。对象重开必须使用更大的接收域 incarnation，不能用于重置旧域的承诺。
+
+M5.3.6 增加控制路径桥接 `EagerReceiveDomain::CloseDestroyed(const raw::ReceiveDomainCloser&)`，用于接收域已经物理销毁后清退冻结、已释放但未补投的 receipt。该入口要求 M1 协调器真实到达 `kClosed`，且对应同一 RxBufferPool 的本次成功 Open incarnation；同时核对 Eager 打开时捕获的 Credit 接收域 incarnation，阻止旧关闭证据作用于重开的域。即使残留 Posted 为 0，也必须实际完成 M1 关闭；空 CQ、Stopped、控制断开或 `retired_on_delete()==0` 都不能替代证据。
+
+核销前整批核验：没有 Held 或正在 Dispatch 的条目，所有 queued receipt 身份仍有效且已经 Release，Credit 全局 Held 为 0，released 总数与这批 receipt 一致。任一检查失败，两层元数据都保留。成功后永久清退本层与整个接收授信域的元数据，含已释放的 unknown receipt 和旧授权；过程不 post、不把 U 转为 F、不重授信，也不按猜测给 unknown 分配类别。等待 Lease、DeleteJfr/注销失败或其他未完成 M1 阶段都保留到重试成功；故障 CQ 的保留流程不支持此核销。远端关闭协议、来源退休和 Runtime 解绑仍是独立责任，不能由此接口自动推断。
 
 ## 宿主组合顺序与范围
 

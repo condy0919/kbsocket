@@ -127,7 +127,11 @@ raw RX 停止或队列被保留时，ErrorCallback 和补投阶段会将状态�
 
 Connection::Close 返回 Retained 时继续保留注册与全部借用资源。可信 TX 终结即使在 Failed/Closing 状态也报告 `tx_retired`，宿主据此重试 Close；成功后才 Detach。Detach 不关闭 Connection，也不撤销远端 Credit。关闭 RuntimeShard 只解除调度关系，不能替代连接、导入、来源和 raw 资源关闭。
 
-退出时先按上述顺序停止新命令并领取全部结果，再完成连接收敛，继续调度导入缓存的失效/Unimport；所有任务收割后关闭 RuntimeShard，再关闭 companion 和缓存。来源删除及 raw 域销毁仍要求真实静默/终结证据。冻结 RX 域中的未补投 receipt 尚缺少 DeleteJfr 后统一核销流程，不能把这一阶段当成完整故障关闭协议；无法取得终结证据时保留依赖。
+退出时先按上述顺序停止新命令并领取全部结果，再完成连接收敛，继续调度导入缓存的失效/Unimport；所有任务收割后关闭 RuntimeShard，再关闭 companion 和缓存。来源删除及 raw 域销毁仍要求真实静默/终结证据。相关 Runtime、ConnectionIoBinding 和外部队列访问停用后，宿主在控制路径推进 M1 接收域关闭，不能在 Tick 或业务 mailbox 内执行删除/注销。
+
+M5.3.6 增加 `EagerReceiveDomain::CloseDestroyed(const raw::ReceiveDomainCloser&)`：要求协调器真实 `kClosed`，匹配同一 RxBufferPool 本次成功 Open incarnation 及本层捕获的 Credit receive-domain incarnation，且 Held 为 0、全部 queued receipt 有效且已释放、全局 released 数量匹配。整批检查通过才永久清退 Eager 与接收授信元数据，不 post、不恢复额度、不重授信。冻结或 unknown 的已释放 receipt 可沿此路径结束；没有真实关闭证据时仍保留全部责任。
+
+等待应用归还、DeleteJfr/注销失败及其他 M1 未完成阶段都不能提前核销；残留 RX 数为 0 也需要同样证据。故障 CQ 的 `kRetained` 流程不支持此入口。它不自动调用 RetireSources 或解绑 Runtime，不生成远端关闭/授信撤回证明；来源退休、旧会话隔离和剩余依赖顺序仍由宿主分别完成。每个 Credit 域只允许一个 Eager owner，重复绑定被拒绝；绑定期间不能直接 Credit Close，普通 Eager Close 成功才解绑。Eager 关闭失败后的异常析构保留条目及绑定，外部依赖仍由宿主维持。
 
 ## 验证与剩余范围
 
@@ -137,4 +141,4 @@ M5.3.2/3 新增协议边界、原子登记/更新、授权和来源就绪门禁�
 
 M5.3.5 增加并发提交/领取、完成背压、有限预算、缓冲复制、陈旧句柄、一次执行与零分配测试；Mock raw 闭环还覆盖 mailbox Read/FIN、Credit 补投以及慢导入期间同 context 暂停、另一 context 继续执行。
 
-下一阶段继续补远端关闭/授信撤回、冻结接收责任核销及 raw 资源装配，再收口显式 C ABI 和零拷贝接口。完整 raw 资源所有者仍须先闭合 DeleteJfr 后冻结/未补投 receipt 的核销流程，不能通过 ConnectionOwner 析构推断物理资源可释放。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。
+下一阶段继续补远端关闭/授信撤回协议及 raw 资源装配，再收口显式 C ABI 和零拷贝接口。M5.3.6 已提供 M1 完整关闭后冻结/未补投 receipt 的核销入口，完整 raw 资源所有者仍须组织此前的静默、来源退休与进度解绑，不能通过 ConnectionOwner 析构推断物理资源可释放。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。

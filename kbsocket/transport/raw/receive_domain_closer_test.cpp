@@ -280,7 +280,9 @@ TEST_P(ReceiveDomainResidualTest, DeletesResidualRxOnlyAfterAllDependentJetties)
     }
     // 全未消费、部分消费及只剩最后一个 RX 均以 DeleteJfr 成功为终结证据。
     ASSERT_TRUE(closer_.Begin(pool_, buffers_));
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, buffers_.incarnation()));
     Finish(posted - consumed);
+    EXPECT_TRUE(closer_.ClosedDomain(buffers_, buffers_.incarnation()));
     auto again = closer_.Advance({}, {});
     ASSERT_TRUE(again);
     EXPECT_EQ(again->stage, ReceiveDomainCloseStage::kClosed);
@@ -308,6 +310,7 @@ TEST_P(ReceiveDomainProofTest, AnEmptyCqCannotReplaceAnyQuiescenceProof) {
     EXPECT_EQ(result->stage, ReceiveDomainCloseStage::kDraining);
     EXPECT_EQ(result->retired_rx, 0u);
     EXPECT_EQ(buffers_.posted(), 3u);
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, buffers_.incarnation()));
     ExpectExclusiveClose();
     Finish(3);
 }
@@ -341,6 +344,7 @@ TEST_F(ReceiveDomainCloserTest, ACompletionAfterAnEmptyPollIsDeliveredBeforeDele
     result = closer_.Advance(Quiesced(), events_);
     ASSERT_TRUE(result);
     EXPECT_EQ(result->stage, ReceiveDomainCloseStage::kWaitingForLeases);
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, buffers_.incarnation()));
     EXPECT_EQ(result->rx_events, 0u);
     EXPECT_EQ(result->retired_rx, 2u);
     EXPECT_EQ(buffers_.posted(), 0u);
@@ -360,6 +364,7 @@ TEST_F(ReceiveDomainCloserTest, ACompletionAfterAnEmptyPollIsDeliveredBeforeDele
     ASSERT_TRUE(result);
     EXPECT_EQ(result->stage, ReceiveDomainCloseStage::kClosed);
     EXPECT_EQ(result->retired_rx, 2u);
+    EXPECT_TRUE(closer_.ClosedDomain(buffers_, buffers_.incarnation()));
 }
 
 TEST_F(ReceiveDomainCloserTest, BeginFreezesAdmissionButAllowsExistingTicketsToFinish) {
@@ -469,6 +474,8 @@ TEST_P(ReceiveDomainDeleteRetryTest, FailurePreservesDependenciesAndRetriesOnlyR
                                 : failed_step == 4 ? ReceiveDomainCloseStage::kWaitingForLeases
                                                    : ReceiveDomainCloseStage::kDeletingCompletionQueues;
     EXPECT_EQ(closer_.stage(), expected_stage);
+    // 任一删除/注销失败都不发出整域关闭证据，即使 JFR 或 MR 已经销毁。
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, buffers_.incarnation()));
     EXPECT_EQ(buffers_.posted(), failed_step <= 3 ? 3u : 0u);
     EXPECT_EQ(buffers_.retired_on_delete(), failed_step <= 3 ? 0u : 3u);
     auto pool_close = pool_.Close();
@@ -488,6 +495,7 @@ TEST_P(ReceiveDomainDeleteRetryTest, FailurePreservesDependenciesAndRetriesOnlyR
     ASSERT_TRUE(result);
     EXPECT_EQ(result->stage, ReceiveDomainCloseStage::kClosed);
     EXPECT_EQ(result->retired_rx, 3u);
+    EXPECT_TRUE(closer_.ClosedDomain(buffers_, buffers_.incarnation()));
 }
 
 INSTANTIATE_TEST_SUITE_P(EachDependency, ReceiveDomainDeleteRetryTest, ::testing::Range(0, 7));
@@ -533,6 +541,7 @@ TEST_F(ReceiveDomainEventCloseTest, HeldLeaseAndFailedJfceDeletionPreserveFinalD
     EXPECT_EQ(progress.error().queue_error->resource, JettyPoolResource::kJfce);
     EXPECT_EQ(progress.error().queue_error->provider_error, URMA_EAGAIN);
     EXPECT_EQ(closer_.stage(), ReceiveDomainCloseStage::kDeletingCompletionQueues);
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, buffers_.incarnation()));
     EXPECT_EQ(pool_.recv_jfc(), nullptr);
     EXPECT_EQ(pool_.send_jfc(), nullptr);
     EXPECT_EQ(pool_.jfce(), &jfce_);
@@ -546,6 +555,7 @@ TEST_F(ReceiveDomainEventCloseTest, HeldLeaseAndFailedJfceDeletionPreserveFinalD
     EXPECT_EQ(progress->stage, ReceiveDomainCloseStage::kClosed);
     EXPECT_EQ(progress->retired_rx, 2u);
     EXPECT_EQ(pool_.jfce(), nullptr);
+    EXPECT_TRUE(closer_.ClosedDomain(buffers_, buffers_.incarnation()));
     EXPECT_TRUE(closer_.Advance({}, {}));
 }
 
@@ -620,6 +630,7 @@ TEST_F(ReceiveDomainCloserTest, SecondCloserCannotStealTheDomain) {
 }
 
 TEST_F(ReceiveDomainCloserTest, ClosedCloserAndOldLeaseCannotAffectReopenedObjects) {
+    const auto old_incarnation = buffers_.incarnation();
     Refill(1);
     ExpectRx({Completion(0)});
     auto polled = buffers_.Poll(events_);
@@ -631,8 +642,12 @@ TEST_F(ReceiveDomainCloserTest, ClosedCloserAndOldLeaseCannotAffectReopenedObjec
     Refill();
     ASSERT_TRUE(closer_.Begin(pool_, buffers_));
     Finish(3);
+    EXPECT_TRUE(closer_.ClosedDomain(buffers_, old_incarnation));
 
     Open();
+    EXPECT_GT(buffers_.incarnation(), old_incarnation);
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, old_incarnation));
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, buffers_.incarnation()));
     EXPECT_EQ(buffers_.retired_on_delete(), 0u);
     Refill(1);
     ExpectRx({Completion(0)});
@@ -665,6 +680,42 @@ TEST_F(ReceiveDomainCloserTest, ClosedCloserAndOldLeaseCannotAffectReopenedObjec
     ASSERT_TRUE(result);
     EXPECT_EQ(result->stage, ReceiveDomainCloseStage::kClosed);
     EXPECT_EQ(result->retired_rx, 0u);
+    EXPECT_TRUE(next.ClosedDomain(buffers_, buffers_.incarnation()));
+}
+
+TEST_F(ReceiveDomainCloserTest, ClosedProofIncludesZeroPostLifetimeAndRejectsForeignOrReopenedBuffers) {
+    const auto incarnation = buffers_.incarnation();
+    ASSERT_NE(incarnation, 0u);
+    RxBufferPool foreign;
+    EXPECT_EQ(foreign.incarnation(), 0u);
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, incarnation));
+    ASSERT_TRUE(closer_.Begin(pool_, buffers_));
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, incarnation));
+    // 从未投递过 RX 仍须经过真实删除流程；零残留计数本身不能成为关闭证明。
+    Finish(0);
+    EXPECT_TRUE(closer_.ClosedDomain(buffers_, incarnation));
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, 0));
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, incarnation + 1));
+    EXPECT_FALSE(closer_.ClosedDomain(foreign, incarnation));
+    ASSERT_TRUE(buffers_.Close());
+    EXPECT_EQ(buffers_.incarnation(), incarnation);
+    EXPECT_TRUE(closer_.ClosedDomain(buffers_, incarnation));
+
+    // 也没有投递的下一代必须有不同身份，不能因 lease ID 高水位没变化复用旧证据。
+    Open();
+    EXPECT_GT(buffers_.incarnation(), incarnation);
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, incarnation));
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, buffers_.incarnation()));
+    ReceiveDomainCloser next;
+    ASSERT_TRUE(next.Begin(pool_, buffers_));
+    ExpectRx();
+    ExpectDeleteSteps();
+    const auto closed = next.Advance(Quiesced(), events_);
+    ASSERT_TRUE(closed);
+    EXPECT_EQ(closed->stage, ReceiveDomainCloseStage::kClosed);
+    EXPECT_EQ(closed->retired_rx, 0u);
+    EXPECT_TRUE(next.ClosedDomain(buffers_, buffers_.incarnation()));
+    EXPECT_FALSE(closer_.ClosedDomain(buffers_, incarnation));
 }
 
 } // namespace

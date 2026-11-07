@@ -27,6 +27,7 @@ cc_library(
         ":credit_account",
         ":reorder_window",
         ":wire_frame",
+        "//kbsocket/transport/raw:receive_domain_closer",
         "//kbsocket/transport/raw:rx_buffer_pool",
     ],
 )
@@ -52,6 +53,17 @@ cc_test(
     srcs = ["eager_tx_test.cpp"],
     deps = [
         ":eager_tx",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "eager_receive_close_test",
+    srcs = ["eager_receive_close_test.cpp"],
+    deps = [
+        ":eager_rx",
+        "//kbsocket/transport/raw:receive_domain_closer",
         "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",
     ],

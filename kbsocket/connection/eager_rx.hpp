@@ -14,6 +14,9 @@
 #include "kbsocket/transport/raw/rx_buffer_pool.hpp"
 
 namespace kbsocket {
+namespace raw {
+class ReceiveDomainCloser;
+}
 namespace connection {
 
 enum class EagerRxErrorCode : std::uint8_t {
@@ -31,7 +34,8 @@ enum class EagerRxErrorCode : std::uint8_t {
     kRefillFailed,
     kReorderFailed,
     kStopped,
-    kRetained
+    kRetained,
+    kProofRequired
 };
 struct EagerRxError {
     EagerRxErrorCode code;
@@ -64,6 +68,7 @@ using EagerRxHandler = std::expected<EagerRxDisposition, EagerRxError> (*)(void*
 /// 共享 JFR 的单 owner RX 接入；不拥有 poll 权，Dispatch 只接收唯一 poll owner 的真实事件。
 /// 来源必须由接收路径独立校验，不能从 IMM/token 或预期路由反推 PeerRuntime/session/epoch。
 /// Open 要求整份初始物理容量已实际 post 并记账，此后本对象独占 refill/release/receipt 结账。
+/// 一个 ReceiveCreditDomain 只能绑定一个 EagerReceiveDomain，解绑前拒绝直接关闭信用账。
 /// callback 成功 kHeld 才转移 packet；kRelease 或失败由本对象归还。callback 不可重入 Dispatch。
 class EagerReceiveDomain {
 public:
@@ -83,6 +88,10 @@ public:
     void Freeze() noexcept;
     /// 只解除本层借用，不关闭真实队列/信用账；held/released/未知责任未解决时拒绝。
     std::expected<void, EagerRxError> Close() noexcept;
+    /// 控制路径整域清退：实际 M1 Closed 且绑定代次一致、全部 Lease/receipt 已归还后，
+    /// 原子关闭本层及 ReceiveCreditDomain，不补投、不重新授信。失败保留全部元数据。
+    /// 宿主先解绑 Runtime/来源及连接访问；不能以断链、空 CQ 或手工布尔值代替物理关闭。
+    std::expected<void, EagerRxError> CloseDestroyed(const raw::ReceiveDomainCloser& closer) noexcept;
     bool frozen() const noexcept;
     std::size_t held() const noexcept;
     std::size_t pending_refill() const noexcept;

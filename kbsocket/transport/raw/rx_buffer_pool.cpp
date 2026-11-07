@@ -61,6 +61,9 @@ std::expected<void, RxBufferError> RxBufferPool::Open(JettyPool& pool, std::uint
     if (!pool.ready()) {
         return Error(RxBufferErrorCode::kNotReady);
     }
+    if (incarnation_ == std::numeric_limits<std::uint64_t>::max()) {
+        return Error(RxBufferErrorCode::kSequenceExhausted);
+    }
     const auto count = buffer_count ? buffer_count : pool.rx_depth_;
     const long page_size = ::sysconf(_SC_PAGESIZE);
     if (!count || page_size <= 0 || count > std::numeric_limits<std::size_t>::max() / kBufferSize) {
@@ -110,6 +113,7 @@ std::expected<void, RxBufferError> RxBufferPool::Open(JettyPool& pool, std::uint
     retired_on_delete_ = 0;
     pool_ = &pool;
     pool.rx_owner_ = this;
+    ++incarnation_;
     return {};
 }
 

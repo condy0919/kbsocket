@@ -89,12 +89,16 @@ public:
     ReceiveDomainCloseStage stage() const noexcept {
         return stage_;
     }
+    /// 仅整域实际关闭成功才成立；匹配本对象捕获的 RX Open 代次，拒绝另一对象或重新打开的池。
+    /// 查询不替代宿主证明远端/队列使用者静默；buffers 对象须持续存活，不能复用其对象地址。
+    bool ClosedDomain(const RxBufferPool& buffers, std::uint64_t incarnation) const noexcept;
 
 private:
     ReceiveDomainCloseProgress Progress(std::size_t rx_events = 0) const noexcept;
 
     JettyPool* pool_ = nullptr;
     RxBufferPool* buffers_ = nullptr;
+    std::uint64_t buffer_incarnation_ = 0;
     ReceiveDomainCloseStage stage_ = ReceiveDomainCloseStage::kIdle;
     std::size_t retired_rx_ = 0;
     std::optional<RxBufferError> poll_error_;

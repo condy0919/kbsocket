@@ -23,10 +23,16 @@ std::expected<void, ReceiveDomainCloseError> ReceiveDomainCloser::Begin(JettyPoo
     }
     pool_ = &pool;
     buffers_ = &buffers;
+    buffer_incarnation_ = buffers.incarnation();
     pool.close_owner_ = this;
     pool.StopAdmission();
     stage_ = ReceiveDomainCloseStage::kDraining;
     return {};
+}
+
+bool ReceiveDomainCloser::ClosedDomain(const RxBufferPool& buffers, std::uint64_t incarnation) const noexcept {
+    return stage_ == ReceiveDomainCloseStage::kClosed && buffers_ == &buffers && incarnation != 0 &&
+           buffer_incarnation_ == incarnation && buffers.incarnation() == incarnation;
 }
 
 ReceiveDomainCloseProgress ReceiveDomainCloser::Progress(std::size_t rx_events) const noexcept {

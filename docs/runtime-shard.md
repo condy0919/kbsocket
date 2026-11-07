@@ -90,6 +90,10 @@ JFCE fd readiness、JFC 通知和 CQE 是三种不同证据。`WaitJfc(..., time
 
 M1 的 `ReceiveDomainCloser` 仍由宿主提供远端静默、事件确认、队列用户停止和 CQ 健康证明，并在控制路径推进。涉及删除时，必须先停用对应进度绑定并排除外部借用，避免事件循环或 worker 同时访问即将销毁的对象。顺序仍是删除所有关联 Jetty、删除 JFR、清退残留 Posted、等待 Held 归还，再注销 MR、删除 JFC，最后删除 JFCE；详情见 [设计 §5.3](design/kbsocket-design-v1.md#53-接收域安全关闭状态机m1-核心规范)。M3 没有新增能够代替这些证明的自动关闭流程。
 
+M5.3.6 的 `EagerReceiveDomain::CloseDestroyed(const raw::ReceiveDomainCloser&)` 在 M1 真正 `kClosed` 后衔接冻结账务关闭。它核对 RxBufferPool 本次成功 Open 代次和本层捕获的接收授信域 incarnation，确认零 Held、全部 queued receipt 已释放且全局 released 数量一致，再清退两层元数据。无需补投来消除 pending receipt，不恢复任何授信；unknown receipt 也不重新猜测归属。该操作只在控制路径执行，不能作为 Runtime Tick 或业务 mailbox 命令自动运行。同一 Credit 域只能绑定一个 Eager owner；直接 Credit Close 必须先解除该绑定，普通 Eager Close 失败时继续保留条目与绑定。
+
+DeleteJfr 已成功但仍等待 Lease、MR 注销失败或 JFC 删除尚未完成时，继续保留账务到 M1 `kClosed`；残留 Posted 为 0 不豁免实际关闭证明。故障 CQ 隔离流程不适用。Runtime 解绑、RetireSources 和远端协议仍是独立步骤，不能以这个元数据核销入口替代所需屏障。
+
 正常调用必须显式 Close。若异常析构时控制任务仍未终结，`RuntimeShard` 保留内部 State（含进度源、任务参数和线程），`ControlExecutor` 同样保留其内部槽位/线程/FD，避免 worker 访问已释放内部对象。**保留内部 State 不接管借用 raw 对象、回调 cookie 或外部任务参数**；调用方仍必须让全部依赖存活，无法取得终结证明时保持隔离，不能在析构后释放这些依赖。
 
 ## 验证

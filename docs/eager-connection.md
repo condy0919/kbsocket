@@ -28,6 +28,16 @@
 
 旧 token 即使路由被拒绝，真实 RX 也先扣原 Peer Credit、再归还/补投。无法归属的真实 RX 扣 unknown 责任并冻结域。重复 CQE 不重复扣一份物理 RQE。
 
+## 已销毁接收域的账务关闭
+
+每个 Credit 接收域只允许绑定一个 EagerReceiveDomain，重复绑定被拒绝。普通 Eager `Close` 成功后解除绑定，之后才可单独关闭 Credit；未完成关闭的异常析构保留本层元数据及绑定，宿主仍须保留全部外部依赖。
+
+`EagerReceiveDomain::Freeze` 停止补投和新授信，现有应用 Lease 仍可 Release；已归还的 receipt 留在 pending-refill 队列，不能借实际关闭伪造一次 refill。普通 `Close` 仍要求 Held、pending refill 和 unknown 责任已结清。
+
+M5.3.6 的 `CloseDestroyed(const raw::ReceiveDomainCloser&)` 提供独立控制路径：先由宿主取得 M1 要求的远端静默、事件确认、队列用户停止和 CQ 健康证明，停用对应 Runtime/raw 进度绑定，推进真实接收域关闭。只有 M1 已达到 `kClosed`，且匹配 Eager 捕获的 RxBufferPool successful-Open incarnation 和 Credit receive-domain incarnation，才能清理冻结账务。等待 Held、DeleteJfr 或 MR 注销失败时都保留原账并等待重试；已知残留 RX 为 0 也不能跳过实际关闭。
+
+该入口先原子核验全部 queued receipt 的身份及 released 状态、全局 released 数量和零 Held，再永久清退 Eager 与接收授信元数据。成功不补投、不产生可发放额度，也不猜测 unknown 的 Peer/类别。它不会释放仍 Held 的数据，不绕过故障 CQ 隔离，不自动撤路由、退休来源或关闭借用的连接/导入资源；宿主必须先停止这些访问。远端关闭/授信撤回协议与完整 Runtime 资源装配仍待后续接入。
+
 ## 控制流的前进保证
 
 只预留控制 WR 记录仍不够：数据可能占满注册 Slab，也可能把双向控制额度全部消耗，导致 Credit 自己无法发送。本实现同时约束内存、额度和共享发布状态：
