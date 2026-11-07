@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+cc_library(
+    name = "buffer_lease",
+    hdrs = ["buffer_lease.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "quarantine_ledger",
+    srcs = ["quarantine_ledger.cpp"],
+    hdrs = ["quarantine_ledger.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [":buffer_lease"],
+)
+
+cc_library(
+    name = "slab_allocator",
+    srcs = ["slab_allocator.cpp"],
+    hdrs = ["slab_allocator.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":buffer_lease",
+        ":quarantine_ledger",
+        "//kbsocket/transport/raw:urma_api",
+    ],
+)
+
+cc_library(
+    name = "lease_return_queue",
+    srcs = ["lease_return_queue.cpp"],
+    hdrs = ["lease_return_queue.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [":buffer_lease"],
+)
+
+cc_library(
+    name = "lease_return_progress",
+    srcs = ["lease_return_progress.cpp"],
+    hdrs = ["lease_return_progress.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":lease_return_queue",
+        ":slab_allocator",
+        "//kbsocket/runtime:progress_source",
+    ],
+)
+
+cc_test(
+    name = "slab_allocator_test",
+    srcs = ["slab_allocator_test.cpp"],
+    deps = [
+        ":slab_allocator",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "lease_return_queue_test",
+    srcs = ["lease_return_queue_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":lease_return_queue",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "lease_return_progress_test",
+    srcs = ["lease_return_progress_test.cpp"],
+    deps = [
+        ":lease_return_progress",
+        ":lease_return_queue",
+        ":slab_allocator",
+        "//kbsocket/runtime:control_executor",
+        "//kbsocket/runtime:shard_reactor",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)

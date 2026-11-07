@@ -3,7 +3,7 @@
 > **对齐规范**：[kbsocket-design-v1.md](design/kbsocket-design-v1.md) · [hardware-observations.md](hardware-observations.md) · [hardware-validation-matrix.md](hardware-validation-matrix.md) · [OBSERVABILITY-DESIGN-GUIDE.md](OBSERVABILITY-DESIGN-GUIDE.md)
 > **最后更新**：2026-11-07
 
-本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语；M3 已实现借用 raw 资源的单 owner 进度器、四 context 调度、事件与有界控制执行器，验证状态分别见对应小节。M4–M7、L1/L2、O1/O2 仍为待交付计划，其中新类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
+本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语；M3 已实现借用 raw 资源的单 owner 进度器、四 context 调度、事件与有界控制执行器，验证状态分别见对应小节。M4.1 已交付固定 Slab、Lease 责任账本及跨线程归还；M4 的协议/乱序/授信部分以及 M5–M7、L1/L2、O1/O2 仍为待交付计划，未实现类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
 
 ---
 
@@ -17,14 +17,15 @@
 | **动态加载与拓扑发现** | `kbsocket/transport/raw/urma_api.*`<br>`device_catalog.*`<br>`urma_context.*`<br>`raw_runtime.*` | `liburma.so` 符号表加载、设备枚举、`RM_CTP` 能力校验、多 `UrmaContext` 初始化；M3 可显式绑定已创建的 context | 自动拓扑分片、资源创建与 NUMA 亲和性调度尚未接入 |
 | **池化 Jetty 管理** | `kbsocket/transport/raw/jetty_pool.*`<br>`receive_domain_closer.*` | 共享 `JFR`、固定被动接收端点与主动 TX Lanes；Round-Robin、ERROR/边界/flush 排空、接收域分阶段关闭；M2 新增 Lane generation 与显式 `ReplaceDrainedLane`；M3 将排空修改和显式替换交给控制线程 | 关闭/替换的远端静默、旧 CQE 和事件引用屏障仍由调用方证明；M1 关闭需宿主在控制路径推进，M5 远端关闭协议待实现；不支持故障 JFC 在线恢复 |
 | **TX 发送与完成收敛** | `kbsocket/transport/raw/attempt_ledger.*`<br>`tx_sender.*`<br>`tx_completion_processor.*` | 单调 `AttemptId`、SEND/SEND_WITH_IMM/WRITE 提交与接受前缀入账；`LookupPosted` 核验已提交记录及完整 Lane 身份后再处理错误；8/10 逐 WR 退休，9 隔离排空；M3 用 owner 回调交付结果 | 元数据仍为借用身份；Connection 路由、替换屏障的自动证明、WRITE Grant 与 DONE 协议待 M4–M6 接入；不自动重试或重放已接受 WR |
-| **RX 缓冲池** | `kbsocket/transport/raw/rx_buffer_pool.*` | 连续内存预分配、DMA 段注册、`Refill`/`Poll`/`Release`/`Stop`、`RxBufferLease` 借出与归还；M1 在 `DeleteJfr` 成功后内部清退残留 Posted，Held 归还后才注销内存；M3 联动补投与水线重写 | 跨线程归还队列及独立 RMA Grant 生命周期属于 M4/M6，不能由 RX 关闭代为终结 |
-| **单 owner 运行时进度** | `kbsocket/runtime/` | `RuntimeShard` 绑定最多四 context，`ShardReactor` 分类公平预算与事件等待，`RawContextProgress` 做通知/async 归属及错误隔离，`ControlExecutor` 执行慢控制任务 | 借用已有 raw 对象；不创建完整连接/runtime 资源，不实现 mailbox 队列、Grant 或远端关闭协议；接入约束见 [RuntimeShard](runtime-shard.md) |
+| **RX 缓冲池** | `kbsocket/transport/raw/rx_buffer_pool.*` | 连续内存预分配、DMA 段注册、`Refill`/`Poll`/`Release`/`Stop`、`RxBufferLease` 借出与归还；M1 在 `DeleteJfr` 成功后内部清退残留 Posted，Held 归还后才注销内存；M3 联动补投与水线重写 | 独立 Slab 的跨线程归还已在 M4.1 实现；本池 backing 尚未迁移，RMA Grant 协议待 M6，不能由 RX 关闭代为终结 |
+| **单 owner 运行时进度** | `kbsocket/runtime/` | `RuntimeShard` 绑定最多四 context，`ShardReactor` 分类公平预算与事件等待，`RawContextProgress` 做通知/async 归属及错误隔离，`ControlExecutor` 执行慢控制任务 | 借用已有 raw 对象；不创建完整连接/runtime 资源，不实现通用业务 mailbox、Grant 或远端关闭协议；M4.1 已接入 CPU Lease 归还 hooks；接入约束见 [RuntimeShard](runtime-shard.md) |
+| **注册内存与 Lease** | `kbsocket/memory/` | 固定 Slab 最多四 context 注册、共享 backing 硬预算、独立 CPU/DMA/Grant 责任及每槽隔离记录；MPSC 归还队列与 Shard mailbox 预算集成 | 尚无完整 MemoryManager、RX backing 迁移、应用 write 部分接受或远端 Grant 协议；见 [内存与 Lease](memory-leases.md) |
 | **硬件实测工具集** | `tools/*_test` | 已记录 SEND/SGE、RMA、故障隔离、补投及多 context 通知等观测，另有人工确认的大小/生命周期/可见性契约 | 人工契约不等于测试 PASS；WN1–WN4 通知回归尚无真机日志，历史 ACK_TIMEOUT 根因仍待定位；按验证矩阵逐项回归 |
 
 ### 1.2 待建设模块（包括未创建目录与工作区接口草稿）
 
-- `kbsocket/memory/`：多上下文预注册 `Slab`、`BufferLease`、跨线程无锁归还队列、`QuarantineLedger`
-- `kbsocket/runtime/` 后续集成：自动资源创建、NUMA 亲和性、真实 mailbox/连接定时器与跨线程归还；当前已有有界 `ProgressSource` 接口
+- `kbsocket/memory/` 后续集成：多 Slab 扩容管理、RX backing 迁移和连接/Grant 绑定；M4.1 的固定 Slab 与跨线程归还原语已落地
+- `kbsocket/runtime/` 后续集成：自动资源创建、NUMA 亲和性、通用业务 mailbox/连接定时器；当前已有有界 `ProgressSource` 接口及 CPU Lease 归还源
 - `kbsocket/control/`：非阻塞 TCP 握手状态机、`EndpointImportCache`（Single-Flight）、`HealthRegistry`
 - `kbsocket/connection/`：`Connection` 状态机、64-bit `IMM` 编解码、`ReorderWindow`、`CreditAccount`、`WriteRndvEngine`
 - `kbsocket/api/` 与 `kbsocket/socket/`：`kbsocket.h`、`buffer.h`、C++23 `execution` 封装、`FdTable`、`SocketAdapter`、`EpollMux`
@@ -41,7 +42,7 @@ flowchart TD
     M1["M1: 残余 RX 安全关闭闭环<br/>(DeleteJetty -> DeleteJfr -> OnJfrDeleted)"]
     M2["M2: 共享 SQ 故障隔离、主被动 Jetty 解耦与 Lane 在线重建"]
     M3["M3: RuntimeShard 反应堆、4-Context 轮询与异步事件引擎<br/>(已实现，真机待回归)"]
-    M4["M4: MemoryManager、IMM 短帧/扩展帧、乱序重组与 Credit 流控"]
+    M4["M4: 内存、IMM 协议、乱序与 Credit<br/>(M4.1 内存原语已实现)"]
     M5["M5: Connection 状态机、非阻塞建链、Single-Flight 导入与显式 API"]
     M6["M6: WRITE RNDV 大包直写引擎与 Grant 隔离生命周期"]
     M7["M7: Socket/epoll 兼容层、bRPC 适配与 40k 规模验收"]
@@ -164,16 +165,20 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 
 ### M4：`MemoryManager`、`IMM` 短帧/扩展帧、乱序重组与 Credit 流控
 
+- **当前交付 M4.1**：已实现 `SlabAllocator`、共享 `MemoryBudget`、`BufferLease`/`BufferReference`、`QuarantineLedger`、`LeaseReturnQueue` 与 `LeaseReturnProgress`，使用约束见 [注册内存与 Lease](memory-leases.md)。固定 backing 最多四 context 注册；CPU、本地 DMA 与远端 Grant 分账，全部结束才复用；部分注册/注销失败保留依赖与预算。跨线程归还使用预分配 MPSC + eventfd，由 Shard 的 mailbox 预算消费。2026-11-07 运行 `bazel test //kbsocket/memory:all //kbsocket/runtime:all //kbsocket/transport/raw:all //tools/... --test_output=errors`，40 个测试目标、693 个用例通过（新增 memory 36 个）。验证使用 Mock/本机线程与 fd，UB 真机未执行。
+- **下一交付 M4.2**：实现短/扩展帧编解码、连接 token/SN 边界、ReorderWindow 与 CreditAccount。M4.1 尚不提供完整 MemoryManager 扩容策略，不迁移现有 `RxBufferPool` backing，不自动把 `AttemptLedger` 或网络 DONE 转成内存终结证明；应用 write 与完整 Grant 协议仍分别属于 M5/M6。
 - **目标**：实现零分配数据面所需的多上下文预注册内存池、64-bit `IMM` 短帧及扩展协议帧、每连接乱序重排窗口与无死锁信用流控。
 - **设计章节**：[§6 线协议与连接内顺序](design/kbsocket-design-v1.md#6-连接内顺序保留薄适配不构建重放协议)、[§7.1 内存模型](design/kbsocket-design-v1.md#71-四层内存模型与零分配快路径)、[§8 分层流控](design/kbsocket-design-v1.md#8-分层流控守恒总账长期暖窗口与大包准入)
 - **涉及代码**：
   - `kbsocket/memory/slab_allocator.hpp` / `.cpp`
-  - `kbsocket/memory/buffer_lease.hpp` / `.cpp`
+  - `kbsocket/memory/buffer_lease.hpp`
+  - `kbsocket/memory/lease_return_queue.hpp` / `.cpp`
+  - `kbsocket/memory/lease_return_progress.hpp` / `.cpp`
   - `kbsocket/memory/quarantine_ledger.hpp` / `.cpp`
   - `kbsocket/connection/wire_frame.hpp`
   - `kbsocket/connection/reorder_window.hpp` / `.cpp`
   - `kbsocket/connection/credit_account.hpp` / `.cpp`
-  - `tests/unit/memory/*_test.cpp`
+  - `kbsocket/memory/*_test.cpp`
   - `tests/unit/connection/*_test.cpp`
 - **关键改动**：
   1. **多上下文 `SlabAllocator` 与 `BufferLease`**：

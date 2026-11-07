@@ -433,6 +433,8 @@ flowchart LR
 
 映射、预触页和注册均在初始化/控制路径完成，池内借还只更新预分配元数据。扩容先预留容器预算，由控制执行器准备后交 Owner 发布；空池时部分接受、反压或报错，不在收发/poll 路径同步扩容，也不使用未注册 heap 内存绕过限制。活动、Held、扩容中及隔离资源都计入内存上限；同一 backing 多 context 注册时物理字节只计一次。
 
+**M4.1 实现边界**：`SlabAllocator` 目前拥有一个固定容量的页对齐 backing，在最多四个 context 注册，借助共享 `MemoryBudget` 限制 backing 总字节；容量固定的 Lease/引用/隔离/队列元数据及 provider 内部开销不包含在该 backing 计数内。每个 `BufferLease` 只有一份 CPU 所有权，复制描述符不会增引用；每份 DMA/Grant 使用独立 `BufferReference`，经 `Reserve -> Commit -> CompleteDma/EndGrant` 结束，只有明确未暴露的 Reserved 责任允许 Cancel。三类责任全清才复用；不以超时、断链或本地 CQ 清空替代远端 Grant 终结证明。`LeaseReturnQueue` 与 `LeaseReturnProgress` 已接入 M3 hooks，只转移并解除 CPU 持有。当前尚未迁移 `RxBufferPool` backing，也未实现 Slab 扩容管理、应用 write 部分接受及远端 Grant 协议；使用与安全关闭约束见 [注册内存与 Lease](../memory-leases.md)。
+
 ### 7.2 三条数据路径与阈值策略
 
 | 数据路径 | 适用条件 | 内存与完成生命周期 |

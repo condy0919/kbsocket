@@ -7,6 +7,7 @@
 | [实施 roadmap](roadmap.md) | M0 契约修订、M1–M7 交付依赖与验收，SHM/观测支线和当前实现缺口 |
 | [Raw 传输流程](raw-transport-flow.md) | 所有权、初始化、双端 SEND、退出和当前验证范围 |
 | [RuntimeShard 进度器](runtime-shard.md) | 单 owner 四 context、分类预算、通知/async、水线待处理、有界控制执行器与借用资源生命周期 |
+| [注册内存与 Lease](memory-leases.md) | 多 context Slab、独立 CPU/DMA/Grant 责任、有界跨线程归还及隔离回收 |
 | [硬件观测记录](hardware-observations.md) | 用户实测的 SEND/RMA、水线重配、错误事件与隔离、资源回收及验证边界 |
 | [硬件验证矩阵](hardware-validation-matrix.md) | 残留 RX、provider 边界、进程/链路故障、持续多设备收发、JFC 通知与 READ/WRITE 的完整运行顺序 |
 | [URMA 加载与运行时](urma-runtime.md) | 动态加载、gMock 替换、context 校验、会话与进程退出 |
