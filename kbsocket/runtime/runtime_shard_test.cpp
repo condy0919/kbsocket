@@ -76,7 +76,7 @@ protected:
     raw::test_support::ScopedUrmaOverride override_{Functions()};
     std::array<Domain, 4> domains_;
     std::array<RawContextBinding, 4> bindings_{};
-    std::array<Companion, 4> companions_;
+    std::array<Companion, 5> companions_;
     RuntimeShard shard_;
     std::atomic<bool> control_entered_{false}, control_release_{false};
 
@@ -437,6 +437,73 @@ TEST_F(RuntimeShardTest, RejectsCompanionSharedAcrossPauseDomainsOrHooks) {
     bindings_[1].mailbox = nullptr;
     EXPECT_FALSE(shard_.Open(bindings_, {}, &companions_[2]));
     EXPECT_TRUE(shard_.Open(bindings_));
+    EXPECT_TRUE(shard_.Close());
+}
+
+TEST_F(RuntimeShardTest, ImportPausesAllFiveMembersIncludingPeerWithdrawal) {
+    auto& other_peer = companions_[4];
+    bindings_[0].connections = &companions_[0];
+    bindings_[0].control = &companions_[1];
+    bindings_[0].mailbox = &companions_[2];
+    bindings_[0].peers = &companions_[3];
+    bindings_[1].peers = &other_peer;
+    companions_[3].context = &domains_[0].context;
+    other_peer.context = &domains_[1].context;
+    companions_[1].pending =
+        ControlTask{.function = &RuntimeShardTest::RunCompanionControl, .argument = this, .token = 2};
+    ASSERT_TRUE(shard_.Open(bindings_, {.reactor = {.events = true}}));
+    ASSERT_TRUE(shard_.Tick());
+    ASSERT_TRUE(shard_.paused(0));
+    const auto polls = domains_[0].polls;
+    const auto peer_calls = companions_[3].calls;
+    const auto peer_notifications = companions_[3].notifications;
+    const auto other_calls = other_peer.calls;
+    // 第五个成员也借用 Credit 域；阻塞导入期间不可继续冻结/核销，其他 context 保持收发和补投。
+    CompleteOne(0);
+    CompleteOne(1);
+    ASSERT_TRUE(shard_.RunOnce());
+    EXPECT_EQ(domains_[0].polls, polls);
+    EXPECT_EQ(domains_[0].received, 0u);
+    for (const auto& companion : std::span(companions_).first(4)) {
+        EXPECT_EQ(companion.calls, peer_calls);
+        EXPECT_EQ(companion.notifications, peer_notifications);
+    }
+    EXPECT_GT(other_peer.calls, other_calls);
+    EXPECT_EQ(domains_[1].received, 1u);
+    EXPECT_EQ(domains_[1].rx.posted(), 4u);
+    EXPECT_FALSE(shard_.Close());
+    ReleaseControl();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (shard_.paused(0) && std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(shard_.Tick());
+        std::this_thread::yield();
+    }
+    ASSERT_FALSE(shard_.paused(0));
+    EXPECT_EQ(companions_[1].completed, 1u);
+    EXPECT_EQ(companions_[3].completed, 0u);
+    EXPECT_GT(companions_[3].calls, peer_calls);
+    EXPECT_GT(companions_[3].notifications, peer_notifications);
+    EXPECT_EQ(domains_[0].received, 1u);
+    EXPECT_EQ(domains_[0].rx.posted(), 4u);
+    ASSERT_TRUE(shard_.Close());
+}
+
+TEST_F(RuntimeShardTest, RejectsPeerAliasesAndWrongContextBeforeBindingOwners) {
+    bindings_[0].peers = &companions_[0];
+    bindings_[0].connections = &companions_[0];
+    EXPECT_FALSE(shard_.Open(bindings_));
+    bindings_[0].connections = nullptr;
+    bindings_[1].peers = &companions_[0];
+    EXPECT_FALSE(shard_.Open(bindings_));
+    bindings_[1].peers = nullptr;
+    EXPECT_FALSE(shard_.Open(bindings_, {}, &companions_[0]));
+    companions_[0].context = &domains_[1].context;
+    EXPECT_FALSE(shard_.Open(bindings_));
+    // 失败没有留下 raw owner；修正 Peer 的 context 后可完整注册和解绑。
+    companions_[0].context = &domains_[0].context;
+    ASSERT_TRUE(shard_.Open(bindings_));
+    EXPECT_TRUE(shard_.Tick());
+    EXPECT_GT(companions_[0].calls, 0u);
     EXPECT_TRUE(shard_.Close());
 }
 

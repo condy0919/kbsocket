@@ -14,13 +14,13 @@
 namespace kbsocket {
 namespace runtime {
 
-/// 同一 context 的全部 owner 访问作为一个源注册，使 raw、连接和导入共享控制暂停屏障。
+/// 同一 context 的全部 owner 访问作为一个源注册，使 raw、连接、导入、mailbox 和 Peer 共享控制暂停屏障。
 /// 每个成员在每类进度中获得独立 budget，总预算最多 kMaxMembers * budget；轮换首个成员。
 /// 固定借用成员和 fd，不分配、不关闭成员；调用者不得把任何成员再独立注册或并发推进。
 /// 成员及其控制任务依赖须活到 Close 成功；外部借用者也必须遵守 reactor 的 paused 状态。
 class ContextProgressGroup final : public ProgressSource {
 public:
-    static constexpr std::size_t kMaxMembers = 4;
+    static constexpr std::size_t kMaxMembers = 5;
     static constexpr std::size_t kMaxFds = 80;
 
     ContextProgressGroup() = default;

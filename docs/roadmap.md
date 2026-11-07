@@ -1,9 +1,9 @@
 # kbsocket 演进路线图 (Roadmap)
 
 > **对齐规范**：[kbsocket-design-v1.md](design/kbsocket-design-v1.md) · [hardware-observations.md](hardware-observations.md) · [hardware-validation-matrix.md](hardware-validation-matrix.md) · [OBSERVABILITY-DESIGN-GUIDE.md](OBSERVABILITY-DESIGN-GUIDE.md)
-> **最后更新**：2026-11-07
+> **最后更新**：2026-11-08
 
-本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语；M3 已实现借用 raw 资源的单 owner 进度器、四 context 调度、事件与有界控制执行器，验证状态分别见对应小节。M4 已交付 M4.1 固定 Slab/Lease 和 M4.2 协议、顺序、授信原语；M5.1 已交付已连接协议 fd 上的非阻塞握手、完整身份路由和 Single-Flight 导入。M5.2 已接通有界 Eager Connection copy-stream 与 NativeTCP 数据后端；M5.3.1–7 已接通借用 raw 资源的 Runtime owner、context 暂停组、连接 fd 调度、实际 CQE 来源登记校验、HELLO 主动 Lane 交换、在线 UPDATE/ACK，以及拥有连接对象的有界入口和跨线程业务 mailbox；已提供真实物理关闭后冻结 RX receipt 的整域核销，以及独立控制 fd 上的 Peer 共账授信撤回。撤回协调器的自动 Runtime 接线、raw 资源装配及显式 C ABI/零拷贝 API 仍待后续，Grant 联动待 M6。M6–M7、L1/L2、O1/O2 仍为待交付计划，未实现类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
+本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语；M3 已实现借用 raw 资源的单 owner 进度器、四 context 调度、事件与有界控制执行器，验证状态分别见对应小节。M4 已交付 M4.1 固定 Slab/Lease 和 M4.2 协议、顺序、授信原语；M5.1 已交付已连接协议 fd 上的非阻塞握手、完整身份路由和 Single-Flight 导入。M5.2 已接通有界 Eager Connection copy-stream 与 NativeTCP 数据后端；M5.3.1–8 已接通借用 raw 资源的 Runtime owner、context 暂停组、连接 fd 调度、实际 CQE 来源登记校验、HELLO 主动 Lane 交换、在线 UPDATE/ACK，以及拥有连接对象的有界入口和跨线程业务 mailbox；已提供真实物理关闭后冻结 RX receipt 的整域核销，以及独立控制 fd 上的 Peer 共账授信撤回与 Runtime 调度。raw 资源装配、全域关闭编排及显式 C ABI/零拷贝 API 仍待后续，Grant 联动待 M6。M6–M7、L1/L2、O1/O2 仍为待交付计划，未实现类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
 
 ---
 
@@ -222,9 +222,12 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 - **当前交付 M5.3.6**：`EagerReceiveDomain::CloseDestroyed` 在 M1 实际完整关闭后原子核销冻结、已归还未补投及 unknown receipt，并清退整个接收 Credit 域。RX buffer 成功 Open 使用独立单调 incarnation；关闭证据同时核对对象、本代与 credit receive-domain incarnation，零残留也不能跳过证明。同一 Credit 域只允许一个 Eager owner，绑定期间禁止直接关闭 Credit，普通 Eager Close 成功才解绑。Held、错代、失效 receipt 或全局账务数量不匹配时两层元数据不变；删除/注销失败可继续重试 M1。清退只在宿主控制路径执行，不补投、不重新授信、不恢复故障 CQ；普通 Close/RetirePeer 仍需满足各自的终结条件。
 - **M5.3.6 验证**：2026-11-07 完整相关回归通过 65 个测试目标、1100 个用例，新增 18 个。Mock 集成覆盖零残留及冻结/unknown receipt、Held 延迟归还、删除与 MR 注销失败重试、部分/未知接受的补投、关闭时迟到 CQE、错误对象与重开代次、Credit 独占绑定及不一致账务禁止部分清退；raw 测试扩展各关闭阶段的证明门禁。C++23 构建、格式及 diff 检查通过；UB 真机与 40k 验收未执行。
 - **当前交付 M5.3.7**：`PeerCreditControl` 在独立、已认证的非阻塞控制 fd 上撤回整个 PeerRuntime/接收域的共账授信。成功 Open 永久停止 Sender 共账并冻结接收 Peer，等待待决 post 的可信接受集合后交换 DATA/CONTROL 累计 spent；接收端等待真实 CQE 消费量逐类一致、全部 receipt 归还及实际 refill 后才退休旧授信并回 ACK。未知接受、未知 RX、计数矛盾、断链及超时均不推测释放。控制器独占绑定阻止中途关闭/重开账本；Close 解除控制绑定但不恢复发送、不回收尚未证实的授权。旧 Eager 流不能借新 epoch 投递，旧控制 WR 的迟到错误也不能停用新共账。详见 [Peer 授信撤回](peer-credit-control.md)。
-- **M5.3.7 范围**：这是整份 Peer 授信关系的终止，不能由单条连接 Close 自动发起；协议不保证已接受应用 Write 的未提交部分继续发送。Runtime 尚未自动装配或调度该独立 fd，宿主必须停止相关业务提交、关闭受影响连接、持续消费迟到 RX 并真实补投。协议完成只结清远端 RQE 授信，不代替本地 TX CQE/DMA 终结、来源退休或 M1 销毁屏障；没有 RX 的错误 WR 会使本次撤回等待至失败，随后由宿主保留依赖并选择整域关闭。
+- **M5.3.7 范围**：这是整份 Peer 授信关系的终止，不能由单条连接 Close 自动发起；协议不保证已接受应用 Write 的未提交部分继续发送。独立 fd 的 Runtime 调度由 M5.3.8 接入，宿主仍须停止相关业务提交、关闭受影响连接、持续消费迟到 RX 并真实补投。协议完成只结清远端 RQE 授信，不代替本地 TX CQE/DMA 终结、来源退休或 M1 销毁屏障；没有 RX 的错误 WR 会使本次撤回等待至失败，随后由宿主保留依赖并选择整域关闭。
 - **M5.3.7 验证**：2026-11-07 完整相关回归通过 66 个测试目标、1140 个用例，新增 40 个。新增协议测试覆盖双向撤回、身份/epoch/计数与顺序校验、待决及未知 post、迟到 RX/归还/补投、超时/EOF/最终 ACK 背压、绑定回滚、独立 Peer、本地 IPv4 TCP 和无分配推进；Mock RX 集成验证实际补投前禁止退休、授信完成不删除物理资源、控制绑定解除后才可完成 M5.3.6 清退。共享两流停止及旧 epoch 迟到完成也已回归。新增/修改实现通过严格 C++23 `-Wall -Wextra -Werror`、格式及 diff 检查；UB 真机与 40k 验收未执行。
-- **下一步 M5.3.8**：接入撤回协调器的 Runtime 调度与完整 raw 资源关闭/装配，在所有 Peer 关系和独立 DMA/事件责任分别收敛后推进 M1；随后收口显式 C ABI/零拷贝接口。已有 API 草稿尚未作为稳定 ABI 交付。UB 真机与 40k 性能验证继续保持未执行。
+- **当前交付 M5.3.8**：`PeerCreditProgress` 用固定容量槽拥有撤回控制器与独立 fd，通过内部 epoll 向 Reactor 提供一个稳定入口。Begin 先完成可失败的注册/唤醒，再执行不可逆的 Stop/Freeze；完整代次句柄防止旧事件和重开后误访问。mailbox/timer 有界推进专用协议、待决 post 与 RX/refill，EAGAIN 或未完成状态不持续忙转。单 Peer 失败隔离，终态回调一次，显式 Release/Abort 才解除账本绑定并回收槽。`RawContextBinding.peers` 与 raw、连接、导入及 mailbox 共用五成员 context 暂停屏障。
+- **M5.3.8 范围**：宿主仍提供已认证的专用连接和真实账本/context 归属，并关闭受影响逻辑连接、持续结清 RX/TX。完成只撤回授信，不自动退休来源、证明事件静默或调用 M1。完整 raw 所有者与全域关闭编排拆到 M5.3.9；禁止以协议失败/历史完成推测销毁条件。
+- **M5.3.8 验证**：2026-11-08 完整相关回归通过 67 个测试目标、1171 个用例，新增 31 个，无失败或跳过。覆盖本地 IPv4 TCP、96 个动态 fd 汇聚、预算与零分配、待决 post/迟到 RX/实际补投记账、EAGAIN 让出、EOF/超时/未知接受的单 Peer 隔离、fd 接管回滚、旧句柄/dup 迟到事件、终态绑定及显式中止；实际撤回源与阻塞控制 worker 集成验证 context 暂停恢复，五成员 Mock raw 组验证其他 context 继续 RX/refill。新增/修改实现通过严格 C++23 `-Wall -Wextra -Werror`、格式及 diff 检查；UB 真机与 40k 验收未执行。
+- **下一步 M5.3.9**：补完整 raw 资源所有权、装配与关闭编排，在所有 Peer 关系和独立 DMA/事件责任分别收敛后推进 M1；随后收口显式 C ABI/零拷贝接口。已有 API 草稿尚未作为稳定 ABI 交付。UB 真机与 40k 性能验证继续保持未执行。
 
 - **目标**：打通从非阻塞 TCP 握手、`EndpointImportCache` 去重导入、到 `Connection` 收发与显式零拷贝 C/C++ API 的端到端 Eager 数据面闭环，并提供 `NativeTcpBackend` 保底。
 - **设计章节**：[§10.1 非阻塞建链](design/kbsocket-design-v1.md#101-非阻塞建链与能力协商状态机)、[§10.3 分层 API](design/kbsocket-design-v1.md#103-接口分层c-abiposix-兼容与-c23-p2300)

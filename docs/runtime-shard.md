@@ -24,7 +24,9 @@
 
 控制任务会访问 raw 对象，因此提交前冻结整个 context 的访问，而非仅冻结一个 Lane。该 context 的全部 TX/RX/refill/flush、JFC 通知和 async 消费暂停，相关 fd 暂时移出等待集合。控制完成经 owner 收割后才恢复。宿主的外部借用者同样不能在此期间投递、poll、归还 Lease 或删除对象；其他 context 可以继续推进。
 
-`RawContextBinding.mailbox` 是第三个可选 companion，与 `.connections`、`.control` 和 raw 源共同构成最多四成员的暂停组。ConnectionMailbox 继承 owner 的 context 身份，跨 context 绑定或绕过组作为独立 hooks 均被拒绝。暂停期间允许业务线程复制入队、领取已完成结果，但禁止执行命令访问该 context；恢复后由原 owner 有界推进。
+`RawContextBinding` 的 `.connections`、`.control`、`.mailbox` 和 `.peers` 与 raw 源共同构成最多五成员的暂停组。ConnectionMailbox 继承 owner 的 context 身份，PeerCreditProgress 声明借用账本所属的 context；跨 context 绑定或绕过组作为独立 hooks 均被拒绝。暂停期间允许业务线程复制入队、领取已完成结果，但禁止执行命令或撤回协议访问该 context；恢复后由原 owner 有界推进。
+
+M5.3.8 的 [PeerCreditProgress](peer-credit-control.md#runtime-调度与所有权) 拥有授信撤回控制器和独立 fd，以固定 epoll 入口接入 `.peers`，按 mailbox/timer 预算处理握手、背压与待决 RX 账务。单 Peer 协议失败不会停掉其他 Peer；完成后仍需显式 Release 解除绑定。它不负责建立/认证控制连接，授信完成也不代替 M1 关闭证明。宿主必须遵守暂停门禁，不能在 worker 操作同 context 时直接 Begin/Inspect/Release/Abort。
 
 `LeaseReturnProgress` 可作为 `RuntimeShard::Open` 的 hooks source，独占消费一个 `LeaseReturnQueue`，归还回调在 owner 的 mailbox 预算内执行。它只解除 `SlabAllocator` 的 CPU 持有，不操作 raw 队列或自动结清 DMA/Grant，因此 raw context 控制任务期间仍可推进。Slab 注册/注销本身是控制路径，须排除全部相关 context 和 Lease 使用者的并发访问；当前 adapter 不自动安排这些任务。归还源也不接受 `RxBufferPool` 的 `RxBufferLease`，两套 backing 尚未合并。
 

@@ -1,6 +1,6 @@
-# M5.3.7：Peer 授信撤回协调器
+# M5.3.7–8：Peer 授信撤回与 Runtime 调度
 
-[`PeerCreditControl`](../kbsocket/control/peer_credit_control.hpp) 在独立、已认证的非阻塞控制流上交换停止快照与确认，撤回一个 PeerRuntime/接收域/epoch 的物理 RQE 授信关系。它是宿主显式调用的单 owner 组件，不自动接入 Runtime 调度、创建 raw 资源或关闭逻辑连接。
+[`PeerCreditControl`](../kbsocket/control/peer_credit_control.hpp) 在独立、已认证的非阻塞控制流上交换停止快照与确认，撤回一个 PeerRuntime/接收域/epoch 的物理 RQE 授信关系。M5.3.8 的 [`PeerCreditProgress`](../kbsocket/runtime/peer_credit_progress.hpp) 拥有这些控制器及专用 fd，接入 Runtime 的预算、事件与暂停屏障。宿主仍须显式发起撤回、创建 raw 资源并关闭受影响的逻辑连接。
 
 同一 Peer 的多条逻辑连接共享 `SenderCreditAccount` 与接收端的 `CreditPeerHandle`。本协议停止整个共账关系，不能用于仅关闭其中一条连接；所有消费这份授信的发送者必须使用同一个 SenderCreditAccount，不能绕过账本直接 post。其他 Peer 的正常授信和补投不受这一 Peer 的冻结影响。
 
@@ -49,13 +49,36 @@ consumed_control = max_control - control_granted
 1. 在唯一 owner 上停止该 Peer 所有逻辑连接的新业务准入，准备双方已认证的专用 fd 和匹配账本，调用 Open。不要提前 Freeze 整个 EagerReceiveDomain，否则待补投 receipt 无法沿正常路径结账。
 2. 对受影响的 Connection 推进 Close，归还已缓冲及未读的 RX Lease；继续分发真实 TX 完成，处理 Close 返回的 Retained。现有连接检查发现 Peer 已冻结会显式失败；这不是保证应用数据发完的优雅关闭协议，未提交数据按现有失败/关闭语义丢弃，不重放。
 3. 保留旧来源与原接收 owner，继续可信 RX 消费、Lease Release 和 `EagerReceiveDomain::Refill`，包括路由已撤回后的迟到帧。继续结清任何在 Stop 前预留的 post，按真实 accepted 前缀入账。
-4. 在相同 owner 上有界调用 Progress，响应 fd readiness、输出背压和定时检查。等待 RX/补投或 reservation 时也须继续调度；当前没有自动 Runtime source，宿主必须遵守相关 context 的暂停屏障。
-5. 完成后调用协调器 Close 解除绑定，再按独立 TX、来源、事件和 M1 条件推进剩余资源关闭。若仍有其他 Peer，接收域可以继续服务它们；不能因一份 Peer 撤回完成就停掉整个域。
+4. 使用下述 PeerCreditProgress 时由 Runtime 的 mailbox/timer 预算与 fd readiness 推进；直接使用控制器时由相同 owner 有界调用 Progress。等待 RX/补投或 reservation 时也须继续调度，两种方式均须遵守相关 context 的暂停屏障，不可同时驱动同一控制器。
+5. 完成后调用调度器 Release（直接使用时调用协调器 Close）解除绑定，再按独立 TX、来源、事件和 M1 条件推进剩余资源关闭。若仍有其他 Peer，接收域可以继续服务它们；不能因一份 Peer 撤回完成就停掉整个域。
 
 错误或超时锁存首个失败原因并关闭控制 fd，绑定保留至 Close。提前 Close 或失败后的 Close 只解除协议控制权，未退休的接收 Peer 仍冻结、发送账本仍停止，旧 DMA 和授权责任仍由宿主持有。此前已经独立核实并退休的一个方向不会回滚成可发送状态。若正常撤回无法完成，可解除控制器绑定后按已有 M1 真实物理关闭与 M5.3.6 账务清退路径处理；仍须另行取得所需关闭证明，不能把协议失败当作销毁依据。
+
+## Runtime 调度与所有权
+
+`PeerCreditProgress::Open` 在控制路径预分配固定地址的槽、就绪队列及巡检索引，默认容量 4096，上限 65536。每个槽预留完整控制器及其收发缓冲，应按实际同时撤回的 Peer 数配置容量；这不是连接数或吞吐验收结果。它借用发送/接收账本，拥有槽内协调器和成功 Begin 后的专用 fd。动态 fd 由内部 epoll 汇聚为一个固定 Reactor fd，增加或释放 Peer 不改变外层注册集合。
+
+| 接口 | 行为 |
+| --- | --- |
+| `BeginWithdrawal(fd, config, now)` | 先校验容量及注册 fd、唤醒，再执行不可逆的协议 Open；失败仍由调用方拥有 fd，账本不变；成功返回含 owner/代次的句柄 |
+| `Inspect(handle)` | 返回协议阶段、终态及原始协议/调度错误的值快照，不暴露可独立推进的控制器 |
+| `Wake(handle)` | 待决 post 结论或 RX/refill 更新后可显式唤醒；只允许 owner 调用，定时巡检也会发现变化 |
+| `Release(handle)` | 仅完成或失败后可释放槽、fd 与账本绑定；失败时未证实的授权继续保留 |
+| `Abort(handle)` | 显式中止并释放槽；账本仍停止/冻结，不生成任何静默或 DMA 证明 |
+| `Close()` | 所有句柄显式 Release/Abort 且已从 Reactor 解绑后关闭；尚占槽时返回 InUse，析构失败保留存储 |
+
+Begin 的 fd 必须由宿主独占，不能复用 Connection/LaneControl fd 或其 dup。同一调度器拒绝相同 fd 数值；账本独占绑定还会拒绝重叠的撤回。句柄在 Release、Abort、槽复用及调度器 Close/Open 后失效，序号耗尽拒绝准入，绝不回绕。完成和失败槽都占用容量直到显式释放，不能因压力淘汰仍绑定的责任。
+
+`PeerCreditProgressConfig.context` 必须非空，并通过 `RawContextBinding.peers` 加入相同 raw context 的第五个成员位置。它是宿主声明的账本归属，账本本身没有可再次核验的 raw context 指针；Runtime 只核验声明与组一致，并拒绝跨组别名或独立 hooks。组暂停期间所有入口、账本访问和外部调用均暂停，其他 context 继续推进。协议超时使用单调时间，暂停不延长期限；Begin 和 Progress 的 `now_ns` 都只是实际 steady_clock 时间的下界，槽内时间不会倒退。
+
+就绪队列每次 mailbox 调用最多访问 budget 个 Peer；timer 每次最多扫描 budget 个占用槽，默认巡检间隔 1 ms。完整一次巡检所需 Tick 数由槽数/预算决定，事件模式还受 Reactor 有限 `max_wait_ms` 影响，1 ms 并非完成或超时回调的实时保证。fd 使用 oneshot；只有待发输出时订阅可写，最终有效 ACK 后停止读订阅。未完成、EAGAIN、待决 reservation 或未归还 receipt 都不持续设置 runnable，等待 fd、显式 Wake 或下一轮巡检。协议推进、通知和巡检均不分配、不调用 provider。
+
+每个完成或失败只报告一次终态回调；回调不能重入调度器。协议错误仅终结该 Peer，其他撤回继续推进；调度源基础 epoll/eventfd 的错误仍作为 Runtime 错误返回。终态移除或停止重装 fd 监听，避免对端 EOF 造成持续唤醒；完整代次拒绝迟到事件。已经由协议关闭的 fd 不按旧数字执行 DEL，避免触碰复用后的描述符。
+
+Release/Abort 解除绑定不代表可以销毁账本背后的 raw 资源。宿主仍须汇总整个域的所有 Peer 关系和独立 TX、来源、Held、通知/async 责任，停止相关进度绑定后在控制路径推进 M1；正常关闭与故障保留分别遵守原证明门禁。RuntimeShard Close 仅解绑 source，不自动 Close/Abort 这些控制器。
 
 ## 验证与后续范围
 
 控制帧及协调器已通过 Mock 账本、非阻塞 socketpair 和本地 IPv4 TCP 验证。协调器 30 项测试涵盖停止/计数/迟到 RX/超时/身份、发送背压与最终 ACK/EOF 竞态；与真实 Mock RxBufferPool/EagerReceiveDomain 的组合还验证了 Held 归还、实际 refill 和独立 M1 关闭的顺序。完整回归结果见 [roadmap](roadmap.md)。这些测试不构成 UB 真机观测。
 
-本阶段未自动管理专用连接、Peer 生命周期或 Runtime 资源工厂，未实现透明重连、业务重放、RMA Grant 撤销及故障 CQ 在线恢复。完整装配和相关宿主证明仍按 roadmap 继续接入。
+M5.3.8 的调度验证覆盖 fd 接管回滚、容量与代次、定时结账、独立 Peer 失败、终态绑定和暂停屏障；完整结果见 roadmap。建立/认证专用连接、整个 Peer 生命周期、raw 资源工厂及 M1 自动编排仍待后续，不实现透明重连、业务重放、RMA Grant 撤销或故障 CQ 在线恢复。

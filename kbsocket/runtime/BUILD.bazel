@@ -3,6 +3,28 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "peer_credit_progress",
+    srcs = ["peer_credit_progress.cpp"],
+    hdrs = ["peer_credit_progress.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":progress_source",
+        "//kbsocket/control:peer_credit_control",
+    ],
+)
+
+cc_test(
+    name = "peer_credit_progress_test",
+    srcs = ["peer_credit_progress_test.cpp"],
+    deps = [
+        ":context_progress_group",
+        ":peer_credit_progress",
+        ":shard_reactor",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "connection_command_queue",
     srcs = ["connection_command_queue.cpp"],
     hdrs = ["connection_command_queue.hpp"],

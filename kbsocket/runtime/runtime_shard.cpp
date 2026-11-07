@@ -36,10 +36,10 @@ std::expected<void, ProgressError> RuntimeShard::Open(std::span<const RawContext
         return Error(ProgressErrorCode::kInvalidArgument);
     }
     // 成员不能横跨 context 或同时成为 hooks，否则一个暂停屏障之外仍会推进同一份状态。
-    std::array<ProgressSource*, kMaxContexts * 3> companions{};
+    std::array<ProgressSource*, kMaxContexts * 4> companions{};
     std::size_t companion_count = 0;
     for (const auto& context : contexts) {
-        for (auto* companion : {context.connections, context.control, context.mailbox}) {
+        for (auto* companion : {context.connections, context.control, context.mailbox, context.peers}) {
             if (!companion) {
                 continue;
             }
@@ -71,7 +71,7 @@ std::expected<void, ProgressError> RuntimeShard::Open(std::span<const RawContext
         if (!opened) {
             return opened;
         }
-        std::array<ProgressSource*, 4> members{&state->contexts[state->count]};
+        std::array<ProgressSource*, ContextProgressGroup::kMaxMembers> members{&state->contexts[state->count]};
         std::size_t member_count = 1;
         if (context.connections) {
             members[member_count++] = context.connections;
@@ -81,6 +81,9 @@ std::expected<void, ProgressError> RuntimeShard::Open(std::span<const RawContext
         }
         if (context.mailbox) {
             members[member_count++] = context.mailbox;
+        }
+        if (context.peers) {
+            members[member_count++] = context.peers;
         }
         if (auto grouped = state->groups[state->count].Open(std::span(members).first(member_count)); !grouped) {
             return grouped;

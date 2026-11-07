@@ -169,6 +169,38 @@ TEST(ContextProgressGroupTest, IndependentBudgetsRotateFirstMemberAndKeepOtherMe
     EXPECT_TRUE(group.Close());
 }
 
+TEST(ContextProgressGroupTest, FiveMembersKeepIndependentBudgetsAndStableFdOwnership) {
+    ContextProgressGroup group;
+    std::array<Member, 6> members;
+    std::array<ProgressSource*, 6> sources{};
+    for (std::size_t i = 0; i < members.size(); ++i) {
+        sources[i] = &members[i];
+        members[i].hot = true;
+        members[i].fd_count = 1;
+        members[i].fds[0] = 10 + static_cast<int>(i);
+    }
+    EXPECT_FALSE(group.Open(sources));
+    ASSERT_TRUE(group.Open(std::span(sources).first(5)));
+    // 新增的 Peer 源获得自己的预算及 fd 登记，不能挤掉 raw/连接/导入/mailbox 的份额。
+    const auto step = group.Progress(ProgressKind::kMailbox, 3, 1);
+    ASSERT_TRUE(step);
+    EXPECT_EQ(step->processed, 15u);
+    EXPECT_TRUE(step->runnable);
+    ASSERT_EQ(group.wait_fds().size(), 5u);
+    for (std::size_t i = 0; i < 5; ++i) {
+        EXPECT_EQ(members[i].last_budget, 3u);
+        EXPECT_EQ(members[i].progress_calls, 1u);
+        EXPECT_EQ(group.wait_fds()[i], members[i].fds[0]);
+        EXPECT_TRUE(group.WaitFdEnabled(members[i].fds[0]));
+    }
+    members[4].fd_enabled = false;
+    EXPECT_FALSE(group.WaitFdEnabled(members[4].fds[0]));
+    EXPECT_TRUE(group.WaitFdEnabled(members[0].fds[0]));
+    // 停用等待不改写已注册的 fd 身份，也不影响兄弟源。
+    EXPECT_EQ(group.wait_fds()[4], members[4].fds[0]);
+    EXPECT_TRUE(group.Close());
+}
+
 TEST(ContextProgressGroupTest, RejectsDifferentDeviceContextsAndPropagatesSharedIdentity) {
     ContextProgressGroup group;
     std::array<int, 2> contexts{};

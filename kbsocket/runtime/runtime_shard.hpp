@@ -16,17 +16,19 @@ namespace runtime {
 struct RawContextBinding {
     urma_context_t* context = nullptr;
     std::span<const RawQueueBinding> queues;
-    // 同 context 的连接、导入及业务命令与 raw 轮询构成一个暂停单元；不能再作为独立 hooks 注册。
+    // 同 context 的连接、导入、业务命令及 Peer 授信撤回与 raw 轮询共享暂停屏障。
+    // 所有成员都不能再作为独立 hooks 注册。
     ProgressSource* connections = nullptr;
     ProgressSource* control = nullptr;
     ProgressSource* mailbox = nullptr;
+    ProgressSource* peers = nullptr;
 };
 struct RuntimeShardConfig {
     ReactorConfig reactor;
     ControlExecutorConfig control;
 };
 
-/// 将最多四个 raw context 及其连接/控制/mailbox 源绑定至一个 owner，拥有反应堆/控制线程，借用 URMA/DMA。
+/// 将最多四个 raw context 及其连接/控制/mailbox/Peer 源绑定至一个 owner，拥有反应堆/控制线程，借用 URMA/DMA。
 /// 纯 TCP 可用空 contexts 加独立 hooks；raw 模式下同 context 的全部访问必须加入其暂停单元。
 /// 宿主在控制路径 Open 后由同一 owner 推进；回调、raw 句柄与控制任务不得并发或重入。
 /// Open 不创建连接、不授信；完成只归还本地配额，RX lease 由调用方消费并归还。
