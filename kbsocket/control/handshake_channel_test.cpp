@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <limits>
 
 #include <gtest/gtest.h>
 
@@ -46,6 +47,23 @@ HandshakeMessage Ready() {
     message.ready.max_stream_bytes = 256 * 1024;
     return message;
 }
+HandshakeMessage LaneUpdate() {
+    HandshakeMessage message;
+    message.kind = HandshakeMessageKind::kLaneUpdate;
+    message.lane_update.sender = Identity();
+    message.lane_update.receiver = Identity(100);
+    message.lane_update.update_id = 0x0102030405060708;
+    message.lane_update.tx_lanes = Hello().hello.tx_lanes;
+    return message;
+}
+HandshakeMessage LaneAck() {
+    HandshakeMessage message;
+    message.kind = HandshakeMessageKind::kLaneAck;
+    message.lane_ack.sender = Identity(100);
+    message.lane_ack.receiver = Identity();
+    message.lane_ack.update_id = 0x0102030405060708;
+    return message;
+}
 template <class T>
 void ExpectError(const std::expected<T, HandshakeError>& result, HandshakeErrorCode code) {
     ASSERT_FALSE(result);
@@ -70,7 +88,7 @@ TEST(HandshakeCodec, HelloUsesCanonicalBigEndianAndCopiesOnlyDescriptorLength) {
     ASSERT_EQ(*encoded, 152u);
     // 固定头与完整身份均逐字段大端编码，扩展 token 不允许截断成 8 bit generation。
     const std::array<std::byte, 12> header{std::byte{'K'}, std::byte{'B'}, std::byte{'S'}, std::byte{'H'},
-                                           std::byte{0},   std::byte{2},   std::byte{1},   std::byte{0},
+                                           std::byte{0},   std::byte{3},   std::byte{1},   std::byte{0},
                                            std::byte{0},   std::byte{0},   std::byte{0},   std::byte{140}};
     EXPECT_TRUE(std::equal(header.begin(), header.end(), bytes.begin()));
     for (unsigned i = 0; i < 8; ++i) {
@@ -323,6 +341,130 @@ TEST(HandshakeCodec, RejectsDuplicateDecodedLaneDespiteDistinctGeneration) {
     ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
 }
 
+TEST(HandshakeCodec, OnlineLaneUpdateAndAckUseCanonicalFullIdentities) {
+    const auto update = LaneUpdate();
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
+    auto encoded = EncodeHandshakeMessage(update, bytes);
+    ASSERT_TRUE(encoded);
+    EXPECT_EQ(*encoded, 164u);
+    EXPECT_EQ(bytes[5], std::byte{3});
+    EXPECT_EQ(bytes[6], std::byte{4});
+    // 两份完整身份之后才是更新序号和池代次；二者都不能被截成 32 bit。
+    for (unsigned i = 0; i < 8; ++i) {
+        EXPECT_EQ(bytes[108 + i], static_cast<std::byte>(i + 1));
+        EXPECT_EQ(bytes[116 + i], static_cast<std::byte>(i + 1));
+    }
+    EXPECT_EQ(bytes[127], std::byte{1});
+    EXPECT_EQ(bytes[131], std::byte{0});
+    auto decoded = DecodeHandshakeMessage(std::span(bytes).first(*encoded));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->lane_update.sender, update.lane_update.sender);
+    EXPECT_EQ(decoded->lane_update.receiver, update.lane_update.receiver);
+    EXPECT_EQ(decoded->lane_update.update_id, update.lane_update.update_id);
+    EXPECT_TRUE(SameTxLanes(decoded->lane_update.tx_lanes, update.lane_update.tx_lanes));
+
+    const auto ack = LaneAck();
+    encoded = EncodeHandshakeMessage(ack, bytes);
+    ASSERT_TRUE(encoded);
+    EXPECT_EQ(*encoded, 116u);
+    EXPECT_EQ(bytes[6], std::byte{5});
+    decoded = DecodeHandshakeMessage(std::span(bytes).first(*encoded));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->lane_ack.sender, ack.lane_ack.sender);
+    EXPECT_EQ(decoded->lane_ack.receiver, ack.lane_ack.receiver);
+    EXPECT_EQ(decoded->lane_ack.update_id, ack.lane_ack.update_id);
+}
+
+TEST(HandshakeCodec, MaximumOnlineLaneUpdateFitsAndUnencodedTailIsIrrelevant) {
+    auto message = LaneUpdate();
+    auto& lanes = message.lane_update.tx_lanes;
+    lanes.count = kHandshakeMaxTxLanes;
+    for (std::uint32_t i = 1; i < lanes.count; ++i) {
+        lanes.lanes[i] = lanes.lanes[0];
+        lanes.lanes[i].jetty_id += i;
+    }
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
+    const auto size = EncodeHandshakeMessage(message, bytes);
+    ASSERT_TRUE(size);
+    EXPECT_EQ(*size, 2180u);
+    const auto decoded = DecodeHandshakeMessage(std::span(bytes).first(*size));
+    ASSERT_TRUE(decoded);
+    EXPECT_TRUE(SameTxLanes(lanes, decoded->lane_update.tx_lanes));
+    // 相等只看实际公告的前缀；尾槽残留不能迫使连接重复发布同一公告。
+    lanes.count = 1;
+    const auto initial = LaneUpdate().lane_update.tx_lanes;
+    EXPECT_TRUE(SameTxLanes(lanes, initial));
+    ++lanes.lanes[0].generation;
+    EXPECT_FALSE(SameTxLanes(lanes, initial));
+    auto oversized = initial;
+    oversized.count = kHandshakeMaxTxLanes + 1;
+    EXPECT_FALSE(SameTxLanes(oversized, oversized));
+}
+
+TEST(HandshakeCodec, RejectsInvalidOnlineIdentitiesIdsAndLanesWithoutOutputMutation) {
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes;
+    bytes.fill(std::byte{0xab});
+    const auto unchanged = bytes;
+    auto message = LaneUpdate();
+    message.lane_update.sender.runtime = 0;
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+    message = LaneUpdate();
+    message.lane_update.receiver.token.generation = 0;
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+    message = LaneUpdate();
+    message.lane_update.update_id = 0;
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+    message = LaneUpdate();
+    message.lane_update.tx_lanes.count = 0;
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+    message = LaneUpdate();
+    message.lane_update.tx_lanes.count = kHandshakeMaxTxLanes + 1;
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+    message = LaneUpdate();
+    message.lane_update.tx_lanes.count = 2;
+    message.lane_update.tx_lanes.lanes[1] = message.lane_update.tx_lanes.lanes[0];
+    ++message.lane_update.tx_lanes.lanes[1].generation;
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+    message = LaneAck();
+    message.lane_ack.sender.authorization = 0;
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+    message = LaneAck();
+    message.lane_ack.receiver.session = 0;
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+    message = LaneAck();
+    message.lane_ack.update_id = 0;
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+    EXPECT_EQ(bytes, unchanged);
+}
+
+TEST(HandshakeCodec, OnlineDecodeRejectsOldVersionReservedTruncatedAndUnboundedLists) {
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
+    const auto size = EncodeHandshakeMessage(LaneUpdate(), bytes);
+    ASSERT_TRUE(size);
+    const auto original = bytes;
+    // 旧实现不具备在线确认语义，因此连相同布局的 HELLO 也必须显式拒绝旧版本。
+    bytes[5] = std::byte{2};
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kVersionMismatch);
+    bytes = original;
+    bytes[131] = std::byte{1};
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
+    bytes = original;
+    bytes[127] = std::byte{65};
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
+    bytes = original;
+    std::fill_n(bytes.begin() + 108, 8, std::byte{0});
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
+    bytes = original;
+    bytes[11] = std::byte{120};
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(132)), HandshakeErrorCode::kInvalidFrame);
+    bytes = original;
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size - 1)), HandshakeErrorCode::kInvalidFrame);
+    const auto ack_size = EncodeHandshakeMessage(LaneAck(), bytes);
+    ASSERT_TRUE(ack_size);
+    std::fill_n(bytes.begin() + 108, 8, std::byte{0});
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*ack_size)), HandshakeErrorCode::kInvalidFrame);
+}
+
 class HandshakeChannelTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -388,6 +530,61 @@ TEST_F(HandshakeChannelTest, FragmentedBidirectionalHandshakeRespectsEachIoBudge
     EXPECT_TRUE(left.output_flushed());
     EXPECT_TRUE(right.output_flushed());
     ExpectError(left.TakeMessage(), HandshakeErrorCode::kNotReady);
+}
+
+TEST_F(HandshakeChannelTest, FragmentedOnlineUpdateAndAckRespectBudgetsBeyondHandshakeDeadline) {
+    HandshakeChannel left, right;
+    Open(left, 0, std::numeric_limits<std::uint64_t>::max());
+    Open(right, 1, std::numeric_limits<std::uint64_t>::max());
+    ASSERT_TRUE(left.Queue(LaneUpdate()));
+    ASSERT_TRUE(right.Queue(LaneAck()));
+    // 已建立控制流保持打开；每次只准一次短 IO，UPDATE/ACK 不会破坏有限推进预算。
+    for (std::uint64_t tick = 10000; tick < 11000 && !(left.message_ready() && right.message_ready()); ++tick) {
+        const auto a = left.Progress(tick, {7, 1});
+        const auto b = right.Progress(tick, {7, 1});
+        ASSERT_TRUE(a);
+        ASSERT_TRUE(b);
+        EXPECT_LE(a->syscalls, 1u);
+        EXPECT_LE(b->syscalls, 1u);
+        EXPECT_LE(a->sent + a->received, 7u);
+        EXPECT_LE(b->sent + b->received, 7u);
+    }
+    auto ack = left.TakeMessage();
+    auto update = right.TakeMessage();
+    ASSERT_TRUE(ack);
+    ASSERT_TRUE(update);
+    EXPECT_EQ(ack->kind, HandshakeMessageKind::kLaneAck);
+    EXPECT_EQ(update->kind, HandshakeMessageKind::kLaneUpdate);
+    EXPECT_EQ(ack->lane_ack.update_id, update->lane_update.update_id);
+}
+
+TEST_F(HandshakeChannelTest, EstablishedHandoffPreservesCoalescedFirstLaneUpdate) {
+    HandshakeChannel handshake;
+    Open(handshake, 0);
+    std::array<std::byte, 512> bytes{};
+    const auto ready = EncodeHandshakeMessage(Ready(), bytes);
+    ASSERT_TRUE(ready);
+    const auto update = EncodeHandshakeMessage(LaneUpdate(), std::span(bytes).subspan(*ready));
+    ASSERT_TRUE(update);
+    ASSERT_EQ(send(pair_[1], bytes.data(), *ready + *update, MSG_NOSIGNAL), static_cast<ssize_t>(*ready + *update));
+    const auto progressed = handshake.Progress(1);
+    ASSERT_TRUE(progressed);
+    EXPECT_EQ(progressed->received, *ready);
+    ASSERT_TRUE(handshake.TakeMessage());
+    const auto fd = handshake.ReleaseEstablished(true);
+    ASSERT_TRUE(fd);
+    // READY 与首个在线公告同包到达时，接力的新控制通道必须从公告帧边界开始读取。
+    OwnedFd owned{*fd};
+    HandshakeChannel control;
+    ASSERT_TRUE(control.Open(owned.fd, true, 1, std::numeric_limits<std::uint64_t>::max()));
+    owned.fd = -1;
+    const auto received = control.Progress(2);
+    ASSERT_TRUE(received);
+    EXPECT_EQ(received->received, *update);
+    const auto taken = control.TakeMessage();
+    ASSERT_TRUE(taken);
+    EXPECT_EQ(taken->kind, HandshakeMessageKind::kLaneUpdate);
+    EXPECT_EQ(taken->lane_update.update_id, LaneUpdate().lane_update.update_id);
 }
 
 TEST_F(HandshakeChannelTest, EmptySocketIsNonblockingAndRejectsQueueOverwrite) {

@@ -103,6 +103,9 @@ struct ConnectionProgress::State {
             }
         } else if (phase == ConnectionState::kRawActive) {
             mask = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
+            if (slot.connection->control_output_pending()) {
+                mask |= EPOLLOUT;
+            }
         } else if (phase == ConnectionState::kNegotiating || phase == ConnectionState::kPreparing ||
                    phase == ConnectionState::kWaitingReady) {
             mask = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;

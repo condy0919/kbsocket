@@ -30,6 +30,22 @@ ConnectionError TcpError(const tcp::TcpError& error) noexcept {
     return {error.code == tcp::TcpErrorCode::kWouldBlock ? ConnectionErrorCode::kWouldBlock : ConnectionErrorCode::kTcp,
             static_cast<int>(error.code), error.system_error};
 }
+ConnectionError LaneError(const control::LaneControlError& error) noexcept {
+    using Code = control::LaneControlErrorCode;
+    ConnectionErrorCode code = ConnectionErrorCode::kControlProtocol;
+    if (error.code == Code::kLane) {
+        code = ConnectionErrorCode::kLaneChanged;
+    } else if (error.code == Code::kTimeout) {
+        code = ConnectionErrorCode::kLaneUpdateTimeout;
+    } else if (error.code == Code::kSource || error.code == Code::kUnauthorized) {
+        code = ConnectionErrorCode::kSourceAdmission;
+    } else if (error.code == Code::kChannel &&
+               (error.detail == static_cast<int>(control::HandshakeErrorCode::kPeerClosed) ||
+                error.detail == static_cast<int>(control::HandshakeErrorCode::kSystemError))) {
+        code = ConnectionErrorCode::kControlClosed;
+    }
+    return {code, error.detail, error.system_error};
+}
 } // namespace
 
 Connection::~Connection() {
@@ -69,7 +85,8 @@ std::expected<void, ConnectionError> Connection::PrepareRaw(const RawConnectionP
     const auto* peer = handshake_.peer();
     if (!peer || !prep.receive || !prep.sender || !prep.slab || !prep.sender_credits || !prep.connection_id ||
         !prep.handshake.credits || !prep.handshake.imports || !prep.sources || !prep.sender->pool() ||
-        prep.control_credit_target < 4 || !prep.receive->Matches(*prep.handshake.credits, *handshake_.route().owner) ||
+        prep.control_credit_target < 4 || !prep.lane_update_timeout_ns ||
+        !prep.receive->Matches(*prep.handshake.credits, *handshake_.route().owner) ||
         prep.receive->context() != prep.handshake.local_context) {
         return Error(ConnectionErrorCode::kInvalidArgument);
     }
@@ -89,6 +106,7 @@ std::expected<void, ConnectionError> Connection::PrepareRaw(const RawConnectionP
         return Error(ConnectionErrorCode::kCredit);
     }
     raw_ = prep;
+    tx_pool_ = prep.sender->pool();
     raw_.handshake.route_owner = this;
     auto prepared = handshake_.PrepareRaw(raw_.handshake);
     if (!prepared) {
@@ -148,12 +166,15 @@ std::expected<void, ConnectionError> Connection::CheckRawBindings() const noexce
         return Error(ConnectionErrorCode::kCredit);
     }
     const auto* pool = raw_.sender->pool();
-    if (!pool) {
+    if (!pool || pool != tx_pool_) {
         return Error(ConnectionErrorCode::kLaneChanged);
     }
-    auto lanes = control::ValidateLocalTxLanes(*pool, handshake_.local());
-    if (!lanes) {
-        return Error(ConnectionErrorCode::kLaneChanged, static_cast<int>(lanes.error().code));
+    // READY 前仍要求 HELLO 原快照；Active 后由 LaneControl 的公告/确认门禁管理代次变化。
+    if (state_ != ConnectionState::kRawActive) {
+        auto lanes = control::ValidateLocalTxLanes(*pool, handshake_.local());
+        if (!lanes) {
+            return Error(ConnectionErrorCode::kLaneChanged, static_cast<int>(lanes.error().code));
+        }
     }
     auto sources = raw_.sources->Check();
     if (!sources) {
@@ -279,6 +300,23 @@ std::expected<std::size_t, ConnectionError> Connection::Progress(std::uint64_t n
             if (!applied) {
                 return std::unexpected(Fail(applied.error()));
             }
+            auto fd = handshake_.TakeEstablishedFd();
+            if (!fd) {
+                return std::unexpected(Fail(HandshakeError(fd.error())));
+            }
+            auto control_open = lane_control_.Open(*fd,
+                                                   {.local = &handshake_.local(),
+                                                    .peer = handshake_.peer(),
+                                                    .pool = raw_.sender->pool(),
+                                                    .sources = raw_.sources,
+                                                    .authorize_update = raw_.authorize_lane_update,
+                                                    .authorization_cookie = raw_.lane_authorization_cookie,
+                                                    .timeout_ns = raw_.lane_update_timeout_ns},
+                                                   now_ns);
+            if (!control_open) {
+                ::close(*fd);
+                return std::unexpected(Fail(LaneError(control_open.error())));
+            }
             state_ = ConnectionState::kRawActive;
             break;
         }
@@ -306,6 +344,13 @@ std::expected<std::size_t, ConnectionError> Connection::Progress(std::uint64_t n
     if (!timeout) {
         return std::unexpected(Fail({ConnectionErrorCode::kRx, static_cast<int>(timeout.error().code)}));
     }
+    auto lane_progress = lane_control_.Progress(now_ns);
+    if (!lane_progress) {
+        return std::unexpected(Fail(LaneError(lane_progress.error())));
+    }
+    if (!lane_progress->tx_allowed) {
+        return lane_progress->processed;
+    }
     auto credit = RefreshCredit();
     if (!credit) {
         return std::unexpected(Fail(credit.error()));
@@ -313,11 +358,11 @@ std::expected<std::size_t, ConnectionError> Connection::Progress(std::uint64_t n
     auto sent = tx_.Progress();
     if (!sent) {
         if (sent.error().code == EagerTxErrorCode::kWouldBlock) {
-            return 0;
+            return lane_progress->processed;
         }
         return std::unexpected(Fail(TxError(sent.error())));
     }
-    return *sent;
+    return *sent + lane_progress->processed;
 }
 std::expected<std::size_t, ConnectionError> Connection::Write(std::span<const std::byte> input) noexcept {
     if (failure_) {
@@ -422,7 +467,7 @@ std::expected<void, ConnectionError> Connection::OnControlReady() noexcept {
         return Error(ConnectionErrorCode::kNotReady);
     }
     std::byte byte;
-    const auto count = ::recv(handshake_.fd(), &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    const auto count = ::recv(lane_control_.fd(), &byte, 1, MSG_PEEK | MSG_DONTWAIT);
     if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
         return {};
     }
@@ -432,8 +477,8 @@ std::expected<void, ConnectionError> Connection::OnControlReady() noexcept {
     if (count == 0) {
         return std::unexpected(Fail({ConnectionErrorCode::kControlClosed}));
     }
-    // M5.2 raw 控制流在 READY 后不承载业务；私有扩展须先定义 framing，不能误吞未知字节。
-    return std::unexpected(Fail({ConnectionErrorCode::kControlProtocol}));
+    lane_control_.NotifyReadable();
+    return {};
 }
 std::expected<EagerRxDisposition, EagerRxError> Connection::DispatchRx(void* owner, EagerReceiveDomain& domain,
                                                                        const WireFrameView& decoded,
@@ -476,6 +521,7 @@ ConnectionError Connection::Fail(ConnectionError error) noexcept {
         failure_ = error;
     }
     state_ = ConnectionState::kFailed;
+    lane_control_.Cancel();
     handshake_.Cancel();
     tx_.Fail();
     rx_.Fail();
@@ -492,6 +538,7 @@ std::expected<void, ConnectionError> Connection::Close() noexcept {
         return {};
     }
     state_ = ConnectionState::kClosing;
+    (void)lane_control_.Close();
     handshake_.Cancel();
     tx_.Fail();
     rx_.Fail();
@@ -522,7 +569,10 @@ std::expected<void, ConnectionError> Connection::Close() noexcept {
     return {};
 }
 int Connection::fd() const noexcept {
-    return state_ == ConnectionState::kTcpActive ? tcp_.fd() : handshake_.fd();
+    if (state_ == ConnectionState::kTcpActive) {
+        return tcp_.fd();
+    }
+    return state_ == ConnectionState::kRawActive ? lane_control_.fd() : handshake_.fd();
 }
 } // namespace connection
 } // namespace kbsocket

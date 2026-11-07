@@ -11,6 +11,7 @@
 #include "kbsocket/connection/eager_rx.hpp"
 #include "kbsocket/connection/eager_tx.hpp"
 #include "kbsocket/control/connection_handshake.hpp"
+#include "kbsocket/control/lane_control.hpp"
 #include "kbsocket/control/raw_source_admission.hpp"
 #include "kbsocket/transport/tcp/native_tcp_backend.hpp"
 
@@ -45,7 +46,8 @@ enum class ConnectionErrorCode : std::uint8_t {
     kControlClosed,
     kControlProtocol,
     kSourceAdmission,
-    kLaneChanged
+    kLaneChanged,
+    kLaneUpdateTimeout
 };
 struct ConnectionError {
     ConnectionErrorCode code;
@@ -56,6 +58,7 @@ struct ConnectionReadResult {
     std::size_t bytes = 0;
     bool eof = false;
 };
+using LaneUpdateAuthorizer = control::LaneUpdateAuthorizer;
 struct RawConnectionPreparation {
     control::RawHandshakePreparation handshake;
     EagerReceiveDomain* receive = nullptr;
@@ -70,6 +73,10 @@ struct RawConnectionPreparation {
     control::RawSourceAdmission* sources = nullptr;
     // 宿主已认证并授权 peer HELLO 中的整份 Lane 公告；远端自报字段不构成认证。
     bool peer_lanes_authorized = false;
+    // 显式启用在线更新；回调在 owner 上验证每份新公告，必须有界、无阻塞且不得重入。
+    LaneUpdateAuthorizer authorize_lane_update = nullptr;
+    void* lane_authorization_cookie = nullptr;
+    std::uint64_t lane_update_timeout_ns = 5'000'000'000;
 };
 
 /// 单 owner 的有界 copy-stream 接口；Write 返回的前缀可立即复用，Read 只交付连续字节。
@@ -117,6 +124,18 @@ public:
         return tx_.stats();
     }
     int fd() const noexcept;
+    bool control_output_pending() const noexcept {
+        return state_ == ConnectionState::kRawActive ? lane_control_.output_pending() : handshake_.output_pending();
+    }
+    bool lane_update_pending() const noexcept {
+        return lane_control_.pending();
+    }
+    std::uint64_t local_lane_update_id() const noexcept {
+        return lane_control_.local_update_id();
+    }
+    std::uint64_t peer_lane_update_id() const noexcept {
+        return lane_control_.peer_update_id();
+    }
     // Reactor 用于身份分发和 context 暂停约束，不转移底层资源所有权。
     std::uint64_t connection_id() const noexcept {
         return raw_prepared_ ? raw_.connection_id : 0;
@@ -134,10 +153,12 @@ private:
     std::expected<void, ConnectionError> ApplyPeerReady() noexcept;
     std::expected<void, ConnectionError> CheckRawBindings() const noexcept;
     control::ConnectionHandshake handshake_;
+    control::LaneControl lane_control_;
     EagerTxStream tx_;
     EagerRxStream rx_;
     tcp::NativeTcpBackend tcp_;
     RawConnectionPreparation raw_;
+    const raw::JettyPool* tx_pool_ = nullptr;
     SequenceSession tx_session_;
     CreditIdentity tx_identity_;
     std::uint64_t last_data_ = 0, last_control_ = 0, last_frames_ = 0, last_bytes_ = 0;

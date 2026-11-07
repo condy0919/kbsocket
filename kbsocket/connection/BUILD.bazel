@@ -40,6 +40,7 @@ cc_library(
         ":eager_rx",
         ":eager_tx",
         "//kbsocket/control:connection_handshake",
+        "//kbsocket/control:lane_control",
         "//kbsocket/control:raw_source_admission",
         "//kbsocket/control:tx_lane_snapshot",
         "//kbsocket/transport/tcp:native_tcp_backend",

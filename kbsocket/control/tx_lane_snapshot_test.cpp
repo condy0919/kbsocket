@@ -279,6 +279,44 @@ TEST_F(TxLaneSnapshotTest, PoolReopenInvalidatesOldEpoch) {
     EXPECT_TRUE(ValidateLocalTxLanes(pool_, updated));
 }
 
+TEST_F(TxLaneSnapshotTest, OnlineSnapshotKeepsUnchangedFaultedLaneWhileAnotherIsRebuilt) {
+    ASSERT_TRUE(Open(pool_, context_));
+    const auto hello = Hello();
+    const auto first = pool_.lane(0);
+    const auto second = pool_.lane(1);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    ASSERT_TRUE(pool_.MarkFaulted(*second));
+    Drain(*first);
+    ASSERT_TRUE(pool_.ReplaceDrainedLane(*first, Quiesced()));
+    // 初始 HELLO 的严格 READY 门禁保留；在线公告仍可携带另一条已隔离但身份未变的 Lane。
+    EXPECT_FALSE(CaptureTxLanes(pool_));
+    const auto online = CaptureTxLanes(pool_, false);
+    ASSERT_TRUE(online);
+    EXPECT_EQ(online->lanes[1], hello.tx_lanes.lanes[1]);
+    EXPECT_TRUE(ValidateTxLaneUpdate(hello.tx_lanes, *online));
+    EXPECT_TRUE(ValidateLocalTxLanes(pool_, hello, *online));
+    EXPECT_FALSE(ValidateLocalTxLanes(pool_, hello));
+}
+
+TEST_F(TxLaneSnapshotTest, UpdateRequiresMonotoneSlotGenerationAndStablePoolGeometry) {
+    ASSERT_TRUE(Open(pool_, context_));
+    const auto before = Hello().tx_lanes;
+    auto after = before;
+    EXPECT_FALSE(ValidateTxLaneUpdate(before, after));
+    ++after.lanes[0].jetty_id;
+    EXPECT_FALSE(ValidateTxLaneUpdate(before, after));
+    after = before;
+    ++after.lanes[0].generation;
+    EXPECT_TRUE(ValidateTxLaneUpdate(before, after)); // 硬件复用 ID 时仍需新的软件代次。
+    EXPECT_FALSE(ValidateTxLaneUpdate(after, before));
+    ++after.pool_epoch;
+    EXPECT_FALSE(ValidateTxLaneUpdate(before, after));
+    after = before;
+    --after.count;
+    EXPECT_FALSE(ValidateTxLaneUpdate(before, after));
+}
+
 } // namespace
 } // namespace control
 } // namespace kbsocket

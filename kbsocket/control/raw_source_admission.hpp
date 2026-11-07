@@ -22,7 +22,8 @@ enum class RawSourceAdmissionError : std::uint8_t {
     kInUse,
     kUnauthorized,
     kRegistry,
-    kRetained
+    kRetained,
+    kExhausted
 };
 struct RawSourceAdmissionRequest {
     const HandshakeHello* local = nullptr;
@@ -43,6 +44,10 @@ public:
     virtual ~RawSourceAdmission() = default;
     virtual std::expected<void, RawSourceAdmissionError> Prepare(const RawSourceAdmissionRequest& request) noexcept = 0;
     virtual std::expected<void, RawSourceAdmissionError> Check() const noexcept = 0;
+    // 在线更新必须先安装新来源才能确认；默认实现显式拒绝，不能把旧准入器当作支持更新。
+    virtual std::expected<void, RawSourceAdmissionError> Update(const HandshakeTxLanes&, bool) noexcept {
+        return std::unexpected(RawSourceAdmissionError::kNotReady);
+    }
 };
 
 } // namespace control

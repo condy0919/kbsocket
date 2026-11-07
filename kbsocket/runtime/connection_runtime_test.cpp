@@ -72,6 +72,9 @@ protected:
         std::uint64_t callback_rx_changes = 0;
         std::size_t callback_rx_pending = 0;
         bool callback_bad_id = false;
+        bool lane_updates_enabled = false, reject_lane_update = false;
+        std::uint64_t lane_authorizations = 0;
+        std::uint64_t lane_update_timeout_ns = 5'000'000'000ull;
         std::atomic<unsigned> importing{0};
         std::atomic<bool> block_import{false};
         std::deque<Receive> posted;
@@ -106,6 +109,19 @@ protected:
             ++endpoint.callback_rx_changes;
             endpoint.callback_rx_pending = event.rx_pending;
         }
+    }
+    static bool AuthorizeLaneUpdate(void* cookie, const control::HandshakeIdentity& peer,
+                                    const control::HandshakeTxLanes& lanes) noexcept {
+        auto& endpoint = *static_cast<Endpoint*>(cookie);
+        ++endpoint.lane_authorizations;
+        const auto* known_peer = endpoint.connection.handshake().peer();
+        if (endpoint.reject_lane_update || !known_peer || peer != known_peer->identity) {
+            return false;
+        }
+        // 测试宿主通过独立可信拓扑验证整份公告，不能把对端自报的 Lane 当成授权依据。
+        const auto other = &endpoint == &self->endpoints_[0] ? 1u : 0u;
+        const auto actual = control::CaptureTxLanes(self->endpoints_[other].pool);
+        return actual && control::SameTxLanes(*actual, lanes);
     }
     static raw::UrmaFunctions Functions() {
         raw::UrmaFunctions f;
@@ -308,21 +324,25 @@ protected:
     }
     RawConnectionPreparation Preparation(std::size_t i) {
         auto& e = endpoints_[i];
-        return {.handshake = {.imports = &imports_,
-                              .local_context = &e.context,
-                              .local_context_incarnation = 1,
-                              .descriptor_compatible = true,
-                              .credits = &e.credits,
-                              .credit_peer = e.credit_peer,
-                              .reorder = {.window = 4, .max_resident_bytes = 16384}},
-                .receive = &e.receive,
-                .sender = &e.sender,
-                .slab = &e.slab,
-                .sender_credits = &e.send_credits,
-                .connection_id = e.scheduled.id,
-                .tx_capacity = 8,
-                .sources = &e.handshake_sources,
-                .peer_lanes_authorized = true};
+        RawConnectionPreparation preparation{.handshake = {.imports = &imports_,
+                                                           .local_context = &e.context,
+                                                           .local_context_incarnation = 1,
+                                                           .descriptor_compatible = true,
+                                                           .credits = &e.credits,
+                                                           .credit_peer = e.credit_peer,
+                                                           .reorder = {.window = 4, .max_resident_bytes = 16384}},
+                                             .receive = &e.receive,
+                                             .sender = &e.sender,
+                                             .slab = &e.slab,
+                                             .sender_credits = &e.send_credits,
+                                             .connection_id = e.scheduled.id,
+                                             .tx_capacity = 8,
+                                             .sources = &e.handshake_sources,
+                                             .peer_lanes_authorized = true};
+        preparation.authorize_lane_update = e.lane_updates_enabled ? &AuthorizeLaneUpdate : nullptr;
+        preparation.lane_authorization_cookie = &e;
+        preparation.lane_update_timeout_ns = e.lane_update_timeout_ns;
+        return preparation;
     }
     void Deliver() {
         while (!packets_.empty()) {
@@ -381,6 +401,30 @@ protected:
             return endpoints_[0].connection.state() == ConnectionState::kRawActive &&
                    endpoints_[1].connection.state() == ConnectionState::kRawActive;
         }));
+    }
+    void EnableLaneUpdates() {
+        for (auto& endpoint : endpoints_) {
+            endpoint.lane_updates_enabled = true;
+        }
+    }
+    void ReplaceEmptyLane(std::size_t side, std::uint32_t index = 0) {
+        auto& endpoint = endpoints_[side];
+        ASSERT_EQ(endpoint.slab.stats().local_dma, 0u);
+        ASSERT_TRUE(endpoint.completions[0].empty());
+        const auto old_lane = endpoint.pool.lane(index);
+        ASSERT_TRUE(old_lane);
+        const auto old_id = endpoint.pool.lane_jetty(index)->jetty_id.id;
+        // owner 未运行；已消费全部真实 TX CQE，空 SQ 再经 ERROR/边界/空 flush 后才替换。
+        ASSERT_TRUE(endpoint.pool.BeginDrain(*old_lane));
+        ASSERT_TRUE(endpoint.pool.ObserveFlushDone(*old_lane));
+        std::array<urma_cr_t, 1> flushed{};
+        const auto count = endpoint.pool.FlushSend(*old_lane, flushed);
+        ASSERT_TRUE(count);
+        ASSERT_EQ(*count, 0);
+        const auto replacement = endpoint.pool.ReplaceDrainedLane(*old_lane, {true, true, true});
+        ASSERT_TRUE(replacement);
+        EXPECT_EQ(replacement->generation, old_lane->generation + 1);
+        EXPECT_NE(endpoint.pool.lane_jetty(index)->jetty_id.id, old_id);
     }
     void TearDown() override {
         for (auto& endpoint : endpoints_) {
@@ -553,6 +597,227 @@ TEST_F(ConnectionRuntimeTest, ReplacingActiveLaneRejectsQueuedWriteUnderOldHello
     EXPECT_EQ(endpoint.slab.stats().local_dma, 0u);
     EXPECT_TRUE(packets_.empty());
     EXPECT_EQ(endpoint.sources.size(), 2u);
+}
+
+TEST_F(ConnectionRuntimeTest, RebuiltLaneWaitsForPeerAckBeforeSubmittingQueuedData) {
+    EnableLaneUpdates();
+    Activate();
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    const auto passive = sender.pool.rx_target_jetty_id();
+    ASSERT_TRUE(passive);
+    ReplaceEmptyLane(0);
+    const std::array payload{std::byte{0x31}, std::byte{0x72}};
+    ASSERT_EQ(sender.connection.Write(payload), payload.size());
+
+    // 只推进发送方，接收方尚未读公告/安装来源/返回 ACK；业务数据必须始终留在本地队列。
+    for (unsigned i = 0; i < 4; ++i) {
+        ASSERT_TRUE(sender.connection.Progress(Now()));
+    }
+    EXPECT_TRUE(sender.connection.lane_update_pending());
+    EXPECT_EQ(sender.connection.local_lane_update_id(), 0u);
+    EXPECT_EQ(sender.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(sender.slab.stats().local_dma, 0u);
+    EXPECT_EQ(receiver.sources.size(), 2u);
+    EXPECT_TRUE(packets_.empty());
+    // 对端已安装新来源并写出 ACK，但本端尚未消费确认；也不能提前放行注册 Slab 的业务 WR。
+    for (unsigned i = 0; i < 4; ++i) {
+        ASSERT_TRUE(receiver.connection.OnControlReady());
+        ASSERT_TRUE(receiver.connection.Progress(Now()));
+    }
+    EXPECT_EQ(receiver.connection.peer_lane_update_id(), 1u);
+    EXPECT_EQ(receiver.sources.size(), 3u);
+    EXPECT_EQ(sender.connection.local_lane_update_id(), 0u);
+    EXPECT_EQ(sender.connection.tx_stats().accepted, 0u);
+    ASSERT_TRUE(sender.scheduler.Wake(sender.scheduled));
+    ASSERT_TRUE(receiver.scheduler.Wake(receiver.scheduled));
+    ASSERT_TRUE(Until([&] {
+        return sender.connection.local_lane_update_id() == 1 && receiver.connection.peer_lane_update_id() == 1 &&
+               receiver.connection.rx_pending() != 0;
+    }));
+    EXPECT_FALSE(sender.connection.lane_update_pending());
+    EXPECT_EQ(receiver.sources.size(), 3u);
+    EXPECT_EQ(receiver.lane_authorizations, 1u);
+    EXPECT_GT(sender.posts_by_jetty[3], 0u);
+    EXPECT_EQ(sender.pool.rx_target_jetty_id()->id, passive->id);
+    std::array<std::byte, 2> output{};
+    const auto read = receiver.connection.Read(output, Now());
+    ASSERT_TRUE(read);
+    EXPECT_EQ(read->bytes, output.size());
+    EXPECT_EQ(output, payload);
+    EXPECT_FALSE(receiver.io.first_error());
+}
+
+TEST_F(ConnectionRuntimeTest, SimultaneousLaneUpdatesCompleteInBothDirections) {
+    EnableLaneUpdates();
+    Activate();
+    ReplaceEmptyLane(0);
+    ReplaceEmptyLane(1);
+    const std::array payloads{std::array{std::byte{0x51}}, std::array{std::byte{0x62}}};
+    for (std::size_t side = 0; side < endpoints_.size(); ++side) {
+        auto& endpoint = endpoints_[side];
+        ASSERT_EQ(endpoint.connection.Write(payloads[side]), 1u);
+        ASSERT_TRUE(endpoint.connection.Progress(Now()));
+        EXPECT_TRUE(endpoint.connection.lane_update_pending());
+        EXPECT_EQ(endpoint.connection.tx_stats().accepted, 0u);
+        ASSERT_TRUE(endpoint.scheduler.Wake(endpoint.scheduled));
+    }
+    // 双向都处于等待 ACK 状态时也须处理对端 UPDATE，不能让单发送缓冲造成互相等待。
+    ASSERT_TRUE(Until([&] {
+        return std::all_of(endpoints_.begin(), endpoints_.end(), [](const auto& endpoint) {
+            return endpoint.connection.local_lane_update_id() == 1 && endpoint.connection.peer_lane_update_id() == 1 &&
+                   endpoint.connection.rx_pending() != 0;
+        });
+    }));
+    for (std::size_t side = 0; side < endpoints_.size(); ++side) {
+        auto& endpoint = endpoints_[side];
+        EXPECT_EQ(endpoint.connection.state(), ConnectionState::kRawActive);
+        EXPECT_FALSE(endpoint.connection.lane_update_pending());
+        EXPECT_EQ(endpoint.sources.size(), 3u);
+        EXPECT_EQ(endpoint.lane_authorizations, 1u);
+        EXPECT_GT(endpoint.posts_by_jetty[3], 0u);
+        std::array<std::byte, 1> output{};
+        ASSERT_TRUE(endpoint.connection.Read(output, Now()));
+        EXPECT_EQ(output, payloads[1 - side]);
+        EXPECT_FALSE(endpoint.io.first_error());
+    }
+}
+
+TEST_F(ConnectionRuntimeTest, LaneAckDoesNotRetireOldSourceWithDelayedReceive) {
+    EnableLaneUpdates();
+    Activate();
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    const std::array payload{std::byte{0x3b}};
+    ASSERT_EQ(sender.connection.Write(payload), payload.size());
+    ASSERT_TRUE(sender.scheduler.Wake(sender.scheduled));
+    ASSERT_TRUE(shard_.Tick());
+    ASSERT_EQ(packets_.size(), 1u);
+    auto delayed = std::move(packets_.front());
+    packets_.pop_front();
+    ASSERT_EQ(delayed.source.id, sender.pool.lane_jetty(0)->jetty_id.id);
+    // 本地 TX 先终结，但远端 RX 尚未交付；这只能证明本地替换安全，不能撤销旧来源。
+    ASSERT_TRUE(Until([&] { return sender.slab.stats().local_dma == 0; }));
+    ReplaceEmptyLane(0);
+    ASSERT_TRUE(sender.scheduler.Wake(sender.scheduled));
+    ASSERT_TRUE(Until([&] { return sender.connection.local_lane_update_id() == 1; }));
+    EXPECT_EQ(receiver.sources.size(), 3u);
+    EXPECT_FALSE(receiver.handshake_sources.Retire({1, true, true, false}));
+    EXPECT_EQ(receiver.sources.size(), 3u);
+    packets_.push_back(std::move(delayed));
+    Deliver();
+    ASSERT_TRUE(Until([&] { return receiver.connection.rx_pending() != 0; }));
+    std::array<std::byte, 1> output{};
+    ASSERT_TRUE(receiver.connection.Read(output, Now()));
+    EXPECT_EQ(output, payload);
+    EXPECT_FALSE(receiver.io.first_error());
+    EXPECT_FALSE(receiver.receive.frozen());
+    EXPECT_EQ(receiver.sources.size(), 3u);
+}
+
+TEST_F(ConnectionRuntimeTest, RejectedLanePolicyNeverAcknowledgesOrPostsFromNewSource) {
+    EnableLaneUpdates();
+    Activate();
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    receiver.reject_lane_update = true;
+    ReplaceEmptyLane(0);
+    const std::array payload{std::byte{0x41}};
+    ASSERT_TRUE(sender.connection.Write(payload));
+    ASSERT_TRUE(sender.scheduler.Wake(sender.scheduled));
+    ASSERT_TRUE(Until([&] {
+        return sender.connection.state() == ConnectionState::kFailed &&
+               receiver.connection.state() == ConnectionState::kFailed;
+    }));
+    ASSERT_TRUE(receiver.connection.failure());
+    EXPECT_EQ(receiver.connection.failure()->code, ConnectionErrorCode::kSourceAdmission);
+    EXPECT_EQ(receiver.lane_authorizations, 1u);
+    EXPECT_EQ(receiver.connection.peer_lane_update_id(), 0u);
+    EXPECT_EQ(sender.connection.local_lane_update_id(), 0u);
+    EXPECT_EQ(receiver.sources.size(), 2u);
+    EXPECT_EQ(sender.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(sender.slab.stats().local_dma, 0u);
+    EXPECT_TRUE(packets_.empty());
+}
+
+class FullSourceRuntimeTest : public ConnectionRuntimeTest {
+protected:
+    std::uint32_t SourceCapacity(std::size_t side) const override {
+        return side == 1 ? 2 : 8;
+    }
+};
+
+TEST_F(FullSourceRuntimeTest, FailedOnlineSourceInstallCannotAcknowledgeReplacement) {
+    EnableLaneUpdates();
+    Activate();
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    ASSERT_EQ(receiver.sources.size(), 2u);
+    ReplaceEmptyLane(0);
+    const std::array payload{std::byte{0x19}};
+    ASSERT_TRUE(sender.connection.Write(payload));
+    ASSERT_TRUE(sender.scheduler.Wake(sender.scheduled));
+    // 初始两个来源已占满表，更新不能提前删除仍可能有迟到 RX 的旧键腾出空间。
+    ASSERT_TRUE(Until([&] {
+        return sender.connection.state() == ConnectionState::kFailed &&
+               receiver.connection.state() == ConnectionState::kFailed;
+    }));
+    ASSERT_TRUE(receiver.connection.failure());
+    EXPECT_EQ(receiver.connection.failure()->code, ConnectionErrorCode::kSourceAdmission);
+    EXPECT_EQ(receiver.lane_authorizations, 1u);
+    EXPECT_EQ(receiver.sources.size(), 2u);
+    EXPECT_EQ(receiver.connection.peer_lane_update_id(), 0u);
+    EXPECT_EQ(sender.connection.local_lane_update_id(), 0u);
+    EXPECT_EQ(sender.connection.tx_stats().accepted, 0u);
+    EXPECT_TRUE(packets_.empty());
+}
+
+TEST_F(ConnectionRuntimeTest, ControlCloseWhileWaitingForLaneAckKeepsSourcesAndStopsData) {
+    EnableLaneUpdates();
+    Activate();
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    ReplaceEmptyLane(0);
+    const std::array payload{std::byte{0x41}};
+    ASSERT_TRUE(sender.connection.Write(payload));
+    ASSERT_TRUE(sender.connection.Progress(Now()));
+    ASSERT_TRUE(sender.connection.lane_update_pending());
+    // 对端未处理 UPDATE 即关闭控制连接，EOF 不能当作 ACK 或远端静默证明。
+    receiver.connection.Cancel();
+    ASSERT_TRUE(sender.scheduler.Wake(sender.scheduled));
+    ASSERT_TRUE(Until([&] { return sender.connection.state() == ConnectionState::kFailed; }));
+    ASSERT_TRUE(sender.connection.failure());
+    EXPECT_EQ(sender.connection.failure()->code, ConnectionErrorCode::kControlClosed);
+    EXPECT_EQ(sender.connection.local_lane_update_id(), 0u);
+    EXPECT_EQ(sender.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(sender.slab.stats().local_dma, 0u);
+    EXPECT_EQ(sender.sources.size(), 2u);
+    EXPECT_EQ(receiver.sources.size(), 2u);
+    EXPECT_FALSE(receiver.handshake_sources.Close());
+    EXPECT_TRUE(packets_.empty());
+}
+
+TEST_F(ConnectionRuntimeTest, UnacknowledgedLaneUpdateHasBoundedDeadline) {
+    EnableLaneUpdates();
+    endpoints_[0].lane_update_timeout_ns = 1'000'000;
+    Activate();
+    auto& sender = endpoints_[0];
+    ReplaceEmptyLane(0);
+    const std::array payload{std::byte{0x77}};
+    ASSERT_TRUE(sender.connection.Write(payload));
+    const auto start = Now();
+    ASSERT_TRUE(sender.connection.Progress(start));
+    ASSERT_TRUE(sender.connection.lane_update_pending());
+    // 仅推进本端并使用确定的截止时间，无需睡眠或依赖对端处理速度。
+    auto timed_out = sender.connection.Progress(start + sender.lane_update_timeout_ns + 1);
+    ASSERT_FALSE(timed_out);
+    EXPECT_EQ(timed_out.error().code, ConnectionErrorCode::kLaneUpdateTimeout);
+    EXPECT_EQ(sender.connection.state(), ConnectionState::kFailed);
+    EXPECT_EQ(sender.connection.local_lane_update_id(), 0u);
+    EXPECT_EQ(sender.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(sender.slab.stats().local_dma, 0u);
+    EXPECT_EQ(endpoints_[1].sources.size(), 2u);
+    EXPECT_TRUE(packets_.empty());
 }
 
 TEST_F(ConnectionRuntimeTest, CancelRetainsHelloSourcesUntilQueuedReceiveHasSettled) {

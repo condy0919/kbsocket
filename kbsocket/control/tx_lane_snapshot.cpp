@@ -18,7 +18,8 @@ bool SameEid(const std::array<std::byte, 16>& expected, const urma_eid_t& actual
 }
 } // namespace
 
-std::expected<HandshakeTxLanes, HandshakeError> CaptureTxLanes(const raw::JettyPool& pool) noexcept {
+std::expected<HandshakeTxLanes, HandshakeError> CaptureTxLanes(const raw::JettyPool& pool,
+                                                               bool require_ready) noexcept {
     if (!pool.context() || pool.retained()) {
         return std::unexpected(NotReady());
     }
@@ -42,7 +43,8 @@ std::expected<HandshakeTxLanes, HandshakeError> CaptureTxLanes(const raw::JettyP
             return std::unexpected(Invalid());
         }
         const auto state = pool.lane_state(*lane);
-        if (!state || *state != raw::JettyLaneState::kReady) {
+        if (!state || *state == raw::JettyLaneState::kReplacing ||
+            (require_ready && *state != raw::JettyLaneState::kReady)) {
             return std::unexpected(NotReady());
         }
         if (index == 0) {
@@ -65,10 +67,14 @@ std::expected<HandshakeTxLanes, HandshakeError> CaptureTxLanes(const raw::JettyP
 
 std::expected<void, HandshakeError> ValidateLocalTxLanes(const raw::JettyPool& pool,
                                                          const HandshakeHello& hello) noexcept {
+    return ValidateLocalTxLanes(pool, hello, hello.tx_lanes);
+}
+
+std::expected<void, HandshakeError> ValidateLocalTxLanes(const raw::JettyPool& pool, const HandshakeHello& hello,
+                                                         const HandshakeTxLanes& snapshot) noexcept {
     if (!pool.context() || pool.retained()) {
         return std::unexpected(NotReady());
     }
-    const auto& snapshot = hello.tx_lanes;
     if (!(hello.capabilities & kHandshakeCapabilityRaw) || !snapshot.count || snapshot.count > kHandshakeMaxTxLanes ||
         snapshot.count != pool.capacity() || !snapshot.pool_epoch) {
         return std::unexpected(Invalid());
@@ -93,6 +99,28 @@ std::expected<void, HandshakeError> ValidateLocalTxLanes(const raw::JettyPool& p
             !SameEid(entry.eid, jetty->jetty_id.eid)) {
             return std::unexpected(Invalid());
         }
+    }
+    return {};
+}
+
+std::expected<void, HandshakeError> ValidateTxLaneUpdate(const HandshakeTxLanes& before,
+                                                         const HandshakeTxLanes& after) noexcept {
+    if (!ValidateHandshakeTxLanes(before) || !ValidateHandshakeTxLanes(after) ||
+        before.pool_epoch != after.pool_epoch || before.count != after.count) {
+        return std::unexpected(Invalid());
+    }
+    bool changed = false;
+    for (std::uint32_t i = 0; i < before.count; ++i) {
+        const auto& old_lane = before.lanes[i];
+        const auto& new_lane = after.lanes[i];
+        if (new_lane.generation < old_lane.generation ||
+            (new_lane.generation == old_lane.generation && new_lane != old_lane)) {
+            return std::unexpected(Invalid());
+        }
+        changed |= new_lane.generation > old_lane.generation;
+    }
+    if (!changed) {
+        return std::unexpected(Invalid());
     }
     return {};
 }

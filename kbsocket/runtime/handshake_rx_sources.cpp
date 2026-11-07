@@ -15,6 +15,17 @@ bool ValidIdentity(const control::HandshakeIdentity& identity) noexcept {
     return identity.runtime && identity.receive_domain && identity.endpoint_generation && identity.authorization &&
            identity.session && identity.token.generation;
 }
+urma_jetty_id_t PhysicalSource(const control::HandshakeTxLane& lane) noexcept {
+    urma_jetty_id_t result{};
+    std::memcpy(&result.eid, lane.eid.data(), lane.eid.size());
+    result.uasid = lane.uasid;
+    result.id = lane.jetty_id;
+    return result;
+}
+bool SamePhysicalSource(const urma_jetty_id_t& left, const urma_jetty_id_t& right) noexcept {
+    return left.id == right.id && left.uasid == right.uasid &&
+           std::memcmp(&left.eid, &right.eid, sizeof(left.eid)) == 0;
+}
 } // namespace
 
 std::expected<void, ErrorCode> HandshakeRxSources::Open(RxSourceRegistry& registry) noexcept {
@@ -88,12 +99,78 @@ std::expected<void, ErrorCode> HandshakeRxSources::Prepare(const control::RawSou
         return Error(ErrorCode::kRegistry);
     }
     count_ = peer.tx_lanes.count;
+    current_lanes_ = peer.tx_lanes;
+    route_template_ = routes[0];
+    peer_passive_eid_ = peer.eid;
+    peer_passive_id_ = peer.jetty_id;
+    for (std::size_t i = 0; i < count_; ++i) {
+        physical_sources_[i] = routes[i].remote_id;
+    }
     context_ = request.context;
     buffers_ = request.buffers;
     context_incarnation_ = request.context_incarnation;
     credit_peer_ = request.credit_peer;
     credit_identity_ = identity;
     prepared_once_ = true;
+    return {};
+}
+
+std::expected<void, ErrorCode> HandshakeRxSources::Update(const control::HandshakeTxLanes& lanes,
+                                                          bool authorized) noexcept {
+    if (!authorized) {
+        return Error(ErrorCode::kUnauthorized);
+    }
+    if (const auto checked = Check(); !checked) {
+        return checked;
+    }
+    if (!control::ValidateHandshakeTxLanes(lanes) || lanes.pool_epoch != current_lanes_.pool_epoch ||
+        lanes.count != current_lanes_.count) {
+        return Error(ErrorCode::kInvalidArgument);
+    }
+    bool advanced = false;
+    std::array<RxSourceRoute, control::kHandshakeMaxTxLanes> additions{};
+    std::size_t added_count = 0;
+    for (std::uint32_t i = 0; i < lanes.count; ++i) {
+        const auto& previous = current_lanes_.lanes[i];
+        const auto& next = lanes.lanes[i];
+        if (next.generation < previous.generation || (next.generation == previous.generation && next != previous) ||
+            (next.jetty_id == peer_passive_id_ && next.eid == peer_passive_eid_)) {
+            return Error(ErrorCode::kInvalidArgument);
+        }
+        advanced |= next.generation > previous.generation;
+        const auto physical = PhysicalSource(next);
+        bool retained = false;
+        for (std::size_t j = 0; j < count_; ++j) {
+            if (SamePhysicalSource(physical_sources_[j], physical)) {
+                retained = true;
+                break;
+            }
+        }
+        if (!retained) {
+            additions[added_count] = route_template_;
+            additions[added_count++].remote_id = physical;
+        }
+    }
+    if (!advanced) {
+        return Error(ErrorCode::kInvalidArgument);
+    }
+    if (added_count > kMaxRetainedSources - count_) {
+        return Error(ErrorCode::kExhausted);
+    }
+    // CQE 不携带软件 Lane generation；同一物理键继续归属于同一会话，不新增重复键。
+    // 只有新物理来源才原子插入，失败不会改变 current_lanes_ 或丢失历史来源责任。
+    if (added_count) {
+        const auto added = registry_->RegisterBatch(std::span(additions).first(added_count),
+                                                    std::span(leases_).subspan(count_, added_count));
+        if (!added) {
+            return Error(ErrorCode::kRegistry);
+        }
+        for (std::size_t i = 0; i < added_count; ++i) {
+            physical_sources_[count_ + i] = additions[i].remote_id;
+        }
+        count_ += added_count;
+    }
+    current_lanes_ = lanes;
     return {};
 }
 

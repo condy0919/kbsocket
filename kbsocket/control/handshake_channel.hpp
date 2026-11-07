@@ -19,11 +19,11 @@ inline constexpr std::size_t kHandshakeMaxTxLanes = 64;
 inline constexpr std::size_t kHandshakeHeaderBytes = 12;
 inline constexpr std::size_t kHandshakeMaxFrameBytes =
     kHandshakeHeaderBytes + 104 + 32 * kHandshakeMaxTxLanes + kHandshakeMaxDescriptorBytes;
-inline constexpr std::uint16_t kHandshakeVersion = 2;
+inline constexpr std::uint16_t kHandshakeVersion = 3;
 inline constexpr std::uint16_t kHandshakeCapabilityRaw = 1;
 inline constexpr std::uint16_t kHandshakeCapabilityTcp = 2;
 
-enum class HandshakeMessageKind : std::uint8_t { kHello = 1, kReady = 2, kReject = 3 };
+enum class HandshakeMessageKind : std::uint8_t { kHello = 1, kReady = 2, kReject = 3, kLaneUpdate = 4, kLaneAck = 5 };
 enum class HandshakeTransport : std::uint32_t { kRaw = 1, kTcp = 2 };
 
 /// session 为本端 HELLO 的不可复用 nonce；双方 READY 必须完整回显两个 identity。
@@ -81,11 +81,25 @@ struct HandshakeReject {
     std::uint64_t receiver_session = 0;
     std::uint32_t reason = 0;
 };
+/// 在线公告绑定既有双向会话；ACK 只确认该公告已安装，不证明旧 RX 已经排空。
+struct HandshakeLaneUpdate {
+    HandshakeIdentity sender;
+    HandshakeIdentity receiver;
+    std::uint64_t update_id = 0;
+    HandshakeTxLanes tx_lanes;
+};
+struct HandshakeLaneAck {
+    HandshakeIdentity sender;
+    HandshakeIdentity receiver;
+    std::uint64_t update_id = 0;
+};
 struct HandshakeMessage {
     HandshakeMessageKind kind = HandshakeMessageKind::kHello;
     HandshakeHello hello;
     HandshakeReady ready;
     HandshakeReject reject;
+    HandshakeLaneUpdate lane_update;
+    HandshakeLaneAck lane_ack;
 };
 enum class HandshakeErrorCode : std::uint8_t {
     kInvalidArgument,
@@ -109,6 +123,8 @@ struct HandshakeError {
 
 /// 验证 RAW 主动 Lane 快照的数量、代次和物理来源唯一性；无分配。
 std::expected<void, HandshakeError> ValidateHandshakeTxLanes(const HandshakeTxLanes& lanes) noexcept;
+/// 只比较 wire 有效前缀，未使用数组槽不参与公告身份；超界数量一律不相等。
+bool SameTxLanes(const HandshakeTxLanes& left, const HandshakeTxLanes& right) noexcept;
 
 /// 固定大端字段；失败不写 output。Decode 只接受恰好一帧，不读取 C++ 结构体布局。
 std::expected<std::size_t, HandshakeError> EncodeHandshakeMessage(const HandshakeMessage& message,
@@ -159,6 +175,9 @@ public:
     }
     bool message_ready() const noexcept {
         return message_ready_;
+    }
+    bool input_pending() const noexcept {
+        return rx_size_ != 0;
     }
     const std::optional<HandshakeError>& failure() const noexcept {
         return failure_;

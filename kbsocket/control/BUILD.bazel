@@ -22,6 +22,19 @@ cc_library(
 )
 
 cc_library(
+    name = "lane_control",
+    srcs = ["lane_control.cpp"],
+    hdrs = ["lane_control.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":handshake_channel",
+        ":raw_source_admission",
+        ":tx_lane_snapshot",
+        "//kbsocket/transport/raw:jetty_pool",
+    ],
+)
+
+cc_library(
     name = "endpoint_import_cache",
     srcs = ["endpoint_import_cache.cpp"],
     hdrs = ["endpoint_import_cache.hpp"],
@@ -29,6 +42,17 @@ cc_library(
     deps = [
         "//kbsocket/runtime:control_executor",
         "//kbsocket/transport/raw:urma_api",
+    ],
+)
+
+cc_test(
+    name = "lane_control_test",
+    srcs = ["lane_control_test.cpp"],
+    deps = [
+        ":lane_control",
+        ":tx_lane_snapshot",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
     ],
 )
 

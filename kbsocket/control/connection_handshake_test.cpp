@@ -499,6 +499,25 @@ TEST_F(ConnectionHandshakeTest, WrongPeerAuthorizationFailsBeforeAnyRouteOrImpor
     EXPECT_EQ(import_calls_, 0);
 }
 
+TEST_F(ConnectionHandshakeTest, OnlineUpdateBeforeReadyCannotBypassInitialHandshake) {
+    int sockets[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sockets), 0);
+    ASSERT_TRUE(a_.Open(
+        sockets[0], a_table_,
+        {.local = Hello(1), .expected_peer_authorization = 7, .compatible_peer = true, .deadline_ns = 1000}, 0));
+    HandshakeChannel remote;
+    ASSERT_TRUE(remote.Open(sockets[1], true, 0, 1000));
+    HandshakeMessage update;
+    update.kind = HandshakeMessageKind::kLaneUpdate;
+    update.lane_update = {Hello(2).identity, a_.local().identity, 1, Hello(2).tx_lanes};
+    ASSERT_TRUE(remote.Queue(update));
+    ASSERT_TRUE(remote.Progress(++now_));
+    // 结构合法的在线消息也不能替代 HELLO/READY，尚未准入任何来源或导入。
+    ExpectError(a_.Progress(++now_), Code::kProtocol);
+    EXPECT_EQ(a_table_.published(), 0u);
+    EXPECT_EQ(import_calls_, 0);
+}
+
 TEST_F(ConnectionHandshakeTest, InvalidOpenLeavesFdOwnedByCallerAndRetiresReservation) {
     int sockets[2];
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sockets), 0);

@@ -26,11 +26,13 @@ M5.1 将 M4 的身份、乱序窗口和授信原语接入建链准备流程：�
 
 ## 2. HELLO、READY 与两个方向的身份
 
-控制帧使用固定大端字段，不直接发送 C++ 结构体。12 字节帧头包含 `KBSH`、握手版本、消息类型、保留字节和正文长度。M5.3.2 将握手版本升为 2：HELLO 正文为 104 字节固定字段、每条 32 字节的主动 Lane 列表以及最多 4096 字节的 opaque 端点描述；最多 64 条 Lane，整帧上限 6260 字节。READY 正文仍为 144 字节，REJECT 为 20 字节。旧 v1 显式拒绝，不能混用两版。
+控制帧使用固定大端字段，不直接发送 C++ 结构体。12 字节帧头包含 `KBSH`、协议版本、消息类型、保留字节和正文长度。M5.3.3 使用版本 3；HELLO 沿用 M5.3.2 的布局，正文为 104 字节固定字段、每条 32 字节的主动 Lane 列表以及最多 4096 字节的 opaque 端点描述；最多 64 条 Lane，整帧上限 6260 字节。READY 正文仍为 144 字节，REJECT 为 20 字节。旧 v1/v2 显式拒绝，双端须同时升级。
 
 每份 `HandshakeIdentity` 包含 runtime 实例、接收域、被动端点代次、授权策略身份、不可复用 session nonce 和完整 32-bit slot/generation。HELLO 另携带数据 wire 版本、能力位、本端接收授信 epoch、被动 EID/Jetty ID、导入 token 及描述符，以及独立的主动 Lane pool epoch、数量和列表。每条 Lane 包含 EID/UASID/Jetty ID/generation。RAW 快照不能为空，不允许零代次、重复物理来源或主动/被动角色冲突；TCP-only 的 raw 字段及 Lane 数量/epoch 必须为零。宿主负责生成不复用的 runtime/domain/session 身份；协调器不会生成随机身份，也不会把自报 `authorization` 当认证凭证。
 
 READY 完整回显发送方和接收方各自的 identity，并携带所选传输、授信 epoch 以及数据、控制、帧序号和驻留字节的累计上界。raw READY 的这些额度必须有效且 epoch 与该发送方 HELLO 一致；TCP READY 不携带 raw 额度。重复 HELLO/READY、身份不一致、意外版本或错误传输选择会使握手显式失败。
+
+版本 3 另定义 raw Active 后的 `LANE_UPDATE`（类型 4）与 `LANE_ACK`（类型 5）。UPDATE 正文为 120 字节固定字段及每条 32 字节的完整主动 Lane 快照，ACK 正文为 104 字节；两者均携带 sender/receiver 的完整身份和从 1 开始的单调更新序号。UPDATE 限于原 pool epoch 和 Lane 数量内的代次递增。接收端逐份授权并原子安装来源后才返回 ACK；发送端收到匹配 ACK 并重新检查实际池快照后才恢复投递。握手阶段拒绝这两类消息。具体状态、时限及旧来源保留规则见[在线 Lane 更新](connection-runtime.md#在线-lane-更新)。
 
 假定本端为 A、对端为 B，入站身份与信用的两个方向分别是：
 
@@ -49,7 +51,7 @@ READY 完整回显发送方和接收方各自的 identity，并携带所选传�
 
 每个方向只保留一个有界帧缓冲。`Progress` 默认共处理最多 16384 字节、8 次系统调用；调用方可缩小预算，系统调用预算上限为 64。短写、短读和 `EAGAIN` 保留当前偏移后立即返回，不使用阻塞 wait/poll。时间采用调用方提供的单调时钟，截止时间贯穿整个握手，不因碎片到达或重复推进而延长。
 
-接收恰好一帧后停止读取，下一帧仍留在内核。协调器收到对端 READY 后关闭握手读取，只继续排空本端输出；因此与 READY 合并到同一 TCP 包中的首个业务字节不会被吞掉或误解码。Active 后 `TakeEstablishedFd` 可转交这个已消费完协议字节的 fd：raw 路径供后续控制通道使用，协商 TCP 路径供后续 TCP 后端使用。
+接收恰好一帧后停止读取，下一帧仍留在内核。协调器收到对端 READY 后关闭握手读取，只继续排空本端输出；因此与 READY 合并到同一 TCP 包中的后续字节不会被吞掉或误解码。Active 后 `TakeEstablishedFd` 转交这个恰好消费完握手字节的 fd：完整 Connection 的 raw 路径交给 `LaneControl` 处理 UPDATE/ACK，协商 TCP 路径交给 TCP 数据后端。
 
 错误、超时和取消关闭已接管的协议 fd，保留首个失败原因，并撤回已发布路由。raw 导入失败不会在同一个脏流上自动变成普通 TCP，也不迁移已经激活的旧字节流；重连及是否选择新 TCP 连接由宿主策略决定。当前只实现初始共同能力选择，尚未实现双 IOdie Primary/Secondary 拓扑决策。
 
@@ -88,4 +90,4 @@ Open 一次分配所有条目、引用票据和描述符存储。默认上限为
 
 当前测试覆盖协议分片与合并、有限 IO 预算、超时/取消、真实本机 TCP 协议交换、READY 前路由发布及首包竞态、相反方向的信用 epoch、1000 等待者单次导入、旧身份拒绝、部分准备失败、导入取消及清理重试。raw provider 由 Mock 替代；本机 TCP 握手测试不代表完整 NativeTCP 后端，也没有形成 UB 真机正确性、吞吐或 40k 建链性能结论。
 
-M5.2 已交付 connect/listener、NativeTCP 后端、有界 Connection copy-stream、RX/补投结账与发送共账接线。M5.3.1/2 已增加 Runtime 公平推进、实际 RX 来源映射和 HELLO 主动 Lane 自动登记；完整 Connection 在来源安装之前禁止 READY，见 [连接 Runtime](connection-runtime.md)。低层 ConnectionHandshake 仍是可独立组合的原语，不替宿主消费 RX 或安装来源。业务 mailbox、在线 Lane 更新、自动资源/拓扑管理、显式 C ABI/零拷贝 API，以及关闭协商与远端静默证明仍待实现。M6 的 WRITE Grant/DONE 生命周期保持独立。
+M5.2 已交付 connect/listener、NativeTCP 后端、有界 Connection copy-stream、RX/补投结账与发送共账接线。M5.3.1/2 已增加 Runtime 公平推进、实际 RX 来源映射和 HELLO 主动 Lane 自动登记；完整 Connection 在来源安装之前禁止 READY。M5.3.3 增加宿主显式启用的在线 Lane 更新及确认，见 [连接 Runtime](connection-runtime.md)。低层 ConnectionHandshake 仍是可独立组合的原语，不替宿主消费 RX 或安装来源。业务 mailbox、自动资源/拓扑管理、显式 C ABI/零拷贝 API，以及关闭协商与远端静默证明仍待实现。M6 的 WRITE Grant/DONE 生命周期保持独立。

@@ -896,6 +896,238 @@ TEST_F(RxSourceRegistryTest, HelloAdmissionFrozenCreditStopsReadinessButKeepsLat
     EXPECT_TRUE(admission.Close());
 }
 
+TEST_F(RxSourceRegistryTest, LaneUpdatesKeepEveryOldPhysicalSourceUntilExplicitRetirement) {
+    control::HandshakeHello local, peer;
+    HelloPair(local, peer);
+    HandshakeRxSources admission;
+    ASSERT_TRUE(admission.Open(registry_));
+    ASSERT_TRUE(admission.Prepare(Request(local, peer)));
+    const auto old_event = HeldEvent(route_);
+    auto update = peer.tx_lanes;
+    ++update.lanes[0].generation;
+    update.lanes[0].jetty_id = 81;
+    allocations = 0;
+    count_allocations = true;
+    const auto changed = admission.Update(update, true);
+    const auto checked = admission.Check();
+    count_allocations = false;
+    ASSERT_TRUE(changed);
+    ASSERT_TRUE(checked);
+    EXPECT_EQ(allocations, 0u);
+    EXPECT_EQ(admission.size(), 3u);
+    EXPECT_EQ(*admission.current_lanes(), update);
+    EXPECT_TRUE(registry_.Resolve(old_event));
+    auto first_new = route_;
+    first_new.remote_id.id = 81;
+    const auto first_new_event = HeldEvent(first_new);
+    EXPECT_TRUE(registry_.Resolve(first_new_event));
+
+    // 第二次更新同一会话的另一条 Lane；历史来源不能因当前列表中已不存在而被撤销。
+    ++update.lanes[1].generation;
+    update.lanes[1].jetty_id = 82;
+    ASSERT_TRUE(admission.Update(update, true));
+    auto second_new = route_;
+    second_new.remote_id.id = 82;
+    const auto second_new_event = HeldEvent(second_new);
+    auto source = registry_.Resolve(second_new_event);
+    ASSERT_TRUE(source);
+    EXPECT_EQ(source->peer_context.session, local.identity.session);
+    EXPECT_EQ(source->peer_context.peer_runtime, peer.identity.runtime);
+    EXPECT_EQ(source->peer.domain, &credits_);
+    EXPECT_TRUE(registry_.Resolve(old_event));
+    EXPECT_TRUE(registry_.Resolve(first_new_event));
+    EXPECT_EQ(admission.size(), 4u);
+    EXPECT_FALSE(admission.Close());
+    EXPECT_FALSE(admission.Retire({101, true, true, false}));
+    EXPECT_EQ(registry_.size(), 4u);
+    ASSERT_TRUE(admission.Retire(Proof()));
+    EXPECT_EQ(admission.current_lanes(), nullptr);
+    EXPECT_FALSE(registry_.Resolve(old_event));
+    EXPECT_FALSE(registry_.Resolve(first_new_event));
+    EXPECT_FALSE(registry_.Resolve(second_new_event));
+    EXPECT_EQ(registry_.size(), 0u);
+    EXPECT_TRUE(admission.Close());
+}
+
+TEST_F(RxSourceRegistryTest, LaneUpdatesRejectUnauthorizedOrNonMonotonicSnapshotsAtomically) {
+    control::HandshakeHello local, peer;
+    HelloPair(local, peer);
+    HandshakeRxSources admission;
+    ASSERT_TRUE(admission.Open(registry_));
+    ASSERT_TRUE(admission.Prepare(Request(local, peer)));
+    auto update = peer.tx_lanes;
+    ++update.lanes[0].generation;
+    update.lanes[0].jetty_id = 81;
+    auto untrusted = admission.Update(update, false);
+    ASSERT_FALSE(untrusted);
+    EXPECT_EQ(untrusted.error(), control::RawSourceAdmissionError::kUnauthorized);
+    const auto reject = [&](const control::HandshakeTxLanes& snapshot) {
+        auto result = admission.Update(snapshot, true);
+        EXPECT_FALSE(result);
+        if (!result) {
+            EXPECT_EQ(result.error(), control::RawSourceAdmissionError::kInvalidArgument);
+        }
+        EXPECT_EQ(registry_.size(), 2u);
+        EXPECT_EQ(*admission.current_lanes(), peer.tx_lanes);
+    };
+    auto malformed = update;
+    ++malformed.pool_epoch;
+    reject(malformed);
+    malformed = update;
+    --malformed.count;
+    reject(malformed);
+    malformed = update;
+    malformed.count = control::kHandshakeMaxTxLanes + 1;
+    reject(malformed);
+    malformed = update;
+    malformed.lanes[0].generation = 0;
+    reject(malformed);
+    malformed = update;
+    malformed.lanes[0].generation = peer.tx_lanes.lanes[0].generation;
+    reject(malformed);
+    malformed = update;
+    --malformed.lanes[1].generation;
+    reject(malformed);
+    // 后缀重复物理来源或改成被动目标，不能先安装合法的新前缀。
+    malformed = update;
+    malformed.lanes[1] = malformed.lanes[0];
+    reject(malformed);
+    malformed = update;
+    malformed.lanes[1].jetty_id = peer.jetty_id;
+    malformed.lanes[1].eid = peer.eid;
+    ++malformed.lanes[1].generation;
+    reject(malformed);
+    reject(peer.tx_lanes);
+    auto rejected_source = route_;
+    rejected_source.remote_id.id = 81;
+    EXPECT_FALSE(registry_.Resolve(HeldEvent(rejected_source)));
+    ASSERT_TRUE(admission.Update(update, true));
+    EXPECT_EQ(admission.size(), 3u);
+    ASSERT_TRUE(admission.Retire(Proof()));
+    EXPECT_TRUE(admission.Close());
+}
+
+TEST_F(RxSourceRegistryTest, LaneUpdateRegistryCapacityFailurePreservesOldSnapshotAndSources) {
+    control::HandshakeHello local, peer;
+    HelloPair(local, peer);
+    HandshakeRxSources admission;
+    ASSERT_TRUE(admission.Open(registry_));
+    ASSERT_TRUE(admission.Prepare(Request(local, peer)));
+    for (std::uint32_t i = 0; i < 5; ++i) {
+        auto other = route_;
+        other.token.slot = 10 + i;
+        Register(other);
+    }
+    auto update = peer.tx_lanes;
+    for (std::uint32_t i = 0; i < update.count; ++i) {
+        ++update.lanes[i].generation;
+        update.lanes[i].jetty_id += 10;
+    }
+    // 仅一个空槽，不足安装两个新来源；不能留下前缀或推进当前快照。
+    auto exhausted = admission.Update(update, true);
+    ASSERT_FALSE(exhausted);
+    EXPECT_EQ(exhausted.error(), control::RawSourceAdmissionError::kRegistry);
+    EXPECT_EQ(registry_.size(), 7u);
+    EXPECT_EQ(admission.size(), 2u);
+    EXPECT_EQ(*admission.current_lanes(), peer.tx_lanes);
+    EXPECT_TRUE(registry_.Resolve(HeldEvent(route_)));
+    auto new_route = route_;
+    new_route.remote_id.id = 81;
+    EXPECT_FALSE(registry_.Resolve(HeldEvent(new_route)));
+    ASSERT_TRUE(registry_.Remove(handles_[0], Proof()));
+    ASSERT_TRUE(admission.Update(update, true));
+    EXPECT_EQ(admission.size(), 4u);
+    EXPECT_EQ(registry_.size(), 8u);
+    ASSERT_TRUE(admission.Retire(Proof()));
+    EXPECT_TRUE(admission.Close());
+}
+
+TEST_F(RxSourceRegistryTest, LaneUpdateReusesHistoricalPhysicalIdentityWithoutDuplicateBinding) {
+    control::HandshakeHello local, peer;
+    HelloPair(local, peer);
+    HandshakeRxSources admission;
+    ASSERT_TRUE(admission.Open(registry_));
+    ASSERT_TRUE(admission.Prepare(Request(local, peer)));
+    auto update = peer.tx_lanes;
+    ++update.lanes[0].generation;
+    ASSERT_TRUE(admission.Update(update, true));
+    EXPECT_EQ(admission.size(), 2u);
+    ++update.lanes[0].generation;
+    update.lanes[0].jetty_id = 81;
+    ASSERT_TRUE(admission.Update(update, true));
+    EXPECT_EQ(admission.size(), 3u);
+    // 硬件再次分配初代物理 ID：同一逻辑 token/session/Peer 不产生重复来源条目。
+    ++update.lanes[0].generation;
+    update.lanes[0].jetty_id = peer.tx_lanes.lanes[0].jetty_id;
+    ASSERT_TRUE(admission.Update(update, true));
+    EXPECT_EQ(admission.size(), 3u);
+    EXPECT_EQ(*admission.current_lanes(), update);
+    EXPECT_TRUE(registry_.Resolve(HeldEvent(route_)));
+    auto previous = route_;
+    previous.remote_id.id = 81;
+    EXPECT_TRUE(registry_.Resolve(HeldEvent(previous)));
+    ASSERT_TRUE(admission.Retire(Proof()));
+    EXPECT_TRUE(admission.Close());
+}
+
+TEST_F(RxSourceRegistryTest, LaneHistoryLimitRejectsNewKeysButAllowsGenerationOnlyAdvance) {
+    control::HandshakeHello local, peer;
+    HelloPair(local, peer);
+    RxSourceRegistry large_registry;
+    ASSERT_TRUE(large_registry.Open(Config(512)));
+    HandshakeRxSources admission;
+    ASSERT_TRUE(admission.Open(large_registry));
+    ASSERT_TRUE(admission.Prepare(Request(local, peer)));
+    auto update = peer.tx_lanes;
+    for (std::size_t round = 1; round < HandshakeRxSources::kMaxRetainedSources / 2; ++round) {
+        for (std::uint32_t i = 0; i < update.count; ++i) {
+            ++update.lanes[i].generation;
+            update.lanes[i].jetty_id = 1000 + 2 * round + i;
+        }
+        ASSERT_TRUE(admission.Update(update, true));
+    }
+    ASSERT_EQ(admission.size(), HandshakeRxSources::kMaxRetainedSources);
+    const auto before = update;
+    ++update.lanes[0].generation;
+    update.lanes[0].jetty_id = 2000;
+    // Registry 仍有空间；适配器自身历史预算必须提供独立、可预测的硬上限。
+    auto exhausted = admission.Update(update, true);
+    ASSERT_FALSE(exhausted);
+    EXPECT_EQ(exhausted.error(), control::RawSourceAdmissionError::kExhausted);
+    EXPECT_EQ(large_registry.size(), HandshakeRxSources::kMaxRetainedSources);
+    EXPECT_EQ(*admission.current_lanes(), before);
+    update = before;
+    ++update.lanes[0].generation;
+    ASSERT_TRUE(admission.Update(update, true));
+    EXPECT_EQ(admission.size(), HandshakeRxSources::kMaxRetainedSources);
+    ASSERT_TRUE(admission.Retire(Proof()));
+    EXPECT_EQ(large_registry.size(), 0u);
+    EXPECT_TRUE(admission.Close());
+    EXPECT_TRUE(large_registry.Close());
+}
+
+TEST_F(RxSourceRegistryTest, LaneUpdateRequiresLivePreparedSourcesAndCredit) {
+    control::HandshakeHello local, peer;
+    HelloPair(local, peer);
+    HandshakeRxSources admission;
+    auto update = peer.tx_lanes;
+    ++update.lanes[0].generation;
+    update.lanes[0].jetty_id += 10;
+    EXPECT_FALSE(admission.Update(update, true));
+    ASSERT_TRUE(admission.Open(registry_));
+    EXPECT_FALSE(admission.Update(update, true));
+    ASSERT_TRUE(admission.Prepare(Request(local, peer)));
+    ASSERT_TRUE(credits_.FreezePeer(route_.source.peer));
+    const auto frozen = admission.Update(update, true);
+    ASSERT_FALSE(frozen);
+    EXPECT_EQ(frozen.error(), control::RawSourceAdmissionError::kRegistry);
+    EXPECT_EQ(*admission.current_lanes(), peer.tx_lanes);
+    EXPECT_TRUE(registry_.Resolve(HeldEvent(route_)));
+    ASSERT_TRUE(admission.Retire(Proof()));
+    EXPECT_FALSE(admission.Update(update, true));
+    EXPECT_TRUE(admission.Close());
+}
+
 } // namespace
 } // namespace runtime
 } // namespace kbsocket

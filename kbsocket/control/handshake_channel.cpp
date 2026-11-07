@@ -14,6 +14,7 @@ namespace control {
 namespace {
 constexpr std::uint32_t kMagic = 0x4b425348; // KBSH
 constexpr std::size_t kHelloPrefix = 104, kTxLaneBytes = 32, kReadyBytes = 144, kRejectBytes = 20;
+constexpr std::size_t kLaneUpdatePrefix = 120, kLaneAckBytes = 104;
 constexpr std::uint16_t kCapabilities = kHandshakeCapabilityRaw | kHandshakeCapabilityTcp;
 
 class Writer {
@@ -126,6 +127,23 @@ std::expected<std::size_t, HandshakeError> BodySize(const HandshakeMessage& mess
             return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
         }
         return kRejectBytes;
+    case HandshakeMessageKind::kLaneUpdate: {
+        const auto& update = message.lane_update;
+        if (!ValidIdentity(update.sender) || !ValidIdentity(update.receiver) || !update.update_id) {
+            return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+        }
+        const auto valid = ValidateHandshakeTxLanes(update.tx_lanes);
+        if (!valid) {
+            return std::unexpected(valid.error());
+        }
+        return kLaneUpdatePrefix + kTxLaneBytes * update.tx_lanes.count;
+    }
+    case HandshakeMessageKind::kLaneAck:
+        if (!ValidIdentity(message.lane_ack.sender) || !ValidIdentity(message.lane_ack.receiver) ||
+            !message.lane_ack.update_id) {
+            return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+        }
+        return kLaneAckBytes;
     }
     return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
 }
@@ -148,7 +166,10 @@ std::expected<std::size_t, HandshakeError> ParseHeader(std::span<const std::byte
         (kind == HandshakeMessageKind::kHello && length >= kHelloPrefix &&
          length <= kHelloPrefix + kTxLaneBytes * kHandshakeMaxTxLanes + kHandshakeMaxDescriptorBytes) ||
         (kind == HandshakeMessageKind::kReady && length == kReadyBytes) ||
-        (kind == HandshakeMessageKind::kReject && length == kRejectBytes);
+        (kind == HandshakeMessageKind::kReject && length == kRejectBytes) ||
+        (kind == HandshakeMessageKind::kLaneUpdate && length >= kLaneUpdatePrefix &&
+         length <= kLaneUpdatePrefix + kTxLaneBytes * kHandshakeMaxTxLanes) ||
+        (kind == HandshakeMessageKind::kLaneAck && length == kLaneAckBytes);
     if (reserved != 0 || !valid_size) {
         return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
     }
@@ -174,6 +195,13 @@ std::expected<void, HandshakeError> ValidateHandshakeTxLanes(const HandshakeTxLa
         }
     }
     return {};
+}
+
+bool SameTxLanes(const HandshakeTxLanes& left, const HandshakeTxLanes& right) noexcept {
+    if (left.pool_epoch != right.pool_epoch || left.count != right.count || left.count > kHandshakeMaxTxLanes) {
+        return false;
+    }
+    return std::equal(left.lanes.begin(), left.lanes.begin() + left.count, right.lanes.begin());
 }
 
 std::expected<std::size_t, HandshakeError> EncodeHandshakeMessage(const HandshakeMessage& message,
@@ -233,6 +261,28 @@ std::expected<std::size_t, HandshakeError> EncodeHandshakeMessage(const Handshak
         out.Put(message.reject.sender_session, 8);
         out.Put(message.reject.receiver_session, 8);
         out.Put(message.reject.reason, 4);
+        break;
+    case HandshakeMessageKind::kLaneUpdate: {
+        const auto& update = message.lane_update;
+        PutIdentity(out, update.sender);
+        PutIdentity(out, update.receiver);
+        out.Put(update.update_id, 8);
+        out.Put(update.tx_lanes.pool_epoch, 8);
+        out.Put(update.tx_lanes.count, 4);
+        out.Put(0, 4);
+        for (std::uint32_t i = 0; i < update.tx_lanes.count; ++i) {
+            const auto& lane = update.tx_lanes.lanes[i];
+            out.Copy(lane.eid);
+            out.Put(lane.uasid, 4);
+            out.Put(lane.jetty_id, 4);
+            out.Put(lane.generation, 8);
+        }
+        break;
+    }
+    case HandshakeMessageKind::kLaneAck:
+        PutIdentity(out, message.lane_ack.sender);
+        PutIdentity(out, message.lane_ack.receiver);
+        out.Put(message.lane_ack.update_id, 8);
         break;
     }
     return size;
@@ -299,6 +349,33 @@ std::expected<HandshakeMessage, HandshakeError> DecodeHandshakeMessage(std::span
         message.reject.sender_session = in.Get(8);
         message.reject.receiver_session = in.Get(8);
         message.reject.reason = static_cast<std::uint32_t>(in.Get(4));
+        break;
+    case HandshakeMessageKind::kLaneUpdate: {
+        auto& update = message.lane_update;
+        update.sender = GetIdentity(in);
+        update.receiver = GetIdentity(in);
+        update.update_id = in.Get(8);
+        update.tx_lanes.pool_epoch = in.Get(8);
+        update.tx_lanes.count = static_cast<std::uint32_t>(in.Get(4));
+        const auto reserved = in.Get(4);
+        // 在线公告也先核对精确正文长度，再访问有界 Lane 列表。
+        if (update.tx_lanes.count > kHandshakeMaxTxLanes || reserved != 0 ||
+            frame.size() != kHandshakeHeaderBytes + kLaneUpdatePrefix + kTxLaneBytes * update.tx_lanes.count) {
+            return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+        }
+        for (std::uint32_t i = 0; i < update.tx_lanes.count; ++i) {
+            auto& lane = update.tx_lanes.lanes[i];
+            in.Copy(lane.eid);
+            lane.uasid = static_cast<std::uint32_t>(in.Get(4));
+            lane.jetty_id = static_cast<std::uint32_t>(in.Get(4));
+            lane.generation = in.Get(8);
+        }
+        break;
+    }
+    case HandshakeMessageKind::kLaneAck:
+        message.lane_ack.sender = GetIdentity(in);
+        message.lane_ack.receiver = GetIdentity(in);
+        message.lane_ack.update_id = in.Get(8);
         break;
     }
     const auto valid = BodySize(message);
