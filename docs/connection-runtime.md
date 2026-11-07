@@ -1,21 +1,22 @@
 # M5.3：连接 Runtime 与主动 Lane 来源协商
 
-本阶段将 Connection、raw 队列、导入缓存和 RX 来源表接入同一个 `RuntimeShard`。owner 通过 `Tick`/`RunOnce` 推进 HELLO/READY、导入、TX/RX、物理补投、累计 Credit 和 FIN。M5.3.2 通过 HELLO 交换主动 Lane，并在 READY 前自动登记 RX 来源；M5.3.3 增加在线 Lane 公告与确认；M5.3.4 用 `ConnectionOwner` 统一拥有连接对象及其来源适配器，提供有界建链与读写入口。raw 物理资源、入口认证和跨线程命令仍由宿主负责；当前尚未形成完整 Runtime 工厂或稳定应用 ABI。
+本阶段将 Connection、raw 队列、导入缓存和 RX 来源表接入同一个 `RuntimeShard`。owner 通过 `Tick`/`RunOnce` 推进 HELLO/READY、导入、TX/RX、物理补投、累计 Credit 和 FIN。M5.3.2 通过 HELLO 交换主动 Lane，并在 READY 前自动登记 RX 来源；M5.3.3 增加在线 Lane 公告与确认；M5.3.4 用 `ConnectionOwner` 统一拥有连接对象及其来源适配器，提供有界建链与读写入口。M5.3.5 增加 `ConnectionMailbox`，把业务线程的读写等命令交给唯一 owner。raw 物理资源与入口认证仍由宿主负责；当前尚未形成完整 Runtime 工厂或稳定应用 ABI。
 
 ## 组件与暂停范围
 
 | 组件 | 职责 |
 | :--- | :--- |
-| `ContextProgressGroup` | 将同 context 的 raw、连接和导入源合为一个 Reactor source；任何成员的慢控制任务都暂停整个组 |
+| `ContextProgressGroup` | 将同 context 的 raw、连接、导入和业务 mailbox 合为一个 Reactor source；任何成员的慢控制任务都暂停整个组 |
 | `ImportProgress` | 按 context 指针及 incarnation 过滤缓存操作，通过 Reactor 的唯一控制执行器提交和收割 |
 | `ConnectionProgress` | 固定容量连接槽、完整代次 TX 分发、就绪队列、周期巡检、外部 RX 补投和动态 fd 通知 |
 | `ConnectionOwner` | 拥有固定容量的 Connection 与来源适配器；接管 fd、注入真实调度身份，按关闭与来源退休两道门禁释放槽 |
+| `ConnectionCommandQueue` / `ConnectionMailbox` | 固定容量 MPSC 命令与结果槽，复制 I/O 数据，由 owner 有界执行且仅一次，领取结果后才复用槽 |
 | `RxSourceRegistry` | 根据真实 CQE 的本地端点、远端主动发送端点和完整 token 查找已登记的可信会话来源 |
 | `HandshakeRxSources` | 把经过宿主授权的对端 HELLO Lane 快照一次性登记到对应 RX pool，保留绑定直至明确静默 |
 | `LaneControl` | 在双方 READY 后接管控制 fd；新 Lane 经远端登记并确认后才开放本端投递 |
 | `ConnectionIoBinding` | raw 回调到 Connection 的桥接；旧帧物理结账、未知来源冻结、错误记录与 Credit 冻结传播 |
 
-`RawContextBinding.connections` 和 `.control` 分别指向连接源及导入源。设备进度源声明 `exclusive_context()`；RuntimeShard 为每个 context 组装暂停组，拒绝归属不一致的源、跨 context 复用的 companion 以及访问 raw 的独立 hooks。现有 mailbox/内存归还 hooks 可继续独立接入；它们不能在 context 暂停期间操作该 context。无 raw context 时可以只注册 NativeTCP hooks。
+`RawContextBinding.connections`、`.control` 和 `.mailbox` 分别指向连接源、导入源及业务命令源。设备进度源声明 `exclusive_context()`；RuntimeShard 为每个 context 组装暂停组，拒绝归属不一致的源、跨 context 复用的 companion 以及访问 raw 的独立 hooks。内存归还 hooks 可继续独立接入；它们不能在 context 暂停期间操作该 context。raw mailbox 从 ConnectionOwner 继承 context 身份，必须加入对应暂停组。无 raw context 时，可把 NativeTCP 的 ConnectionProgress 与 ConnectionMailbox 合为一个 ContextProgressGroup 后作为 hooks 接入。
 
 每个成员在每个 `ProgressKind` 上拥有独立预算，组内轮换访问顺序。Reactor 提交控制任务前移除整个组的等待 fd 并停止其进度，收割完成并交给原成员后才恢复。`paused(context_index)` 表示整个组；外部应用、回调和借用者也必须遵守这个门禁，不能绕过组直接 post/poll/refill 或准备 raw 连接。
 
@@ -26,9 +27,9 @@
 1. 在控制路径创建 raw context、JettyPool、AttemptLedger、`TxSender::Open(ledger, true)`、Slab、RX pool、Credit 总账、路由表及导入缓存。初始 RX 全部实际 post 并记账后打开 `EagerReceiveDomain`。
 2. 每个 context 打开 `ConnectionProgress`（指定同一个 context）和 `ImportProgress`（指定完整 incarnation）；每个 RX pool 打开独立 `RxSourceRegistry`。用 `ConnectionIoBinding::Open` 绑定三者，同时登记由连接源负责补投的接收域。
 3. `RawQueueBinding` 配置 `TxCallback`、`RxCallback`、`ErrorCallback`，cookie 指向对应 `ConnectionIoBinding`，并设置 `external_refill=true`。其余 CQ/async/通知仍由唯一 RawContextProgress 消费。
-4. 将连接源和导入源交给 `RawContextBinding`，打开 RuntimeShard。使用 `CaptureTxLanes(pool)` 填充本端 HELLO，声明实际提交器的主动 Lane 快照。Connection 可在此前或运行期间 Attach；Attach 必须早于 PrepareRaw。把返回 `ScheduledConnection.id` 用作 `RawConnectionPreparation.connection_id`。
+4. 将连接源、导入源及可选业务 mailbox 交给 `RawContextBinding`，打开 RuntimeShard。使用 `CaptureTxLanes(pool)` 填充本端 HELLO，声明实际提交器的主动 Lane 快照。Connection 可在此前或运行期间 Attach；Attach 必须早于 PrepareRaw。把返回 `ScheduledConnection.id` 用作 `RawConnectionPreparation.connection_id`。
 5. 每条 raw 连接用 `HandshakeRxSources::Open(registry)` 打开独立准入器；Preparing 时完成资源/授信准备，将其作为 `RawConnectionPreparation.sources`。宿主认证并授权对端整份公告后才设置 `peer_lanes_authorized=true`。PrepareRaw 校验本地公告与实际池一致，初始化收发状态后自动一次性登记对端全部 Lane；未完成登记不能发送 READY。
-6. 应用每次 Write、Read、Prepare、Shutdown 后调用 owner 侧 `Wake(handle)`。唯一 owner 反复 Tick/RunOnce，禁止同时手动驱动 Connection、导入 executor 或 raw CQ。跨线程业务命令仍需宿主 mailbox 转交 owner，不能跨线程调用 Wake 或 Connection。
+6. 应用每次 Write、Read、Prepare、Shutdown 后调用 owner 侧 `Wake(handle)`。唯一 owner 反复 Tick/RunOnce，禁止同时手动驱动 Connection、导入 executor 或 raw CQ。使用 ConnectionOwner 时这些 Wake 已自动完成；跨线程业务通过下述 ConnectionMailbox 提交，不能直接调用 Wake 或 Connection。
 
 初始资源创建和来源登记是控制路径工作，可分配内存。队列推进、fd 收割、TX 分发、RX 查表与补投使用预分配存储，不进行堆分配。当前 Attach/来源登记仍扫描已登记条目做冲突检查，不表示已经满足 40k/s 建链目标。
 
@@ -49,7 +50,7 @@ Adopt 先占槽、注册 Idle Connection，最后才 Open；成功才转移 fd �
 
 `OwnedConnection` 包含 owner、槽号及完整单调代次；Release 后旧句柄永久失效，序号耗尽停止准入。`Inspect` 返回的 `ScheduledConnection` 可关联既有 Runtime 回调。`Peer` 仅借用 HELLO 到 Release，不授予修改权或绕过认证的权限。普通 TCP 与协议入口可共用同一 owner；raw Prepare 的 context 必须匹配调度器。`prep.connection_id` 和 `prep.sources` 必须留空，来源适配器首次 Open 后固定 registry；授权等可修正的准备错误允许重试，换 registry 则重新建链。发送 Credit 和接收物理总账继续按 Peer/域共享。
 
-所有接口都由单 owner 调用，遵守 context 暂停屏障；业务线程仍需经宿主 mailbox 转交。Prepare 是允许分配的控制路径；正常 Read/Write/Inspect 和推进不分配。Read/Write 先 Wake 再接受/交付字节，避免信号错误覆盖已完成的字节前缀。`StopAccepting` 只关闭新 Adopt，不影响已接受连接的准备、收发和排空。
+ConnectionOwner 的所有接口都由单 owner 调用，遵守 context 暂停屏障；业务线程经下述 ConnectionMailbox 转交。Prepare 是允许分配的控制路径；正常 Read/Write/Inspect 和推进不分配。Read/Write 先 Wake 再接受/交付字节，避免信号错误覆盖已完成的字节前缀。`StopAccepting` 只关闭新 Adopt，不影响已接受连接的准备、收发和排空。
 
 关闭按以下顺序执行：
 
@@ -57,6 +58,29 @@ Adopt 先占槽、注册 Idle Connection，最后才 Open；成功才转移 fd �
 2. Connection 已 Closed 后，来源仍保留用于迟到 RX 结账。宿主取得独立 `RxSourceRetireProof` 后调用 `RetireSources`；控制 EOF、Lane ACK 或 Close 成功均不替代此证明，也不自动撤回 Peer Credit。
 3. `Release(handle)` 要求连接已 Closed 且来源全部退休，随后 Detach 并重构槽。无来源的 TCP/未完成 raw 准备连接可直接 Release。等待证明的槽占用容量，耗尽时拒绝新入口，不淘汰旧责任。
 4. 全部槽释放后 `ConnectionOwner::Close` 成功；还有占用槽则返回 InUse。停止 Runtime 调度后再关闭借用的 scheduler、来源表、导入和 raw 资源。错误析构保留整份内部槽存储，宿主仍须保留外部依赖，不提供强制回收。
+
+## 有界业务命令与结果
+
+`ConnectionMailbox::Open(owner, config, callback, cookie)` 借用已打开的 ConnectionOwner，预分配命令及结果环，默认容量 256，上限 65536，实际容量向上取至少 2 的二次幂。每个槽固定保留最多 4096 B 数据，容量预算须包含这份 backing；没有每连接单独分配 mailbox。Open/Close 属于 owner 控制路径，同一个队列成功 Open 后不能重新打开。
+
+| 命令 | 执行及完成结果 |
+| :--- | :--- |
+| `kWrite` | Submit 时复制输入，owner 调用 Write 一次，返回实际接受字节数或原错误 |
+| `kRead` | owner 向槽内缓冲 Read 一次；TakeCompletion 复制已读字节并返回 EOF，不保存调用方输出指针 |
+| `kShutdownWrite` / `kCancel` | owner 执行既有半关闭或取消，未完成 DMA 仍沿用原责任账本 |
+| `kInspect` / `kWatchTcp` | 返回执行时状态快照，或按需求设置一次性 TCP readiness |
+
+Write/Read 的 `bytes` 必须为 1–4096；Write 输入长度必须一致，其余命令不携带输入。Submit 返回票据只表示命令已复制入队；Write 的完成字节数表示 Connection 接受的前缀，并不证明 raw DMA、远端接收或应用消费已经结束。短读写、WouldBlock 和其他连接错误都作为结果交回；mailbox 不自动重试，也不重放已接受数据。业务可结合 ConnectionProgress 的通知自行决定下一条命令。
+
+队列允许多线程 Submit 与 TakeCompletion；owner 只按预留顺序消费连续已发布前缀，不等待 producer 发布空洞。单个 producer 的顺序保持，多个 producer 之间由预留顺序串行化。同一 Tick 最多执行 `min(budget, 16)` 条命令，预算不足保留 readiness；未轮到的 raw context 或控制暂停期间，命令只占槽、不访问连接。Read 执行时刷新单调时钟，避免旧 Tick 时间早于同轮 RX 更新。
+
+排队、执行中及完成未领取的命令都占容量；环绕遇到未领取槽即返回 `kFull`，即使其他位置已有空槽，也不会越过它重排。调用方须保存每张成功票据，并最终领取。TakeCompletion 通过代次和原子领取保护槽：尚未完成返回 `kPending`，过期/错队列票据拒绝；同一票据并发领取最多一次成功。Read 输出不足返回 `kOutputTooSmall` 并保留原结果，可用更大缓冲再次领取，不重新执行 Read。
+
+入队通过 eventfd 唤醒 owner。可选完成回调只传票据、连接句柄和业务 token，在 owner 上有界执行，不得阻塞、重入或销毁 mailbox/依赖；没有额外完成 fd。结果发布后 collector 可立即领取和复用槽，因此回调使用提前复制的身份，不引用槽内数据。连接句柄的代次由 owner 在执行时核验；已排队命令不能因连接槽复用而作用于新连接。
+
+停止时先 `StopAccepting()`，协调并等待 producer 结束；此前已取得预留资格的并发提交仍可能成功，必须一并处理。owner 继续执行已接受命令，collector 领取全部结果后退出。停止调度并解除 source 绑定，再以 `Close(true)` 显式证明 producer/collector 均已静默，且队列没有任何未领取责任，才释放槽与 fd。空计数本身不构成线程静默证明；未成功 Close 的析构保留存储。宿主仍须保留借用的 owner、scheduler 与 raw 依赖，不能靠保留队列替代外部生命周期管理。
+
+此 mailbox 不执行任意函数，也不把 Adopt/Prepare/CloseConnection/Release 等可能分配、释放或需要控制屏障的操作放入热循环；这些入口继续由宿主在 owner 控制路径串行驱动。`kCancel` 取消连接，不删除队列中后续命令；后续命令仍逐个执行并返回连接状态对应的结果。
 
 ## 实际来源与旧帧
 
@@ -103,7 +127,7 @@ raw RX 停止或队列被保留时，ErrorCallback 和补投阶段会将状态�
 
 Connection::Close 返回 Retained 时继续保留注册与全部借用资源。可信 TX 终结即使在 Failed/Closing 状态也报告 `tx_retired`，宿主据此重试 Close；成功后才 Detach。Detach 不关闭 Connection，也不撤销远端 Credit。关闭 RuntimeShard 只解除调度关系，不能替代连接、导入、来源和 raw 资源关闭。
 
-退出时先停止新业务并完成连接收敛，继续调度导入缓存的失效/Unimport；所有任务收割后关闭 RuntimeShard，再关闭 companion 和缓存。来源删除及 raw 域销毁仍要求真实静默/终结证据。冻结 RX 域中的未补投 receipt 尚缺少 DeleteJfr 后统一核销流程，不能把这一阶段当成完整故障关闭协议；无法取得终结证据时保留依赖。
+退出时先按上述顺序停止新命令并领取全部结果，再完成连接收敛，继续调度导入缓存的失效/Unimport；所有任务收割后关闭 RuntimeShard，再关闭 companion 和缓存。来源删除及 raw 域销毁仍要求真实静默/终结证据。冻结 RX 域中的未补投 receipt 尚缺少 DeleteJfr 后统一核销流程，不能把这一阶段当成完整故障关闭协议；无法取得终结证据时保留依赖。
 
 ## 验证与剩余范围
 
@@ -111,4 +135,6 @@ Connection::Close 返回 Retained 时继续保留注册与全部借用资源。�
 
 M5.3.2/3 新增协议边界、原子登记/更新、授权和来源就绪门禁、双主动 Lane 自动来源解析、双向同时更新、ACK 前禁止投递和 ACK 后迟到旧 RX 测试。M5.3.4 增加 fd 接管回滚、重复 fd、带代次句柄复用、自动 Wake、TCP/协议 TCP、Owned raw DATA/Credit/FIN、关闭保留 DMA 和迟到来源的测试。
 
-下一阶段继续补完整业务 mailbox、远端关闭/授信撤回、冻结接收责任核销及 raw 资源装配，再收口显式 C ABI 和零拷贝接口。完整 raw 资源所有者仍须先闭合 DeleteJfr 后冻结/未补投 receipt 的核销流程，不能通过 ConnectionOwner 析构推断物理资源可释放。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。
+M5.3.5 增加并发提交/领取、完成背压、有限预算、缓冲复制、陈旧句柄、一次执行与零分配测试；Mock raw 闭环还覆盖 mailbox Read/FIN、Credit 补投以及慢导入期间同 context 暂停、另一 context 继续执行。
+
+下一阶段继续补远端关闭/授信撤回、冻结接收责任核销及 raw 资源装配，再收口显式 C ABI 和零拷贝接口。完整 raw 资源所有者仍须先闭合 DeleteJfr 后冻结/未补投 receipt 的核销流程，不能通过 ConnectionOwner 析构推断物理资源可释放。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。

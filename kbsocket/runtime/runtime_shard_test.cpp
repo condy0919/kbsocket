@@ -380,9 +380,11 @@ TEST_F(RuntimeShardTest, SlowControlPausesOneContextAndCloseWaitsForItsCompletio
     ASSERT_TRUE(shard_.Close());
 }
 
-TEST_F(RuntimeShardTest, CompanionControlPausesRawPollAndConnectionWork) {
+TEST_F(RuntimeShardTest, CompanionControlPausesRawConnectionAndMailboxWork) {
     bindings_[0].connections = &companions_[0];
     bindings_[0].control = &companions_[1];
+    bindings_[0].mailbox = &companions_[2];
+    bindings_[1].mailbox = &companions_[3];
     companions_[1].pending =
         ControlTask{.function = &RuntimeShardTest::RunCompanionControl, .argument = this, .token = 1};
     ASSERT_TRUE(shard_.Open(bindings_));
@@ -390,11 +392,17 @@ TEST_F(RuntimeShardTest, CompanionControlPausesRawPollAndConnectionWork) {
     ASSERT_TRUE(shard_.paused(0));
     const auto polls = domains_[0].polls;
     const auto calls = companions_[0].calls;
-    // 暂停必须双向生效：连接导入任务同样禁止 RawContextProgress 在该 context 上轮询。
+    const auto mailbox_calls = companions_[2].calls;
+    const auto mailbox_notifications = companions_[2].notifications;
+    const auto other_mailbox_calls = companions_[3].calls;
+    // 暂停必须覆盖第四个成员：业务命令不能借 mailbox 在导入期间访问同 context 的连接。
     CompleteOne(1);
     ASSERT_TRUE(shard_.Tick());
     EXPECT_EQ(domains_[0].polls, polls);
     EXPECT_EQ(companions_[0].calls, calls);
+    EXPECT_EQ(companions_[2].calls, mailbox_calls);
+    EXPECT_EQ(companions_[2].notifications, mailbox_notifications);
+    EXPECT_GT(companions_[3].calls, other_mailbox_calls);
     EXPECT_EQ(domains_[1].received, 1u);
     EXPECT_EQ(companions_[1].submitted, 1u);
     EXPECT_FALSE(shard_.Close());
@@ -407,6 +415,7 @@ TEST_F(RuntimeShardTest, CompanionControlPausesRawPollAndConnectionWork) {
     EXPECT_FALSE(shard_.paused(0));
     EXPECT_EQ(companions_[1].completed, 1u);
     EXPECT_EQ(companions_[0].completed, 0u);
+    EXPECT_GT(companions_[2].calls, mailbox_calls);
     EXPECT_TRUE(shard_.Close());
 }
 
@@ -420,6 +429,13 @@ TEST_F(RuntimeShardTest, RejectsCompanionSharedAcrossPauseDomainsOrHooks) {
     EXPECT_FALSE(shard_.Open(bindings_));
     // 注册失败前不能泄漏任何 raw owner 登记，修正后可以完整打开。
     bindings_[0].control = &companions_[1];
+    bindings_[0].mailbox = &companions_[0];
+    EXPECT_FALSE(shard_.Open(bindings_));
+    bindings_[0].mailbox = &companions_[2];
+    bindings_[1].mailbox = &companions_[2];
+    EXPECT_FALSE(shard_.Open(bindings_));
+    bindings_[1].mailbox = nullptr;
+    EXPECT_FALSE(shard_.Open(bindings_, {}, &companions_[2]));
     EXPECT_TRUE(shard_.Open(bindings_));
     EXPECT_TRUE(shard_.Close());
 }
@@ -429,6 +445,9 @@ TEST_F(RuntimeShardTest, RejectsWrongContextCompanionAndDeviceHooksBeforeBinding
     companions_[0].context = &domains_[1].context;
     EXPECT_FALSE(shard_.Open(bindings_));
     bindings_[0].connections = nullptr;
+    bindings_[0].mailbox = &companions_[0];
+    EXPECT_FALSE(shard_.Open(bindings_));
+    bindings_[0].mailbox = nullptr;
     // 有设备关联的源必须进入所属 context 的组，不能单独注册为 hooks 或伪装纯 TCP shard。
     EXPECT_FALSE(shard_.Open(bindings_, {}, &companions_[0]));
     EXPECT_FALSE(shard_.Open({}, {}, &companions_[0]));

@@ -17,6 +17,7 @@
 #include "kbsocket/connection/connection.hpp"
 #include "kbsocket/control/tx_lane_snapshot.hpp"
 #include "kbsocket/runtime/connection_io.hpp"
+#include "kbsocket/runtime/connection_mailbox.hpp"
 #include "kbsocket/runtime/connection_owner.hpp"
 #include "kbsocket/runtime/connection_progress.hpp"
 #include "kbsocket/runtime/handshake_rx_sources.hpp"
@@ -615,6 +616,262 @@ protected:
         ConnectionRuntimeTest::TearDown();
     }
 };
+
+class MailboxConnectionRuntimeTest : public OwnedConnectionRuntimeTest {
+protected:
+    std::array<runtime::ConnectionMailbox, 2> mailboxes_;
+    std::array<std::vector<runtime::ConnectionMailboxNotice>, 2> notices_;
+    std::array<bool, 2> mailbox_open_{};
+
+    void BindMailboxes(bool enabled) {
+        ASSERT_TRUE(shard_.Close());
+        shard_open_ = false;
+        std::array<runtime::RawContextBinding, 2> contexts;
+        for (std::size_t side = 0; side < contexts.size(); ++side) {
+            auto& endpoint = endpoints_[side];
+            contexts[side] = {.context = &endpoint.context,
+                              .queues = std::span(&endpoint.binding, 1),
+                              .connections = &endpoint.scheduler,
+                              .control = &endpoint.imports,
+                              .mailbox = enabled ? &mailboxes_[side] : nullptr};
+        }
+        ASSERT_TRUE(shard_.Open(contexts, {.reactor = {.budget = 8}, .control = {.workers = 2, .capacity = 4}}));
+        shard_open_ = true;
+    }
+
+    void SetUp() override {
+        OwnedConnectionRuntimeTest::SetUp();
+        if (HasFatalFailure()) {
+            return;
+        }
+        for (std::size_t side = 0; side < mailboxes_.size(); ++side) {
+            ASSERT_TRUE(mailboxes_[side].Open(
+                owners_[side], {.capacity = 16},
+                [](void* cookie, const runtime::ConnectionMailboxNotice& notice) noexcept {
+                    static_cast<std::vector<runtime::ConnectionMailboxNotice>*>(cookie)->push_back(notice);
+                },
+                &notices_[side]));
+            mailbox_open_[side] = true;
+            EXPECT_EQ(mailboxes_[side].exclusive_context(), &endpoints_[side].context);
+        }
+        BindMailboxes(true);
+    }
+
+    std::optional<runtime::ConnectionCommandCompletion>
+    AwaitCompletion(std::size_t side, runtime::ConnectionCommandTicket ticket, std::span<std::byte> output = {}) {
+        std::optional<runtime::ConnectionCommandCompletion> completion;
+        EXPECT_TRUE(Until([&] {
+            if (completion) {
+                return true;
+            }
+            const auto result = mailboxes_[side].TakeCompletion(ticket, output);
+            if (result) {
+                completion = *result;
+            } else {
+                EXPECT_EQ(result.error().code, runtime::CommandQueueErrorCode::kPending);
+            }
+            return completion.has_value();
+        }));
+        return completion;
+    }
+
+    void TearDown() override {
+        for (auto& endpoint : endpoints_) {
+            endpoint.block_import.store(false);
+            endpoint.block_import.notify_all();
+        }
+        if (shard_open_) {
+            for (auto& mailbox : mailboxes_) {
+                mailbox.StopAccepting();
+            }
+            // 测试失败也先执行并领取剩余命令；解绑 mailbox 后才能关闭其 fd 和借用的 owner。
+            ASSERT_TRUE(Until([&] {
+                std::array<std::byte, runtime::ConnectionCommandQueue::kMaxIoBytes> output{};
+                for (std::size_t side = 0; side < mailboxes_.size(); ++side) {
+                    for (const auto& notice : notices_[side]) {
+                        (void)mailboxes_[side].TakeCompletion(notice.ticket, output);
+                    }
+                }
+                return !shard_.paused(0) && !shard_.paused(1) && mailboxes_[0].outstanding() == 0 &&
+                       mailboxes_[1].outstanding() == 0;
+            }));
+            BindMailboxes(false);
+        }
+        for (std::size_t side = 0; side < mailboxes_.size(); ++side) {
+            if (mailbox_open_[side]) {
+                ASSERT_TRUE(mailboxes_[side].Close(true));
+                mailbox_open_[side] = false;
+            }
+        }
+        OwnedConnectionRuntimeTest::TearDown();
+    }
+};
+
+TEST_F(MailboxConnectionRuntimeTest, CopiedCommandsDriveRawDataRefillAndOrderedFin) {
+    ActivateOwned();
+    std::array<std::byte, 4096> input;
+    input.fill(std::byte{0x6b});
+    const auto write = mailboxes_[0].TrySubmit(
+        {.kind = runtime::ConnectionCommandKind::kWrite, .connection = owned_[0], .token = 11, .bytes = input.size()},
+        input);
+    ASSERT_TRUE(write);
+    input.fill(std::byte{0});
+    const auto written = AwaitCompletion(0, *write);
+    ASSERT_TRUE(written);
+    ASSERT_TRUE(written->result);
+    EXPECT_EQ(written->result->bytes, input.size());
+    EXPECT_EQ(written->command.token, 11u);
+    ASSERT_EQ(notices_[0].size(), 1u);
+    EXPECT_EQ(notices_[0][0].ticket, *write);
+    EXPECT_EQ(notices_[0][0].connection, owned_[0]);
+    EXPECT_EQ(notices_[0][0].token, 11u);
+    ASSERT_TRUE(Until([&] {
+        const auto status = owners_[1].Inspect(owned_[1]);
+        return status && status->rx_pending != 0;
+    }));
+
+    // Write 入队时已经复制；Read 完成区必须跨越领取时间保持数据，短读不提前归还物理 RX。
+    std::array<std::byte, 4096> output{};
+    const auto first = mailboxes_[1].TrySubmit(
+        {.kind = runtime::ConnectionCommandKind::kRead, .connection = owned_[1], .token = 12, .bytes = 17});
+    ASSERT_TRUE(first);
+    const auto prefix = AwaitCompletion(1, *first, std::span(output).first(17));
+    ASSERT_TRUE(prefix);
+    ASSERT_TRUE(prefix->result);
+    EXPECT_EQ(prefix->result->bytes, 17u);
+    EXPECT_FALSE(prefix->result->eof);
+    EXPECT_NE(endpoints_[1].buffers.held(), 0u);
+    std::size_t received = prefix->result->bytes;
+    while (received < output.size()) {
+        const auto read = mailboxes_[1].TrySubmit({.kind = runtime::ConnectionCommandKind::kRead,
+                                                   .connection = owned_[1],
+                                                   .bytes = static_cast<std::uint32_t>(output.size() - received)});
+        ASSERT_TRUE(read);
+        const auto suffix = AwaitCompletion(1, *read, std::span(output).subspan(received));
+        ASSERT_TRUE(suffix);
+        ASSERT_TRUE(suffix->result);
+        ASSERT_GT(suffix->result->bytes, 0u);
+        received += suffix->result->bytes;
+    }
+    EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](auto byte) { return byte == std::byte{0x6b}; }));
+    ASSERT_TRUE(Until([&] {
+        return endpoints_[1].buffers.held() == 0 && endpoints_[1].receive.pending_refill() == 0 &&
+               endpoints_[0].send_credits.available(CreditClass::kData) == 4;
+    }));
+
+    const auto shutdown = mailboxes_[0].TrySubmit(
+        {.kind = runtime::ConnectionCommandKind::kShutdownWrite, .connection = owned_[0], .token = 13});
+    ASSERT_TRUE(shutdown);
+    const auto stopped = AwaitCompletion(0, *shutdown);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(stopped->result);
+    // FIN 按序到达前允许 WouldBlock，但不得以命令入队成功伪造 EOF。
+    bool eof = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!eof && std::chrono::steady_clock::now() < deadline) {
+        const auto read = mailboxes_[1].TrySubmit(
+            {.kind = runtime::ConnectionCommandKind::kRead, .connection = owned_[1], .bytes = 1});
+        ASSERT_TRUE(read);
+        const auto completion = AwaitCompletion(1, *read, std::span(output).first(1));
+        ASSERT_TRUE(completion);
+        if (completion->result) {
+            EXPECT_EQ(completion->result->bytes, 0u);
+            eof = completion->result->eof;
+        } else {
+            ASSERT_TRUE(completion->result.error().connection);
+            ASSERT_EQ(completion->result.error().connection->code, ConnectionErrorCode::kWouldBlock);
+        }
+    }
+    EXPECT_TRUE(eof);
+    for (const auto& endpoint : endpoints_) {
+        EXPECT_FALSE(endpoint.callback_bad_id);
+        EXPECT_FALSE(endpoint.io.first_error());
+    }
+}
+
+TEST_F(MailboxConnectionRuntimeTest, ConcurrentSubmissionWaitsForItsContextImportBarrier) {
+    endpoints_[0].block_import.store(true);
+    for (std::size_t side = 0; side < owners_.size(); ++side) {
+        ASSERT_TRUE(owners_[side].PrepareRaw(owned_[side], OwnedPreparation(side), endpoints_[side].sources));
+    }
+    ASSERT_TRUE(Until([&] { return shard_.paused(0) && endpoints_[0].importing.load() == 1; }));
+    ASSERT_TRUE(Until([&] { return !shard_.paused(1) && endpoints_[1].importing.load() == 1; }));
+    const auto polls_before = endpoints_[0].polls;
+    const auto visits_before = endpoints_[0].scheduler.stats()->visits;
+    std::array<std::optional<runtime::ConnectionCommandTicket>, 2> tickets;
+    std::array<std::thread, 2> producers;
+    // producer 可在 context 控制调用阻塞时入队，只有 owner 的命令执行必须被同一屏障挡住。
+    for (std::size_t side = 0; side < producers.size(); ++side) {
+        producers[side] = std::thread([&, side] {
+            const auto submitted = mailboxes_[side].TrySubmit(
+                {.kind = runtime::ConnectionCommandKind::kInspect, .connection = owned_[side], .token = side + 21});
+            EXPECT_TRUE(submitted);
+            if (submitted) {
+                tickets[side] = *submitted;
+            }
+        });
+    }
+    for (auto& producer : producers) {
+        producer.join();
+    }
+    ASSERT_TRUE(tickets[0]);
+    ASSERT_TRUE(tickets[1]);
+    const auto other = AwaitCompletion(1, *tickets[1]);
+    ASSERT_TRUE(other);
+    ASSERT_TRUE(other->result);
+    ASSERT_TRUE(other->result->status);
+    EXPECT_EQ(other->command.token, 22u);
+    EXPECT_TRUE(notices_[0].empty());
+    const auto pending = mailboxes_[0].TakeCompletion(*tickets[0]);
+    ASSERT_FALSE(pending);
+    EXPECT_EQ(pending.error().code, runtime::CommandQueueErrorCode::kPending);
+    EXPECT_EQ(endpoints_[0].polls, polls_before);
+    EXPECT_EQ(endpoints_[0].scheduler.stats()->visits, visits_before);
+
+    endpoints_[0].block_import.store(false);
+    endpoints_[0].block_import.notify_all();
+    const auto resumed = AwaitCompletion(0, *tickets[0]);
+    ASSERT_TRUE(resumed);
+    ASSERT_TRUE(resumed->result);
+    ASSERT_TRUE(resumed->result->status);
+    EXPECT_EQ(resumed->command.token, 21u);
+    ASSERT_EQ(notices_[0].size(), 1u);
+    EXPECT_EQ(notices_[0][0].ticket, *tickets[0]);
+    EXPECT_FALSE(shard_.paused(0));
+    EXPECT_GT(endpoints_[0].polls, polls_before);
+    ASSERT_TRUE(Until([&] {
+        const auto left = owners_[0].Inspect(owned_[0]);
+        const auto right = owners_[1].Inspect(owned_[1]);
+        return left && right && left->state == ConnectionState::kRawActive &&
+               right->state == ConnectionState::kRawActive;
+    }));
+}
+
+TEST_F(MailboxConnectionRuntimeTest, ReadRefreshesStaleBatchTimestampAfterRawReceive) {
+    ActivateOwned();
+    const auto batch_started = Now();
+    const std::array payload{std::byte{0x42}};
+    ASSERT_EQ(owners_[0].Write(owned_[0], payload), payload.size());
+    ASSERT_TRUE(Until([&] {
+        const auto status = owners_[1].Inspect(owned_[1]);
+        return status && status->rx_pending != 0;
+    }));
+    const auto read =
+        mailboxes_[1].TrySubmit({.kind = runtime::ConnectionCommandKind::kRead, .connection = owned_[1], .bytes = 1});
+    ASSERT_TRUE(read);
+    // 同一轮 RX 已使用更新的单调时间；命令执行不能把旧批次时间送入重排窗口导致连接失败。
+    ASSERT_TRUE(mailboxes_[1].Progress(runtime::ProgressKind::kMailbox, 8, batch_started));
+    std::array<std::byte, 1> output{};
+    const auto completion = mailboxes_[1].TakeCompletion(*read, output);
+    ASSERT_TRUE(completion);
+    ASSERT_TRUE(completion->result);
+    EXPECT_EQ(completion->result->bytes, 1u);
+    EXPECT_EQ(output, payload);
+    const auto status = owners_[1].Inspect(owned_[1]);
+    ASSERT_TRUE(status);
+    EXPECT_EQ(status->state, ConnectionState::kRawActive);
+    EXPECT_FALSE(status->failure);
+}
 
 TEST_F(OwnedConnectionRuntimeTest, OwnedRawConnectionsUseRuntimeForBidirectionalDataRefillAndFin) {
     ActivateOwned();

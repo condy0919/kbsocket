@@ -112,6 +112,8 @@ public:
     /// 停止新入口；有任一占用槽时返回 kInUse，不自动销毁连接或停止借用的调度器。
     std::expected<void, ConnectionOwnerError> Close() noexcept;
     ConnectionOwnerStats stats() const noexcept;
+    /// 控制路径取得真实调度 context，供业务 mailbox 加入同一暂停组；不授予跨线程访问 owner。
+    const void* exclusive_context() const noexcept;
 
 private:
     struct State;

@@ -394,6 +394,9 @@ std::expected<void, ConnectionOwnerError> ConnectionOwner::Close() noexcept {
 ConnectionOwnerStats ConnectionOwner::stats() const noexcept {
     return state_ ? state_->stats : ConnectionOwnerStats{};
 }
+const void* ConnectionOwner::exclusive_context() const noexcept {
+    return state_ ? state_->progress->exclusive_context() : nullptr;
+}
 
 } // namespace runtime
 } // namespace kbsocket

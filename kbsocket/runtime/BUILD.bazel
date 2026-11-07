@@ -3,6 +3,47 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "connection_command_queue",
+    srcs = ["connection_command_queue.cpp"],
+    hdrs = ["connection_command_queue.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [":connection_owner"],
+)
+
+cc_library(
+    name = "connection_mailbox",
+    srcs = ["connection_mailbox.cpp"],
+    hdrs = ["connection_mailbox.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":connection_command_queue",
+        ":connection_owner",
+        ":progress_source",
+    ],
+)
+
+cc_test(
+    name = "connection_command_queue_test",
+    srcs = ["connection_command_queue_test.cpp"],
+    deps = [
+        ":connection_command_queue",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "connection_mailbox_test",
+    srcs = ["connection_mailbox_test.cpp"],
+    deps = [
+        ":connection_mailbox",
+        ":context_progress_group",
+        ":runtime_shard",
+        "//kbsocket/transport/tcp:native_tcp_backend",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "connection_owner",
     srcs = ["connection_owner.cpp"],
     hdrs = ["connection_owner.hpp"],
@@ -238,6 +279,7 @@ cc_test(
     srcs = ["connection_runtime_test.cpp"],
     deps = [
         ":connection_io",
+        ":connection_mailbox",
         ":connection_owner",
         ":connection_progress",
         ":handshake_rx_sources",

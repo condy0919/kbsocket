@@ -12,7 +12,7 @@
 | [`RawContextProgress`](../kbsocket/runtime/raw_context_progress.hpp) | 一个 context 的唯一 async 消费者；驱动绑定域的 TX/RX/refill/flush 与通知 | 每 context 1–8 个独立接收域、每域最多 64 条主动 Lane；进程内 async 消费者登记表最多 64 个 context |
 | [`ShardReactor`](../kbsocket/runtime/shard_reactor.hpp) | 公平预算、轮询/事件双模式、控制提交和完成收割 | 最多 8 个 source、80 个 source fd；RuntimeShard 使用最多 4 个 context group 和 1 个可选 hooks source；动态连接 fd 在组内汇聚 |
 | [`ControlExecutor`](../kbsocket/runtime/control_executor.hpp) | 执行可能阻塞的控制函数，将结果交回 owner | 固定 1–4 个 worker、1–4096 个槽位，worker 数不得大于槽位数 |
-| [`ProgressSource`](../kbsocket/runtime/progress_source.hpp) | 宿主接入有界 mailbox/timer/retire 等进度 | M4.1 的 `LeaseReturnProgress` 使用 mailbox 预算处理 CPU 归还；M5.3.1 的 ConnectionProgress 使用 mailbox/timer 预算推进连接；没有通用业务 mailbox 或 Grant 协议实现 |
+| [`ProgressSource`](../kbsocket/runtime/progress_source.hpp) | 宿主接入有界 mailbox/timer/retire 等进度 | M4.1 的 `LeaseReturnProgress` 使用 mailbox 预算处理 CPU 归还；M5.3.1 的 ConnectionProgress 使用 mailbox/timer 预算推进连接；M5.3.5 的 ConnectionMailbox 使用 mailbox 预算执行 typed 业务命令；Grant 协议待实现 |
 
 配置的上限是显式资源限制，不能据此推断吞吐或 40k 连接容量已经通过验收。`ControlExecutorConfig` 默认 1 个 worker、64 个槽位；所有排队、执行中以及完成但尚未被收割的任务都占用槽位。`ReactorConfig` 默认 `events=false`、`budget=32`、`busy_poll_ns=50000`、`max_wait_ms=10`；预算允许 1–64，单次等待允许 0–1000 ms。
 
@@ -20,9 +20,11 @@
 
 宿主先在控制路径创建 `UrmaContext`、`JettyPool`、`RxBufferPool` 和 `AttemptLedger`，再构造 `RawQueueBinding`。每个绑定的 pool、RX 与 ledger 必须属于同一 context/池；重复 pool 或重复 async owner 被拒绝。事件模式要求各 pool 创建有效 JFCE，注册期间所有 fd 保持有效且身份不变。
 
-`RuntimeShard` 的推进、替换请求、统计访问和关闭由同一 owner 串行执行。TX/RX/async/error 回调也在该 owner 上同步执行，不得阻塞、重入或销毁依赖。RX 回调必须接收并最终归还全部 `RxBufferLease`；TX 回调只表示本地 WR 的完成，不会生成远端 credits。跨线程生产者只能在宿主自己的发布协议完成后调用 `Notify` 唤醒，不能并发访问 raw 句柄；`Notify` 与关闭 fd 的生命周期也必须由宿主协调。
+`RuntimeShard` 的推进、替换请求、统计访问和关闭由同一 owner 串行执行。TX/RX/async/error 回调也在该 owner 上同步执行，不得阻塞、重入或销毁依赖。RX 回调必须接收并最终归还全部 `RxBufferLease`；TX 回调只表示本地 WR 的完成，不会生成远端 credits。业务线程通过 ConnectionMailbox 提交并由其 eventfd 唤醒；其他跨线程生产者只能在宿主自己的发布协议完成后调用 `Notify` 唤醒，不能并发访问 raw 句柄；`Notify` 与关闭 fd 的生命周期也必须由宿主协调。
 
 控制任务会访问 raw 对象，因此提交前冻结整个 context 的访问，而非仅冻结一个 Lane。该 context 的全部 TX/RX/refill/flush、JFC 通知和 async 消费暂停，相关 fd 暂时移出等待集合。控制完成经 owner 收割后才恢复。宿主的外部借用者同样不能在此期间投递、poll、归还 Lease 或删除对象；其他 context 可以继续推进。
+
+`RawContextBinding.mailbox` 是第三个可选 companion，与 `.connections`、`.control` 和 raw 源共同构成最多四成员的暂停组。ConnectionMailbox 继承 owner 的 context 身份，跨 context 绑定或绕过组作为独立 hooks 均被拒绝。暂停期间允许业务线程复制入队、领取已完成结果，但禁止执行命令访问该 context；恢复后由原 owner 有界推进。
 
 `LeaseReturnProgress` 可作为 `RuntimeShard::Open` 的 hooks source，独占消费一个 `LeaseReturnQueue`，归还回调在 owner 的 mailbox 预算内执行。它只解除 `SlabAllocator` 的 CPU 持有，不操作 raw 队列或自动结清 DMA/Grant，因此 raw context 控制任务期间仍可推进。Slab 注册/注销本身是控制路径，须排除全部相关 context 和 Lease 使用者的并发访问；当前 adapter 不自动安排这些任务。归还源也不接受 `RxBufferPool` 的 `RxBufferLease`，两套 backing 尚未合并。
 

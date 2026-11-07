@@ -582,7 +582,7 @@ flowchart TD
 
 ### 10.1 非阻塞建链与能力协商状态机
 
-**当前实现 M5.1–M5.3.4**：`HandshakeChannel` 接管宿主已连接的非阻塞协议 fd；`ConnectionHandshake` 对接 M4 接收窗口/授信账本与 `ConnectionTable`，等待 `EndpointImportCache` 的控制线程结果后先发布路由、再发送 READY。HELLO 提前广告本端接收授信 epoch，READY 重复确认；入站 CREDIT 使用对端 epoch，本地物理 RX 消耗使用本地账本，两者独立。双方 READY 且本端 READY 写尽后才激活；对端 READY 后停止握手读取，保留后续字节。有界 Connection、NativeTCP connect/listen/backend 与 Runtime owner 接线已交付。控制协议 v3 的 HELLO 交换最多 64 条主动 Lane 的物理身份与代次，完整 Connection 在来源原子登记前禁止 READY；在线 UPDATE/ACK 由宿主显式启用并逐份授权，健康连接等待新来源安装确认后才恢复投递。失败连接不因此复活，旧来源继续保留，ACK 不代表 DMA 终结或远端静默。M5.3.4 的 `ConnectionOwner` 已拥有固定容量的连接对象和来源适配器，提供带代次句柄的 fd 接管、准备、收发和分阶段关闭入口；自动拓扑及 raw 物理资源装配仍未交付，以下状态图保留完整目标。组件约束见 [建链组件](../connection-handshake.md)及[连接 Runtime](../connection-runtime.md)。
+**当前实现 M5.1–M5.3.5**：`HandshakeChannel` 接管宿主已连接的非阻塞协议 fd；`ConnectionHandshake` 对接 M4 接收窗口/授信账本与 `ConnectionTable`，等待 `EndpointImportCache` 的控制线程结果后先发布路由、再发送 READY。HELLO 提前广告本端接收授信 epoch，READY 重复确认；入站 CREDIT 使用对端 epoch，本地物理 RX 消耗使用本地账本，两者独立。双方 READY 且本端 READY 写尽后才激活；对端 READY 后停止握手读取，保留后续字节。有界 Connection、NativeTCP connect/listen/backend 与 Runtime owner 接线已交付。控制协议 v3 的 HELLO 交换最多 64 条主动 Lane 的物理身份与代次，完整 Connection 在来源原子登记前禁止 READY；在线 UPDATE/ACK 由宿主显式启用并逐份授权，健康连接等待新来源安装确认后才恢复投递。失败连接不因此复活，旧来源继续保留，ACK 不代表 DMA 终结或远端静默。M5.3.4 的 `ConnectionOwner` 已拥有固定容量的连接对象和来源适配器，提供带代次句柄的 fd 接管、准备、收发和分阶段关闭入口；M5.3.5 的固定容量 ConnectionMailbox 支持跨线程复制读写、半关闭、取消、状态及 TCP watch，完成领取前持续占槽，raw 命令与 context 一起暂停；控制路径建链/关闭不进入热 mailbox。自动拓扑及 raw 物理资源装配仍未交付，以下状态图保留完整目标。组件约束见 [建链组件](../connection-handshake.md)及[连接 Runtime](../connection-runtime.md)。
 
 ```mermaid
 stateDiagram-v2
