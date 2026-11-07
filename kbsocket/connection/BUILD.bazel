@@ -17,6 +17,27 @@ cc_library(
 )
 
 cc_library(
+    name = "connection_table",
+    srcs = ["connection_table.cpp"],
+    hdrs = ["connection_table.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":connection_tokens",
+        ":wire_frame",
+    ],
+)
+
+cc_test(
+    name = "connection_table_test",
+    srcs = ["connection_table_test.cpp"],
+    deps = [
+        ":connection_table",
+        ":wire_frame",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "tx_sequence_window",
     srcs = ["tx_sequence_window.cpp"],
     hdrs = ["tx_sequence_window.hpp"],

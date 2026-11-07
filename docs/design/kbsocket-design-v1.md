@@ -582,6 +582,8 @@ flowchart TD
 
 ### 10.1 非阻塞建链与能力协商状态机
 
+**当前实现 M5.1**：`HandshakeChannel` 接管宿主已连接的非阻塞协议 fd；`ConnectionHandshake` 对接 M4 接收窗口/授信账本与 `ConnectionTable`，等待 `EndpointImportCache` 的控制线程结果后先发布路由、再发送 READY。HELLO 提前广告本端接收授信 epoch，READY 重复确认；入站 CREDIT 使用对端 epoch，本地物理 RX 消耗使用本地账本，两者独立。双方 READY 且本端 READY 写尽后才激活；对端 READY 后停止握手读取，保留首个业务字节。完整 connect/listen、业务 Connection、自动拓扑选路与 NativeTCP backend 尚待后续 M5 集成，以下状态图保留完整目标。组件约束见 [建链组件](../connection-handshake.md)。
+
 ```mermaid
 stateDiagram-v2
     [*] --> kTcpConnecting: socket() + connect() (非阻塞 TCP)

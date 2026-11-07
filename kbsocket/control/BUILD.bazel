@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+cc_library(
+    name = "handshake_channel",
+    srcs = ["handshake_channel.cpp"],
+    hdrs = ["handshake_channel.hpp"],
+    visibility = ["//visibility:public"],
+    deps = ["//kbsocket/connection:wire_frame"],
+)
+
+cc_library(
+    name = "endpoint_import_cache",
+    srcs = ["endpoint_import_cache.cpp"],
+    hdrs = ["endpoint_import_cache.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//kbsocket/runtime:control_executor",
+        "//kbsocket/transport/raw:urma_api",
+    ],
+)
+
+cc_library(
+    name = "connection_handshake",
+    srcs = ["connection_handshake.cpp"],
+    hdrs = ["connection_handshake.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":endpoint_import_cache",
+        ":handshake_channel",
+        "//kbsocket/connection:connection_table",
+        "//kbsocket/connection:credit_account",
+        "//kbsocket/connection:reorder_window",
+    ],
+)
+
+cc_test(
+    name = "handshake_channel_test",
+    srcs = ["handshake_channel_test.cpp"],
+    deps = [
+        ":handshake_channel",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "endpoint_import_cache_test",
+    srcs = ["endpoint_import_cache_test.cpp"],
+    deps = [
+        ":endpoint_import_cache",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "connection_handshake_test",
+    srcs = ["connection_handshake_test.cpp"],
+    deps = [
+        ":connection_handshake",
+        ":endpoint_import_cache",
+        ":handshake_channel",
+        "//kbsocket/connection:connection_table",
+        "//kbsocket/connection:credit_account",
+        "//kbsocket/connection:wire_frame",
+        "//kbsocket/runtime:control_executor",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)

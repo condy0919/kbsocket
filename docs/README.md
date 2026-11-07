@@ -9,6 +9,7 @@
 | [RuntimeShard 进度器](runtime-shard.md) | 单 owner 四 context、分类预算、通知/async、水线待处理、有界控制执行器与借用资源生命周期 |
 | [注册内存与 Lease](memory-leases.md) | 多 context Slab、独立 CPU/DMA/Grant 责任、有界跨线程归还及隔离回收 |
 | [连接协议原语](connection-primitives.md) | IMM 短/扩展帧、身份代次、发送序号、乱序交付与应用驻留、数据/控制 Credit 守恒 |
+| [连接建链与导入缓存](connection-handshake.md) | 非阻塞 HELLO/READY、完整身份路由、Single-Flight 导入、首包与 fd 交接门禁 |
 | [硬件观测记录](hardware-observations.md) | 用户实测的 SEND/RMA、水线重配、错误事件与隔离、资源回收及验证边界 |
 | [硬件验证矩阵](hardware-validation-matrix.md) | 残留 RX、provider 边界、进程/链路故障、持续多设备收发、JFC 通知与 READ/WRITE 的完整运行顺序 |
 | [URMA 加载与运行时](urma-runtime.md) | 动态加载、gMock 替换、context 校验、会话与进程退出 |

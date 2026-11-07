@@ -1,6 +1,6 @@
 # 连接线协议、顺序窗口与授信原语
 
-本文记录 [roadmap](roadmap.md) 的 M4.2 实现。`kbsocket/connection/` 提供有界、单 owner 的编解码、身份分配、发送顺序、接收重排及物理 RQE 授信账本；这些组件不提交 WR，也没有实现完整的 `Connection`、TCP 握手、控制逃生通道或 Socket API。宿主负责把可信的 post、CQE、Lease 归还和协议证明接入对应账本。
+本文记录 [roadmap](roadmap.md) 的 M4.2 实现。`kbsocket/connection/` 提供有界、单 owner 的编解码、身份分配、发送顺序、接收重排及物理 RQE 授信账本；这些组件不提交 WR。M5.1 已增加 [连接建链与导入缓存](connection-handshake.md)，完整业务 `Connection`、TCP 控制逃生及 Socket API 尚未实现。宿主负责把可信的 post、CQE、Lease 归还和协议证明接入对应账本。
 
 ## Wire v1 格式
 
@@ -41,6 +41,8 @@
 `EncodeWireFrame` 将头部和数据写入调用方连续输出区间。`EncodeWireHeader` 只写头部并返回 `{imm_data, payload_bytes, header_bytes}`，不读取或复制业务数据；短 DATA 的 `header_bytes=0`，可传空输出区间。宿主可用一个注册 header SGE 加原有 Lease 数据 SGE 组成 WR，纯控制帧的 header 就是完整 payload。两接口在校验失败或输出不足时都不改写输出，输出区间不得覆盖输入数据。它们不注册内存、不持有 Lease，也不延长 DMA 生命周期。
 
 `DecodeWireFrame` 的输入必须恰好截取到 CQE 的 `completion_len`，返回的 `frame.data` 借用原 payload。`ValidateWireIdentity` 比较完整 `WireReceiveContext`、token，以及控制帧的 session/credit epoch。完整来源、runtime、接收域 incarnation 和 Session 必须由宿主已协商并校验的路由事实提供；8 B 扩展身份本身不携带这些事实，此函数也不实现认证或握手。不得用“预期 context”冒充未经验证的实际来源。
+
+`WireSessionBinding.credit_epoch` 绑定**对端接收域**广告的授信 epoch，用于校验入站 CREDIT_UPDATE 以及解释捎带授信；它不是本地物理 RQE 被消耗时使用的 epoch。M5.1 在 HELLO 提前交换该值，READY 重复确认，所以路由在收到首包前就有完整绑定。两端 epoch 可以不同，同一个 PeerRuntime/接收域的多个逻辑连接仍共用一个 SenderCreditAccount，不能每次握手重建额度。
 
 ## Token 与发送顺序
 
@@ -118,4 +120,4 @@ F 是可授出的已 post 槽，G 是已经授出的承诺，U 是尚未初始 p
 bazel test //kbsocket/connection:all --test_output=errors
 ```
 
-单元测试覆盖 wire 字节格式、身份/序号边界、部分接受、乱序/慢读/FIN、数据与控制授信、receipt 复用和隔离；`eager_primitives_test.cpp` 使用 Mock Slab 与这些原语组合验证。它们不代表已经有双机 Eager `Connection`、非阻塞握手、TCP 信用逃生、自动 Credit scheduler、应用 API 或完整 RNDV，也不构成本轮 UB 真机 PASS。
+单元测试覆盖 wire 字节格式、身份/序号边界、部分接受、乱序/慢读/FIN、数据与控制授信、receipt 复用和隔离；`eager_primitives_test.cpp` 使用 Mock Slab 与这些原语组合验证。M5.1 的独立测试另行覆盖非阻塞握手；上述测试不代表已经有双机 Eager `Connection`、TCP 信用逃生、自动 Credit scheduler、应用 API 或完整 RNDV，也不构成本轮 UB 真机 PASS。
