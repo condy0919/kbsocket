@@ -32,6 +32,7 @@ enum class JettyPoolErrorCode : std::uint8_t {
     kModifyFailed,
     kInvalidState,
     kFlushFailed,
+    kStopped,
 };
 
 struct JettyPoolFailure {

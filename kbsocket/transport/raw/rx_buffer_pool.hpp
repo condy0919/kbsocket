@@ -16,6 +16,7 @@
 namespace kbsocket {
 namespace raw {
 class RxBufferPool;
+class ReceiveDomainCloser;
 
 enum class RxBufferErrorCode : std::uint8_t {
     kInvalidArgument,
@@ -74,6 +75,7 @@ public:
     std::expected<void, RxBufferError> Open(JettyPool& pool, std::uint32_t buffer_count = 0) noexcept;
     /// 仅在无在途 WR、无上层 lease 时注销内存并解绑；注销失败保留所有资源供重试。
     /// 不假定空 CQ 或对端断开代表 DMA 已停止；退出时仍有未决 WR 应常驻整个依赖链。
+    /// 有残留 Posted 时使用 ReceiveDomainCloser；协调器绑定期间不得单独 Close 绕过关闭顺序。
     std::expected<void, RxBufferError> Close() noexcept;
     /// 最多补入 limit 个 WR，受空闲 buffer 和 JFR 剩余额度限制；返回 0 表示当前无需/无法补充。
     /// 部分投递失败只回收确定未接受的后缀；边界不明则停止投递并保留整批。
@@ -102,8 +104,18 @@ public:
     bool stopped() const noexcept {
         return stopped_;
     }
+    /// 本次 Open 中由成功 DeleteJfr 终结的残留 RX；不计作成功接收，也不产生 lease。
+    std::size_t retired_on_delete() const noexcept {
+        return retired_on_delete_;
+    }
 
 private:
+    friend class ReceiveDomainCloser;
+
+    /// 仅关闭协调器在实际 DeleteJfr 成功后调用；不能由调用方声明 DMA 已终结。
+    void OnJfrDeleted() noexcept;
+    std::expected<void, RxBufferError> CloseMemory() noexcept;
+
     enum class State : std::uint8_t { kFree, kPosted, kHeld };
     struct Entry {
         std::uint64_t id = 0;
@@ -125,10 +137,12 @@ private:
     std::uint32_t free_head_ = 0;
     std::size_t posted_ = 0;
     std::size_t held_ = 0;
+    std::size_t retired_on_delete_ = 0;
     // id = 本次 block 起点 + 槽位；block 每次递增 capacity，Close/Open 不重置高水位，防 ABA。
     std::uint64_t next_id_ = 1;
     std::uint64_t base_id_ = 1;
     bool stopped_ = false;
+    bool jfr_deleted_ = false;
 };
 } // namespace raw
 } // namespace kbsocket

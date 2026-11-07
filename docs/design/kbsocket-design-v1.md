@@ -320,6 +320,26 @@ sequenceDiagram
 - **剩余完成与授权**：销毁前在 provider 对象仍有效时解析相关 CQE，并取得通知/async 的确认屏障；销毁竞态中的剩余完成必须有明确的 provider 清理或安全解析契约覆盖，无法证明则保留依赖。不得先删除对象再通过它解析迟到 CQE。`DeleteJfr` 成功只终结残留 Posted RX，不伪造成功 CQE、不撤销 Held Lease，也不终结独立 RMA Grant；MR 注销/内存释放还须等待这些条件结清。
 - **失败可重试**：若任一 `DeleteJetty`、`DeleteJfr` 或 `UnregisterSeg` 返回非零错误，保留当前阶段状态与底层依赖（绝不提前 `free(memory_)`），允许后续重试从断点继续推进。正常关闭门槛无法满足或 JFC 已故障时采用隔离；该流程不能把软件超时当作 DMA 终结证明。
 
+#### M1 raw 实现与调用责任
+
+当前入口为 [`ReceiveDomainCloser`](../../kbsocket/transport/raw/receive_domain_closer.hpp)。它是借用 `JettyPool` / `RxBufferPool` 的单 owner 控制对象，关闭过程中两池、context、MR 及本协调器必须持续存活；析构不自动推进硬件销毁。完整控制协议与事件引擎分别在 M5/M3 接入，本阶段不以空 CQ、断链或等待超时自动构造静默证明。
+
+1. `Begin(pool, buffers)` 取得该域的独占关闭权，只停止 TX `Reserve` / `ReserveOn` / `Get`。现存票据仍可 `Commit`、`Cancel`、`Complete`，TX poll/ERROR/flush 继续可用；RX `Poll` / `Release` / `Refill` 在确认远端静默前继续可用，避免关闭握手期间因提前停止补投而制造 RNR。这些操作由同一 owner 串行推进。
+2. `Advance(quiescence, events)` 首次收到 `peer_stopped = true` 后调用 RX `Stop`，该停止不可逆，远端静默须持续至关闭完成。在 `kDraining` 阶段每次执行一次有界 RX poll，最多消费 `RxBufferPool::kPollBatch` 项，并通过 `rx_events` 返回本次事件数。出现 RX 事件时当次不进入删除，调用方须处理每个返回事件，包括带错误但持有 lease 的事件。TX 票据退休和 ERROR/flush 完成仍由调用方负责。RX poll 失败则进入 `kRetained` 并封禁整个域的队列推进；后续 `Advance` 只报告保留错误，直接 TX/RX poll 也被禁止，仅允许已有 Held lease 归还。此阶段不继续 TX 退休或尝试故障 CQ 回收，整个依赖链保留至退出。
+3. 在确认静默、事件/软件引用屏障、正常 CQ，以及观察到 RX poll 为空且所有 TX lane 已排空后，协调器进入 `kDeletingQueues`。它通过私有 `CloseQueues()` 逆序删除全部 jetty，再删除 JFR。私有 `OnJfrDeleted()` 只在实际删除成功后清退残留 Posted，累计到 `retired_rx` / `retired_on_delete()`，不计作成功接收；Held 的内容和 lease 不变。
+4. `kWaitingForLeases` 等待 Held 归还，再注销 RX MR、释放 backing 并解绑；`kDeletingCompletionQueues` 依次删除 RX/TX JFC，最终进入 `kClosed`。成功阶段不重复执行；删除/注销失败保留错误、阶段和未释放依赖，下次 `Advance` 继续。进入删除阶段即停止 provider poll，即使删除失败也不能恢复收发。池仍绑定协调器时，普通 `Close()` 被独占关闭权阻挡，不能绕过上述顺序；RX 内存已经关闭并解绑后，单独 `RxBufferPool::Close()` 可幂等返回成功，余下 JFC 仍由协调器关闭。
+
+`ReceiveDomainQuiescence` 是调用方对外部事实的明确声明，四项默认 false；它不是测试开关或强制回收标志。事实须在进入删除阶段前成立，并保持至关闭完成：
+
+| 字段 | 调用方必须证明的条件 |
+| --- | --- |
+| `peer_stopped` | 所有远端已停止向该接收域发送；首次确认便停止 RX 补投，此后至关闭完成均不得再恢复远端发送。连接 EOF 或空 CQ 本身不构成证明 |
+| `events_acked` | 与待销毁对象关联的 JFCE/URMA async 事件已经 Get/Ack，未持有待确认事件对象引用；纯 poll 配置也不能忽略 context async 责任 |
+| `queue_users_stopped` | 除当前 owner 推进排空和被单独计数的 Held lease 外，其他调用方已停止访问队列/注册内存且引用责任结清；不存在由此流程无法终结的独立 RMA 授权 |
+| `completion_queues_healthy` | 当前为可正常解析、按 provider 契约销毁的 CQ；发生 JFC 错误或完成证据丢失时不能设为 true |
+
+源码依据与适用范围：本地 UMDK `32a1386b72b3b4a890c89d397f7f6d510564b7a9` 的 [UDMA jetty 删除](../../../umdk/src/urma/hw/udma/udma_u_jetty.c) 和 [JFR 删除](../../../umdk/src/urma/hw/udma/udma_u_jfr.c) 在释放队列前调用 [`udma_u_clean_jfc`](../../../umdk/src/urma/hw/udma/udma_u_jfc.c)，按本地对象 ID 清除残余 CQE。该清理仅覆盖普通、非 custom JFC，当前 raw 池采用此配置；被清除的 CQE 不再交给应用。删除失败路径也可能移除 provider 对象表项，故只能继续销毁重试，不能重新 poll 旧对象。该源码契约覆盖最后一次 poll 与删除之间的残余 CQE，不能替代远端静默和事件确认，也不扩展到故障 CQ。此项为本地源码核对，不构成本轮真机 PASS；新关闭流程的 UB 真机回归尚未执行。
+
 ---
 
 ## 6. 连接内顺序：保留薄适配，不构建重放协议

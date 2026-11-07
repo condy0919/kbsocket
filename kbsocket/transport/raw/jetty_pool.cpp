@@ -66,7 +66,7 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
     const auto link_priority = FLAGS_kbsocket_link_priority;
 
     // 防止重复打开：已持有硬件队列资源或槽位时直接拒绝。
-    if (send_jfc_ || recv_jfc_ || jfr_ || !slots_.empty()) {
+    if (close_owner_ || send_jfc_ || recv_jfc_ || jfr_ || !slots_.empty()) {
         return std::unexpected(JettyPoolError{
             .failure =
                 {
@@ -231,14 +231,26 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
     tx_depth_ = tx_depth;
     rx_depth_ = rx_depth;
     ctx_ = ctx;
+    admission_stopped_ = false;
     ready_ = true;
     return {};
 }
 
 std::expected<void, JettyPoolFailure> JettyPool::Close() noexcept {
-    if (rx_owner_) {
+    if (close_owner_ || rx_owner_) {
         return std::unexpected(Failure(JettyPoolErrorCode::kInUse));
     }
+    if (auto result = CloseQueues(); !result) {
+        return result;
+    }
+    return CloseCompletionQueues();
+}
+
+void JettyPool::StopAdmission() noexcept {
+    admission_stopped_ = true;
+}
+
+std::expected<void, JettyPoolFailure> JettyPool::CheckTxDrained() const noexcept {
     // 票据必须全部退休；已经切 ERROR 的队列还须消费边界并完成软件排空，避免丢下 fake CQE。
     // 拒绝关闭时刻意保持 ready_ 为 true，确保调用方仍可继续调用 PollSend/PollRecv 与 Complete 推进排空。
     for (std::uint32_t i = 0; i < slots_.size(); ++i) {
@@ -247,8 +259,17 @@ std::expected<void, JettyPoolFailure> JettyPool::Close() noexcept {
             return std::unexpected(Failure(JettyPoolErrorCode::kInUse, i));
         }
     }
+    return {};
+}
 
-    // 全部发送票据已退休，置为未就绪以阻断新的提交与轮询。
+std::expected<void, JettyPoolFailure> JettyPool::CloseQueues() noexcept {
+    if (auto result = CheckTxDrained(); !result) {
+        return result;
+    }
+
+    // 删除一旦开始便永久停止本生命周期的提交与轮询；provider 删除失败也可能已移除对象表项。
+    // 保留失败句柄只用于继续关闭，不能恢复正常 poll/post。
+    StopAdmission();
     ready_ = false;
 
     // 逆序销毁各个 Jetty 硬件句柄；若任一删除失败，保留剩余句柄并中断返回，允许外部排查后重试。
@@ -265,8 +286,33 @@ std::expected<void, JettyPoolFailure> JettyPool::Close() noexcept {
     }
     slots_.clear();
 
-    // 严格按依赖关系反向销毁父级队列：JFR -> Recv JFC -> Send JFC。
-    // 使用 lambda 确保：成功删除后立即将指针置空以防重试时重复释放；若子资源删除失败，绝不提前销毁其引用的父 JFC。
+    // 本地 udma 普通 JFC 路径在删除 Jetty/JFR 时先清理其 CQE，再释放 provider 队列。
+    // 成功删除 JFR 后由域关闭协调器终结残留 RX；其 MR 与 JFC 在这一阶段继续存活。
+    if (jfr_) {
+        const auto status = UrmaApi::DeleteJfr(jfr_);
+        if (status != URMA_SUCCESS) {
+            return std::unexpected(JettyPoolFailure{
+                .code = JettyPoolErrorCode::kDeleteFailed,
+                .resource = JettyPoolResource::kJfr,
+                .provider_error = status,
+            });
+        }
+        jfr_ = nullptr;
+    }
+    return {};
+}
+
+std::expected<void, JettyPoolFailure> JettyPool::CloseCompletionQueues() noexcept {
+    if (rx_owner_ || jfr_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kInUse));
+    }
+    for (const auto& slot : slots_) {
+        if (slot.jetty) {
+            return std::unexpected(Failure(JettyPoolErrorCode::kInUse));
+        }
+    }
+
+    // RX owner 已解除且所有队列已删除，才能逆序销毁 CQ；成功置空保证重试不重复释放。
     auto drop = [](auto*& ptr, auto deleter, JettyPoolResource resource) -> std::expected<void, JettyPoolFailure> {
         if (!ptr) {
             return {};
@@ -282,9 +328,6 @@ std::expected<void, JettyPoolFailure> JettyPool::Close() noexcept {
         ptr = nullptr;
         return {};
     };
-    if (auto r = drop(jfr_, UrmaApi::DeleteJfr, JettyPoolResource::kJfr); !r) {
-        return r;
-    }
     if (auto r = drop(recv_jfc_, UrmaApi::DeleteJfc, JettyPoolResource::kRecvJfc); !r) {
         return r;
     }
@@ -364,7 +407,7 @@ std::expected<JettyLane, JettyPoolFailure> JettyPool::FindLane(std::uint32_t loc
 }
 
 std::size_t JettyPool::available() const noexcept {
-    if (!ready_) {
+    if (!ready_ || admission_stopped_) {
         return 0;
     }
 
@@ -379,6 +422,9 @@ std::size_t JettyPool::available() const noexcept {
 std::expected<JettyTicket, JettyPoolFailure> JettyPool::Reserve() noexcept {
     if (!ready_) {
         return std::unexpected(Failure(JettyPoolErrorCode::kNotReady));
+    }
+    if (admission_stopped_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kStopped));
     }
 
     // Round-Robin 轮转查找未故障且有空闲额度的 SQ。
@@ -400,6 +446,9 @@ std::expected<JettyTicket, JettyPoolFailure> JettyPool::ReserveOn(JettyLane lane
     auto result = Find(lane);
     if (!result) {
         return std::unexpected(result.error());
+    }
+    if (admission_stopped_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kStopped, lane.index));
     }
 
     auto& slot = **result;
@@ -429,6 +478,9 @@ std::expected<urma_jetty_t*, JettyPoolFailure> JettyPool::Get(JettyLane lane) no
     auto slot = Find(lane);
     if (!slot) {
         return std::unexpected(slot.error());
+    }
+    if (admission_stopped_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kStopped, lane.index));
     }
     // 故障 SQ 严禁获取硬件句柄投递新请求。
     if ((*slot)->state != JettyLaneState::kReady) {

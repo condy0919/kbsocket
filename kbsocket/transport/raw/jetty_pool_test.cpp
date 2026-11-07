@@ -263,6 +263,49 @@ TEST_F(JettyPoolTest, EveryDeletionFailureStopsBeforeDependenciesAndCanRetry) {
     }
 }
 
+TEST_F(JettyPoolTest, DeleteFailureKeepsDataPathIsolatedUntilReopen) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    ExpectCreate();
+    JettyPool pool;
+    ASSERT_TRUE(pool.Open(&ctx_, cap_));
+    auto ticket = pool.Reserve();
+    ASSERT_TRUE(ticket);
+    const auto lane = ticket->lane;
+    ASSERT_TRUE(pool.Cancel(*ticket));
+
+    // provider 即使删除失败也可能移除对象表项，关闭开始后不得恢复正常轮询或投递。
+    EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(URMA_EAGAIN));
+    auto closed = pool.Close();
+    ASSERT_FALSE(closed);
+    EXPECT_EQ(closed.error().code, JettyPoolErrorCode::kDeleteFailed);
+    EXPECT_FALSE(pool.ready());
+    EXPECT_EQ(pool.available(), 0u);
+    EXPECT_EQ(pool.jfr(), nullptr);
+    EXPECT_FALSE(pool.Reserve());
+    EXPECT_FALSE(pool.ReserveOn(lane));
+    EXPECT_FALSE(pool.Get(lane));
+    urma_cr_t cr[1]{};
+    EXPECT_FALSE(pool.PollSend(cr));
+    EXPECT_FALSE(pool.PollRecv(cr));
+    auto reopened = pool.Open(&ctx_, cap_);
+    ASSERT_FALSE(reopened);
+    EXPECT_EQ(reopened.error().failure.code, JettyPoolErrorCode::kInUse);
+
+    // 只能继续删除保留的资源；全关闭后重新 Open 才能重置停止准入状态与生命周期纪元。
+    ExpectDelete();
+    ASSERT_TRUE(pool.Close());
+    ExpectCreate();
+    ASSERT_TRUE(pool.Open(&ctx_, cap_));
+    EXPECT_EQ(pool.available(), 1u);
+    auto fresh = pool.Reserve();
+    ASSERT_TRUE(fresh);
+    EXPECT_NE(fresh->lane.epoch, lane.epoch);
+    EXPECT_EQ(pool.Get(fresh->lane), &jetty_);
+    ASSERT_TRUE(pool.Cancel(*fresh));
+    ExpectDelete();
+    ASSERT_TRUE(pool.Close());
+}
+
 TEST_F(JettyPoolTest, SharedSqAcceptsDifferentTargetsBeforeEitherCompletes) {
     test_support::ScopedUrmaOverride scope(MockedFunctions());
     ExpectCreate(-1, 2);

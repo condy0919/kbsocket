@@ -43,6 +43,7 @@ struct JettyPoolConfig {
 
 class JettyPool;
 class RxBufferPool;
+class ReceiveDomainCloser;
 
 /// 物理发送队列（SQ）的稳定通道身份。
 /// - 共享通道模型：同一物理 Jetty 通道在生命周期内可同时服务多个逻辑连接与远端目标。
@@ -178,6 +179,7 @@ public:
 
 private:
     friend class RxBufferPool;
+    friend class ReceiveDomainCloser;
 
     enum class TicketState : std::uint8_t {
         kFree,
@@ -203,14 +205,23 @@ private:
     std::expected<Entry*, JettyPoolFailure> Find(JettyTicket ticket) noexcept;
     std::expected<void, JettyPoolFailure> Retire(JettyTicket ticket, TicketState state) noexcept;
 
+    // 停止新的发送准入，但保留已有票据、CQ 轮询与 ERROR 排空能力。
+    void StopAdmission() noexcept;
+    std::expected<void, JettyPoolFailure> CheckTxDrained() const noexcept;
+    // 仅由具备远端静默和事件屏障的域关闭协调器跨越 RX owner 绑定销毁队列。
+    std::expected<void, JettyPoolFailure> CloseQueues() noexcept;
+    std::expected<void, JettyPoolFailure> CloseCompletionQueues() noexcept;
+
     std::expected<void, JettyPoolError> Rollback(JettyPoolResource resource, int error,
                                                  std::uint32_t index = 0) noexcept;
 
     std::expected<int, JettyPoolFailure> Poll(urma_jfc_t* jfc, JettyPoolResource resource,
                                               std::span<urma_cr_t> completions) noexcept;
 
-    // RX owner 独占 JFR/RX CQ；解除绑定前禁止关闭底层队列。
+    // RX owner 独占 JFR/RX CQ；绑定期间仅域关闭协调器可先删除队列再回收残留 RX。
     RxBufferPool* rx_owner_ = nullptr;
+    // 协调器独占分阶段关闭，禁止 public Open/Close 绕过其生命周期屏障。
+    ReceiveDomainCloser* close_owner_ = nullptr;
     urma_context_t* ctx_ = nullptr;
     std::uint32_t rx_depth_ = 0;
     urma_jfc_t* send_jfc_ = nullptr;
@@ -222,6 +233,7 @@ private:
     std::uint32_t next_lane_ = 0;
     std::uint32_t tx_depth_ = 0;
     bool ready_ = false;
+    bool admission_stopped_ = false;
 };
 } // namespace raw
 } // namespace kbsocket

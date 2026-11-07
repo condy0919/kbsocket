@@ -1,9 +1,9 @@
 # kbsocket 演进路线图 (Roadmap)
 
 > **对齐规范**：[kbsocket-design-v1.md](design/kbsocket-design-v1.md) · [hardware-observations.md](hardware-observations.md) · [hardware-validation-matrix.md](hardware-validation-matrix.md) · [OBSERVABILITY-DESIGN-GUIDE.md](OBSERVABILITY-DESIGN-GUIDE.md)
-> **最后更新**：2026-11-05
+> **最后更新**：2026-11-07
 
-本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础，M1–M7、L1/L2、O1/O2 均为待交付计划；下述新类、接口和测试路径是拟议落点，不代表已经实现。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
+本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已新增 raw 关闭协调器与 Mock 用例，验证状态见 M1 小节。M2–M7、L1/L2、O1/O2 仍为待交付计划，其中新类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
 
 ---
 
@@ -15,9 +15,9 @@
 | :--- | :--- | :--- | :--- |
 | **错误与基础原语** | `kbsocket/base/`<br>`kbsocket/transport/raw/*_error.hpp` 及各组件头文件 | 已有日志、RAII 工具及基于 `std::expected` 的组件错误类型 | 尚无统一 `base/error.hpp`；统一应用层错误、控制面分类及 C ABI 映射时保留数据路径零分配，不新增自定义 expected 容器 |
 | **动态加载与拓扑发现** | `kbsocket/transport/raw/urma_api.*`<br>`device_catalog.*`<br>`urma_context.*`<br>`raw_runtime.*` | `liburma.so` 符号表加载、设备枚举、`RM_CTP` 能力校验、多 `UrmaContext` 初始化 | 尚未与 `RuntimeShard` 和 NUMA 亲和性调度绑定 |
-| **池化 Jetty 管理** | `kbsocket/transport/raw/jetty_pool.*` | 共享 `JFR` + 固定数量 `Jetty`、Round-Robin 分配、软件故障门禁与 ERROR/边界/flush 排空 | 1. 尚未分离被动 `rx_target_jetty` 与主动 `tx_lanes`（[设计文档 §5.1](design/kbsocket-design-v1.md#51-关键架构改进被动接收端点rx-endpoint与主动发送通道tx-lanes解耦)）；<br>2. 缺少 per-lane `lane_generation` 与 `status 9` 在线重建（`ReplaceDrainedLane`）；<br>3. 当前已先 `DeleteJetty` 再 `DeleteJfr`，但 RX owner 仍阻止 pool 关闭，缺少接收域级残留 RX 协调 |
+| **池化 Jetty 管理** | `kbsocket/transport/raw/jetty_pool.*`<br>`receive_domain_closer.*` | 共享 `JFR` + 固定数量 `Jetty`、Round-Robin 分配、软件故障门禁与 ERROR/边界/flush 排空；M1 新增独立 TX 准入门禁及接收域分阶段关闭 | 1. 尚未分离被动 `rx_target_jetty` 与主动 `tx_lanes`（[设计文档 §5.1](design/kbsocket-design-v1.md#51-关键架构改进被动接收端点rx-endpoint与主动发送通道tx-lanes解耦)）；<br>2. 缺少 per-lane `lane_generation` 与 `status 9` 在线重建（`ReplaceDrainedLane`）；<br>3. 关闭所需远端静默与事件引用屏障仍由调用方证明，M3/M5 接入自动协调 |
 | **TX 发送与完成收敛** | `kbsocket/transport/raw/attempt_ledger.*`<br>`tx_sender.*`<br>`tx_completion_processor.*` | 64-bit 单调 `AttemptId` 写入 `user_ctx`、`SEND_WITH_IMM` 提交、接受前缀入账与 `AttemptLedger::Complete` 退休；元数据记录借用身份 | 1. `TxCompletionProcessor::Process` 在校验 `AttemptLedger::Lookup` 之前即调用 `FindLane`/`BeginDrain`；<br>2. `status 10` (`RNR`) 仍触发整条共享 SQ `BeginDrain`，需改为像 `status 8` 一样仅作废单连接/单 WR；<br>3. `TxSender` 尚未支持 `URMA_OPC_WRITE`（`WRITE RNDV` 所需） |
-| **RX 缓冲池** | `kbsocket/transport/raw/rx_buffer_pool.*` | 连续内存预分配、DMA 段注册、`Refill`/`Poll`/`Release`/`Stop`、`RxBufferLease` 借出与归还 | 1. `Close()` 要求 `posted_ == 0 && held_ == 0`，缺少 `DeleteJfr` 销毁未消费 `kPosted` WR 的 `OnJfrDeleted()` 闭环；<br>2. 缺少 `JFR_LIMIT` 水位重设联动 |
+| **RX 缓冲池** | `kbsocket/transport/raw/rx_buffer_pool.*` | 连续内存预分配、DMA 段注册、`Refill`/`Poll`/`Release`/`Stop`、`RxBufferLease` 借出与归还；M1 在 `DeleteJfr` 成功后内部清退残留 Posted，Held 归还后才注销内存 | 缺少 `JFR_LIMIT` 水位重设联动；独立 RMA Grant 生命周期属于 M4/M6，不能由 RX 关闭代为终结 |
 | **硬件实测工具集** | `tools/*_test` | 已记录 SEND/SGE、RMA、故障隔离、补投及多 context 通知等观测，另有人工确认的大小/生命周期/可见性契约 | 人工契约不等于测试 PASS；WN1–WN4 通知回归尚无真机日志，历史 ACK_TIMEOUT 根因仍待定位；按验证矩阵逐项回归 |
 
 ### 1.2 待建设模块（包括未创建目录与工作区接口草稿）
@@ -68,15 +68,18 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 
 ### M1：残余 RX 安全关闭闭环 (`RxBufferPool` + `JettyPool`)
 
+- **当前交付**：已实现 `ReceiveDomainCloser` 与配套 Mock 用例；2026-11-07 运行 `bazel test //kbsocket/transport/raw:all --test_output=errors`，9 个测试目标、130 个用例通过，其中关闭协调器包含 22 个用例。UB 真机回归未执行。这里只交付可显式驱动的 raw 控制原语，M3 的 `ControlExecutor` 与事件消费、M5 的远端关闭协议尚未实现。
 - **目标**：扩展 `RxBufferPool` 与接收域关闭协调器，支持残留 Posted 在取得 DMA 终结证明后安全结账，落地 `H9` 硬件契约（`DeleteJfr` 可直接销毁未消费的 `kPosted` WR，无需 `ModifyJfr(ERROR)` 排空）。
 - **设计章节**：[§5.3 接收域安全关闭状态机](design/kbsocket-design-v1.md#53-接收域安全关闭状态机m1-核心规范)
 - **涉及代码**：
   - `kbsocket/transport/raw/rx_buffer_pool.hpp` / `.cpp`
   - `kbsocket/transport/raw/jetty_pool.hpp` / `.cpp`
+  - `kbsocket/transport/raw/receive_domain_closer.hpp` / `.cpp`
+  - `kbsocket/transport/raw/receive_domain_closer_test.cpp`
   - `kbsocket/transport/raw/rx_buffer_pool_test.cpp`
   - `kbsocket/transport/raw/jetty_pool_test.cpp`
 - **关键改动**：
-  1. **建立接收域关闭协调器**：停止新准入/提交并协调确认远端停止向该域发送，再停止补投；期间继续 TX 排空、通知确认及 Lease 归还。失联或空 CQ 不等于远端静默，无法建立销毁屏障时保留依赖；解除当前 RX owner 与 pool 互相等待的关闭依赖。保持已有先删所有关联 `Jetty`、再删 `JFR` 的顺序，M2 引入被动端点后将其一并纳入。
+  1. **建立接收域关闭协调器**：先停止本地新准入/提交，在协调确认远端停止向该域发送之前继续 RX 消费、Lease 归还和补投，避免关闭握手期间人为制造 RNR；确认远端静默后才不可逆地停止补投。期间继续 TX 排空与通知确认。失联或空 CQ 不等于远端静默，无法建立销毁屏障时保留依赖；解除当前 RX owner 与 pool 互相等待的关闭依赖。保持已有先删所有关联 `Jetty`、再删 `JFR` 的顺序，M2 引入被动端点后将其一并纳入。
   2. **新增 `RxBufferPool::OnJfrDeleted()`**：当底层 `DeleteJfr` 成功后调用该接口，将残留 `kPosted` 标记为 DMA 已终结并逐条结账；关闭域不再投递这些槽位，也不伪造成功 RX。此操作不撤销 `Held`、CPU 引用或独立 RMA Grant。
   3. **两阶段 `Close()` 校验**：
      - 若 `jfr_deleted_ == false` 且 `posted_ > 0`，`Close()` 拒绝注销 `segment_`（防止硬件仍在 DMA 写入时解除页表映射）；
@@ -84,6 +87,8 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
      - provider 仍可能解析队列地址的 CQE/事件必须在对象有效时处理。删除/注销失败保留依赖，从已完成阶段重试，不能强制清零或重复回收。
 - **验收门禁**：
   - 单元测试覆盖：① 通过 `Refill()` 补满 RX、对端未发送业务数据时建立静默与销毁屏障，再走 `JettyPool` + `RxBufferPool` 残留 Posted 关闭流程，验证零内存泄漏与零悬垂注销；② 存在未归还 `RxBufferLease` (`held_ > 0`) 时调用 `Close()`，验证 `UnregisterSeg` 延迟至最后一个 Lease 经 `Release` 归还且其他引用结清后触发；③ `DeleteJetty`/`DeleteJfr`/注销失败后可重试且无提前释放；④ 晚到 CQE、通知引用、无法证明远端静默、最后一个残留 RX、空闲与正常关闭均安全。
+
+**调用边界**：由唯一 owner 调用 `Begin(pool, buffers)` 冻结 TX 准入，再以预分配的 `RxBufferEvent` 数组调用 `Advance(quiescence, events)`。在 `peer_stopped` 首次确认前，RX `Poll` / `Release` / `Refill` 继续可用；首次确认后 `Advance` 才调用 `Stop`，不再恢复补投，该静默条件须保持至关闭完成。调用方继续推进 TX 逐 WR 退休、处理每次返回的 RX 事件并归还 lease；协调器不会代替连接层消费业务数据，也不推测完成。`ReceiveDomainQuiescence` 的 `peer_stopped`、`events_acked`、`queue_users_stopped` 和 `completion_queues_healthy` 均默认 false，须由调用方根据各自责任确认。关闭期间的直接 `JettyPool::Close()` / `RxBufferPool::Close()` 不能绕过协调器；进入删除阶段后不再 poll，失败只从保留阶段重试。具体状态、provider 适用范围与屏障责任见设计 §5.3。
 
 ---
 

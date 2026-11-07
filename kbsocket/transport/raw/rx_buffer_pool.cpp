@@ -52,7 +52,7 @@ RxBufferPool::~RxBufferPool() {
 }
 
 std::expected<void, RxBufferError> RxBufferPool::Open(JettyPool& pool, std::uint32_t buffer_count) noexcept {
-    if (pool_ || pool.rx_owner_) {
+    if (pool_ || pool.rx_owner_ || pool.close_owner_) {
         return Error(RxBufferErrorCode::kInUse);
     }
     if (!pool.ready()) {
@@ -103,12 +103,21 @@ std::expected<void, RxBufferError> RxBufferPool::Open(JettyPool& pool, std::uint
     free_head_ = 0;
     base_id_ = next_id_;
     stopped_ = false;
+    jfr_deleted_ = false;
+    retired_on_delete_ = 0;
     pool_ = &pool;
     pool.rx_owner_ = this;
     return {};
 }
 
 std::expected<void, RxBufferError> RxBufferPool::Close() noexcept {
+    if (pool_ && pool_->close_owner_) {
+        return Error(RxBufferErrorCode::kInUse);
+    }
+    return CloseMemory();
+}
+
+std::expected<void, RxBufferError> RxBufferPool::CloseMemory() noexcept {
     if (posted_ || held_) {
         return Error(RxBufferErrorCode::kInUse);
     }
@@ -129,6 +138,22 @@ std::expected<void, RxBufferError> RxBufferPool::Close() noexcept {
         pool_ = nullptr;
     }
     return {};
+}
+
+void RxBufferPool::OnJfrDeleted() noexcept {
+    // 此私有入口只接受真实删除结果；失败重试或重复调用不能重复结账。
+    if (!pool_ || pool_->jfr_ || !pool_->close_owner_ || jfr_deleted_) {
+        return;
+    }
+    stopped_ = true;
+    jfr_deleted_ = true;
+    for (std::uint32_t i = 0; i < entries_.size(); ++i) {
+        if (entries_[i].state == State::kPosted) {
+            Recycle(i);
+            --posted_;
+            ++retired_on_delete_;
+        }
+    }
 }
 
 void RxBufferPool::Recycle(std::uint32_t index) noexcept {
@@ -195,7 +220,7 @@ std::expected<std::size_t, RxBufferError> RxBufferPool::Refill(std::size_t limit
 }
 
 std::expected<std::size_t, RxBufferError> RxBufferPool::Poll(std::span<RxBufferEvent> events) noexcept {
-    if (!pool_) {
+    if (!pool_ || jfr_deleted_ || !pool_->ready()) {
         return Error(RxBufferErrorCode::kNotReady);
     }
     if (events.empty()) {

@@ -219,3 +219,27 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "receive_domain_closer",
+    srcs = ["receive_domain_closer.cpp"],
+    hdrs = ["receive_domain_closer.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":jetty_pool",
+        ":rx_buffer_pool",
+        "//kbsocket/base:log",
+    ],
+)
+
+cc_test(
+    name = "receive_domain_closer_test",
+    srcs = ["receive_domain_closer_test.cpp"],
+    deps = [
+        ":jetty_pool",
+        ":receive_domain_closer",
+        ":rx_buffer_pool",
+        ":urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
