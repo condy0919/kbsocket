@@ -66,7 +66,10 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
     const auto link_priority = FLAGS_kbsocket_link_priority;
 
     // 防止重复打开：已持有硬件队列资源或槽位时直接拒绝。
-    if (close_owner_ || send_jfc_ || recv_jfc_ || jfr_ || rx_target_jetty_ || !slots_.empty()) {
+    if (retained_) {
+        return std::unexpected(JettyPoolError{.failure = Failure(JettyPoolErrorCode::kRetained), .cleanup_error = {}});
+    }
+    if (close_owner_ || jfce_ || send_jfc_ || recv_jfc_ || jfr_ || rx_target_jetty_ || !slots_.empty()) {
         return std::unexpected(JettyPoolError{
             .failure =
                 {
@@ -155,11 +158,21 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
         });
     }
 
+    // 事件模式先创建公共通知通道，逆序关闭时必须等两个 JFC 均删除后才删除它。
+    if (c.events) {
+        errno = 0;
+        jfce_ = UrmaApi::CreateJfce(ctx);
+        if (!jfce_) {
+            return Rollback(JettyPoolResource::kJfce, errno ? errno : EIO);
+        }
+    }
+
     // 硬件拓扑创建：
-    // 阶段 1：创建发送完成队列（Send JFC）。配置 lock_free=1 实现无锁推进，不创建 JFCE（纯用户态轮询）。
+    // 阶段 1：创建发送完成队列（Send JFC），配置 lock_free=1 实现无锁推进。
     urma_jfc_cfg_t cq{};
     cq.depth = c.tx_cq_depth;
     cq.flag.bs.lock_free = 1;
+    cq.jfce = jfce_;
     errno = 0;
     send_jfc_ = UrmaApi::CreateJfc(ctx, &cq);
     if (!send_jfc_) {
@@ -170,6 +183,7 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
     cq = {};
     cq.depth = c.rx_cq_depth;
     cq.flag.bs.lock_free = 1;
+    cq.jfce = jfce_;
     errno = 0;
     recv_jfc_ = UrmaApi::CreateJfc(ctx, &cq);
     if (!recv_jfc_) {
@@ -248,6 +262,9 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
 }
 
 std::expected<void, JettyPoolFailure> JettyPool::Close() noexcept {
+    if (retained_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kRetained));
+    }
     if (close_owner_ || rx_owner_) {
         return std::unexpected(Failure(JettyPoolErrorCode::kInUse));
     }
@@ -257,11 +274,21 @@ std::expected<void, JettyPoolFailure> JettyPool::Close() noexcept {
     return CloseCompletionQueues();
 }
 
+void JettyPool::RetainDependencies() noexcept {
+    // 不调用 provider，不制造终结证据；RX 内存池亦读取此门禁，Held lease 仍可归还。
+    retained_ = true;
+    StopAdmission();
+    ready_ = false;
+}
+
 void JettyPool::StopAdmission() noexcept {
     admission_stopped_ = true;
 }
 
 std::expected<void, JettyPoolFailure> JettyPool::CheckTxDrained() const noexcept {
+    if (retained_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kRetained));
+    }
     // 票据必须全部退休；已经切 ERROR 的队列还须消费边界并完成软件排空，避免丢下 fake CQE。
     // 拒绝关闭时刻意保持 ready_ 为 true，确保调用方仍可继续调用 PollSend/PollRecv 与 Complete 推进排空。
     for (std::uint32_t i = 0; i < slots_.size(); ++i) {
@@ -327,6 +354,9 @@ std::expected<void, JettyPoolFailure> JettyPool::CloseQueues() noexcept {
 }
 
 std::expected<void, JettyPoolFailure> JettyPool::CloseCompletionQueues() noexcept {
+    if (retained_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kRetained));
+    }
     if (rx_owner_ || jfr_ || rx_target_jetty_) {
         return std::unexpected(Failure(JettyPoolErrorCode::kInUse));
     }
@@ -355,14 +385,17 @@ std::expected<void, JettyPoolFailure> JettyPool::CloseCompletionQueues() noexcep
     if (auto r = drop(recv_jfc_, UrmaApi::DeleteJfc, JettyPoolResource::kRecvJfc); !r) {
         return r;
     }
-    return drop(send_jfc_, UrmaApi::DeleteJfc, JettyPoolResource::kSendJfc);
+    if (auto r = drop(send_jfc_, UrmaApi::DeleteJfc, JettyPoolResource::kSendJfc); !r) {
+        return r;
+    }
+    return drop(jfce_, UrmaApi::DeleteJfce, JettyPoolResource::kJfce);
 }
 
 std::expected<int, JettyPoolFailure> JettyPool::Poll(urma_jfc_t* jfc, JettyPoolResource resource,
                                                      std::span<urma_cr_t> completions) noexcept {
     if (!ready_) {
         return std::unexpected(JettyPoolFailure{
-            .code = JettyPoolErrorCode::kNotReady,
+            .code = retained_ ? JettyPoolErrorCode::kRetained : JettyPoolErrorCode::kNotReady,
             .resource = resource,
         });
     }
@@ -412,6 +445,9 @@ bool JettyPool::IsReceiveJetty(std::uint32_t local_id) const noexcept {
 }
 
 std::expected<JettyPool::Slot*, JettyPoolFailure> JettyPool::Find(JettyLane lane) noexcept {
+    if (retained_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kRetained, lane.index));
+    }
     // 校验池生命周期、单 Lane 代次和槽位边界，避免旧票据或控制操作命中替换后的对象。
     if (!ready_ || lane.pool != this || lane.epoch != epoch_ || lane.index >= slots_.size() ||
         lane.generation != slots_[lane.index].generation) {
@@ -465,7 +501,7 @@ std::size_t JettyPool::available() const noexcept {
 
 std::expected<JettyTicket, JettyPoolFailure> JettyPool::Reserve() noexcept {
     if (!ready_) {
-        return std::unexpected(Failure(JettyPoolErrorCode::kNotReady));
+        return std::unexpected(Failure(retained_ ? JettyPoolErrorCode::kRetained : JettyPoolErrorCode::kNotReady));
     }
     if (admission_stopped_) {
         return std::unexpected(Failure(JettyPoolErrorCode::kStopped));
@@ -598,8 +634,22 @@ std::expected<JettyLaneState, JettyPoolFailure> JettyPool::lane_state(JettyLane 
     return slots_[lane.index].state;
 }
 
+std::expected<JettyLane, JettyPoolFailure> JettyPool::lane(std::uint32_t index) const noexcept {
+    if (!ready_) {
+        return std::unexpected(
+            Failure(retained_ ? JettyPoolErrorCode::kRetained : JettyPoolErrorCode::kNotReady, index));
+    }
+    if (index >= slots_.size()) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kInvalidLane, index));
+    }
+    return JettyLane{this, index, epoch_, slots_[index].generation};
+}
+
 std::expected<JettyLane, JettyPoolFailure>
 JettyPool::ReplaceDrainedLane(JettyLane lane, const JettyLaneQuiescence& quiescence) noexcept {
+    if (retained_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kRetained, lane.index));
+    }
     if (close_owner_ || admission_stopped_) {
         return std::unexpected(Failure(JettyPoolErrorCode::kStopped, lane.index));
     }
@@ -642,6 +692,7 @@ JettyPool::ReplaceDrainedLane(JettyLane lane, const JettyLaneQuiescence& quiesce
     slot.free_head = 0;
     slot.jetty = replacement;
     ++slot.generation;
+    slot.deferred_flush_done = false;
     slot.state = JettyLaneState::kReady;
     return JettyLane{this, lane.index, epoch_, slot.generation};
 }
@@ -662,7 +713,21 @@ std::expected<void, JettyPoolFailure> JettyPool::BeginDrain(JettyLane lane) noex
     if (status != URMA_SUCCESS) {
         return std::unexpected(Failure(JettyPoolErrorCode::kModifyFailed, lane.index, status));
     }
-    slot.state = JettyLaneState::kError;
+    slot.state = slot.deferred_flush_done ? JettyLaneState::kFlushReady : JettyLaneState::kError;
+    return {};
+}
+
+std::expected<void, JettyPoolFailure> JettyPool::RememberFlushDone(JettyLane lane) noexcept {
+    auto found = Find(lane);
+    if (!found) {
+        return std::unexpected(found.error());
+    }
+    auto& slot = **found;
+    if (slot.state != JettyLaneState::kFaulted || slot.deferred_flush_done) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kInvalidState, lane.index));
+    }
+    // 只保存已消费的边界证据；控制路径 ModifyJetty 成功前不授予软件 flush 权限。
+    slot.deferred_flush_done = true;
     return {};
 }
 

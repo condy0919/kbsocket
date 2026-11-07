@@ -168,6 +168,47 @@ TEST_F(TxCompletionProcessorTest, FullSqBecomesUsableAfterCompletionRetiresCredi
     EXPECT_EQ(ledger_.size(), 0u);
 }
 
+TEST_F(TxCompletionProcessorTest, DeferredFatalRetiresBatchAndRemembersEarlyBoundaryWithoutModify) {
+    // Reactor 的 poll 线程只能封禁准入。provider 慢 modify 由控制线程接手，
+    // 同批先到的边界也必须保存，不能因尚未执行 modify 丢失排空证据。
+    TxCompletionProcessor deferred(ledger_, true);
+    std::array requests{Request(), Request(2), Request()};
+    std::array<AttemptId, 3> ids{};
+    EXPECT_CALL(*this, Post(&jetty_, _, _)).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_TRUE(sender_.Send(requests, ids));
+    auto lane = pool_.FindLane(jetty_.jetty_id.id);
+    ASSERT_TRUE(lane);
+    std::array<TxCompletionEvent, 3> events{};
+    EXPECT_CALL(*this, Poll(&tx_, 3, _)).WillOnce([&](auto*, int, auto* out) {
+        out[0] = Completion(ids[0], URMA_CR_ACK_TIMEOUT_ERR);
+        out[1] = Completion(ids[1], URMA_CR_WR_FLUSH_ERR);
+        out[2] = Completion(ids[2], URMA_CR_WR_FLUSH_ERR_DONE);
+        return 3;
+    });
+    auto batch = deferred.Poll(events);
+    ASSERT_TRUE(batch);
+    EXPECT_EQ(batch->retired, 2u);
+    EXPECT_EQ(events[2].kind, TxCompletionKind::kFlushDone);
+    EXPECT_FALSE(events[2].record);
+    EXPECT_EQ(pool_.lane_state(*lane), JettyLaneState::kFaulted);
+    EXPECT_FALSE(pool_.ReserveOn(*lane));
+    EXPECT_FALSE(deferred.Flush(*lane, events));
+
+    // 移交完成后才允许 modify，并立即进入已记住的 flush-ready 阶段；剩余 WR 逐条退休。
+    EXPECT_CALL(*this, Modify(&jetty_, _)).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_TRUE(pool_.BeginDrain(*lane));
+    EXPECT_EQ(pool_.lane_state(*lane), JettyLaneState::kFlushReady);
+    EXPECT_CALL(*this, Flush(&jetty_, 3, _)).WillOnce([&](auto*, int, auto* out) {
+        out[0] = Completion(ids[2], URMA_CR_WR_UNHANDLED);
+        return 1;
+    });
+    ASSERT_TRUE(deferred.Flush(*lane, events));
+    EXPECT_EQ(ledger_.size(), 0u);
+    EXPECT_CALL(*this, Flush(&jetty_, 3, _)).WillOnce(Return(0));
+    ASSERT_TRUE(deferred.Flush(*lane, events));
+    EXPECT_EQ(pool_.lane_state(*lane), JettyLaneState::kDrained);
+}
+
 TEST_F(TxCompletionProcessorTest, DuplicateAndUnknownIdsDoNotDropLaterValidCqes) {
     std::array requests{Request(), Request(2)};
     std::array<AttemptId, 2> ids{};

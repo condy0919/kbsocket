@@ -36,10 +36,12 @@ using ::testing::Return;
 
 class MockQueues {
 public:
+    MOCK_METHOD(urma_jfce_t*, CreateJfce, (urma_context_t*));
     MOCK_METHOD(urma_jfc_t*, CreateJfc, (urma_context_t*, urma_jfc_cfg_t*));
     MOCK_METHOD(urma_jfr_t*, CreateJfr, (urma_context_t*, urma_jfr_cfg_t*));
     MOCK_METHOD(urma_jetty_t*, CreateJetty, (urma_context_t*, urma_jetty_cfg_t*));
     MOCK_METHOD(urma_status_t, DeleteJfc, (urma_jfc_t*));
+    MOCK_METHOD(urma_status_t, DeleteJfce, (urma_jfce_t*));
     MOCK_METHOD(urma_status_t, DeleteJfr, (urma_jfr_t*));
     MOCK_METHOD(urma_status_t, DeleteJetty, (urma_jetty_t*));
     MOCK_METHOD(urma_status_t, Post, (urma_jetty_t*, urma_jfs_wr_t*, urma_jfs_wr_t**));
@@ -73,10 +75,12 @@ public:
 
     UrmaFunctions MockedFunctions() {
         UrmaFunctions f{};
+        f.create_jfce = [](auto* c) { return active_->CreateJfce(c); };
         f.create_jfc = [](auto* c, auto* cfg) { return active_->CreateJfc(c, cfg); };
         f.create_jfr = [](auto* c, auto* cfg) { return active_->CreateJfr(c, cfg); };
         f.create_jetty = [](auto* c, auto* cfg) { return active_->CreateJetty(c, cfg); };
         f.delete_jfc = [](auto* q) { return active_->DeleteJfc(q); };
+        f.delete_jfce = [](auto* q) { return active_->DeleteJfce(q); };
         f.delete_jfr = [](auto* q) { return active_->DeleteJfr(q); };
         f.delete_jetty = [](auto* q) { return active_->DeleteJetty(q); };
         f.poll_jfc = [](auto* q, int n, auto* cr) { return active_->Poll(q, n, cr); };
@@ -87,13 +91,16 @@ public:
     }
 
     void ExpectCreate(int fail = -1, unsigned tx_depth = 128, unsigned rx_depth = 128, unsigned tx_cq_depth = 256,
-                      unsigned priority = 4) {
+                      unsigned priority = 4, bool events = false) {
         ::testing::InSequence order;
+        if (events) {
+            EXPECT_CALL(mock_, CreateJfce(&ctx_)).WillOnce(Return(&jfce_));
+        }
         for (int i = 0; i < 2 && (fail < 0 || i <= fail); ++i) {
             EXPECT_CALL(mock_, CreateJfc(&ctx_, _))
-                .WillOnce([this, i, fail, tx_cq_depth](auto*, auto* cfg) -> urma_jfc_t* {
+                .WillOnce([this, i, fail, tx_cq_depth, events](auto*, auto* cfg) -> urma_jfc_t* {
                     EXPECT_EQ(cfg->depth, i == 0 ? tx_cq_depth : 256u);
-                    EXPECT_EQ(cfg->jfce, nullptr);
+                    EXPECT_EQ(cfg->jfce, events ? &jfce_ : nullptr);
                     EXPECT_EQ(cfg->flag.bs.lock_free, 1u);
                     if (fail == i) {
                         errno = ENOMEM;
@@ -156,7 +163,7 @@ public:
                             });
     }
 
-    void ExpectDelete(int count = 5) {
+    void ExpectDelete(int count = 5, bool events = false) {
         ::testing::InSequence order;
         if (count >= 5) {
             EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
@@ -172,6 +179,9 @@ public:
         }
         if (count >= 1) {
             EXPECT_CALL(mock_, DeleteJfc(&send_)).WillOnce(Return(URMA_SUCCESS));
+        }
+        if (events) {
+            EXPECT_CALL(mock_, DeleteJfce(&jfce_)).WillOnce(Return(URMA_SUCCESS));
         }
     }
 
@@ -195,6 +205,7 @@ protected:
     ::testing::StrictMock<MockQueues> mock_;
     urma_context_t ctx_{};
     urma_device_cap_t cap_{};
+    urma_jfce_t jfce_{};
     urma_jfc_t send_{}, recv_{};
     urma_jfr_t jfr_{};
     urma_jetty_t jetty_{}, passive_{};
@@ -221,6 +232,17 @@ TEST_F(JettyPoolTest, LinksQueuesPollsAndClosesInDependencyOrder) {
     EXPECT_EQ(pool.max_write_size(), cap_.max_write_size);
     EXPECT_EQ(pool.max_send_sge(), 1u);
     EXPECT_EQ(pool.context(), &ctx_);
+    EXPECT_EQ(pool.send_jfc(), &send_);
+    EXPECT_EQ(pool.recv_jfc(), &recv_);
+    EXPECT_EQ(pool.jfce(), nullptr);
+    EXPECT_EQ(pool.rx_depth(), 128u);
+    auto indexed_lane = pool.lane(0);
+    ASSERT_TRUE(indexed_lane);
+    EXPECT_EQ(indexed_lane->pool, lease->lane.pool);
+    EXPECT_EQ(indexed_lane->index, lease->lane.index);
+    EXPECT_EQ(indexed_lane->epoch, lease->lane.epoch);
+    EXPECT_EQ(indexed_lane->generation, lease->lane.generation);
+    EXPECT_FALSE(pool.lane(1));
     auto missing_generation = lease->lane;
     missing_generation.generation = 0;
     EXPECT_FALSE(pool.Get(missing_generation));
@@ -241,9 +263,99 @@ TEST_F(JettyPoolTest, LinksQueuesPollsAndClosesInDependencyOrder) {
     EXPECT_FALSE(pool.rx_target_jetty_id());
     EXPECT_FALSE(pool.IsReceiveJetty(passive_.jetty_id.id));
     EXPECT_EQ(pool.context(), nullptr);
+    EXPECT_EQ(pool.send_jfc(), nullptr);
+    EXPECT_EQ(pool.recv_jfc(), nullptr);
+    EXPECT_FALSE(pool.lane(0));
     EXPECT_FALSE(pool.Reserve());
     EXPECT_FALSE(pool.PollSend(cr));
     EXPECT_TRUE(pool.Close());
+}
+
+TEST_F(JettyPoolTest, EventQueuesShareJfceAndDeleteItAfterBothCompletionQueues) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    JettyPool pool;
+    JettyPoolConfig config;
+    config.events = true;
+    ExpectCreate(-1, 128, 128, 256, 4, true);
+    ASSERT_TRUE(pool.Open(&ctx_, cap_, config));
+    EXPECT_EQ(pool.jfce(), &jfce_);
+    EXPECT_EQ(pool.send_jfc(), &send_);
+    EXPECT_EQ(pool.recv_jfc(), &recv_);
+    ExpectDelete(5, true);
+    ASSERT_TRUE(pool.Close());
+    EXPECT_EQ(pool.jfce(), nullptr);
+    EXPECT_TRUE(pool.Close());
+}
+
+TEST_F(JettyPoolTest, JfceCreationFailureDoesNotCreateOrDeleteDependentQueues) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    JettyPool pool;
+    JettyPoolConfig config;
+    config.events = true;
+    EXPECT_CALL(mock_, CreateJfce(&ctx_)).WillOnce([](auto*) -> urma_jfce_t* {
+        errno = EMFILE;
+        return nullptr;
+    });
+    const auto opened = pool.Open(&ctx_, cap_, config);
+    ASSERT_FALSE(opened);
+    EXPECT_EQ(opened.error().failure.resource, JettyPoolResource::kJfce);
+    EXPECT_EQ(opened.error().failure.provider_error, EMFILE);
+    EXPECT_FALSE(opened.error().cleanup_error);
+    EXPECT_EQ(pool.jfce(), nullptr);
+    EXPECT_EQ(pool.capacity(), 0u);
+    ExpectCreate(-1, 128, 128, 256, 4, true);
+    ASSERT_TRUE(pool.Open(&ctx_, cap_, config));
+    ExpectDelete(5, true);
+    ASSERT_TRUE(pool.Close());
+}
+
+TEST_F(JettyPoolTest, EventModeCreationFailuresRollbackJfceAfterItsDependents) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    JettyPoolConfig config;
+    config.events = true;
+    for (int fail = 0; fail < 5; ++fail) {
+        SCOPED_TRACE(fail);
+        JettyPool pool;
+        ExpectCreate(fail, 128, 128, 256, 4, true);
+        ExpectDelete(fail, true);
+        const auto opened = pool.Open(&ctx_, cap_, config);
+        ASSERT_FALSE(opened);
+        EXPECT_FALSE(opened.error().cleanup_error);
+        EXPECT_EQ(pool.jfce(), nullptr);
+        EXPECT_EQ(pool.send_jfc(), nullptr);
+        EXPECT_EQ(pool.recv_jfc(), nullptr);
+        ExpectCreate(-1, 128, 128, 256, 4, true);
+        ASSERT_TRUE(pool.Open(&ctx_, cap_, config));
+        ExpectDelete(5, true);
+        ASSERT_TRUE(pool.Close());
+    }
+}
+
+TEST_F(JettyPoolTest, FailedJfceRollbackPreservesBothErrorsAndCanRetry) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    JettyPool pool;
+    JettyPoolConfig config;
+    config.events = true;
+    ExpectCreate(1, 128, 128, 256, 4, true);
+    {
+        ::testing::InSequence order;
+        EXPECT_CALL(mock_, DeleteJfc(&send_)).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, DeleteJfce(&jfce_)).WillOnce(Return(URMA_EAGAIN));
+    }
+    const auto opened = pool.Open(&ctx_, cap_, config);
+    ASSERT_FALSE(opened);
+    EXPECT_EQ(opened.error().failure.resource, JettyPoolResource::kRecvJfc);
+    EXPECT_EQ(opened.error().failure.provider_error, ENOMEM);
+    ASSERT_TRUE(opened.error().cleanup_error);
+    EXPECT_EQ(opened.error().cleanup_error->resource, JettyPoolResource::kJfce);
+    EXPECT_EQ(opened.error().cleanup_error->provider_error, URMA_EAGAIN);
+    EXPECT_EQ(pool.jfce(), &jfce_);
+    EXPECT_EQ(pool.send_jfc(), nullptr);
+    EXPECT_EQ(pool.recv_jfc(), nullptr);
+    EXPECT_FALSE(pool.Open(&ctx_, cap_, config));
+    ExpectDelete(0, true);
+    ASSERT_TRUE(pool.Close());
+    EXPECT_EQ(pool.jfce(), nullptr);
 }
 
 TEST_F(JettyPoolTest, EveryCreationFailureRollsBackAndAllowsRetry) {
@@ -380,6 +492,101 @@ TEST_F(JettyPoolTest, DeleteFailureKeepsDataPathIsolatedUntilReopen) {
     ASSERT_TRUE(pool.Cancel(*fresh));
     ExpectDelete();
     ASSERT_TRUE(pool.Close());
+}
+
+TEST_F(JettyPoolTest, EventModeDeletionFailuresRetainJfceUntilBothCqsAreGone) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    JettyPoolConfig config;
+    config.events = true;
+    for (int remaining = 6; remaining > 0; --remaining) {
+        SCOPED_TRACE(remaining);
+        JettyPool pool;
+        ExpectCreate(-1, 128, 128, 256, 4, true);
+        ASSERT_TRUE(pool.Open(&ctx_, cap_, config));
+        {
+            ::testing::InSequence order;
+            EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(remaining == 6 ? URMA_EAGAIN : URMA_SUCCESS));
+            if (remaining < 6) {
+                EXPECT_CALL(mock_, DeleteJetty(&passive_))
+                    .WillOnce(Return(remaining == 5 ? URMA_EAGAIN : URMA_SUCCESS));
+            }
+            if (remaining < 5) {
+                EXPECT_CALL(mock_, DeleteJfr(&jfr_)).WillOnce(Return(remaining == 4 ? URMA_EAGAIN : URMA_SUCCESS));
+            }
+            if (remaining < 4) {
+                EXPECT_CALL(mock_, DeleteJfc(&recv_)).WillOnce(Return(remaining == 3 ? URMA_EAGAIN : URMA_SUCCESS));
+            }
+            if (remaining < 3) {
+                EXPECT_CALL(mock_, DeleteJfc(&send_)).WillOnce(Return(remaining == 2 ? URMA_EAGAIN : URMA_SUCCESS));
+            }
+            if (remaining < 2) {
+                EXPECT_CALL(mock_, DeleteJfce(&jfce_)).WillOnce(Return(URMA_EAGAIN));
+            }
+        }
+        const auto closed = pool.Close();
+        ASSERT_FALSE(closed);
+        EXPECT_EQ(closed.error().provider_error, URMA_EAGAIN);
+        EXPECT_FALSE(pool.ready());
+        EXPECT_EQ(pool.jfce(), &jfce_);
+        if (remaining == 1) {
+            EXPECT_EQ(closed.error().resource, JettyPoolResource::kJfce);
+            EXPECT_EQ(pool.send_jfc(), nullptr);
+            EXPECT_EQ(pool.recv_jfc(), nullptr);
+        }
+        ExpectDelete(remaining - 1, true);
+        ASSERT_TRUE(pool.Close());
+        EXPECT_EQ(pool.jfce(), nullptr);
+        EXPECT_TRUE(pool.Close());
+    }
+}
+
+TEST_F(JettyPoolTest, RetainedDomainPermanentlyBlocksDataControlAndDestructorDeletion) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    ExpectCreate(-1, 128, 128, 256, 4, true);
+    {
+        JettyPool pool;
+        JettyPoolConfig config;
+        config.events = true;
+        ASSERT_TRUE(pool.Open(&ctx_, cap_, config));
+        auto ticket = pool.Reserve();
+        ASSERT_TRUE(ticket);
+        ASSERT_TRUE(pool.Commit(*ticket));
+        pool.RetainDependencies();
+        pool.RetainDependencies();
+        EXPECT_TRUE(pool.retained());
+        EXPECT_FALSE(pool.ready());
+        EXPECT_EQ(pool.available(), 0u);
+        EXPECT_EQ(pool.jfr(), nullptr);
+        EXPECT_EQ(pool.context(), nullptr);
+        EXPECT_FALSE(pool.rx_target_jetty_id());
+        // 已保留的句柄仅供事件归属和 Ack，不授予 post/poll/delete 权限。
+        EXPECT_EQ(pool.jfce(), &jfce_);
+        EXPECT_EQ(pool.send_jfc(), &send_);
+        EXPECT_EQ(pool.recv_jfc(), &recv_);
+        EXPECT_EQ(pool.rx_target_jetty(), &passive_);
+        EXPECT_EQ(pool.lane_jetty(0), &jetty_);
+        EXPECT_EQ(pool.lane_jetty(1), nullptr);
+        EXPECT_FALSE(pool.Reserve());
+        EXPECT_FALSE(pool.ReserveOn(ticket->lane));
+        EXPECT_FALSE(pool.Get(ticket->lane));
+        EXPECT_FALSE(pool.Complete(*ticket));
+        EXPECT_FALSE(pool.MarkFaulted(ticket->lane));
+        EXPECT_FALSE(pool.BeginDrain(ticket->lane));
+        EXPECT_FALSE(pool.ObserveFlushDone(ticket->lane));
+        EXPECT_FALSE(pool.ReplaceDrainedLane(ticket->lane, LaneQuiesced()));
+        EXPECT_FALSE(pool.lane(0));
+        urma_cr_t cr{};
+        EXPECT_FALSE(pool.PollSend(std::span(&cr, 1)));
+        EXPECT_FALSE(pool.PollRecv(std::span(&cr, 1)));
+        EXPECT_FALSE(pool.FlushSend(ticket->lane, std::span(&cr, 1)));
+        auto closed = pool.Close();
+        ASSERT_FALSE(closed);
+        EXPECT_EQ(closed.error().code, JettyPoolErrorCode::kRetained);
+        auto opened = pool.Open(&ctx_, cap_, config);
+        ASSERT_FALSE(opened);
+        EXPECT_EQ(opened.error().failure.code, JettyPoolErrorCode::kRetained);
+        // StrictMock 无任何删除期望，连析构也不得触发 provider 清理。
+    }
 }
 
 TEST_F(JettyPoolTest, SharedSqAcceptsDifferentTargetsBeforeEitherCompletes) {
@@ -800,6 +1007,49 @@ TEST_F(JettyPoolTest, FlushRejectsCountExceedingClampedRequestEvenWhenBufferCanH
     EXPECT_EQ(pool.lane_state(lane), JettyLaneState::kDrained);
     ExpectDelete();
     EXPECT_TRUE(pool.Close());
+}
+
+TEST_F(JettyPoolTest, DeferredFlushBoundarySurvivesModifyFailureButDoesNotAuthorizeEarlyFlush) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    ExpectCreate();
+    JettyPool pool;
+    ASSERT_TRUE(pool.Open(&ctx_, cap_));
+    auto lane = pool.lane(0);
+    ASSERT_TRUE(lane);
+    EXPECT_FALSE(pool.RememberFlushDone(*lane));
+    ASSERT_TRUE(pool.MarkFaulted(*lane));
+    ASSERT_TRUE(pool.RememberFlushDone(*lane));
+    EXPECT_FALSE(pool.RememberFlushDone(*lane));
+    EXPECT_EQ(pool.lane_state(*lane), JettyLaneState::kFaulted);
+    urma_cr_t cr{};
+    EXPECT_FALSE(pool.FlushSend(*lane, std::span(&cr, 1)));
+    EXPECT_CALL(mock_, Modify(&jetty_, _)).WillOnce(Return(URMA_EAGAIN));
+    EXPECT_FALSE(pool.BeginDrain(*lane));
+    EXPECT_EQ(pool.lane_state(*lane), JettyLaneState::kFaulted);
+    EXPECT_FALSE(pool.FlushSend(*lane, std::span(&cr, 1)));
+    EXPECT_CALL(mock_, Modify(&jetty_, _)).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_TRUE(pool.BeginDrain(*lane));
+    EXPECT_EQ(pool.lane_state(*lane), JettyLaneState::kFlushReady);
+    ASSERT_TRUE(pool.BeginDrain(*lane));
+    EXPECT_CALL(mock_, Flush(&jetty_, 1, &cr)).WillOnce(Return(0));
+    ASSERT_EQ(pool.FlushSend(*lane, std::span(&cr, 1)), 0);
+
+    EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(mock_, CreateJetty(&ctx_, _)).WillOnce(Return(&jetty_));
+    const auto replacement = pool.ReplaceDrainedLane(*lane, LaneQuiesced());
+    ASSERT_TRUE(replacement);
+    EXPECT_FALSE(pool.RememberFlushDone(*lane));
+    EXPECT_FALSE(pool.RememberFlushDone(*replacement));
+    EXPECT_CALL(mock_, Modify(&jetty_, _)).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_TRUE(pool.BeginDrain(*replacement));
+    // 新代次不能继承旧边界；仍须等待属于当前对象的 FLUSH_ERR_DONE。
+    EXPECT_EQ(pool.lane_state(*replacement), JettyLaneState::kError);
+    EXPECT_FALSE(pool.FlushSend(*replacement, std::span(&cr, 1)));
+    ASSERT_TRUE(pool.ObserveFlushDone(*replacement));
+    EXPECT_CALL(mock_, Flush(&jetty_, 1, &cr)).WillOnce(Return(0));
+    ASSERT_EQ(pool.FlushSend(*replacement, std::span(&cr, 1)), 0);
+    ExpectDelete();
+    ASSERT_TRUE(pool.Close());
 }
 
 TEST_F(JettyPoolTest, InvalidLimitsNeverCallProvider) {

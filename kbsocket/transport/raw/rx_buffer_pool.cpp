@@ -52,6 +52,9 @@ RxBufferPool::~RxBufferPool() {
 }
 
 std::expected<void, RxBufferError> RxBufferPool::Open(JettyPool& pool, std::uint32_t buffer_count) noexcept {
+    if (pool.retained()) {
+        return Error(RxBufferErrorCode::kRetained);
+    }
     if (pool_ || pool.rx_owner_ || pool.close_owner_) {
         return Error(RxBufferErrorCode::kInUse);
     }
@@ -111,6 +114,9 @@ std::expected<void, RxBufferError> RxBufferPool::Open(JettyPool& pool, std::uint
 }
 
 std::expected<void, RxBufferError> RxBufferPool::Close() noexcept {
+    if (pool_ && pool_->retained()) {
+        return Error(RxBufferErrorCode::kRetained);
+    }
     if (pool_ && pool_->close_owner_) {
         return Error(RxBufferErrorCode::kInUse);
     }
@@ -118,6 +124,9 @@ std::expected<void, RxBufferError> RxBufferPool::Close() noexcept {
 }
 
 std::expected<void, RxBufferError> RxBufferPool::CloseMemory() noexcept {
+    if (pool_ && pool_->retained()) {
+        return Error(RxBufferErrorCode::kRetained);
+    }
     if (posted_ || held_) {
         return Error(RxBufferErrorCode::kInUse);
     }
@@ -142,7 +151,7 @@ std::expected<void, RxBufferError> RxBufferPool::CloseMemory() noexcept {
 
 void RxBufferPool::OnJfrDeleted() noexcept {
     // 此私有入口只接受真实删除结果；失败重试或重复调用不能重复结账。
-    if (!pool_ || pool_->jfr_ || !pool_->close_owner_ || jfr_deleted_) {
+    if (!pool_ || pool_->retained() || pool_->jfr_ || !pool_->close_owner_ || jfr_deleted_) {
         return;
     }
     stopped_ = true;
@@ -165,6 +174,12 @@ void RxBufferPool::Recycle(std::uint32_t index) noexcept {
 
 std::expected<std::size_t, RxBufferError> RxBufferPool::Refill(std::size_t limit) noexcept {
     if (!pool_) {
+        return Error(RxBufferErrorCode::kNotReady);
+    }
+    if (pool_->retained()) {
+        return Error(RxBufferErrorCode::kRetained);
+    }
+    if (!pool_->ready()) {
         return Error(RxBufferErrorCode::kNotReady);
     }
     if (stopped_) {
@@ -220,6 +235,9 @@ std::expected<std::size_t, RxBufferError> RxBufferPool::Refill(std::size_t limit
 }
 
 std::expected<std::size_t, RxBufferError> RxBufferPool::Poll(std::span<RxBufferEvent> events) noexcept {
+    if (pool_ && pool_->retained()) {
+        return Error(RxBufferErrorCode::kRetained);
+    }
     if (!pool_ || jfr_deleted_ || !pool_->ready()) {
         return Error(RxBufferErrorCode::kNotReady);
     }

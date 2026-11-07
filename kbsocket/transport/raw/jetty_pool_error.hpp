@@ -16,6 +16,7 @@ enum class JettyPoolResource : std::uint8_t {
     kJfr,
     kJetty,
     kRxTargetJetty,
+    kJfce,
 };
 
 enum class JettyPoolErrorCode : std::uint8_t {
@@ -34,6 +35,7 @@ enum class JettyPoolErrorCode : std::uint8_t {
     kInvalidState,
     kFlushFailed,
     kStopped,
+    kRetained,
 };
 
 struct JettyPoolFailure {

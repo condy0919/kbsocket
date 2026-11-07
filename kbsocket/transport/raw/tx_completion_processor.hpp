@@ -67,7 +67,9 @@ class TxCompletionProcessor {
 public:
     static constexpr std::size_t kMaxPollBatch = 64;
 
-    explicit TxCompletionProcessor(AttemptLedger& ledger) noexcept : ledger_(ledger) {}
+    /// defer_drain 将同步 ModifyJetty 留给控制执行器，poll 只封禁准入；owner 必须继续安排 BeginDrain。
+    explicit TxCompletionProcessor(AttemptLedger& ledger, bool defer_drain = false) noexcept
+        : ledger_(ledger), defer_drain_(defer_drain) {}
 
     TxCompletionProcessor(const TxCompletionProcessor&) = delete;
     TxCompletionProcessor& operator=(const TxCompletionProcessor&) = delete;
@@ -91,6 +93,7 @@ private:
                               std::optional<JettyLane> flushing_lane = {}) noexcept;
 
     AttemptLedger& ledger_;
+    bool defer_drain_ = false;
     std::array<urma_cr_t, kMaxPollBatch> completions_{};
 };
 } // namespace raw

@@ -27,10 +27,12 @@ using ::testing::StrictMock;
 
 class ReceiveDomainUrmaMock {
 public:
+    MOCK_METHOD(urma_jfce_t*, CreateJfce, (urma_context_t*));
     MOCK_METHOD(urma_jfc_t*, CreateJfc, (urma_context_t*, urma_jfc_cfg_t*));
     MOCK_METHOD(urma_jfr_t*, CreateJfr, (urma_context_t*, urma_jfr_cfg_t*));
     MOCK_METHOD(urma_jetty_t*, CreateJetty, (urma_context_t*, urma_jetty_cfg_t*));
     MOCK_METHOD(urma_status_t, DeleteJfc, (urma_jfc_t*));
+    MOCK_METHOD(urma_status_t, DeleteJfce, (urma_jfce_t*));
     MOCK_METHOD(urma_status_t, DeleteJfr, (urma_jfr_t*));
     MOCK_METHOD(urma_status_t, DeleteJetty, (urma_jetty_t*));
     MOCK_METHOD(urma_target_seg_t*, Register, (urma_context_t*, urma_seg_cfg_t*));
@@ -42,10 +44,12 @@ public:
 
     static UrmaFunctions Functions() {
         UrmaFunctions f{};
+        f.create_jfce = [](auto* c) { return active->CreateJfce(c); };
         f.create_jfc = [](auto* c, auto* cfg) { return active->CreateJfc(c, cfg); };
         f.create_jfr = [](auto* c, auto* cfg) { return active->CreateJfr(c, cfg); };
         f.create_jetty = [](auto* c, auto* cfg) { return active->CreateJetty(c, cfg); };
         f.delete_jfc = [](auto* q) { return active->DeleteJfc(q); };
+        f.delete_jfce = [](auto* q) { return active->DeleteJfce(q); };
         f.delete_jfr = [](auto* q) { return active->DeleteJfr(q); };
         f.delete_jetty = [](auto* q) { return active->DeleteJetty(q); };
         f.register_seg = [](auto* c, auto* cfg) { return active->Register(c, cfg); };
@@ -73,7 +77,7 @@ protected:
         rx_target_.jetty_id.id = 29;
         jetties_[0].jetty_id.id = 19;
         jetties_[1].jetty_id.id = 20;
-        Open();
+        Open(Events());
     }
 
     void TearDown() override {
@@ -86,8 +90,24 @@ protected:
         ReceiveDomainUrmaMock::active = nullptr;
     }
 
-    void Open() {
-        EXPECT_CALL(api_, CreateJfc(&ctx_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
+    virtual bool Events() const noexcept {
+        return false;
+    }
+
+    void Open(bool events = false) {
+        ::testing::InSequence creation;
+        if (events) {
+            EXPECT_CALL(api_, CreateJfce(&ctx_)).WillOnce(Return(&jfce_));
+        }
+        EXPECT_CALL(api_, CreateJfc(&ctx_, _))
+            .WillOnce([&, events](auto*, auto* cfg) {
+                EXPECT_EQ(cfg->jfce, events ? &jfce_ : nullptr);
+                return &tx_;
+            })
+            .WillOnce([&, events](auto*, auto* cfg) {
+                EXPECT_EQ(cfg->jfce, events ? &jfce_ : nullptr);
+                return &rx_;
+            });
         EXPECT_CALL(api_, CreateJfr(&ctx_, _)).WillOnce(Return(&jfr_));
         EXPECT_CALL(api_, CreateJetty(&ctx_, _))
             .WillOnce(Return(&rx_target_))
@@ -106,6 +126,7 @@ protected:
         config.rx_depth = 3;
         config.tx_cq_depth = 9;
         config.rx_cq_depth = 3;
+        config.events = events;
         ASSERT_TRUE(pool_.Open(&ctx_, cap, config));
         ASSERT_TRUE(buffers_.Open(pool_, 5));
     }
@@ -182,6 +203,9 @@ protected:
         case 6:
             EXPECT_CALL(api_, DeleteJfc(&tx_)).InSequence(cleanup_).WillOnce(Return(status));
             break;
+        case 7:
+            EXPECT_CALL(api_, DeleteJfce(&jfce_)).InSequence(cleanup_).WillOnce(Return(status));
+            break;
         default:
             ADD_FAILURE() << "invalid deletion step";
         }
@@ -216,6 +240,7 @@ protected:
     StrictMock<ReceiveDomainUrmaMock> api_;
     test_support::ScopedUrmaOverride scope_{ReceiveDomainUrmaMock::Functions()};
     urma_context_t ctx_{};
+    urma_jfce_t jfce_{};
     urma_jfc_t tx_{}, rx_{};
     urma_jfr_t jfr_{};
     urma_jetty_t rx_target_{};
@@ -466,6 +491,63 @@ TEST_P(ReceiveDomainDeleteRetryTest, FailurePreservesDependenciesAndRetriesOnlyR
 }
 
 INSTANTIATE_TEST_SUITE_P(EachDependency, ReceiveDomainDeleteRetryTest, ::testing::Range(0, 7));
+
+class ReceiveDomainEventCloseTest : public ReceiveDomainCloserTest {
+protected:
+    bool Events() const noexcept override {
+        return true;
+    }
+};
+
+TEST_F(ReceiveDomainEventCloseTest, HeldLeaseAndFailedJfceDeletionPreserveFinalDependencyUntilRetry) {
+    Refill();
+    ASSERT_TRUE(closer_.Begin(pool_, buffers_));
+    ExpectRx({Completion(0)});
+    auto progress = closer_.Advance({}, events_);
+    ASSERT_TRUE(progress);
+    ASSERT_EQ(progress->rx_events, 1u);
+    ASSERT_TRUE(events_[0].lease);
+    const auto lease = *events_[0].lease;
+
+    ExpectRx();
+    ExpectDeleteSteps(0, 4);
+    progress = closer_.Advance(Quiesced(), events_);
+    ASSERT_TRUE(progress);
+    EXPECT_EQ(progress->stage, ReceiveDomainCloseStage::kWaitingForLeases);
+    EXPECT_EQ(progress->retired_rx, 2u);
+    EXPECT_EQ(buffers_.posted(), 0u);
+    EXPECT_EQ(buffers_.held(), 1u);
+    EXPECT_EQ(pool_.recv_jfc(), &rx_);
+    EXPECT_EQ(pool_.send_jfc(), &tx_);
+    EXPECT_EQ(pool_.jfce(), &jfce_);
+    ExpectExclusiveClose();
+    ASSERT_TRUE(buffers_.Release(lease));
+
+    // MR 和两个 CQ 成功删除后，JFCE 删除失败只保留最后一个通知资源。
+    ExpectDeleteSteps(4, 7);
+    ExpectDeleteStep(7, URMA_EAGAIN);
+    progress = closer_.Advance(Quiesced(), events_);
+    ASSERT_FALSE(progress);
+    EXPECT_EQ(progress.error().code, ReceiveDomainCloseErrorCode::kQueueCloseFailed);
+    ASSERT_TRUE(progress.error().queue_error);
+    EXPECT_EQ(progress.error().queue_error->resource, JettyPoolResource::kJfce);
+    EXPECT_EQ(progress.error().queue_error->provider_error, URMA_EAGAIN);
+    EXPECT_EQ(closer_.stage(), ReceiveDomainCloseStage::kDeletingCompletionQueues);
+    EXPECT_EQ(pool_.recv_jfc(), nullptr);
+    EXPECT_EQ(pool_.send_jfc(), nullptr);
+    EXPECT_EQ(pool_.jfce(), &jfce_);
+    EXPECT_EQ(buffers_.pool(), nullptr);
+    EXPECT_FALSE(pool_.Close()); // 仍由协调器独占，不能跳过其最后一步。
+
+    // StrictMock 确保不再 poll、注销 MR 或删除已释放的队列，仅重试 JFCE。
+    ExpectDeleteStep(7);
+    progress = closer_.Advance(Quiesced(), events_);
+    ASSERT_TRUE(progress);
+    EXPECT_EQ(progress->stage, ReceiveDomainCloseStage::kClosed);
+    EXPECT_EQ(progress->retired_rx, 2u);
+    EXPECT_EQ(pool_.jfce(), nullptr);
+    EXPECT_TRUE(closer_.Advance({}, {}));
+}
 
 TEST_F(ReceiveDomainCloserTest, UnknownRxPostBoundaryIsResolvedByActualJfrDeletion) {
     EXPECT_CALL(api_, Post(&jfr_, _, _)).WillOnce([&](auto*, auto* wr, auto**) {

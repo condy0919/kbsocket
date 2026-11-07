@@ -39,6 +39,8 @@ struct JettyPoolConfig {
     std::uint8_t send_sge = 1;
     /// 单个发送 WR 支持的最大内联（inline）数据字节数；为 0 表示遵循 URMA 约定使用设备默认值，并非禁用。
     std::uint32_t inline_bytes = 0;
+    /// 创建并拥有 JFCE，两个 JFC 共用其通知通道；默认纯轮询，不创建事件资源。
+    bool events = false;
 };
 
 class JettyPool;
@@ -119,6 +121,13 @@ public:
     /// 若仍绑定 RX buffer 池、有票据或尚未完成 ERROR 排空，返回 `kInUse` 并保持轮询可用；删除失败保留句柄供重试。
     std::expected<void, JettyPoolFailure> Close() noexcept;
 
+    /// 永久隔离整个 CQ 依赖域，禁止 post/poll、替换及删除；只能保留依赖至进程退出。
+    /// 不是故障恢复；调用方仍须让池、RX 内存、账本、context 和事件引用一起存活。
+    void RetainDependencies() noexcept;
+    bool retained() const noexcept {
+        return retained_;
+    }
+
     /// 轮询发送完成队列（Send JFC），由调用方传入预分配的完成条目缓冲区（零动态分配）。
     std::expected<int, JettyPoolFailure> PollSend(std::span<urma_cr_t> completions) noexcept;
 
@@ -128,6 +137,29 @@ public:
     /// 获取共享接收队列（JFR）句柄，供调用方投递 Recv WR；未初始化或未就绪时返回 nullptr。
     urma_jfr_t* jfr() const noexcept {
         return ready_ ? jfr_ : nullptr;
+    }
+
+    /// 只借用句柄供通知 Get/Ack 和事件对象归属检查，不授予绕过池状态 post/poll/delete 的权限。
+    /// 隔离后仍返回保留的对象以确认事件；句柄只在真实删除成功后置空，使用者须遵守 owner 交接。
+    urma_jfc_t* send_jfc() const noexcept {
+        return send_jfc_;
+    }
+    urma_jfc_t* recv_jfc() const noexcept {
+        return recv_jfc_;
+    }
+    urma_jfce_t* jfce() const noexcept {
+        return jfce_;
+    }
+    urma_jetty_t* rx_target_jetty() const noexcept {
+        return rx_target_jetty_;
+    }
+    /// 只用于事件指针匹配，不授予发送权；替换中的旧对象不再参与路由。
+    urma_jetty_t* lane_jetty(std::uint32_t index) const noexcept {
+        return index < slots_.size() && slots_[index].state != JettyLaneState::kReplacing ? slots_[index].jetty
+                                                                                          : nullptr;
+    }
+    std::uint32_t rx_depth() const noexcept {
+        return rx_depth_;
     }
 
     /// 导出完整的固定被动接收端点身份，主动 Lane 替换不会改变它。
@@ -179,6 +211,10 @@ public:
     /// 边界不对应 WR；不读取 user_ctx，也不归还票据。
     std::expected<void, JettyPoolFailure> ObserveFlushDone(JettyLane lane) noexcept;
 
+    /// 数据面已隔离但同步 modify 尚未执行时，保存真实边界；仍须 BeginDrain 成功才允许软件 flush。
+    /// 仅接受 kFaulted 的当前代次，重复边界拒绝，不改变 Lane 状态。
+    std::expected<void, JettyPoolFailure> RememberFlushDone(JettyLane lane) noexcept;
+
     /// 仅在边界之后调用软件 flush；返回的 WR_UNHANDLED 仍须逐条核验并退休。
     /// 实际请求数量同时受输出缓冲和创建时的 TX 深度限制，不能直接复用共享 CQ 的 poll 数量。
     /// 返回 0 且该 SQ 无残留票据才进入 kDrained；残留票据返回 kInUse，禁止推测释放。
@@ -191,6 +227,10 @@ public:
                                                                   const JettyLaneQuiescence& quiescence) noexcept;
 
     std::expected<JettyLaneState, JettyPoolFailure> lane_state(JettyLane lane) const noexcept;
+
+    /// 取得指定主动槽位的当前完整身份（包括排空/替换中的槽位），供 owner 有界轮转推进。
+    /// 不授予发送权限；未就绪或索引越界返回错误。
+    std::expected<JettyLane, JettyPoolFailure> lane(std::uint32_t index) const noexcept;
 
     /// 用 TX CQE 的本地 jetty id 查找当前通道，包括已隔离但仍需排空的 SQ。
     /// 不授予发送权限；未知 id 返回 kInvalidLane。
@@ -234,6 +274,7 @@ private:
         std::uint32_t used = 0;
         std::uint64_t generation = 1;
         JettyLaneState state = JettyLaneState::kReady;
+        bool deferred_flush_done = false;
     };
 
     std::expected<Slot*, JettyPoolFailure> Find(JettyLane lane) noexcept;
@@ -259,6 +300,7 @@ private:
     ReceiveDomainCloser* close_owner_ = nullptr;
     urma_context_t* ctx_ = nullptr;
     std::uint32_t rx_depth_ = 0;
+    urma_jfce_t* jfce_ = nullptr;
     urma_jfc_t* send_jfc_ = nullptr;
     urma_jfc_t* recv_jfc_ = nullptr;
     urma_jfr_t* jfr_ = nullptr;
@@ -274,6 +316,8 @@ private:
     std::uint8_t max_send_sge_ = 0;
     bool ready_ = false;
     bool admission_stopped_ = false;
+    // 一经保留不可复位，包含 Open/Close 和析构兜底在内均不得再删除依赖。
+    bool retained_ = false;
 };
 } // namespace raw
 } // namespace kbsocket

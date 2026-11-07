@@ -66,15 +66,17 @@ public:
         ASSERT_TRUE(buffers_.Open(pool_, 5));
     }
 
-    void OpenPool(std::uint32_t depth) {
+    void OpenPool(std::uint32_t depth, bool expect_cleanup = true) {
         EXPECT_CALL(*this, CreateJfc(_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
         EXPECT_CALL(*this, CreateJfr(_, _)).WillOnce(Return(&jfr_));
         EXPECT_CALL(*this, CreateJetty(_, _)).WillOnce(Return(&rx_target_)).WillOnce(Return(&jetty_));
-        EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
-        EXPECT_CALL(*this, DeleteJetty(&rx_target_)).WillOnce(Return(URMA_SUCCESS));
-        EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
-        EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
-        EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
+        if (expect_cleanup) {
+            EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+            EXPECT_CALL(*this, DeleteJetty(&rx_target_)).WillOnce(Return(URMA_SUCCESS));
+            EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
+            EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
+            EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
+        }
         urma_device_cap_t cap{};
         cap.trans_mode = URMA_TM_RM;
         cap.rm_tp_cap.bs.ctp = 1;
@@ -167,6 +169,7 @@ protected:
 };
 
 TEST_F(RxBufferPoolTest, HeldBufferIsNotRepostedAndMetadataSurvives) {
+    EXPECT_EQ(buffers_.pool(), &pool_);
     Refill();
     const auto first_batch = posted_;
     EXPECT_EQ(buffers_.posted(), 3u);
@@ -425,6 +428,60 @@ TEST_F(RxBufferPoolTest, FixedBatchLimitAndPollBudget) {
     EXPECT_CALL(*this, Poll(&rx_, 64, _)).WillOnce(Return(0));
     EXPECT_EQ(*buffers_.Poll(events), 0u);
     Retire(posted_);
+}
+
+TEST_F(RxBufferPoolTest, RetainedDomainAllowsLeaseReleaseButNeverUnregistersEvenWhenEmpty) {
+    // 永久保留通过子进程验证，避免有意保留的 DMA slab 污染父进程和泄漏检查。
+    ASSERT_TRUE(buffers_.Close());
+    EXPECT_EQ(buffers_.pool(), nullptr);
+    ASSERT_TRUE(pool_.Close());
+    EXPECT_EXIT(
+        {
+            OpenPool(3, false);
+            ASSERT_TRUE(buffers_.Open(pool_, 5));
+            Refill(1);
+            const auto completion = Completion(posted_[0].id);
+            auto events = Complete(std::span(&completion, 1));
+            ASSERT_TRUE(events[0].lease);
+            ASSERT_EQ(buffers_.posted(), 0u);
+            ASSERT_EQ(buffers_.held(), 1u);
+            EXPECT_CALL(*this, Unregister(_)).Times(0);
+            EXPECT_CALL(*this, DeleteJetty(_)).Times(0);
+            EXPECT_CALL(*this, DeleteJfr(_)).Times(0);
+            EXPECT_CALL(*this, DeleteJfc(_)).Times(0);
+            EXPECT_CALL(*this, Post(_, _, _)).Times(0);
+            EXPECT_CALL(*this, Poll(_, _, _)).Times(0);
+            pool_.RetainDependencies();
+            EXPECT_TRUE(buffers_.stopped());
+            EXPECT_EQ(buffers_.pool(), &pool_);
+            const auto refill = buffers_.Refill(1);
+            ASSERT_FALSE(refill);
+            EXPECT_EQ(refill.error().code, RxBufferErrorCode::kRetained);
+            RxBufferEvent event{};
+            const auto polled = buffers_.Poll(std::span(&event, 1));
+            ASSERT_FALSE(polled);
+            EXPECT_EQ(polled.error().code, RxBufferErrorCode::kRetained);
+            EXPECT_TRUE(buffers_.Release(*events[0].lease));
+            EXPECT_FALSE(buffers_.Release(*events[0].lease));
+            EXPECT_EQ(buffers_.held(), 0u);
+            EXPECT_EQ(buffers_.posted(), 0u);
+            const auto closed = buffers_.Close();
+            ASSERT_FALSE(closed);
+            EXPECT_EQ(closed.error().code, RxBufferErrorCode::kRetained);
+            EXPECT_EQ(buffers_.capacity(), 5u);
+            EXPECT_EQ(buffers_.pool(), &pool_);
+            RxBufferPool another;
+            const auto opened = another.Open(pool_);
+            ASSERT_FALSE(opened);
+            EXPECT_EQ(opened.error().code, RxBufferErrorCode::kRetained);
+            EXPECT_FALSE(pool_.Close());
+            // 连析构兜底也不得释放保留域；随后立即退出，不再访问已析构成员。
+            buffers_.~RxBufferPool();
+            pool_.~JettyPool();
+            const bool verified = ::testing::Mock::VerifyAndClearExpectations(this);
+            ::_exit(verified && !::testing::Test::HasFailure() ? 0 : 1);
+        },
+        ::testing::ExitedWithCode(0), "");
 }
 } // namespace
 } // namespace raw

@@ -130,7 +130,10 @@ TxCompletionEvent TxCompletionProcessor::Process(JettyPool& pool, const urma_cr_
         // 无 user_ctx 的边界只能配合本地排空状态消费，不提供新代次故障证据。
         // 替换前的旧边界清理仍依赖 ReplaceDrainedLane 的显式事件/队列屏障。
         if (cr.status == URMA_CR_WR_FLUSH_ERR_DONE) {
-            auto observed = pool.ObserveFlushDone(*lane);
+            const auto state = pool.lane_state(*lane);
+            // 已隔离的同代 SQ 可能在控制线程切 ERROR 前交付边界，先保存证据，不能提前软件 flush。
+            auto observed = defer_drain_ && state && *state == JettyLaneState::kFaulted ? pool.RememberFlushDone(*lane)
+                                                                                        : pool.ObserveFlushDone(*lane);
             if (!observed) {
                 event.error =
                     TxCompletionError{.code = TxCompletionErrorCode::kPoolFailure, .pool_error = observed.error()};
@@ -171,7 +174,7 @@ TxCompletionEvent TxCompletionProcessor::Process(JettyPool& pool, const urma_cr_
             // 真实 FLUSH_ERR 也可能先于本地 ERROR 转换到达，仍须隔离并退休，不能丢失终结证据。
             // BeginDrain 对 Error/FlushReady 幂等，不重复 modify 或回退已取得的边界。
             // modify 失败仍保留当前 WR 的退休记录，控制路径错误与终结证据同时返回。
-            auto fault = pool.BeginDrain(*lane);
+            auto fault = defer_drain_ ? pool.MarkFaulted(*lane) : pool.BeginDrain(*lane);
             if (!fault) {
                 event.error = TxCompletionError{
                     .code = TxCompletionErrorCode::kPoolFailure,

@@ -57,7 +57,7 @@ ReceiveDomainCloser::Advance(const ReceiveDomainQuiescence& quiescence, std::spa
         if (!polled) {
             // 无法可信读取 CQ 时不能以删除协议猜测终结，也不能重入正常 polling。
             poll_error_ = polled.error();
-            pool_->ready_ = false;
+            pool_->RetainDependencies();
             buffers_->Stop();
             stage_ = ReceiveDomainCloseStage::kRetained;
             return std::unexpected(

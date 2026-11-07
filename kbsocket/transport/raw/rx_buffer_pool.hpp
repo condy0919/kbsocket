@@ -33,6 +33,7 @@ enum class RxBufferErrorCode : std::uint8_t {
     kUnexpectedCompletion,
     kInvalidLease,
     kReceiveFailed,
+    kRetained,
 };
 
 struct RxBufferError {
@@ -92,6 +93,10 @@ public:
     std::size_t capacity() const noexcept {
         return entries_.size();
     }
+    /// 借用绑定的队列池，供同 owner 校验接收域归属；成功关闭后返回 nullptr。
+    JettyPool* pool() const noexcept {
+        return pool_;
+    }
     std::size_t posted() const noexcept {
         return posted_;
     }
@@ -102,7 +107,7 @@ public:
         return capacity() - posted_ - held_;
     }
     bool stopped() const noexcept {
-        return stopped_;
+        return stopped_ || (pool_ && pool_->retained());
     }
     /// 本次 Open 中由成功 DeleteJfr 终结的残留 RX；不计作成功接收，也不产生 lease。
     std::size_t retired_on_delete() const noexcept {
