@@ -2,7 +2,7 @@
 
 `RuntimeShard` 将已经创建的 raw context、队列池、RX 缓冲池和 TX 账本绑定到一个 owner，统一推进收发、补投、事件和慢控制任务。它拥有反应堆与控制执行器，借用全部 URMA/DMA 对象；`Open` 不负责创建连接、分配 Grant、授信或创建完整 raw runtime。
 
-M5.3.9 的 [RawDomain](raw-domain.md) 可创建并拥有这些单接收域资源，`Bind(ConnectionProgress&)` 返回完整 RawQueueBinding。RuntimeShard 的借用语义不变，关闭调度器不关闭域或 context；宿主在任务收割、独立责任收敛及进度解绑后调用 RawDomain::AdvanceClose。
+M5.3.9 的 [RawDomain](raw-domain.md) 可创建并拥有这些单接收域资源，`Bind(ConnectionProgress&)` 返回完整 RawQueueBinding。RuntimeShard 的借用语义不变，关闭调度器不关闭域或 context；宿主在任务收割、独立责任收敛及进度解绑后调用 RawDomain::AdvanceClose。 M5.3.10 的 [RawStack](raw-stack.md) 将最多四个域、context/session、共享 Slab/import 及 companion 合为稳定所有者，负责装配与关闭次序；其 BeginClose 保留控制调度，直到 unimport 完成后才调用 RuntimeShard::Close。
 
 本实现对应 [roadmap M3](roadmap.md#m3runtimeshard-反应堆4-context-轮询与异步事件引擎)。M4.1 已通过可选 hooks 接入 [LeaseReturnProgress](memory-leases.md)，负责注册 Slab 的跨线程 CPU Lease 归还；M5.2 已提供 [Eager Connection](eager-connection.md) 与物理 Credit 接线；M5.3.1 已通过 [连接 Runtime](connection-runtime.md) 接通 context 暂停组、连接进度、导入和动态 fd；自动资源创建、完整 MemoryManager 和 WRITE RNDV 仍按后续阶段交付。当前无 UB 真机回归，也未据 Mock 结果新增硬件 PASS。
 

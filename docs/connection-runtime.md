@@ -1,6 +1,6 @@
 # M5.3：连接 Runtime 与主动 Lane 来源协商
 
-本阶段将 Connection、raw 队列、导入缓存和 RX 来源表接入同一个 `RuntimeShard`。owner 通过 `Tick`/`RunOnce` 推进 HELLO/READY、导入、TX/RX、物理补投、累计 Credit 和 FIN。M5.3.2 通过 HELLO 交换主动 Lane，并在 READY 前自动登记 RX 来源；M5.3.3 增加在线 Lane 公告与确认；M5.3.4 用 `ConnectionOwner` 统一拥有连接对象及其来源适配器，提供有界建链与读写入口。M5.3.5 增加 `ConnectionMailbox`，把业务线程的读写等命令交给唯一 owner。M5.3.7–8 提供 [Peer 授信撤回协调器及其 Runtime 调度](peer-credit-control.md)。M5.3.9 的 [RawDomain](raw-domain.md) 拥有单接收域资源并协调物理关闭及元数据清退；context、Slab、导入及入口认证仍由宿主负责，当前尚未形成完整 Runtime 工厂或稳定应用 ABI。
+本阶段将 Connection、raw 队列、导入缓存和 RX 来源表接入同一个 `RuntimeShard`。owner 通过 `Tick`/`RunOnce` 推进 HELLO/READY、导入、TX/RX、物理补投、累计 Credit 和 FIN。M5.3.2 通过 HELLO 交换主动 Lane，并在 READY 前自动登记 RX 来源；M5.3.3 增加在线 Lane 公告与确认；M5.3.4 用 `ConnectionOwner` 统一拥有连接对象及其来源适配器，提供有界建链与读写入口。M5.3.5 增加 `ConnectionMailbox`，把业务线程的读写等命令交给唯一 owner。M5.3.7–8 提供 [Peer 授信撤回协调器及其 Runtime 调度](peer-credit-control.md)。M5.3.9 的 [RawDomain](raw-domain.md) 拥有单接收域资源并协调物理关闭及元数据清退；M5.3.10 的 [RawStack](raw-stack.md) 再汇总 context/会话、共享 Slab/import 和每域连接/调度资源。入口认证与独立静默证明仍由宿主负责，应用 ABI 尚未稳定。
 
 ## 组件与暂停范围
 
@@ -153,4 +153,4 @@ M5.3.5 增加并发提交/领取、完成背压、有限预算、缓冲复制、
 
 M5.3.9 已交付 RawDomain 单域所有者。Runtime 解绑后，`ConnectionIoBinding::Close(true)` 从 ConnectionProgress 的固定补投数组移除本域再清除借用；未停止回调时拒绝，不分配、不调用 provider。ConnectionProgress 可先 Close，但对象必须存活且不得重开，直到桥接解绑。单独使用桥接的宿主也须遵守这一顺序。
 
-下一阶段继续补多 context 顶层装配及 Slab/导入/ConnectionOwner 的关闭编排，再收口显式 C ABI 和零拷贝接口。宿主仍须组织静默、来源退休与进度解绑，不能通过 ConnectionOwner 析构或授信 ACK 推断物理资源可释放。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。
+M5.3.10 的 RawStack 已补齐最多四 context 顶层装配及 Slab/导入/ConnectionOwner 的关闭门禁。BeginClose 保留 Runtime 控制调度到 unimport 等责任收敛，再逐域关闭。下一阶段收口显式应用 API 和零拷贝接口。宿主仍须组织静默、来源退休与进度解绑，不能通过 ConnectionOwner 析构或授信 ACK 推断物理资源可释放。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。

@@ -1,6 +1,6 @@
 # M5.3.9：raw 接收域资源所有权
 
-[`RawDomain`](../kbsocket/runtime/raw_domain.hpp) 在控制路径创建并拥有一个 raw 接收域，统一管理队列、RX 注册内存、TX 账本、接收授信、路由与来源表，并把真实物理关闭和 Eager 元数据清退接起来。`RuntimeShard` 仍只借用这些对象推进；context/provider、Slab、导入缓存、逻辑连接、Peer 发送账本和撤回调度器由宿主拥有。
+[`RawDomain`](../kbsocket/runtime/raw_domain.hpp) 在控制路径创建并拥有一个 raw 接收域，统一管理队列、RX 注册内存、TX 账本、接收授信、路由与来源表，并把真实物理关闭和 Eager 元数据清退接起来。`RuntimeShard` 仍只借用这些对象推进。M5.3.10 的 [RawStack](raw-stack.md) 可进一步拥有 context/会话、共享 Slab/import、逻辑连接和撤回调度器；独立使用 RawDomain 时这些依赖仍由宿主拥有，Peer 发送账本与 provider 加载责任继续由宿主管理。
 
 ## 创建与接线
 
@@ -50,4 +50,4 @@ DeleteJetty/DeleteJfr/UnregisterSeg/删除完成队列失败均保留当前阶�
 
 故障 CQ 或不可信终结证据进入 `kRetained`，不提供强制清零、在线回收或恢复。未成功 Closed 就析构时保留整份 State，避免分别析构成员破坏 DMA 依赖；这不是正常关闭，也不接管外部 context/provider、Slab、导入或回调借用者。宿主必须维持所有相关外部依赖。
 
-本次 Mock 验证覆盖初始批次/部分和未知接受、创建及回滚失败、Runtime 接线、TX/来源/路由/撤回门禁、迟到 RX、Held 和删除/注销重试。多 context 顶层工厂、外部资源关闭编排及应用 C ABI 继续留给后续阶段；UB 真机与 40k 验收未执行。
+本次 Mock 验证覆盖初始批次/部分和未知接受、创建及回滚失败、Runtime 接线、TX/来源/路由/撤回门禁、迟到 RX、Held 和删除/注销重试。M5.3.10 已在 RawStack 汇总多 context 和共享资源的关闭门禁；应用 C ABI 留给后续阶段。UB 真机与 40k 验收未执行。

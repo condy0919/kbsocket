@@ -77,11 +77,12 @@ public:
         });
         EXPECT_CALL(mock_, FreeDevices(pointers_));
         for (int i = 0; i < 4; ++i) {
-            EXPECT_CALL(mock_, Query(&devices_[i], _)).WillOnce([](auto*, auto* attr) {
+            EXPECT_CALL(mock_, Query(&devices_[i], _)).WillOnce([i](auto*, auto* attr) {
                 *attr = {};
                 attr->dev_cap.trans_mode = URMA_TM_RM;
                 attr->dev_cap.rm_tp_cap.bs.ctp = 1;
                 attr->dev_cap.max_eid_cnt = 256;
+                attr->dev_cap.max_jfs_depth = 64 * (i + 1);
                 return URMA_SUCCESS;
             });
             EXPECT_CALL(mock_, Eids(&devices_[i], _)).WillOnce([this, i](auto*, auto* n) {
@@ -108,11 +109,12 @@ public:
         // 配置先出现 raw1，再出现 raw0；能力和 EID 查询应保持首次出现顺序，且每个设备仅查询一次。
         // raw1 的两个 EID 共用一份列表，后续创建顺序由配置决定，不受列表中的 EID 排序影响。
         for (int device : {1, 0}) {
-            EXPECT_CALL(mock_, Query(&devices_[device], _)).WillOnce([](auto*, auto* attr) {
+            EXPECT_CALL(mock_, Query(&devices_[device], _)).WillOnce([device](auto*, auto* attr) {
                 *attr = {};
                 attr->dev_cap.trans_mode = URMA_TM_RM;
                 attr->dev_cap.rm_tp_cap.bs.ctp = 1;
                 attr->dev_cap.max_eid_cnt = 256;
+                attr->dev_cap.max_jfs_depth = 64 * (device + 1);
                 return URMA_SUCCESS;
             });
             auto* first_eid = &eids_[device == 1 ? 0 : 2];
@@ -205,13 +207,20 @@ TEST_F(RawRuntimeTest, FourContextsPublishTogetherAndCloseInReverseOrder) {
     ExpectCloseAll();
     RawRuntime runtime;
     // 验证多设备端点原子发布与边界保护。
+    EXPECT_EQ(runtime.capabilities(0), nullptr);
     ASSERT_TRUE(runtime.Initialize(configs_));
     EXPECT_TRUE(runtime.ready());
     ASSERT_EQ(runtime.context_count(), 4u);
     for (int i = 0; i < 4; ++i) {
         EXPECT_EQ(runtime.context(i), &contexts_[i]);
+        // 不同设备的能力值必须跟随完整端点索引；重复查询复用快照，不额外触发 QueryDevice。
+        const auto* capabilities = runtime.capabilities(i);
+        ASSERT_NE(capabilities, nullptr);
+        EXPECT_EQ(capabilities->max_jfs_depth, 64u * (i + 1));
+        EXPECT_EQ(runtime.capabilities(i), capabilities);
     }
     EXPECT_EQ(runtime.context(4), nullptr);
+    EXPECT_EQ(runtime.capabilities(4), nullptr);
 
     // 验证进程级排他性：同一进程不能启动第二个活跃会话，防止重新枚举使已有的设备指针悬挂失效。
     RawRuntime other;
@@ -222,6 +231,7 @@ TEST_F(RawRuntimeTest, FourContextsPublishTogetherAndCloseInReverseOrder) {
     // 验证关闭状态与幂等性：关闭后句柄置空，重复 Close 安全成功。
     ASSERT_TRUE(runtime.Close());
     EXPECT_EQ(runtime.context(0), nullptr);
+    EXPECT_EQ(runtime.capabilities(0), nullptr);
     EXPECT_TRUE(runtime.Close());
 }
 
@@ -249,7 +259,15 @@ TEST_F(RawRuntimeTest, SharedDeviceEidsUseOneSnapshotAndKeepConfigOrder) {
     EXPECT_EQ(runtime.context(1), &contexts_[2]);
     EXPECT_EQ(runtime.context(2), &contexts_[0]);
     EXPECT_EQ(runtime.context(3), nullptr);
+    // 端点顺序是 raw1/raw0/raw1，能力不能误按目录的物理设备下标读取。
+    ASSERT_NE(runtime.capabilities(0), nullptr);
+    ASSERT_NE(runtime.capabilities(1), nullptr);
+    EXPECT_EQ(runtime.capabilities(0)->max_jfs_depth, 128u);
+    EXPECT_EQ(runtime.capabilities(1)->max_jfs_depth, 64u);
+    EXPECT_EQ(runtime.capabilities(2), runtime.capabilities(0));
+    EXPECT_EQ(runtime.capabilities(3), nullptr);
     EXPECT_TRUE(runtime.Close());
+    EXPECT_EQ(runtime.capabilities(0), nullptr);
 }
 
 TEST_F(RawRuntimeTest, SharedDeviceCreateFailureRollsBackAndAllowsRetry) {
@@ -280,6 +298,9 @@ TEST_F(RawRuntimeTest, SharedDeviceCreateFailureRollsBackAndAllowsRetry) {
     EXPECT_FALSE(runtime.ready());
     EXPECT_EQ(runtime.context_count(), 0u);
     EXPECT_EQ(runtime.context(0), nullptr);
+    // 前缀端点已有能力映射也不能在创建失败后公开。
+    EXPECT_EQ(runtime.capabilities(0), nullptr);
+    EXPECT_EQ(runtime.capabilities(2), nullptr);
     ASSERT_TRUE(::testing::Mock::VerifyAndClearExpectations(&mock_));
 
     // 彻底回滚后重新查询每个设备一次，并重新创建全部端点，验证独占标记与部分 context 均已释放。
@@ -296,6 +317,8 @@ TEST_F(RawRuntimeTest, SharedDeviceCreateFailureRollsBackAndAllowsRetry) {
     }
     ASSERT_TRUE(runtime.Initialize(configs));
     EXPECT_EQ(runtime.context_count(), 3u);
+    ASSERT_NE(runtime.capabilities(2), nullptr);
+    EXPECT_EQ(runtime.capabilities(2)->max_jfs_depth, 128u);
     EXPECT_TRUE(runtime.Close());
 }
 
@@ -343,6 +366,8 @@ TEST_F(RawRuntimeTest, ThirdCreateFailureRollsBackAndAllowsRetry) {
     EXPECT_FALSE(runtime.ready());
     EXPECT_EQ(runtime.context(0), nullptr);
 
+    EXPECT_EQ(runtime.capabilities(0), nullptr);
+
     // 验证回滚可恢复性：彻底回滚后状态干净，同一对象能够重新初始化完整会话。
     ExpectDiscovery();
     ExpectCreateAll();
@@ -373,6 +398,8 @@ TEST_F(RawRuntimeTest, RollbackFailureRetainsHandlesAndBothErrors) {
     EXPECT_EQ(failed.error().cleanup_error->device_index, 1u);
     EXPECT_EQ(failed.error().cleanup_error->provider_error, URMA_EAGAIN);
     EXPECT_EQ(runtime.context(0), nullptr);
+    // 回滚失败时仍持有底层对象，但能力与 context 一样不得发布给新的借用者。
+    EXPECT_EQ(runtime.capabilities(0), nullptr);
 
     // 验证句柄保留与防重入：由于回滚清理未彻底完成，runtime 必须继续锁定占有权，禁止重复初始化以防句柄泄漏。
     auto blocked = runtime.Initialize(configs_);
@@ -406,6 +433,8 @@ TEST_F(RawRuntimeTest, CloseFailureDoesNotDeleteSuccessfulContextTwice) {
     ASSERT_FALSE(failed);
     EXPECT_EQ(failed.error().device_index, 2u);
     EXPECT_FALSE(runtime.ready());
+    EXPECT_EQ(runtime.capabilities(0), nullptr);
+    EXPECT_EQ(runtime.capabilities(3), nullptr);
 
     // 验证防二次释放（Double Free）：重试 Close() 时，已删除成功的 context[3] 绝不能被再次调用，
     // 严格从此前失败的 context[2] 继续往前删除，直到最终结束会话。

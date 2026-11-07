@@ -83,4 +83,4 @@ M5.3.9 的 [RawDomain](raw-domain.md) 提供单域资源所有权。BeginClose �
 
 控制帧及协调器已通过 Mock 账本、非阻塞 socketpair 和本地 IPv4 TCP 验证。协调器 30 项测试涵盖停止/计数/迟到 RX/超时/身份、发送背压与最终 ACK/EOF 竞态；与真实 Mock RxBufferPool/EagerReceiveDomain 的组合还验证了 Held 归还、实际 refill 和独立 M1 关闭的顺序。完整回归结果见 [roadmap](roadmap.md)。这些测试不构成 UB 真机观测。
 
-M5.3.8 的调度验证覆盖 fd 接管回滚、容量与代次、定时结账、独立 Peer 失败、终态绑定和暂停屏障；完整结果见 roadmap。M5.3.9 已有单域资源所有者，建立/认证专用连接、整个 Peer 生命周期及跨域关闭编排仍待后续，不实现透明重连、业务重放、RMA Grant 撤销或故障 CQ 在线恢复。
+M5.3.8 的调度验证覆盖 fd 接管回滚、容量与代次、定时结账、独立 Peer 失败、终态绑定和暂停屏障；完整结果见 roadmap。M5.3.9–10 已有单域和多 context 资源所有者，跨域关闭须等待全部撤回槽释放；建立/认证专用连接与整个 Peer 生命周期仍由宿主驱动，不实现透明重连、业务重放、RMA Grant 撤销或故障 CQ 在线恢复。

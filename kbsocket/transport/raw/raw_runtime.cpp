@@ -89,6 +89,7 @@ std::expected<void, RuntimeError> RawRuntime::Initialize(const std::vector<Devic
         std::vector<std::string> names;
         names.reserve(devices.size());
         contexts_.reserve(devices.size());
+        capabilities_.reserve(devices.size());
         for (const auto& device : devices) {
             // 同一设备的多个端点共用目录快照，只查询一次设备能力和 EID 列表。
             // 白名单保留设备首次出现的顺序，context 则与完整配置逐项对应。
@@ -130,6 +131,16 @@ std::expected<void, RuntimeError> RawRuntime::Initialize(const std::vector<Devic
                 });
             }
             endpoints.push_back(*endpoint);
+            const auto& records = catalog_->devices();
+            const auto record = std::ranges::find(records, endpoint->device, &DeviceRecord::device);
+            if (record == records.end()) {
+                return Rollback({
+                    .code = RuntimeErrorCode::kCatalogFailed,
+                    .device_index = i,
+                    .catalog_error = CatalogError{CatalogErrorCode::kInvalidProviderData},
+                });
+            }
+            capabilities_.push_back(&record->attributes.dev_cap);
         }
 
         // 阶段二：所有端点确认就绪后再依次打开 context；任一打开失败立即中止并触发回滚。
@@ -172,6 +183,7 @@ std::expected<void, RuntimeCloseError> RawRuntime::Close() noexcept {
     }
 
     contexts_.clear();
+    capabilities_.clear();
     catalog_.reset();
     auto status = URMA_SUCCESS;
     if (initialized_) {

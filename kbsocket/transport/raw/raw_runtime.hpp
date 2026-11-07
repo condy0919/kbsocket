@@ -55,10 +55,10 @@ struct RuntimeError {
     std::size_t device_index = 0;
     // 底层 URMA 状态码（如 urma_init 失败时）。
     int provider_error = 0;
-    std::optional<CatalogError> catalog_error;
-    std::optional<ContextError> context_error;
+    std::optional<CatalogError> catalog_error = std::nullopt;
+    std::optional<ContextError> context_error = std::nullopt;
     // 初始化失败触发回滚时，若清理过程中亦发生错误，在此记录回滚错误，避免覆盖最初的失败根因。
-    std::optional<RuntimeCloseError> cleanup_error;
+    std::optional<RuntimeCloseError> cleanup_error = std::nullopt;
 };
 
 /// 单个 URMA 会话的核心所有者，管理设备目录及按配置顺序创建的端点 context。
@@ -105,11 +105,19 @@ public:
         return ready_ && index < contexts_.size() ? contexts_[index]->get() : nullptr;
     }
 
+    /// 借用指定端点所属设备的初始化能力快照；按完整配置顺序索引，同设备的多个 EID 共用快照。
+    /// 查询不分配、不调用 provider；未就绪或越界返回 nullptr，借用只在本次 Close 开始前有效。
+    const urma_device_cap_t* capabilities(std::size_t index) const noexcept {
+        return ready_ && index < capabilities_.size() ? capabilities_[index] : nullptr;
+    }
+
 private:
     std::expected<void, RuntimeError> Rollback(RuntimeError error) noexcept;
 
     std::unique_ptr<DeviceCatalog> catalog_;
     std::vector<std::unique_ptr<UrmaContext>> contexts_;
+    // 指向 catalog_ 的稳定设备快照；映射与 contexts_ 保持相同的端点顺序。
+    std::vector<const urma_device_cap_t*> capabilities_;
     bool claimed_ = false;
     bool initialized_ = false;
     bool ready_ = false;

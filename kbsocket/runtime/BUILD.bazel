@@ -3,6 +3,39 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "raw_stack",
+    srcs = ["raw_stack.cpp"],
+    hdrs = ["raw_stack.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":connection_command_queue",
+        ":connection_mailbox",
+        ":connection_owner",
+        ":connection_progress",
+        ":import_progress",
+        ":peer_credit_progress",
+        ":progress_source",
+        ":raw_domain",
+        ":runtime_shard",
+        "//kbsocket/control:endpoint_import_cache",
+        "//kbsocket/memory:buffer_lease",
+        "//kbsocket/memory:slab_allocator",
+        "//kbsocket/transport/raw:raw_runtime",
+    ],
+)
+
+cc_test(
+    name = "raw_stack_test",
+    srcs = ["raw_stack_test.cpp"],
+    deps = [
+        ":raw_stack",
+        "//kbsocket/connection:wire_frame",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "raw_domain",
     srcs = ["raw_domain.cpp"],
     hdrs = ["raw_domain.hpp"],
