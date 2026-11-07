@@ -2,7 +2,7 @@
 
 `RuntimeShard` 将已经创建的 raw context、队列池、RX 缓冲池和 TX 账本绑定到一个 owner，统一推进收发、补投、事件和慢控制任务。它拥有反应堆与控制执行器，借用全部 URMA/DMA 对象；`Open` 不负责创建连接、分配 Grant、授信或创建完整 raw runtime。
 
-本实现对应 [roadmap M3](roadmap.md#m3runtimeshard-反应堆4-context-轮询与异步事件引擎)。M4.1 已通过可选 hooks 接入 [LeaseReturnProgress](memory-leases.md)，负责注册 Slab 的跨线程 CPU Lease 归还；连接协议、完整 MemoryManager 和 WRITE RNDV 仍按后续阶段交付。当前无 UB 真机回归，也未据 Mock 结果新增硬件 PASS。
+本实现对应 [roadmap M3](roadmap.md#m3runtimeshard-反应堆4-context-轮询与异步事件引擎)。M4.1 已通过可选 hooks 接入 [LeaseReturnProgress](memory-leases.md)，负责注册 Slab 的跨线程 CPU Lease 归还；M5.2 已提供 [Eager Connection](eager-connection.md) 与物理 Credit 接线；自动 runtime 装配、完整 MemoryManager 和 WRITE RNDV 仍按后续阶段交付。当前无 UB 真机回归，也未据 Mock 结果新增硬件 PASS。
 
 ## 组件与容量
 
@@ -104,3 +104,7 @@ bazel test //kbsocket/runtime:all //kbsocket/transport/raw:all //tools/... --tes
 ```
 
 Mock 能检查调用顺序、资源身份与安全门禁，不能证明真机延迟、调度性能或新的硬件通知行为；这些继续按[硬件验证矩阵](hardware-validation-matrix.md)记录。
+
+## M5.2 连接层接线
+
+绑定 `EagerReceiveDomain` 的队列必须设置 `RawQueueBinding.external_refill=true`，由宿主在相同 owner 上有界推进该域的 `Refill`，确保可信 post 前缀与物理 Credit 同时结账；原源继续独占 CQ 和通知消费。连接发送使用 `TxSender::Open(ledger, true)`，post 接受未知或账务错误仅 `MarkFaulted`，由既有控制任务执行 `BeginDrain`，不能在数据推进中同步 ModifyJetty。Connection/Credit 调度与控制 fd 的 Reactor 注册尚待 M5.3 自动装配。

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+cc_library(
+    name = "native_tcp_backend",
+    srcs = ["native_tcp_backend.cpp"],
+    hdrs = ["native_tcp_backend.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "native_tcp_backend_test",
+    srcs = ["native_tcp_backend_test.cpp"],
+    deps = [
+        ":native_tcp_backend",
+        "@googletest//:gtest_main",
+    ],
+)

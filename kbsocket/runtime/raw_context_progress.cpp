@@ -228,6 +228,9 @@ std::expected<ProgressBatch, ProgressError> RawContextProgress::Progress(Progres
                 domain.binding.on_rx(domain.binding.cookie, rx_events_[i]);
             }
         } else if (kind == ProgressKind::kRefill) {
+            if (domain.binding.external_refill) {
+                continue;
+            }
             auto& rx = *domain.binding.rx;
             if (rx.stopped() || now_ns < domain.refill_after || !rx.available() ||
                 rx.posted() >= domain.binding.pool->rx_depth()) {

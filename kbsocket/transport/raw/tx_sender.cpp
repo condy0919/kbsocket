@@ -31,7 +31,7 @@ bool Covers(const urma_sge_t& sge, const urma_context_t* context) noexcept {
 }
 } // namespace
 
-std::expected<void, TxSendError> TxSender::Open(AttemptLedger& ledger) noexcept {
+std::expected<void, TxSendError> TxSender::Open(AttemptLedger& ledger, bool defer_drain) noexcept {
     if (ledger_) {
         return Error(TxSendErrorCode::kInUse);
     }
@@ -41,6 +41,7 @@ std::expected<void, TxSendError> TxSender::Open(AttemptLedger& ledger) noexcept 
     ledger_ = &ledger;
     pool_ = ledger.pool();
     blocked_ = false;
+    defer_drain_ = defer_drain;
     return {};
 }
 
@@ -174,7 +175,7 @@ std::expected<std::size_t, TxSendError> TxSender::Send(std::span<const TxSendReq
     }
     if ((status != URMA_SUCCESS && accepted == requests.size()) || (status == URMA_SUCCESS && bad_wr)) {
         blocked_ = true;
-        auto fault = pool_->BeginDrain(*lane);
+        auto fault = defer_drain_ ? pool_->MarkFaulted(*lane) : pool_->BeginDrain(*lane);
         return std::unexpected(TxSendError{
             .code = TxSendErrorCode::kProviderContract,
             .accepted = std::nullopt,
@@ -195,7 +196,7 @@ std::expected<std::size_t, TxSendError> TxSender::Send(std::span<const TxSendReq
     }
     if (accounting_error) {
         blocked_ = true;
-        auto fault = pool_->BeginDrain(*lane);
+        auto fault = defer_drain_ ? pool_->MarkFaulted(*lane) : pool_->BeginDrain(*lane);
         return std::unexpected(TxSendError{
             .code = TxSendErrorCode::kAccountingFailure,
             .accepted = accepted,

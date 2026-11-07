@@ -2,7 +2,7 @@
 
 M5.1 将 M4 的身份、乱序窗口和授信原语接入建链准备流程：通过非阻塞协议流交换 HELLO，合并相同端点的导入请求，在接收状态与路由就绪后发送 READY，双方 READY 完成后才开放本端发送准入。
 
-当前交付是可显式驱动的建链组件。它接管宿主已经连接的 fd，借用预建的 raw 资源、信用账本和连接对象；尚未提供完整 `Connection` 收发 API 或 `NativeTcpBackend`。与后续集成的边界见[路线图](roadmap.md) M5，协议及信用原语见[连接协议原语](connection-primitives.md)。
+本文描述可显式驱动的 M5.1 建链组件：接管宿主已连接的 fd，借用预建 raw 资源、信用账本和连接对象。M5.2 已通过 [Eager Connection](eager-connection.md) 接通有界 copy-stream 和 `NativeTcpBackend`，自动 Runtime 装配与稳定 ABI 仍待后续。与后续集成的边界见[路线图](roadmap.md) M5，协议及信用原语见[连接协议原语](connection-primitives.md)。
 
 ## 1. 组件与调用顺序
 
@@ -88,4 +88,4 @@ Open 一次分配所有条目、引用票据和描述符存储。默认上限为
 
 当前测试覆盖协议分片与合并、有限 IO 预算、超时/取消、真实本机 TCP 协议交换、READY 前路由发布及首包竞态、相反方向的信用 epoch、1000 等待者单次导入、旧身份拒绝、部分准备失败、导入取消及清理重试。raw provider 由 Mock 替代；本机 TCP 握手测试不代表完整 NativeTCP 后端，也没有形成 UB 真机正确性、吞吐或 40k 建链性能结论。
 
-后续 M5 仍需交付 connect/listener、完整 Connection 收发调度、业务 mailbox、实际 RX 来源/信用归账、发送端共享授信、自动资源/拓扑管理、NativeTCP 后端、C/C++ API，以及关闭协商与远端静默证明。M6 的 WRITE Grant/DONE 生命周期保持独立。
+M5.2 已交付 connect/listener、NativeTCP 后端、有界 Connection copy-stream、RX/补投结账与发送共账接线。后续 M5.3 仍需交付 Runtime 级公平收发调度、业务 mailbox、实际 RX 来源映射、自动资源/拓扑管理、显式 C ABI/零拷贝 API，以及关闭协商与远端静默证明。M6 的 WRITE Grant/DONE 生命周期保持独立。

@@ -112,6 +112,9 @@ public:
     const HandshakeReady* peer_ready() const noexcept {
         return peer_ready_ ? &remote_ready_ : nullptr;
     }
+    const HandshakeReady* local_ready() const noexcept {
+        return ready_queued_ ? &local_ready_ : nullptr;
+    }
     connection::ConnectionRouteLease route() const noexcept {
         return route_;
     }

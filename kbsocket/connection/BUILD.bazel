@@ -2,6 +2,89 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "eager_tx",
+    srcs = ["eager_tx.cpp"],
+    hdrs = ["eager_tx.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":credit_account",
+        ":tx_sequence_window",
+        ":wire_frame",
+        "//kbsocket/control:endpoint_import_cache",
+        "//kbsocket/memory:slab_allocator",
+        "//kbsocket/transport/raw:tx_completion_processor",
+        "//kbsocket/transport/raw:tx_sender",
+    ],
+)
+
+cc_library(
+    name = "eager_rx",
+    srcs = ["eager_rx.cpp"],
+    hdrs = ["eager_rx.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":connection_table",
+        ":credit_account",
+        ":reorder_window",
+        ":wire_frame",
+        "//kbsocket/transport/raw:rx_buffer_pool",
+    ],
+)
+
+cc_library(
+    name = "connection",
+    srcs = ["connection.cpp"],
+    hdrs = ["connection.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":eager_rx",
+        ":eager_tx",
+        "//kbsocket/control:connection_handshake",
+        "//kbsocket/transport/tcp:native_tcp_backend",
+    ],
+)
+
+cc_test(
+    name = "eager_tx_test",
+    srcs = ["eager_tx_test.cpp"],
+    deps = [
+        ":eager_tx",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "eager_rx_test",
+    srcs = ["eager_rx_test.cpp"],
+    deps = [
+        ":eager_rx",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "connection_tcp_test",
+    srcs = ["connection_tcp_test.cpp"],
+    deps = [
+        ":connection",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "connection_test",
+    srcs = ["connection_test.cpp"],
+    deps = [
+        ":connection",
+        "//kbsocket/transport/raw:receive_domain_closer",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "wire_frame",
     srcs = ["wire_frame.cpp"],
     hdrs = ["wire_frame.hpp"],

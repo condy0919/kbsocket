@@ -938,6 +938,35 @@ TEST_F(TxSenderTest, WriteHonorsDeviceCapabilitySnapshot) {
     ASSERT_EQ(sender_.Send(requests, ids), 1u);
     ASSERT_TRUE(ledger_.Complete(ids[0]));
 }
+
+TEST_F(TxSenderTest, DeferredContractFaultOnlyMarksLaneUntilOwnerRunsControlWork) {
+    ASSERT_TRUE(sender_.Close());
+    ASSERT_TRUE(sender_.Open(ledger_, true));
+    EXPECT_TRUE(sender_.defer_drain());
+    std::array requests{Request()};
+    std::array<AttemptId, 1> ids{};
+    // provider 明确没有投递，但故意遗漏 bad_wr；提交层只能保留 Prepared，禁止快路径 Modify。
+    EXPECT_CALL(*this, Post(&jetty_, _, _)).WillOnce(Return(URMA_EINVAL));
+    const auto sent = sender_.Send(requests, ids);
+    ASSERT_FALSE(sent);
+    EXPECT_EQ(sent.error().code, TxSendErrorCode::kProviderContract);
+    EXPECT_FALSE(sent.error().accepted);
+    ASSERT_NE(ids[0], 0u);
+    const auto record = ledger_.Lookup(ids[0]);
+    ASSERT_TRUE(record);
+    EXPECT_EQ(pool_.lane_state(record->ticket.lane), JettyLaneState::kFaulted);
+    EXPECT_EQ(ledger_.size(), 1u);
+    EXPECT_EQ(ledger_.posted(), 0u);
+    EXPECT_FALSE(sender_.Send(requests, ids));
+    // owner 的慢控制任务在 post 返回后才切 ERROR；以下取消凭本测试明确的未投递事实。
+    EXPECT_CALL(*this, Modify(&jetty_, _)).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_TRUE(pool_.BeginDrain(record->ticket.lane));
+    ASSERT_TRUE(ledger_.Cancel(record->id));
+    ASSERT_TRUE(pool_.ObserveFlushDone(record->ticket.lane));
+    EXPECT_CALL(*this, Flush(&jetty_, 1, _)).WillOnce(Return(0));
+    std::array<urma_cr_t, 1> flushed{};
+    ASSERT_TRUE(pool_.FlushSend(record->ticket.lane, flushed));
+}
 } // namespace
 } // namespace raw
 } // namespace kbsocket

@@ -699,6 +699,26 @@ TEST_F(ReceiveCreditDomainTest, RepeatedCyclesKeepConservationWithNoDataPathAllo
     CheckConservation();
 }
 
+TEST_F(ReceiveCreditDomainTest, PublishedControlIsSharedMonotonicAndCannotExceedActualGrant) {
+    PostAll();
+    auto peer = Admit(1);
+    ASSERT_TRUE(peer);
+    EXPECT_EQ(domain_.PublishedControl(*peer), 0u);
+    EXPECT_FALSE(domain_.RecordPublishedControl(*peer, 1));
+    ASSERT_TRUE(domain_.Grant(*peer, CreditClass::kControl, 4));
+    ASSERT_TRUE(domain_.RecordPublishedControl(*peer, 4));
+    // 同一 peer 的另一个逻辑连接看到共同发布上界，重复/迟到通知不产生新的控制预算。
+    const auto other_connection = *peer;
+    EXPECT_EQ(domain_.PublishedControl(other_connection), 4u);
+    ASSERT_TRUE(domain_.RecordPublishedControl(other_connection, 2));
+    EXPECT_EQ(domain_.PublishedControl(*peer), 4u);
+    EXPECT_FALSE(domain_.RecordPublishedControl(*peer, 5));
+    auto forged = *peer;
+    ++forged.id;
+    EXPECT_FALSE(domain_.PublishedControl(forged));
+    EXPECT_FALSE(domain_.RecordPublishedControl(forged, 4));
+}
+
 } // namespace
 } // namespace connection
 } // namespace kbsocket

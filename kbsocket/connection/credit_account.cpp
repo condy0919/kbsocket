@@ -126,6 +126,7 @@ struct ReceiveCreditDomain::State {
     struct Peer {
         CreditPeerStats stats;
         std::uint64_t id = 0;
+        std::uint64_t published_control = 0;
     };
     struct Receipt {
         std::uint64_t id = 0;
@@ -326,6 +327,27 @@ std::expected<std::uint64_t, CreditError> ReceiveCreditDomain::Grant(CreditPeerH
     pool.granted += count;
     maximum += count;
     return maximum;
+}
+std::expected<std::uint64_t, CreditError>
+ReceiveCreditDomain::PublishedControl(CreditPeerHandle handle) const noexcept {
+    auto index = Find(handle);
+    if (!index) {
+        return std::unexpected(index.error());
+    }
+    return state_->peers[*index].published_control;
+}
+std::expected<void, CreditError> ReceiveCreditDomain::RecordPublishedControl(CreditPeerHandle handle,
+                                                                             std::uint64_t limit) noexcept {
+    auto index = Find(handle);
+    if (!index) {
+        return std::unexpected(index.error());
+    }
+    auto& peer = state_->peers[*index];
+    if (limit > peer.stats.max_control) {
+        return Error(CreditErrorCode::kInvalidArgument);
+    }
+    peer.published_control = std::max(peer.published_control, limit);
+    return {};
 }
 std::expected<RxCreditReceipt, CreditError> ReceiveCreditDomain::NewReceipt(std::uint32_t peer,
                                                                             std::uint8_t bucket) noexcept {

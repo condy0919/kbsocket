@@ -34,6 +34,9 @@ struct RawQueueBinding {
     void (*on_error)(void*, const ProgressError&) noexcept = nullptr;
     // 0 禁用水线重写；非 0 时必须小于 JFR 深度。仅 posted 严格高于水线才交给控制线程 rearm。
     std::uint32_t watermark_threshold = 0;
+    // 接入物理 Credit 结账的接收域后，补投必须由该域统一执行，禁止旁路 raw.Refill。
+    // 宿主在同一 owner 的有界调度中推进外部 refill；本源仍独占 CQ/事件消费。
+    bool external_refill = false;
 };
 
 struct RawDomainProgressStats {

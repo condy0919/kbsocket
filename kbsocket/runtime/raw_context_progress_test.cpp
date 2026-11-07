@@ -414,6 +414,23 @@ TEST_F(RawContextProgressTest, RefillBudgetRotatesDomainsAndDefersEagainWithoutB
     EXPECT_LE(buffers_[0].posted(), 4u);
 }
 
+TEST_F(RawContextProgressTest, ExternalCreditOwnerPreventsUnaccountedAutomaticRefill) {
+    bindings_[0].external_refill = true;
+    Open();
+    ASSERT_TRUE(source_.Progress(ProgressKind::kRefill, 8, 10));
+    // 外部域必须在可信 post 前缀后更新 Credit；原进度源不能旁路这一账本。
+    EXPECT_EQ(post_calls_[0], 0u);
+    EXPECT_EQ(buffers_[0].posted(), 0u);
+    EXPECT_EQ(buffers_[1].posted(), 4u);
+    ASSERT_TRUE(buffers_[0].Refill(1));
+    QueueRx(0);
+    auto polled = source_.Progress(ProgressKind::kRx, 8, 11);
+    ASSERT_TRUE(polled);
+    EXPECT_EQ(rx_callbacks_[0], 1u);
+    ASSERT_TRUE(source_.Progress(ProgressKind::kRefill, 8, 12));
+    EXPECT_EQ(post_calls_[0], 1u);
+}
+
 TEST_F(RawContextProgressTest, UnsubmittedControlIntentCanBeDetachedWithoutDeletingRawResources) {
     bindings_[0].watermark_threshold = 2;
     Open();

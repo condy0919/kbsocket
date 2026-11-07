@@ -67,7 +67,14 @@ public:
     TxSender& operator=(const TxSender&) = delete;
 
     /// 绑定已打开的账本与池；单次提交数量由 Send 的请求范围决定，上限为 kMaxBatch。
-    std::expected<void, TxSendError> Open(AttemptLedger& ledger) noexcept;
+    /// defer_drain 在异常 post 时只隔离 SQ；宿主须由控制执行器安排 BeginDrain。
+    std::expected<void, TxSendError> Open(AttemptLedger& ledger, bool defer_drain = false) noexcept;
+    bool defer_drain() const noexcept {
+        return defer_drain_;
+    }
+    urma_context_t* context() const noexcept {
+        return pool_ ? pool_->context() : nullptr;
+    }
     std::expected<void, TxSendError> Close() noexcept;
 
     /// 支持 SEND/SEND_WITH_IMM/WRITE 混合提交，同一批使用一个 SQ，可指定 lane 或由池选择。
@@ -89,6 +96,7 @@ private:
     std::array<urma_sge_t, kMaxBatch> remote_sges_{};
     std::uint64_t next_sequence_ = 0;
     bool blocked_ = false;
+    bool defer_drain_ = false;
 };
 } // namespace raw
 } // namespace kbsocket

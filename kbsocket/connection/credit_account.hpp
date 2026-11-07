@@ -76,6 +76,12 @@ public:
     std::expected<void, CreditError> Close() noexcept;
     std::uint64_t available(CreditClass kind) const noexcept;
     SenderCreditStats stats() const noexcept;
+    CreditIdentity identity() const noexcept {
+        return identity_;
+    }
+    bool ready() const noexcept {
+        return ready_;
+    }
 
 private:
     CreditIdentity identity_{};
@@ -153,6 +159,9 @@ public:
     /// 发布前 F->G；返回可重复发送的累计上界，发布失败不能擅自回收已经可能暴露的授权。
     std::expected<std::uint64_t, CreditError> Grant(CreditPeerHandle peer, CreditClass kind,
                                                     std::uint32_t count) noexcept;
+    /// Peer 共账上已经通过 READY 或可信 accepted CREDIT 暴露的控制授信；不能按逻辑连接重复计新。
+    std::expected<std::uint64_t, CreditError> PublishedControl(CreditPeerHandle peer) const noexcept;
+    std::expected<void, CreditError> RecordPublishedControl(CreditPeerHandle peer, std::uint64_t limit) noexcept;
     /// 以可信 CQE 的完整 Peer 授信归属结账；冻结/旧连接的合法迟到帧仍扣原 epoch。
     /// 若真实 RX CQE 已消耗 RQE 而本调用失败，必须改走 ConsumeUnknown 并隔离，不能只丢帧。
     /// 本接口不是收包前的额度探测；非法/重复调用本身不代表又一次真实 RQE 消耗。
