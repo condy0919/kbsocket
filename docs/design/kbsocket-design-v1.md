@@ -368,6 +368,8 @@ sequenceDiagram
 
 ### 6.1 64-Bit `IMM` 紧凑线协议与完整身份扩展
 
+**M4.2 已交付**：`wire_frame.*` 实现下述 IMM 布局、规范短/扩展身份和 Eager/piggyback/CREDIT/FIN/RST；payload 多字节字段使用大端，IMM 是 URMA 数值，不再次做 `htonll`。扩展时 IMM 的 slot/gen 位清零，slot/gen 可用紧凑格式时不接受冗余扩展编码。CREDIT body 固定 48 B，依次为 session、credit_epoch、max_credit_seq、max_control_credit_seq、max_frame_seq、max_stream_bytes 六个 u64；FIN body 为 session u64，RST body 为 session u64 + 非零 reason u32，均可再前置 8 B 扩展身份。`EncodeWireHeader` 仅输出头部供独立注册 SGE 组合，短 DATA 无 payload 头。RNDV 类型已预留但当前拒绝解析/编码，待 M6 冻结。具体接口及完整来源校验前提见 [连接协议原语](../connection-primitives.md)。
+
 `RM_CTP SEND` 的单 WR 硬件上限为 **4096 字节（含 payload 内头部）**。每帧前置协议头会使 4096 B 独立写入需要分片；这增加 WR/CQE 数量，但吞吐影响仍须测量，不能直接推导为减半。紧凑编码是优化，完整身份校验优先。
 
 `kbsocket` 利用 `URMA_OPC_SEND_IMM` 提供的 **64 位带外立即数（`imm_data`，不占用 4096 B 载荷空间）** 与接收 CQE 的 `cr.completion_len`（实际字节数），在满足紧凑身份条件且无捎带头时实现 **0 字节 payload 头部开销**：
@@ -397,6 +399,8 @@ sequenceDiagram
   - V1 在 32-bit SN 耗尽前停止接受新数据，保留终结 SN 并有序关闭，由上层建立新 Session；不允许在同一 Session 内静默绕回。以后若支持模序号，须另行定义小于半序号空间的窗口与旧帧寿命约束。
 
 ### 6.2 接收乱序重排窗口（`ReorderWindow`）与连续流交付
+
+**M4.2 原语边界**：`TxSequenceWindow` 在 post 前预留连续 SN，可信部分接受只推进前缀，后缀保留原 SN 阻挡新批次；接受未知永久停止准入，最高 SN 仅供 FIN。`ReorderWindow` 保存真实 raw/Slab Lease 描述符，成功 Push 才接管，按预算 Poll 交付并发出 receipt；应用实际归还 Lease 后 Release(receipt) 才释放驻留预算。当前实现保守地发布 `max_frame_seq = min(released_prefix + W, 2^32)`，使未消费前缀继续占描述符容量；`max_stream_bytes` 为累计已消费 payload 字节加驻留上限（溢出时饱和），发送端累计接受字节不得越过该上界。TX 完成不会放开这两项远端窗口。窗口本身不实现 raw 来源路由或协议 RNDV 授权验证。
 
 由于同 SQ 同目标的 `RM_CTP SEND` 可能乱序到达，接收端每个 `Connection` 维护固定容量的环状重排窗口（基线 $W = 64$，协商可调，预分配描述符，零堆分配）。发送方须同时满足接收端发布的独占上界 `sn < max_frame_seq` 与驻留字节上限，接收端保证 `max_frame_seq <= rcv_nxt + W`；不得仅凭 PeerRuntime credits 或本地 TX CQE 越过对端重排窗口。该流控进度不确认业务执行，也不用于重放。延迟 RNDV 占位同样计入 W，防止后续 Eager 在合法发送下把窗口冲破。
 
@@ -490,6 +494,8 @@ sequenceDiagram
 
 ### 8.1 五类独立资源额度
 
+**M4.2 已交付的软件总账**：`SenderCreditAccount` 与 `ReceiveCreditDomain` 分开维护发送侧累计授权和接收侧 F/G/U。接收端只有真实初始 accepted RQE 可授信；每次可信归属 CQE 取得独立 receipt，实际 Lease 归还且对应 refill 被接受后才恢复 F。数据与控制有独立额度，未知 CQE 扣物理 posted 并冻结域，不能猜归属重授。旧 Peer 的 tombstone 保留至域关闭，未结清授权不因逻辑连接关闭归还。当前未接自动 CREDIT 调度、非阻塞 TCP 逃生、RX pool 补投及 M1 销毁回调；账本 Close 不是 DMA 终结证明，不能视为端到端流控已交付。
+
 | 额度类别 | 保护对象 | 耗尽时的行为 |
 | :--- | :--- | :--- |
 | **1. 本地发送缓存配额** | 单连接待发送字节上限（如 256 KiB） | 非阻塞 `write` 返回部分写或 `EAGAIN`，待数据发出回收后触发 `EPOLLOUT` |
@@ -531,7 +537,7 @@ $$F_{\text{elastic}, j} + \sum_{i} \underbrace{(F_{\text{base}, ij} + G_{\text{b
 
 ## 9. 统一进度器（`ShardReactor`）：Busy-Poll 与事件模式
 
-**M3 实现边界**：[`runtime-shard.md`](../runtime-shard.md) 记录已落地的四 context 公平轮询、JFCE/async 消费、水线补投与控制任务所有权移交。实现借用已打开的 raw 资源，owner 线程由宿主提供；`ProgressSource` 为 mailbox/timer/retire 留出独立预算，后续连接调度、跨线程 LeaseReturn、NativeTCP/SHM 和协议级 credits 仍按 roadmap 接入。以下是完整目标模型，不能将 Mock 覆盖视为新硬件或端到端 Socket 验收。
+**M3 实现边界**：[`runtime-shard.md`](../runtime-shard.md) 记录已落地的四 context 公平轮询、JFCE/async 消费、水线补投与控制任务所有权移交。实现借用已打开的 raw 资源，owner 线程由宿主提供；`ProgressSource` 为 mailbox/timer/retire 留出独立预算，M4.1 已接入跨线程 LeaseReturn，M4.2 已提供协议级 credits 原语；完整连接调度、自动授信和 NativeTCP/SHM 仍按 roadmap 接入。以下是完整目标模型，不能将 Mock 覆盖视为新硬件或端到端 Socket 验收。
 
 ### 9.1 单轮有界公平推进（Bounded Fair Progress）
 

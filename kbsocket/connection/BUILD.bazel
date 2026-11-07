@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+cc_library(
+    name = "wire_frame",
+    srcs = ["wire_frame.cpp"],
+    hdrs = ["wire_frame.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "connection_tokens",
+    srcs = ["connection_tokens.cpp"],
+    hdrs = ["connection_tokens.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [":wire_frame"],
+)
+
+cc_library(
+    name = "tx_sequence_window",
+    srcs = ["tx_sequence_window.cpp"],
+    hdrs = ["tx_sequence_window.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "reorder_window",
+    srcs = ["reorder_window.cpp"],
+    hdrs = ["reorder_window.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//kbsocket/memory:buffer_lease",
+        "//kbsocket/transport/raw:rx_buffer_pool",
+    ],
+)
+
+cc_library(
+    name = "credit_account",
+    srcs = ["credit_account.cpp"],
+    hdrs = ["credit_account.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "wire_frame_test",
+    srcs = ["wire_frame_test.cpp"],
+    deps = [
+        ":wire_frame",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "connection_admission_test",
+    srcs = ["connection_admission_test.cpp"],
+    deps = [
+        ":connection_tokens",
+        ":tx_sequence_window",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "reorder_window_test",
+    srcs = ["reorder_window_test.cpp"],
+    deps = [
+        ":reorder_window",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "credit_account_test",
+    srcs = ["credit_account_test.cpp"],
+    deps = [
+        ":credit_account",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "eager_primitives_test",
+    srcs = ["eager_primitives_test.cpp"],
+    deps = [
+        ":connection_tokens",
+        ":credit_account",
+        ":reorder_window",
+        ":tx_sequence_window",
+        ":wire_frame",
+        "//kbsocket/memory:slab_allocator",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)

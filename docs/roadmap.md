@@ -3,7 +3,7 @@
 > **对齐规范**：[kbsocket-design-v1.md](design/kbsocket-design-v1.md) · [hardware-observations.md](hardware-observations.md) · [hardware-validation-matrix.md](hardware-validation-matrix.md) · [OBSERVABILITY-DESIGN-GUIDE.md](OBSERVABILITY-DESIGN-GUIDE.md)
 > **最后更新**：2026-11-07
 
-本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语；M3 已实现借用 raw 资源的单 owner 进度器、四 context 调度、事件与有界控制执行器，验证状态分别见对应小节。M4.1 已交付固定 Slab、Lease 责任账本及跨线程归还；M4 的协议/乱序/授信部分以及 M5–M7、L1/L2、O1/O2 仍为待交付计划，未实现类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
+本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语；M3 已实现借用 raw 资源的单 owner 进度器、四 context 调度、事件与有界控制执行器，验证状态分别见对应小节。M4 已交付 M4.1 固定 Slab/Lease 和 M4.2 协议、顺序、授信原语；完整 Connection 与 raw 生命周期联动尚待 M5/M6。M5–M7、L1/L2、O1/O2 仍为待交付计划，未实现类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
 
 ---
 
@@ -20,6 +20,7 @@
 | **RX 缓冲池** | `kbsocket/transport/raw/rx_buffer_pool.*` | 连续内存预分配、DMA 段注册、`Refill`/`Poll`/`Release`/`Stop`、`RxBufferLease` 借出与归还；M1 在 `DeleteJfr` 成功后内部清退残留 Posted，Held 归还后才注销内存；M3 联动补投与水线重写 | 独立 Slab 的跨线程归还已在 M4.1 实现；本池 backing 尚未迁移，RMA Grant 协议待 M6，不能由 RX 关闭代为终结 |
 | **单 owner 运行时进度** | `kbsocket/runtime/` | `RuntimeShard` 绑定最多四 context，`ShardReactor` 分类公平预算与事件等待，`RawContextProgress` 做通知/async 归属及错误隔离，`ControlExecutor` 执行慢控制任务 | 借用已有 raw 对象；不创建完整连接/runtime 资源，不实现通用业务 mailbox、Grant 或远端关闭协议；M4.1 已接入 CPU Lease 归还 hooks；接入约束见 [RuntimeShard](runtime-shard.md) |
 | **注册内存与 Lease** | `kbsocket/memory/` | 固定 Slab 最多四 context 注册、共享 backing 硬预算、独立 CPU/DMA/Grant 责任及每槽隔离记录；MPSC 归还队列与 Shard mailbox 预算集成 | 尚无完整 MemoryManager、RX backing 迁移、应用 write 部分接受或远端 Grant 协议；见 [内存与 Lease](memory-leases.md) |
+| **连接协议基础** | `kbsocket/connection/` | 短/扩展身份 wire codec、单调连接 token、发送累计窗口、ReorderWindow 和应用 receipt、PeerRuntime 数据/控制 Credit F/G/U 总账 | 无完整 Connection、握手/来源路由、自动授信调度或 TCP 控制逃生路径；RNDV 线格式保留待 M6；见 [连接协议原语](connection-primitives.md) |
 | **硬件实测工具集** | `tools/*_test` | 已记录 SEND/SGE、RMA、故障隔离、补投及多 context 通知等观测，另有人工确认的大小/生命周期/可见性契约 | 人工契约不等于测试 PASS；WN1–WN4 通知回归尚无真机日志，历史 ACK_TIMEOUT 根因仍待定位；按验证矩阵逐项回归 |
 
 ### 1.2 待建设模块（包括未创建目录与工作区接口草稿）
@@ -27,7 +28,7 @@
 - `kbsocket/memory/` 后续集成：多 Slab 扩容管理、RX backing 迁移和连接/Grant 绑定；M4.1 的固定 Slab 与跨线程归还原语已落地
 - `kbsocket/runtime/` 后续集成：自动资源创建、NUMA 亲和性、通用业务 mailbox/连接定时器；当前已有有界 `ProgressSource` 接口及 CPU Lease 归还源
 - `kbsocket/control/`：非阻塞 TCP 握手状态机、`EndpointImportCache`（Single-Flight）、`HealthRegistry`
-- `kbsocket/connection/`：`Connection` 状态机、64-bit `IMM` 编解码、`ReorderWindow`、`CreditAccount`、`WriteRndvEngine`
+- `kbsocket/connection/` 后续集成：`Connection` 状态机、收发调度/完整来源路由及 `WriteRndvEngine`；M4.2 已交付独立协议、顺序及 Credit 原语
 - `kbsocket/api/` 与 `kbsocket/socket/`：`kbsocket.h`、`buffer.h`、C++23 `execution` 封装、`FdTable`、`SocketAdapter`、`EpollMux`
 - `kbsocket/transport/tcp/` 与 `kbsocket/transport/shm/`：`NativeTcpBackend`、`ShmBackend`
 - `kbsocket/observability/` 与 `adapters/brpc/`：缓存行对齐 `ShardMetrics`、USDT 探针、bRPC 零拷贝适配器
@@ -42,7 +43,7 @@ flowchart TD
     M1["M1: 残余 RX 安全关闭闭环<br/>(DeleteJetty -> DeleteJfr -> OnJfrDeleted)"]
     M2["M2: 共享 SQ 故障隔离、主被动 Jetty 解耦与 Lane 在线重建"]
     M3["M3: RuntimeShard 反应堆、4-Context 轮询与异步事件引擎<br/>(已实现，真机待回归)"]
-    M4["M4: 内存、IMM 协议、乱序与 Credit<br/>(M4.1 内存原语已实现)"]
+    M4["M4: 内存、IMM 协议、乱序与 Credit<br/>(内存与协议原语已实现)"]
     M5["M5: Connection 状态机、非阻塞建链、Single-Flight 导入与显式 API"]
     M6["M6: WRITE RNDV 大包直写引擎与 Grant 隔离生命周期"]
     M7["M7: Socket/epoll 兼容层、bRPC 适配与 40k 规模验收"]
@@ -166,7 +167,8 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 ### M4：`MemoryManager`、`IMM` 短帧/扩展帧、乱序重组与 Credit 流控
 
 - **当前交付 M4.1**：已实现 `SlabAllocator`、共享 `MemoryBudget`、`BufferLease`/`BufferReference`、`QuarantineLedger`、`LeaseReturnQueue` 与 `LeaseReturnProgress`，使用约束见 [注册内存与 Lease](memory-leases.md)。固定 backing 最多四 context 注册；CPU、本地 DMA 与远端 Grant 分账，全部结束才复用；部分注册/注销失败保留依赖与预算。跨线程归还使用预分配 MPSC + eventfd，由 Shard 的 mailbox 预算消费。2026-11-07 运行 `bazel test //kbsocket/memory:all //kbsocket/runtime:all //kbsocket/transport/raw:all //tools/... --test_output=errors`，40 个测试目标、693 个用例通过（新增 memory 36 个）。验证使用 Mock/本机线程与 fd，UB 真机未执行。
-- **下一交付 M4.2**：实现短/扩展帧编解码、连接 token/SN 边界、ReorderWindow 与 CreditAccount。M4.1 尚不提供完整 MemoryManager 扩容策略，不迁移现有 `RxBufferPool` backing，不自动把 `AttemptLedger` 或网络 DONE 转成内存终结证明；应用 write 与完整 Grant 协议仍分别属于 M5/M6。
+- **当前交付 M4.2**：已实现短/扩展身份编解码及仅头部编码接口、`ConnectionTokens`、`TxSequenceWindow`、`ReorderWindow`、`SenderCreditAccount` 和 `ReceiveCreditDomain`。通过真实 Slab Lease 与模拟 DMA 的组合测试验证部分接受、乱序交付、慢读窗口、控制额度、FIN 及旧 token 拒绝；具体格式与调用顺序见 [连接协议原语](connection-primitives.md)。2026-11-07 完整回归 `bazel test //kbsocket/connection:all //kbsocket/memory:all //kbsocket/runtime:all //kbsocket/transport/raw:all //tools/... --test_output=errors`：45 个测试目标、765 个用例通过，其中 connection 新增 72 个；UB 真机回归未执行。
+- **下一步 M5 集成**：接入完整 Connection、raw 接收来源/Lease/授信路由、非阻塞握手、控制调度与 Eager/NativeTCP API 闭环。当前内存仍为固定 Slab，完整 MemoryManager 扩容策略和 `RxBufferPool` backing 迁移未实现；信用账本关闭不替代 M1 队列销毁，`AttemptLedger` 和 Grant/DONE 的自动责任联动仍需连接层。RNDV 控制类型明确返回 unsupported，实际协议待 M6。
 - **目标**：实现零分配数据面所需的多上下文预注册内存池、64-bit `IMM` 短帧及扩展协议帧、每连接乱序重排窗口与无死锁信用流控。
 - **设计章节**：[§6 线协议与连接内顺序](design/kbsocket-design-v1.md#6-连接内顺序保留薄适配不构建重放协议)、[§7.1 内存模型](design/kbsocket-design-v1.md#71-四层内存模型与零分配快路径)、[§8 分层流控](design/kbsocket-design-v1.md#8-分层流控守恒总账长期暖窗口与大包准入)
 - **涉及代码**：
@@ -175,11 +177,13 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
   - `kbsocket/memory/lease_return_queue.hpp` / `.cpp`
   - `kbsocket/memory/lease_return_progress.hpp` / `.cpp`
   - `kbsocket/memory/quarantine_ledger.hpp` / `.cpp`
-  - `kbsocket/connection/wire_frame.hpp`
+  - `kbsocket/connection/wire_frame.hpp` / `.cpp`
+  - `kbsocket/connection/connection_tokens.hpp` / `.cpp`
+  - `kbsocket/connection/tx_sequence_window.hpp` / `.cpp`
   - `kbsocket/connection/reorder_window.hpp` / `.cpp`
   - `kbsocket/connection/credit_account.hpp` / `.cpp`
   - `kbsocket/memory/*_test.cpp`
-  - `tests/unit/connection/*_test.cpp`
+  - `kbsocket/connection/*_test.cpp`
 - **关键改动**：
   1. **多上下文 `SlabAllocator` 与 `BufferLease`**：
      - 每个 `Slab` 一次性在关联的多个 `UrmaContext` 上完成 `RegisterSeg`，维护 `std::array<urma_target_seg_t*, kMaxContexts>`；
@@ -187,7 +191,7 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
   2. **`QuarantineLedger` 隔离回收**：
      - 连接异常关闭但仍有未完成 TX DMA 或未决 RNDV Grant 时，关联的 `Slab` / `BufferLease` 转入 `QuarantineLedger`，分别等待本地 DMA、远端 Grant 访问权和 CPU/应用引用终结，再释放回空闲池；本地 `AttemptLedger` 清空不能终结远端 Grant。隔离容量计入硬上限，满额停止新准入。
   3. **64-bit `IMM` 编解码 (`wire_frame.hpp`)**：
-     - 实现 `[63:60] FrameType` + `[59:56] Flags` + `[55:40] DstConnSlot` + `[39:32] ConnGen` + `[31:0] FrameSeq`；16-bit 槽位可承载单 Shard 40k 连接。短格式 token 在所属 runtime/domain 生命周期内不得复用，代次超过 255 必须扩展，禁止截断回绕；
+     - 实现 `[63:60] FrameType` + `[59:56] Flags` + `[55:48] ConnGen` + `[47:32] DstConnSlot` + `[31:0] FrameSeq`；16-bit 槽位可承载单 Shard 40k 连接。短格式 token 在所属 runtime/domain 生命周期内不得复用，代次超过 255 必须扩展，禁止截断回绕；
      - 短帧可装 4096 B 应用载荷；扩展帧携带完整 32-bit slot/gen，数据和控制帧均支持扩展，必要时校验完整 runtime/domain 身份。扩展头、授信头与多 SGE 总长一并计入 4096 B 上限；
      - 定义网络字节序、长度/类型校验、32-bit SN 回绕门禁及旧 Session 处理。
   4. **每连接 `ReorderWindow` 与 `CreditAccount`**：
