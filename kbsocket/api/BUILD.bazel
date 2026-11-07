@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+cc_library(
+    name = "stream",
+    hdrs = ["stream.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "stream_error",
+    srcs = ["stream_error.cpp"],
+    hdrs = ["stream_error.hpp"],
+    deps = [
+        ":stream",
+        "//kbsocket/connection",
+        "//kbsocket/runtime:connection_owner",
+        "//kbsocket/runtime:raw_stack",
+    ],
+)
+
+cc_library(
+    name = "stream_binding",
+    srcs = ["stream_binding.cpp"],
+    hdrs = ["stream_binding.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":stream",
+        ":stream_error",
+        "//kbsocket/runtime:connection_owner",
+        "//kbsocket/runtime:raw_stack",
+    ],
+)
+
+cc_test(
+    name = "stream_error_test",
+    srcs = ["stream_error_test.cpp"],
+    deps = [
+        ":stream_error",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "stream_c_test",
+    testonly = True,
+    srcs = ["stream_c_test.c"],
+    copts = ["-std=c11"],
+    deps = [":stream"],
+)
+
+cc_test(
+    name = "stream_binding_test",
+    srcs = ["stream_binding_test.cpp"],
+    deps = [
+        ":stream_binding",
+        ":stream_c_test",
+        "//kbsocket/connection:wire_frame",
+        "//kbsocket/control:tx_lane_snapshot",
+        "//kbsocket/transport/raw:urma_test_support",
+        "//kbsocket/transport/tcp:native_tcp_backend",
+        "@googletest//:gtest_main",
+    ],
+)
