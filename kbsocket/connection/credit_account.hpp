@@ -11,6 +11,9 @@
 #include <span>
 
 namespace kbsocket {
+namespace control {
+class PeerCreditControl;
+}
 namespace connection {
 
 enum class CreditErrorCode : std::uint8_t {
@@ -52,6 +55,8 @@ struct SenderCreditStats {
     std::array<std::uint64_t, 2> spent{};
     std::array<std::uint64_t, 2> reserved{};
     bool stopped = false;
+    // Resolve(nullopt) 后本 epoch 永久未知；不能用保守 spent 总数生成撤回完成证明。
+    bool accepted_known = true;
 };
 
 /// 单 owner 的远端物理 RQE 授信账；没有通过 TX CQE 返还远端额度的接口。
@@ -84,12 +89,18 @@ public:
     }
 
 private:
+    friend class control::PeerCreditControl;
+    std::expected<void, CreditError> BindWithdrawal(const control::PeerCreditControl& owner) noexcept;
+    std::expected<void, CreditError> UnbindWithdrawal(const control::PeerCreditControl& owner) noexcept;
+    std::expected<SenderCreditStats, CreditError>
+    StoppedSnapshot(const control::PeerCreditControl& owner) const noexcept;
     CreditIdentity identity_{};
     std::array<std::uint64_t, 2> limits_{};
     std::array<std::uint64_t, 2> spent_{};
     CreditReservation pending_{};
+    const control::PeerCreditControl* withdrawal_owner_ = nullptr;
     std::uint64_t next_reservation_ = 0;
-    bool ready_ = false, stopped_ = false;
+    bool ready_ = false, stopped_ = false, accepted_known_ = true;
 };
 
 class ReceiveCreditDomain;
@@ -183,6 +194,14 @@ public:
 
 private:
     friend class EagerReceiveDomain;
+    friend class control::PeerCreditControl;
+    std::expected<void, CreditError> BindWithdrawal(const control::PeerCreditControl& owner,
+                                                    CreditPeerHandle peer) noexcept;
+    std::expected<void, CreditError> UnbindWithdrawal(const control::PeerCreditControl& owner,
+                                                      CreditPeerHandle peer) noexcept;
+    std::expected<void, CreditError> RetireWithdrawn(const control::PeerCreditControl& owner, CreditPeerHandle peer,
+                                                     std::array<std::uint64_t, 2> spent) noexcept;
+    void FinishRetire(std::uint32_t peer) noexcept;
     // 仅接收桥接器在核对 M1 Closed 及绑定代次后使用；不提供可手工置真的删除证明。
     std::expected<void, CreditError> BindReceive(const EagerReceiveDomain& owner) noexcept;
     std::expected<void, CreditError> UnbindReceive(const EagerReceiveDomain& owner) noexcept;

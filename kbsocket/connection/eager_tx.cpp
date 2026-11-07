@@ -320,6 +320,11 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Progress() noexcept {
     if (s.stats.failed) {
         return Error(EagerTxErrorCode::kStopped);
     }
+    if (!s.credits->ready() || s.credits->identity() != s.config.credit_identity) {
+        // 共账撤回后允许以新 epoch 重开；旧流不能借新额度继续向旧会话投递。
+        Fail();
+        return Error(EagerTxErrorCode::kWrongIdentity);
+    }
     if (s.credits->stats().stopped) {
         Fail();
         return Error(EagerTxErrorCode::kCredit);
@@ -365,6 +370,10 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Progress() noexcept {
 }
 std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexcept {
     auto& s = *state_;
+    if (!s.credits->ready() || s.credits->identity() != s.config.credit_identity) {
+        Fail();
+        return Error(EagerTxErrorCode::kWrongIdentity);
+    }
     if (control && s.generation == std::numeric_limits<std::uint64_t>::max()) {
         return Error(EagerTxErrorCode::kStopped);
     }
@@ -652,7 +661,10 @@ std::expected<void, EagerTxError> EagerTxStream::OnCompletion(const raw::TxCompl
     if (terminal_failed && r.consumed_last_control) {
         // 最后控制额度的返还报文失败后，不再能保证共账继续前进；禁止其他同 peer 流静默等待。
         // 不返还已消耗额度、不重放；SQ 故障范围仍由完成处理器决定。
-        s.credits->Stop();
+        // 旧 WR 的迟到终结只影响其原 epoch，不能停用同一对象上已经重开的新共账。
+        if (s.credits->identity() == s.config.credit_identity) {
+            s.credits->Stop();
+        }
         if (s.config.advertised_credits) {
             peer_frozen = s.config.advertised_credits->FreezePeer(s.config.advertised_peer).has_value();
         }

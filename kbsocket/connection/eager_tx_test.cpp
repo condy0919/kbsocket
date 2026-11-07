@@ -321,6 +321,74 @@ TEST_F(EagerTxTest, PartialPostSuffixKeepsSequenceAndPayloadWithoutReplay) {
     EXPECT_EQ(credits_.stats().spent[0], 3u);
 }
 
+TEST_F(EagerTxTest, ReopenedCreditEpochCannotAdmitAnOldStreamAndDoesNotReleaseItsOutstandingDma) {
+    Open(2);
+    const std::array<std::byte, 32> bytes{};
+    ASSERT_EQ(stream_.Write(bytes), bytes.size());
+    ASSERT_EQ(stream_.Progress(), 1u);
+    ASSERT_EQ(stream_.Write(bytes), bytes.size());
+    // 共账完成撤回后可重开新 epoch；旧流即使仍保存未提交数据，也不能借用新额度。
+    ASSERT_TRUE(credits_.Close());
+    auto next = identity_;
+    ++next.epoch;
+    ASSERT_TRUE(credits_.Open(next));
+    ASSERT_TRUE(credits_.Update(next, 10, 10));
+    const auto progressed = stream_.Progress();
+    ASSERT_FALSE(progressed);
+    EXPECT_EQ(progressed.error().code, EagerTxErrorCode::kWrongIdentity);
+    EXPECT_TRUE(stream_.stats().failed);
+    EXPECT_EQ(post_calls_, 1u);
+    EXPECT_EQ(stream_.stats().queued, 0u);
+    EXPECT_EQ(credits_.stats().spent[0], 0u);
+    EXPECT_FALSE(credits_.stats().stopped);
+    // 已接受的旧 WR 仍保留 DMA/import 责任，只能用其真实终结完成来归还。
+    EXPECT_EQ(stream_.stats().in_flight, 1u);
+    EXPECT_EQ(slab_.stats().local_dma, 1u);
+    EXPECT_FALSE(stream_.Close());
+    Complete(0);
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+    EXPECT_TRUE(stream_.Close());
+    EXPECT_EQ(credits_.stats().spent[0], 0u);
+}
+
+TEST_F(EagerTxTest, StoppingSharedCreditBlocksEveryStreamWhileAcceptedDmaRemainsPinned) {
+    Open(2);
+    EagerTxStream sibling;
+    ASSERT_TRUE(sibling.Open(Config(2, 2), sender_, slab_, imports_, endpoint_, credits_));
+    const std::array<std::byte, 32> bytes{};
+    ASSERT_EQ(stream_.Write(bytes), bytes.size());
+    ASSERT_EQ(stream_.Progress(), 1u);
+    ASSERT_EQ(stream_.Write(bytes), bytes.size());
+    ASSERT_EQ(sibling.Write(bytes), bytes.size());
+    EXPECT_EQ(imports_.leases(), 4u); // 调用方、两条流和首条已接受 WR。
+    credits_.Stop();
+    ASSERT_TRUE(credits_.Update(identity_, 2000, 2000));
+    // Peer 共账撤回覆盖所有逻辑流；晚到累计 Credit 不能重新开放任一流的 post。
+    const auto first = stream_.Progress();
+    const auto second = sibling.Progress();
+    ASSERT_FALSE(first);
+    ASSERT_FALSE(second);
+    EXPECT_EQ(first.error().code, EagerTxErrorCode::kCredit);
+    EXPECT_EQ(second.error().code, EagerTxErrorCode::kCredit);
+    EXPECT_TRUE(stream_.stats().failed);
+    EXPECT_TRUE(sibling.stats().failed);
+    EXPECT_EQ(stream_.stats().queued, 0u);
+    EXPECT_EQ(sibling.stats().queued, 0u);
+    EXPECT_EQ(post_calls_, 1u);
+    EXPECT_EQ(credits_.stats().spent[0], 1u);
+    EXPECT_EQ(modifies_, 0u);
+    EXPECT_EQ(slab_.stats().local_dma, 1u);
+    EXPECT_EQ(imports_.leases(), 4u);
+    EXPECT_FALSE(stream_.Close());
+    ASSERT_TRUE(sibling.Close());
+    EXPECT_EQ(slab_.stats().local_dma, 1u);
+    // 停止只丢弃未提交队列，真实终结继续逐 WR 解除原 DMA/import 引用。
+    Complete(0);
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+    ASSERT_TRUE(stream_.Close());
+    EXPECT_EQ(imports_.leases(), 1u);
+}
+
 TEST_F(EagerTxTest, PendingImportAndEarlyCreditsAreValidBeforeRawActive) {
     auto config = Config();
     config.max_frame_seq = config.max_stream_bytes = 0;
@@ -787,6 +855,37 @@ TEST_F(EagerTxTest, LastControlCompletionErrorStopsAccountWithoutPublishedDomain
     EXPECT_EQ(progress.error().code, EagerTxErrorCode::kCredit);
     EXPECT_EQ(modifies_, 0u);
     ASSERT_TRUE(sibling.Close());
+    ASSERT_TRUE(stream_.Close());
+    ASSERT_TRUE(limited.Close());
+}
+
+TEST_F(EagerTxTest, OldLastControlFailureCannotStopAReopenedCreditEpoch) {
+    SenderCreditAccount limited;
+    ASSERT_TRUE(limited.Open(identity_));
+    ASSERT_TRUE(limited.Update(identity_, 1, 1));
+    ASSERT_TRUE(stream_.Open(Config(), sender_, slab_, imports_, endpoint_, limited));
+    PumpImports();
+    const WireFrameInput credit{
+        .type = WireFrameType::kControl, .max_control_credit_seq = 1, .session = session_.session, .credit_epoch = 1};
+    ASSERT_TRUE(stream_.QueueCredit(credit));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    ASSERT_TRUE(limited.Close());
+    auto next = identity_;
+    ++next.epoch;
+    ASSERT_TRUE(limited.Open(next));
+    ASSERT_TRUE(limited.Update(next, 2, 2));
+    // 接收责任已结清与本地 TX CQE 消费是两个时间点；旧错误仍须退休 DMA，但不能污染新账。
+    Enqueue(0, URMA_CR_REM_ACCESS_ABORT_ERR);
+    const auto event = PollOne();
+    const auto completed = stream_.OnCompletion(event);
+    ASSERT_FALSE(completed);
+    EXPECT_EQ(completed.error().provider_status, 8);
+    EXPECT_EQ(stream_.stats().in_flight, 0u);
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+    EXPECT_FALSE(limited.stats().stopped);
+    EXPECT_EQ(limited.available(CreditClass::kControl), 2u);
+    EXPECT_EQ(limited.stats().spent[1], 0u);
+    EXPECT_EQ(modifies_, 0u);
     ASSERT_TRUE(stream_.Close());
     ASSERT_TRUE(limited.Close());
 }

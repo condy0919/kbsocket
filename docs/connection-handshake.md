@@ -90,4 +90,4 @@ Open 一次分配所有条目、引用票据和描述符存储。默认上限为
 
 当前测试覆盖协议分片与合并、有限 IO 预算、超时/取消、真实本机 TCP 协议交换、READY 前路由发布及首包竞态、相反方向的信用 epoch、1000 等待者单次导入、旧身份拒绝、部分准备失败、导入取消及清理重试。raw provider 由 Mock 替代；本机 TCP 握手测试不代表完整 NativeTCP 后端，也没有形成 UB 真机正确性、吞吐或 40k 建链性能结论。
 
-M5.2 已交付 connect/listener、NativeTCP 后端、有界 Connection copy-stream、RX/补投结账与发送共账接线。M5.3.1/2 已增加 Runtime 公平推进、实际 RX 来源映射和 HELLO 主动 Lane 自动登记；完整 Connection 在来源安装之前禁止 READY。M5.3.3 增加宿主显式启用的在线 Lane 更新及确认，见 [连接 Runtime](connection-runtime.md)。低层 ConnectionHandshake 仍是可独立组合的原语，不替宿主消费 RX 或安装来源。业务 mailbox、自动资源/拓扑管理、显式 C ABI/零拷贝 API，以及关闭协商与远端静默证明仍待实现。M6 的 WRITE Grant/DONE 生命周期保持独立。
+M5.2 已交付 connect/listener、NativeTCP 后端、有界 Connection copy-stream、RX/补投结账与发送共账接线。M5.3.1/2 已增加 Runtime 公平推进、实际 RX 来源映射和 HELLO 主动 Lane 自动登记；完整 Connection 在来源安装之前禁止 READY。M5.3.3 增加宿主显式启用的在线 Lane 更新及确认，见 [连接 Runtime](connection-runtime.md)。低层 ConnectionHandshake 仍是可独立组合的原语，不替宿主消费 RX 或安装来源。M5.3.5 已交付业务 mailbox；M5.3.7 增加独立控制 fd 上的 [Peer 授信撤回协调器](peer-credit-control.md)，新 CREDIT_STOP/ACK 不用于初始 HELLO/READY 或在线 LaneControl，也不替代本地 DMA/来源/M1 屏障。自动资源/拓扑管理、撤回协调器 Runtime 接线及显式 C ABI/零拷贝 API 仍待实现。M6 的 WRITE Grant/DONE 生命周期保持独立。

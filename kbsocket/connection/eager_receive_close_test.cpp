@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MulanPSL-2.0
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <array>
@@ -11,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "kbsocket/connection/eager_rx.hpp"
+#include "kbsocket/control/peer_credit_control.hpp"
 #include "kbsocket/transport/raw/receive_domain_closer.hpp"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
 
@@ -548,6 +550,81 @@ TEST_F(EagerReceiveCloseTest, CreditAndRouteIncarnationsMustAgreeBeforeBinding) 
     EXPECT_EQ(credits_.receive_domain(), 33u);
     EXPECT_EQ(buffers_.posted(), 8u);
     EXPECT_TRUE(wrong_routes.Close());
+}
+
+TEST_F(EagerReceiveCloseTest, PeerWithdrawalWaitsForRealRxLeaseAndRefillBeforeIndependentPhysicalClose) {
+    ReceiveCreditDomain remote_receive;
+    SenderCreditAccount local_sender, remote_sender;
+    ASSERT_TRUE(remote_receive.Open({66, 8, 2, 2, 1}));
+    ASSERT_TRUE(remote_receive.RecordInitialPosted(CreditClass::kData, 6));
+    ASSERT_TRUE(remote_receive.RecordInitialPosted(CreditClass::kControl, 2));
+    const auto remote_peer = remote_receive.Admit({11, 66, 88});
+    ASSERT_TRUE(remote_peer);
+    ASSERT_TRUE(remote_receive.Grant(*remote_peer, CreditClass::kData, 6));
+    ASSERT_TRUE(remote_receive.Grant(*remote_peer, CreditClass::kControl, 2));
+    ASSERT_TRUE(local_sender.Open({22, 66, 88}));
+    ASSERT_TRUE(local_sender.Update({22, 66, 88}, 6, 2));
+    ASSERT_TRUE(remote_sender.Open({11, 33, 77}));
+    ASSERT_TRUE(remote_sender.Update({11, 33, 77}, 6, 2));
+    // 模型远端提交一个 DATA，真实 Mock 接收 CQE 延后消费；撤回帧先到也不能把它当未用授权。
+    const auto reservation = remote_sender.Reserve(CreditClass::kData, 1);
+    ASSERT_TRUE(reservation);
+    ASSERT_TRUE(remote_sender.Resolve(*reservation, 1));
+    const control::HandshakeIdentity local{11, 33, 1, 1, 101, {0, 1}};
+    const control::HandshakeIdentity remote{22, 66, 2, 1, 102, {0, 1}};
+    int sockets[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sockets), 0);
+    control::PeerCreditControl left, right;
+    ASSERT_TRUE(left.Open(sockets[0], {local, remote, 77, 88, &local_sender, &credits_, source_.peer, 10000, true}, 0));
+    ASSERT_TRUE(
+        right.Open(sockets[1], {remote, local, 88, 77, &remote_sender, &remote_receive, *remote_peer, 10000, true}, 0));
+    std::uint64_t now = 0;
+    const auto pump = [&] {
+        for (unsigned i = 0; i < 8; ++i) {
+            EXPECT_TRUE(left.Progress(++now));
+            EXPECT_TRUE(right.Progress(now));
+        }
+    };
+    pump();
+    EXPECT_TRUE(left.stats().peer_stop_received);
+    EXPECT_FALSE(left.stats().receive_retired);
+    EXPECT_FALSE(left.stats().complete);
+    EXPECT_FALSE(domain_.frozen());
+    hold_next_ = true;
+    Receive();
+    ASSERT_TRUE(held_packet_);
+    pump();
+    EXPECT_EQ(buffers_.held(), 1u);
+    EXPECT_FALSE(left.stats().receive_retired);
+    ASSERT_TRUE(domain_.Release(*held_packet_));
+    pump();
+    EXPECT_EQ(domain_.pending_refill(), 1u);
+    EXPECT_FALSE(left.stats().receive_retired);
+    const auto posts = post_calls_;
+    const auto refilled = domain_.Refill();
+    ASSERT_TRUE(refilled);
+    EXPECT_EQ(*refilled, 1u);
+    EXPECT_EQ(post_calls_, posts + 1);
+    pump();
+    ASSERT_TRUE(left.stats().complete);
+    ASSERT_TRUE(right.stats().complete);
+    EXPECT_EQ(credits_.stats().active_peers, 0u);
+    EXPECT_EQ(credits_.stats().physical_posted, 8u);
+    EXPECT_EQ(buffers_.posted(), 8u);
+    EXPECT_EQ(jfr_delete_calls_, 0u);
+    EXPECT_EQ(unregister_calls_, 0u);
+
+    // 授信退休仍未删除 raw 域。M1 另外获得完整静默屏障后才能销毁，且不能越过还在借用
+    // 账本的协议控制器直接清空元数据；先 Close 协调器解除绑定，再完成 M5.3.6 核销。
+    ClosePhysical();
+    EXPECT_FALSE(domain_.CloseDestroyed(closer_));
+    ASSERT_TRUE(left.Close());
+    ASSERT_TRUE(right.Close());
+    ASSERT_TRUE(domain_.CloseDestroyed(closer_));
+    ExpectEmptyMetadata();
+    EXPECT_TRUE(local_sender.Close());
+    EXPECT_TRUE(remote_sender.Close());
+    EXPECT_TRUE(remote_receive.Close());
 }
 
 TEST_F(EagerReceiveCloseTest, ExternalReceiptCorruptionRejectsWholeRetirementWithoutPartialClearing) {

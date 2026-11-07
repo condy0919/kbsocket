@@ -90,6 +90,7 @@ TEST(SenderCreditAccountTest, OnlyKnownUnacceptedSuffixReturnsCredits) {
 
     // post 只接受前两条，未接受的四条归还；成功 TX 完成不会额外增加任何 credits。
     ASSERT_TRUE(sender.Resolve(*batch, 2));
+    EXPECT_TRUE(sender.stats().accepted_known);
     EXPECT_EQ(sender.stats().spent[0], 2u);
     EXPECT_EQ(sender.available(CreditClass::kData), 6u);
     EXPECT_FALSE(sender.Resolve(*batch, 0));
@@ -119,9 +120,41 @@ TEST(SenderCreditAccountTest, UnknownAcceptanceConsumesWholeBatchAndStopsBothCla
     EXPECT_EQ(sender.stats().spent[0], 5u);
     EXPECT_EQ(sender.stats().reserved[0], 0u);
     EXPECT_TRUE(sender.stats().stopped);
+    EXPECT_FALSE(sender.stats().accepted_known);
     EXPECT_FALSE(sender.Reserve(CreditClass::kControl, 1));
     ASSERT_TRUE(sender.Update(kIdentity, 100, 100));
     EXPECT_EQ(sender.available(CreditClass::kData), 0u);
+    sender.Stop();
+    EXPECT_FALSE(sender.stats().accepted_known);
+    EXPECT_TRUE(sender.Close());
+    EXPECT_FALSE(sender.stats().accepted_known);
+    // 只有新 epoch 的全新账本可恢复已知性，迟到累计授权不能清除旧接受范围的不确定性。
+    ASSERT_TRUE(sender.Open({kIdentity.peer_runtime, kIdentity.receive_domain, kIdentity.epoch + 1}));
+    EXPECT_TRUE(sender.stats().accepted_known);
+    EXPECT_EQ(sender.stats().spent[0], 0u);
+    EXPECT_TRUE(sender.Close());
+}
+
+TEST(SenderCreditAccountTest, StopPreservesPendingReservationUntilTheProviderAcceptanceIsResolved) {
+    SenderCreditAccount sender;
+    ASSERT_TRUE(sender.Open(kIdentity));
+    ASSERT_TRUE(sender.Update(kIdentity, 8, 2));
+    const auto reservation = sender.Reserve(CreditClass::kData, 5);
+    ASSERT_TRUE(reservation);
+    sender.Stop();
+    // 停止必须阻止两个类别的新预约，但不能抹去已经进入 provider 的接受责任。
+    EXPECT_EQ(sender.stats().reserved[0], 5u);
+    EXPECT_FALSE(sender.Reserve(CreditClass::kData, 1));
+    EXPECT_FALSE(sender.Reserve(CreditClass::kControl, 1));
+    EXPECT_FALSE(sender.Close());
+    ASSERT_TRUE(sender.Resolve(*reservation, 3));
+    EXPECT_TRUE(sender.stats().stopped);
+    EXPECT_TRUE(sender.stats().accepted_known);
+    EXPECT_EQ(sender.stats().reserved[0], 0u);
+    EXPECT_EQ(sender.stats().spent[0], 3u);
+    ASSERT_TRUE(sender.Update(kIdentity, 9, 3));
+    EXPECT_EQ(sender.available(CreditClass::kData), 0u);
+    EXPECT_EQ(sender.available(CreditClass::kControl), 0u);
     EXPECT_TRUE(sender.Close());
 }
 

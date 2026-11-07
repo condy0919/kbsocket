@@ -11,6 +11,7 @@
 #include <array>
 #include <cerrno>
 #include <limits>
+#include <utility>
 
 #include <gtest/gtest.h>
 
@@ -62,6 +63,17 @@ HandshakeMessage LaneAck() {
     message.lane_ack.sender = Identity(100);
     message.lane_ack.receiver = Identity();
     message.lane_ack.update_id = 0x0102030405060708;
+    return message;
+}
+HandshakeMessage CreditStop(HandshakeMessageKind kind = HandshakeMessageKind::kCreditStop) {
+    HandshakeMessage message;
+    message.kind = kind;
+    auto& stop = kind == HandshakeMessageKind::kCreditStop ? message.credit_stop : message.credit_stop_ack;
+    stop.sender = Identity();
+    stop.receiver = Identity(100);
+    stop.sender_credit_epoch = 0x0102030405060708;
+    stop.receiver_credit_epoch = 0x1112131415161718;
+    stop.spent = {0x2122232425262728, std::numeric_limits<std::uint64_t>::max()};
     return message;
 }
 template <class T>
@@ -465,6 +477,127 @@ TEST(HandshakeCodec, OnlineDecodeRejectsOldVersionReservedTruncatedAndUnboundedL
     ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*ack_size)), HandshakeErrorCode::kInvalidFrame);
 }
 
+TEST(HandshakeCodec, CreditStopAndAckPreserveFullIdentitiesEpochsAndLargeFinalCounts) {
+    for (const auto kind : {HandshakeMessageKind::kCreditStop, HandshakeMessageKind::kCreditStopAck}) {
+        const auto message = CreditStop(kind);
+        const auto& expected =
+            kind == HandshakeMessageKind::kCreditStop ? message.credit_stop : message.credit_stop_ack;
+        std::array<std::byte, 160> bytes;
+        bytes.fill(std::byte{0xab});
+        const auto size = EncodeHandshakeMessage(message, bytes);
+        ASSERT_TRUE(size);
+        ASSERT_EQ(*size, 140u);
+        EXPECT_EQ(bytes[6], static_cast<std::byte>(kind));
+        EXPECT_EQ(bytes[11], std::byte{128});
+        // 累计计数可超过 32 bit；逐字节检查大端格式，避免两端共享错误的宿主布局仍往返通过。
+        for (unsigned i = 0; i < 8; ++i) {
+            EXPECT_EQ(bytes[108 + i], static_cast<std::byte>(i + 1));
+            EXPECT_EQ(bytes[116 + i], static_cast<std::byte>(0x11 + i));
+            EXPECT_EQ(bytes[124 + i], static_cast<std::byte>(0x21 + i));
+            EXPECT_EQ(bytes[132 + i], std::byte{0xff});
+        }
+        EXPECT_EQ(bytes[140], std::byte{0xab});
+        const auto decoded = DecodeHandshakeMessage(std::span(bytes).first(*size));
+        ASSERT_TRUE(decoded);
+        EXPECT_EQ(decoded->kind, kind);
+        const auto& actual =
+            kind == HandshakeMessageKind::kCreditStop ? decoded->credit_stop : decoded->credit_stop_ack;
+        EXPECT_EQ(actual, expected);
+    }
+}
+
+TEST(HandshakeCodec, CreditStopAllowsZeroTrafficAndZeroTokenSlot) {
+    for (const auto kind : {HandshakeMessageKind::kCreditStop, HandshakeMessageKind::kCreditStopAck}) {
+        auto message = CreditStop(kind);
+        auto& stop = kind == HandshakeMessageKind::kCreditStop ? message.credit_stop : message.credit_stop_ack;
+        stop.spent = {};
+        stop.sender.token.slot = stop.receiver.token.slot = 0;
+        std::array<std::byte, 140> bytes{};
+        const auto size = EncodeHandshakeMessage(message, bytes);
+        ASSERT_TRUE(size);
+        const auto decoded = DecodeHandshakeMessage(bytes);
+        ASSERT_TRUE(decoded);
+        const auto& actual =
+            kind == HandshakeMessageKind::kCreditStop ? decoded->credit_stop : decoded->credit_stop_ack;
+        EXPECT_EQ(actual, stop);
+    }
+}
+
+TEST(HandshakeCodec, CreditStopRejectsMissingIdentityOrEpochWithoutChangingOutput) {
+    for (const auto kind : {HandshakeMessageKind::kCreditStop, HandshakeMessageKind::kCreditStopAck}) {
+        std::array<std::byte, 140> bytes;
+        bytes.fill(std::byte{0xab});
+        const auto unchanged = bytes;
+        // 每个方向的完整身份和各自授信代次均不可缺；token.slot=0 本身合法，不在此列。
+        for (unsigned field = 0; field < 14; ++field) {
+            auto message = CreditStop(kind);
+            auto& stop = kind == HandshakeMessageKind::kCreditStop ? message.credit_stop : message.credit_stop_ack;
+            auto& id = field < 6 ? stop.sender : stop.receiver;
+            switch (field < 12 ? field % 6 : field) {
+            case 0:
+                id.runtime = 0;
+                break;
+            case 1:
+                id.receive_domain = 0;
+                break;
+            case 2:
+                id.endpoint_generation = 0;
+                break;
+            case 3:
+                id.authorization = 0;
+                break;
+            case 4:
+                id.session = 0;
+                break;
+            case 5:
+                id.token.generation = 0;
+                break;
+            case 12:
+                stop.sender_credit_epoch = 0;
+                break;
+            case 13:
+                stop.receiver_credit_epoch = 0;
+                break;
+            }
+            ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+            EXPECT_EQ(bytes, unchanged);
+        }
+        ExpectError(EncodeHandshakeMessage(CreditStop(kind), std::span(bytes).first(139)),
+                    HandshakeErrorCode::kBufferTooSmall);
+        EXPECT_EQ(bytes, unchanged);
+    }
+}
+
+TEST(HandshakeCodec, CreditStopDecodeRejectsMalformedLengthIdentityAndUnknownKind) {
+    for (const auto kind : {HandshakeMessageKind::kCreditStop, HandshakeMessageKind::kCreditStopAck}) {
+        std::array<std::byte, 141> bytes{};
+        const auto size = EncodeHandshakeMessage(CreditStop(kind), bytes);
+        ASSERT_TRUE(size);
+        const auto original = bytes;
+        // 固定大小的停止消息必须先通过精确长度门禁，半帧、尾随字节和未知类型都不能推进状态机。
+        ExpectError(DecodeHandshakeMessage(std::span(bytes).first(11)), HandshakeErrorCode::kInvalidFrame);
+        ExpectError(DecodeHandshakeMessage(std::span(bytes).first(139)), HandshakeErrorCode::kInvalidFrame);
+        ExpectError(DecodeHandshakeMessage(bytes), HandshakeErrorCode::kInvalidFrame);
+        for (const auto length : {127, 129}) {
+            bytes = original;
+            bytes[11] = static_cast<std::byte>(length);
+            ExpectError(DecodeHandshakeMessage(std::span(bytes).first(12 + length)), HandshakeErrorCode::kInvalidFrame);
+        }
+        for (const auto offset : {12, 20, 28, 36, 44, 56, 60, 68, 76, 84, 92, 104, 108, 116}) {
+            bytes = original;
+            const auto width = offset == 56 || offset == 104 ? 4 : 8;
+            std::fill_n(bytes.begin() + offset, width, std::byte{0});
+            ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
+        }
+        bytes = original;
+        bytes[6] = std::byte{8};
+        ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
+        bytes = original;
+        bytes[7] = std::byte{1};
+        ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
+    }
+}
+
 class HandshakeChannelTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -556,6 +689,37 @@ TEST_F(HandshakeChannelTest, FragmentedOnlineUpdateAndAckRespectBudgetsBeyondHan
     EXPECT_EQ(ack->kind, HandshakeMessageKind::kLaneAck);
     EXPECT_EQ(update->kind, HandshakeMessageKind::kLaneUpdate);
     EXPECT_EQ(ack->lane_ack.update_id, update->lane_update.update_id);
+}
+
+TEST_F(HandshakeChannelTest, FragmentedCreditStopAndAckUseDedicatedBoundedChannel) {
+    HandshakeChannel left, right;
+    Open(left, 0);
+    Open(right, 1);
+    const auto stop = CreditStop();
+    auto ack = CreditStop(HandshakeMessageKind::kCreditStopAck);
+    std::swap(ack.credit_stop_ack.sender, ack.credit_stop_ack.receiver);
+    std::swap(ack.credit_stop_ack.sender_credit_epoch, ack.credit_stop_ack.receiver_credit_epoch);
+    ASSERT_TRUE(left.Queue(stop));
+    ASSERT_TRUE(right.Queue(ack));
+    // ACK 的交换身份由上层协调器验证；底层通道仅保证拆包边界与有限 IO 预算。
+    for (unsigned tick = 0; tick < 1000 && !(left.message_ready() && right.message_ready()); ++tick) {
+        const auto a = left.Progress(tick, {3, 1});
+        const auto b = right.Progress(tick, {3, 1});
+        ASSERT_TRUE(a);
+        ASSERT_TRUE(b);
+        EXPECT_LE(a->sent + a->received, 3u);
+        EXPECT_LE(b->sent + b->received, 3u);
+        EXPECT_LE(a->syscalls, 1u);
+        EXPECT_LE(b->syscalls, 1u);
+    }
+    const auto received_ack = left.TakeMessage();
+    const auto received_stop = right.TakeMessage();
+    ASSERT_TRUE(received_ack);
+    ASSERT_TRUE(received_stop);
+    EXPECT_EQ(received_ack->kind, HandshakeMessageKind::kCreditStopAck);
+    EXPECT_EQ(received_stop->kind, HandshakeMessageKind::kCreditStop);
+    EXPECT_EQ(received_ack->credit_stop_ack, ack.credit_stop_ack);
+    EXPECT_EQ(received_stop->credit_stop, stop.credit_stop);
 }
 
 TEST_F(HandshakeChannelTest, EstablishedHandoffPreservesCoalescedFirstLaneUpdate) {

@@ -15,6 +15,7 @@ namespace {
 constexpr std::uint32_t kMagic = 0x4b425348; // KBSH
 constexpr std::size_t kHelloPrefix = 104, kTxLaneBytes = 32, kReadyBytes = 144, kRejectBytes = 20;
 constexpr std::size_t kLaneUpdatePrefix = 120, kLaneAckBytes = 104;
+constexpr std::size_t kCreditStopBytes = 128;
 constexpr std::uint16_t kCapabilities = kHandshakeCapabilityRaw | kHandshakeCapabilityTcp;
 
 class Writer {
@@ -144,6 +145,16 @@ std::expected<std::size_t, HandshakeError> BodySize(const HandshakeMessage& mess
             return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
         }
         return kLaneAckBytes;
+    case HandshakeMessageKind::kCreditStop:
+    case HandshakeMessageKind::kCreditStopAck: {
+        const auto& stop =
+            message.kind == HandshakeMessageKind::kCreditStop ? message.credit_stop : message.credit_stop_ack;
+        if (!ValidIdentity(stop.sender) || !ValidIdentity(stop.receiver) || !stop.sender_credit_epoch ||
+            !stop.receiver_credit_epoch) {
+            return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+        }
+        return kCreditStopBytes;
+    }
     }
     return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
 }
@@ -169,7 +180,9 @@ std::expected<std::size_t, HandshakeError> ParseHeader(std::span<const std::byte
         (kind == HandshakeMessageKind::kReject && length == kRejectBytes) ||
         (kind == HandshakeMessageKind::kLaneUpdate && length >= kLaneUpdatePrefix &&
          length <= kLaneUpdatePrefix + kTxLaneBytes * kHandshakeMaxTxLanes) ||
-        (kind == HandshakeMessageKind::kLaneAck && length == kLaneAckBytes);
+        (kind == HandshakeMessageKind::kLaneAck && length == kLaneAckBytes) ||
+        ((kind == HandshakeMessageKind::kCreditStop || kind == HandshakeMessageKind::kCreditStopAck) &&
+         length == kCreditStopBytes);
     if (reserved != 0 || !valid_size) {
         return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
     }
@@ -284,6 +297,18 @@ std::expected<std::size_t, HandshakeError> EncodeHandshakeMessage(const Handshak
         PutIdentity(out, message.lane_ack.receiver);
         out.Put(message.lane_ack.update_id, 8);
         break;
+    case HandshakeMessageKind::kCreditStop:
+    case HandshakeMessageKind::kCreditStopAck: {
+        const auto& stop =
+            message.kind == HandshakeMessageKind::kCreditStop ? message.credit_stop : message.credit_stop_ack;
+        PutIdentity(out, stop.sender);
+        PutIdentity(out, stop.receiver);
+        out.Put(stop.sender_credit_epoch, 8);
+        out.Put(stop.receiver_credit_epoch, 8);
+        out.Put(stop.spent[0], 8);
+        out.Put(stop.spent[1], 8);
+        break;
+    }
     }
     return size;
 }
@@ -377,6 +402,17 @@ std::expected<HandshakeMessage, HandshakeError> DecodeHandshakeMessage(std::span
         message.lane_ack.receiver = GetIdentity(in);
         message.lane_ack.update_id = in.Get(8);
         break;
+    case HandshakeMessageKind::kCreditStop:
+    case HandshakeMessageKind::kCreditStopAck: {
+        auto& stop = message.kind == HandshakeMessageKind::kCreditStop ? message.credit_stop : message.credit_stop_ack;
+        stop.sender = GetIdentity(in);
+        stop.receiver = GetIdentity(in);
+        stop.sender_credit_epoch = in.Get(8);
+        stop.receiver_credit_epoch = in.Get(8);
+        stop.spent[0] = in.Get(8);
+        stop.spent[1] = in.Get(8);
+        break;
+    }
     }
     const auto valid = BodySize(message);
     if (!valid) {

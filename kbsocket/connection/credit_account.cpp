@@ -38,6 +38,7 @@ std::expected<void, CreditError> SenderCreditAccount::Open(CreditIdentity identi
     spent_ = {};
     pending_ = {};
     stopped_ = false;
+    accepted_known_ = true;
     ready_ = true;
     return {};
 }
@@ -62,7 +63,8 @@ std::uint64_t SenderCreditAccount::available(CreditClass kind) const noexcept {
     return limits_[index] - spent_[index] - reserved;
 }
 SenderCreditStats SenderCreditAccount::stats() const noexcept {
-    SenderCreditStats result{.limits = limits_, .spent = spent_, .stopped = stopped_};
+    SenderCreditStats result{
+        .limits = limits_, .spent = spent_, .stopped = stopped_, .accepted_known = accepted_known_};
     if (pending_.id) {
         result.reserved[static_cast<std::size_t>(pending_.kind)] = pending_.count;
     }
@@ -106,6 +108,7 @@ std::expected<void, CreditError> SenderCreditAccount::Resolve(CreditReservation 
     spent_[static_cast<std::size_t>(pending_.kind)] += accepted_prefix.value_or(pending_.count);
     if (!accepted_prefix) {
         stopped_ = true;
+        accepted_known_ = false;
     }
     pending_ = {};
     return {};
@@ -115,11 +118,48 @@ std::expected<void, CreditError> SenderCreditAccount::Close() noexcept {
         return {};
     }
     stopped_ = true;
-    if (pending_.id) {
+    if (pending_.id || withdrawal_owner_) {
         return Error(CreditErrorCode::kInUse);
     }
     ready_ = false;
     return {};
+}
+std::expected<void, CreditError> SenderCreditAccount::BindWithdrawal(const control::PeerCreditControl& owner) noexcept {
+    if (!ready_) {
+        return Error(CreditErrorCode::kNotReady);
+    }
+    if (withdrawal_owner_) {
+        return Error(CreditErrorCode::kInUse);
+    }
+    withdrawal_owner_ = &owner;
+    return {};
+}
+std::expected<void, CreditError>
+SenderCreditAccount::UnbindWithdrawal(const control::PeerCreditControl& owner) noexcept {
+    if (withdrawal_owner_ != &owner) {
+        return Error(CreditErrorCode::kWrongIdentity);
+    }
+    withdrawal_owner_ = nullptr;
+    return {};
+}
+std::expected<SenderCreditStats, CreditError>
+SenderCreditAccount::StoppedSnapshot(const control::PeerCreditControl& owner) const noexcept {
+    if (!ready_) {
+        return Error(CreditErrorCode::kNotReady);
+    }
+    if (withdrawal_owner_ != &owner) {
+        return Error(CreditErrorCode::kWrongIdentity);
+    }
+    if (!stopped_) {
+        return Error(CreditErrorCode::kProofRequired);
+    }
+    if (pending_.id) {
+        return Error(CreditErrorCode::kInUse);
+    }
+    if (!accepted_known_) {
+        return Error(CreditErrorCode::kRetained);
+    }
+    return stats();
 }
 
 struct ReceiveCreditDomain::State {
@@ -127,6 +167,7 @@ struct ReceiveCreditDomain::State {
         CreditPeerStats stats;
         std::uint64_t id = 0;
         std::uint64_t published_control = 0;
+        const control::PeerCreditControl* withdrawal_owner = nullptr;
     };
     struct Receipt {
         std::uint64_t id = 0;
@@ -194,6 +235,11 @@ std::expected<void, CreditError> ReceiveCreditDomain::Close() noexcept {
     if (state_->stats.active_peers || state_->stats.held || state_->stats.released) {
         return Error(CreditErrorCode::kInUse);
     }
+    for (std::uint32_t i = 0; i < state_->peer_slots; ++i) {
+        if (state_->peers[i].withdrawal_owner) {
+            return Error(CreditErrorCode::kInUse);
+        }
+    }
     state_.reset();
     return {};
 }
@@ -247,6 +293,11 @@ std::expected<void, CreditError> ReceiveCreditDomain::CloseDestroyed(const Eager
     }
     if (state_->stats.held || state_->stats.released != released_receipts) {
         return Error(CreditErrorCode::kRetained);
+    }
+    for (std::uint32_t i = 0; i < state_->peer_slots; ++i) {
+        if (state_->peers[i].withdrawal_owner) {
+            return Error(CreditErrorCode::kInUse);
+        }
     }
     // 物理域已永久销毁，且桥接器已核验全部 receipt；整体终结元数据，不做 U->F 或重新授信。
     // 未归属的旧 RQE 无需猜测其 Peer/类别，不能把本路径用于仍存活的接收域。
@@ -553,13 +604,80 @@ std::expected<void, CreditError> ReceiveCreditDomain::FreezePeer(CreditPeerHandl
     state_->peers[*index].stats.frozen = true;
     return {};
 }
+std::expected<void, CreditError> ReceiveCreditDomain::BindWithdrawal(const control::PeerCreditControl& owner,
+                                                                     CreditPeerHandle handle) noexcept {
+    const auto index = Find(handle);
+    if (!index) {
+        return std::unexpected(index.error());
+    }
+    auto& peer = state_->peers[*index];
+    if (peer.withdrawal_owner) {
+        return Error(CreditErrorCode::kInUse);
+    }
+    if (peer.stats.retired) {
+        return Error(CreditErrorCode::kStopped);
+    }
+    peer.withdrawal_owner = &owner;
+    return {};
+}
+std::expected<void, CreditError> ReceiveCreditDomain::UnbindWithdrawal(const control::PeerCreditControl& owner,
+                                                                       CreditPeerHandle handle) noexcept {
+    const auto index = Find(handle);
+    if (!index) {
+        return std::unexpected(index.error());
+    }
+    auto& peer = state_->peers[*index];
+    if (peer.withdrawal_owner != &owner) {
+        return Error(CreditErrorCode::kWrongIdentity);
+    }
+    peer.withdrawal_owner = nullptr;
+    return {};
+}
+std::expected<void, CreditError> ReceiveCreditDomain::RetireWithdrawn(const control::PeerCreditControl& owner,
+                                                                      CreditPeerHandle handle,
+                                                                      std::array<std::uint64_t, 2> spent) noexcept {
+    const auto index = Find(handle);
+    if (!index) {
+        return std::unexpected(index.error());
+    }
+    const auto& record = state_->peers[*index];
+    const auto& peer = record.stats;
+    if (record.withdrawal_owner != &owner) {
+        return Error(CreditErrorCode::kWrongIdentity);
+    }
+    if (peer.retired || !peer.frozen) {
+        return Error(CreditErrorCode::kProofRequired);
+    }
+    if (state_->stats.unattributed) {
+        return Error(CreditErrorCode::kRetained);
+    }
+    const std::array<std::uint64_t, 2> issued{peer.max_data, peer.max_control};
+    const std::array<std::uint64_t, 2> consumed{peer.max_data - peer.base.granted - peer.elastic_granted,
+                                                peer.max_control - peer.control_granted};
+    // 只接受停止后已确定的累计接受量；数据和控制分别核对，不能用总数掩盖类别错账。
+    // 少收的 CQE 仍可能迟到，Held/未补投 receipt 仍占真实接收责任，必须继续推进等待。
+    for (std::size_t i = 0; i < spent.size(); ++i) {
+        if (spent[i] > issued[i] || consumed[i] > spent[i]) {
+            return Error(CreditErrorCode::kWrongIdentity);
+        }
+    }
+    if (consumed != spent || peer.pending_rx) {
+        return Error(CreditErrorCode::kInUse);
+    }
+    FinishRetire(*index);
+    return {};
+}
 std::expected<void, CreditError> ReceiveCreditDomain::RetirePeer(CreditPeerHandle handle,
                                                                  CreditRetireProof proof) noexcept {
     auto index = Find(handle);
     if (!index) {
         return std::unexpected(index.error());
     }
-    auto& peer = state_->peers[*index].stats;
+    auto& record = state_->peers[*index];
+    if (record.withdrawal_owner) {
+        return Error(CreditErrorCode::kInUse);
+    }
+    auto& peer = record.stats;
     if (peer.retired) {
         return {};
     }
@@ -573,6 +691,11 @@ std::expected<void, CreditError> ReceiveCreditDomain::RetirePeer(CreditPeerHandl
     if (peer.pending_rx) {
         return Error(CreditErrorCode::kInUse);
     }
+    FinishRetire(*index);
+    return {};
+}
+void ReceiveCreditDomain::FinishRetire(std::uint32_t index) noexcept {
+    auto& peer = state_->peers[index].stats;
     const auto unused_data = peer.base.granted + peer.elastic_granted;
     state_->stats.data.granted -= unused_data;
     state_->stats.data.free += unused_data;
@@ -584,7 +707,6 @@ std::expected<void, CreditError> ReceiveCreditDomain::RetirePeer(CreditPeerHandl
     peer.retired = true;
     --state_->stats.active_peers;
     ++state_->stats.tombstones;
-    return {};
 }
 
 } // namespace connection

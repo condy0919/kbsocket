@@ -63,6 +63,7 @@ cc_test(
     srcs = ["eager_receive_close_test.cpp"],
     deps = [
         ":eager_rx",
+        "//kbsocket/control:peer_credit_control",
         "//kbsocket/transport/raw:receive_domain_closer",
         "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",

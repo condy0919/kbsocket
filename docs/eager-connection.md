@@ -36,7 +36,13 @@
 
 M5.3.6 的 `CloseDestroyed(const raw::ReceiveDomainCloser&)` 提供独立控制路径：先由宿主取得 M1 要求的远端静默、事件确认、队列用户停止和 CQ 健康证明，停用对应 Runtime/raw 进度绑定，推进真实接收域关闭。只有 M1 已达到 `kClosed`，且匹配 Eager 捕获的 RxBufferPool successful-Open incarnation 和 Credit receive-domain incarnation，才能清理冻结账务。等待 Held、DeleteJfr 或 MR 注销失败时都保留原账并等待重试；已知残留 RX 为 0 也不能跳过实际关闭。
 
-该入口先原子核验全部 queued receipt 的身份及 released 状态、全局 released 数量和零 Held，再永久清退 Eager 与接收授信元数据。成功不补投、不产生可发放额度，也不猜测 unknown 的 Peer/类别。它不会释放仍 Held 的数据，不绕过故障 CQ 隔离，不自动撤路由、退休来源或关闭借用的连接/导入资源；宿主必须先停止这些访问。远端关闭/授信撤回协议与完整 Runtime 资源装配仍待后续接入。
+该入口先原子核验全部 queued receipt 的身份及 released 状态、全局 released 数量和零 Held，并确认没有仍绑定的 Peer 授信撤回协调器，再永久清退 Eager 与接收授信元数据。成功不补投、不产生可发放额度，也不猜测 unknown 的 Peer/类别。它不会释放仍 Held 的数据，不绕过故障 CQ 隔离，不自动撤路由、退休来源或关闭借用的连接/导入资源；宿主必须先停止这些访问。完整 Runtime 资源装配仍待后续接入。
+
+## Peer 授信撤回
+
+M5.3.7 的 [`PeerCreditControl`](peer-credit-control.md) 在独立已认证控制 fd 上停止整个 Peer 共账并交换最终接受计数，不能使用某条 Connection 的 Close 或 LaneControl ACK 代替。成功 Open 会 Stop SenderCreditAccount、FreezePeer 接收授信；同 Peer 的 Connection 会因账本停止/冻结而显式失败，宿主须推进这些连接 Close，归还缓冲 RX 并继续处理真实 TX 完成。这一路径不承诺把未提交业务数据发完，也不重放。
+
+撤回期间整个 EagerReceiveDomain 必须继续处理真实迟到 RX、Release 和实际 refill；不要先 Freeze 整个域。接收端 DATA/CONTROL 消费量分别等于对端最终 spent 且全部 receipt 补投结账后，协调器才退休旧授信并 ACK。完成后仍需独立等待本地 DMA/import 引用、来源与事件责任收敛；失败保留冻结账本，Close 只解除控制器绑定，不恢复授信，也不产生 M1 销毁证明。新 epoch 的 Sender 额度不能被旧 Eager TX 流复用。
 
 ## 控制流的前进保证
 
@@ -61,4 +67,4 @@ M5.3.4 的 `ConnectionOwner` 已统一拥有固定容量的连接对象及来源
 
 M5.3.5 已提供固定容量的 `ConnectionMailbox`，支持跨线程复制读写、半关闭、取消及状态命令；完成未领取持续占槽，短操作不自动重试，raw 命令遵守整个 context 的暂停屏障。
 
-raw 资源自动装配、公平额度调度、显式 C ABI/零拷贝接口和关闭协议继续推进。当前代码不自动创建完整 raw Runtime、不探测远端静默，也不根据 Close 或控制断链撤销共账授信或旧来源绑定。工作区已有 API 草稿未作为稳定 ABI 发布。RNDV/Grant、主备选路、故障 CQ 回收和真实规模测试仍按原 roadmap 分期推进。
+raw 资源自动装配、公平额度调度、显式 C ABI/零拷贝接口和完整关闭接线继续推进。Peer 授信撤回已提供独立协调器，尚未自动管理专用 fd 或接入 Runtime 调度；当前代码仍不根据 Connection Close、FIN 或控制断链撤销共账授信和旧来源绑定。工作区已有 API 草稿未作为稳定 ABI 发布。RNDV/Grant、主备选路、故障 CQ 回收和真实规模测试仍按原 roadmap 分期推进。

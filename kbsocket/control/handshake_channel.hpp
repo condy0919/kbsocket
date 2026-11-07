@@ -23,7 +23,15 @@ inline constexpr std::uint16_t kHandshakeVersion = 3;
 inline constexpr std::uint16_t kHandshakeCapabilityRaw = 1;
 inline constexpr std::uint16_t kHandshakeCapabilityTcp = 2;
 
-enum class HandshakeMessageKind : std::uint8_t { kHello = 1, kReady = 2, kReject = 3, kLaneUpdate = 4, kLaneAck = 5 };
+enum class HandshakeMessageKind : std::uint8_t {
+    kHello = 1,
+    kReady = 2,
+    kReject = 3,
+    kLaneUpdate = 4,
+    kLaneAck = 5,
+    kCreditStop = 6,
+    kCreditStopAck = 7
+};
 enum class HandshakeTransport : std::uint32_t { kRaw = 1, kTcp = 2 };
 
 /// session 为本端 HELLO 的不可复用 nonce；双方 READY 必须完整回显两个 identity。
@@ -93,6 +101,16 @@ struct HandshakeLaneAck {
     HandshakeIdentity receiver;
     std::uint64_t update_id = 0;
 };
+/// 独立 Peer 授信撤回通道的停止快照；spent 顺序为 DATA、CONTROL，零流量也允许协商。
+/// ACK 交换双方 identity/epoch 并回显原 STOP 的 spent；它不属于初始握手或 LaneControl。
+struct HandshakeCreditStop {
+    HandshakeIdentity sender;
+    HandshakeIdentity receiver;
+    std::uint64_t sender_credit_epoch = 0;
+    std::uint64_t receiver_credit_epoch = 0;
+    std::array<std::uint64_t, 2> spent{};
+    bool operator==(const HandshakeCreditStop&) const = default;
+};
 struct HandshakeMessage {
     HandshakeMessageKind kind = HandshakeMessageKind::kHello;
     HandshakeHello hello;
@@ -100,6 +118,8 @@ struct HandshakeMessage {
     HandshakeReject reject;
     HandshakeLaneUpdate lane_update;
     HandshakeLaneAck lane_ack;
+    HandshakeCreditStop credit_stop;
+    HandshakeCreditStop credit_stop_ack;
 };
 enum class HandshakeErrorCode : std::uint8_t {
     kInvalidArgument,

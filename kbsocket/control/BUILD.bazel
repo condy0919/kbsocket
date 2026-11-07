@@ -35,6 +35,26 @@ cc_library(
 )
 
 cc_library(
+    name = "peer_credit_control",
+    srcs = ["peer_credit_control.cpp"],
+    hdrs = ["peer_credit_control.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":handshake_channel",
+        "//kbsocket/connection:credit_account",
+    ],
+)
+
+cc_test(
+    name = "peer_credit_control_test",
+    srcs = ["peer_credit_control_test.cpp"],
+    deps = [
+        ":peer_credit_control",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "endpoint_import_cache",
     srcs = ["endpoint_import_cache.cpp"],
     hdrs = ["endpoint_import_cache.hpp"],

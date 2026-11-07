@@ -1,6 +1,6 @@
 # 连接线协议、顺序窗口与授信原语
 
-本文记录 [roadmap](roadmap.md) 的 M4.2 实现。`kbsocket/connection/` 提供有界、单 owner 的编解码、身份分配、发送顺序、接收重排及物理 RQE 授信账本；这些组件不提交 WR。M5.1 已增加 [连接建链与导入缓存](connection-handshake.md)，完整业务 `Connection`、TCP 控制逃生及 Socket API 尚未实现。宿主负责把可信的 post、CQE、Lease 归还和协议证明接入对应账本。
+本文记录 [roadmap](roadmap.md) 的 M4.2 原语及后续生命周期接线。`kbsocket/connection/` 的这些原语提供有界、单 owner 的编解码、身份分配、发送顺序、接收重排及物理 RQE 授信账本，本身不提交 WR。M5 已增加 [连接建链与导入缓存](connection-handshake.md)、[Eager Connection](eager-connection.md) 和 [Peer 授信撤回协调器](peer-credit-control.md)；稳定应用 ABI 与完整资源装配尚未交付。宿主负责把可信的 post、CQE、Lease 归还和协议证明接入对应账本。
 
 ## Wire v1 格式
 
@@ -98,17 +98,19 @@ F 是可授出的已 post 槽，G 是已经授出的承诺，U 是尚未初始 p
 
 `Consume` 只用于已经发生的真实 RX，不是查询额度的试探接口。若真实 RX 无法成功结入原 Peer/类别，包括 G 不足、Peer 已退休、身份无效或无法确定类别，宿主必须在实际来源接收域调用 `ConsumeUnknown`，扣除物理消耗并冻结；不能因 `Consume` 返回错误就遗漏该 RQE。若连未归属记账都无法完成，继续保留该域及全部依赖，不能恢复准入。对 refill 接受范围未知等不能推断 RX 数量的情况，使用 `Freeze()` 仅封禁新准入/授信，不伪造接收或补投证据；已知事实仍须继续结账。
 
-`SenderCreditAccount` 对同一个授信关系维护数据/控制两组累计上界、spent 和当前 reservation。`Reserve` 先扣可用额度；可信 partial post 只将接受前缀计为 spent，并解除未接受后缀 reservation。接受范围未知时把整批保守记为 spent，停止新准入。TX 完成、超时和逻辑连接关闭都没有增加远端 credits 的接口。重复 CREDIT 更新只取累计最大值。
+`SenderCreditAccount` 对同一个授信关系维护数据/控制两组累计上界、spent 和当前 reservation。`Reserve` 先扣可用额度；可信 partial post 只将接受前缀计为 spent，并解除未接受后缀 reservation。接受范围未知时把整批保守记为 spent，停止新准入，并将本 epoch 的 `accepted_known` 永久置为 false；这个上界不能作为授信撤回的确定接受量。TX 完成、超时和逻辑连接关闭都没有增加远端 credits 的接口。重复 CREDIT 更新只取累计最大值。
 
-数据额度耗尽时控制额度仍可单独预留，但必须确实获得控制授权并取得本地 SQ 资源。RNDV RTS 属于数据入口需求，不能消耗全部控制保留；当前 codec 尚未开放 RTS。TCP 控制逃生通道及跨 Peer 公平发放策略尚未实现，不能仅凭两个额度分类就宣称完整协议没有死锁。
+数据额度耗尽时控制额度仍可单独预留，但必须确实获得控制授权并取得本地 SQ 资源。RNDV RTS 属于数据入口需求，不能消耗全部控制保留；当前 codec 尚未开放 RTS。M5.3.7 的独立 TCP 控制流仅用于整份 Peer 授信撤回，尚未承担运行中 CREDIT 的通用逃生或跨 Peer 公平发放；不能仅凭两个额度分类就宣称完整协议没有死锁。
 
 `RetirePeer` 要求宿主同时证明发送端已停止、真实接受集合已结清、未使用授权已撤销，并等待该 Peer 所有接收 receipt 正常 refill 结账；失联、TTL 或空 CQ 不构成证明。退休后保留 tombstone 到域关闭，不复用原表项和旧 epoch。相同 Peer 重新准入要求更高 epoch，且旧关系已经退休。Sender 重开也要求同 Peer/域且 epoch 严格增加，这不代替 Receiver 的终结证明。
+
+M5.3.7 的 `PeerCreditControl` 独占绑定 Sender 共账和本端接收 Peer，通过独立已认证控制 fd 交换停止后的最终 DATA/CONTROL spent。成功 Open 即停止共账新 Reserve、冻结本端 Peer 新 Grant；已有 reservation 必须先按真实接受量结清，RX Consume/Release/实际 refill 继续运行。接收端消费量逐类等于远端最终 spent、`pending_rx==0` 且无 unknown 责任后才内部退休并 ACK。绑定期间拒绝普通 Sender Close、外部 RetirePeer 及整个账本的销毁清退；控制器 Close 只解除绑定，不恢复发送或授权。完整契约见 [Peer 授信撤回](peer-credit-control.md)。
 
 接收授信域与 `EagerReceiveDomain` 采用唯一绑定，同一 Credit 域不能同时被第二个 Eager 域接管。绑定期间直接调用 Credit `Close` 返回 InUse，沿用原 Close 的冻结授信行为。须先成功关闭 Eager，或走下述整域核销入口，避免一份物理关闭证据清掉另一接收域仍在使用的账本。普通 Credit `Close` 只关闭元数据，不销毁真实 JFR，不终结 Posted DMA，也不替代 [M1 接收域关闭](design/kbsocket-design-v1.md#53-接收域安全关闭状态机m1-核心规范)。对象重开必须使用更大的接收域 incarnation，不能用于重置旧域的承诺。
 
 M5.3.6 增加控制路径桥接 `EagerReceiveDomain::CloseDestroyed(const raw::ReceiveDomainCloser&)`，用于接收域已经物理销毁后清退冻结、已释放但未补投的 receipt。该入口要求 M1 协调器真实到达 `kClosed`，且对应同一 RxBufferPool 的本次成功 Open incarnation；同时核对 Eager 打开时捕获的 Credit 接收域 incarnation，阻止旧关闭证据作用于重开的域。即使残留 Posted 为 0，也必须实际完成 M1 关闭；空 CQ、Stopped、控制断开或 `retired_on_delete()==0` 都不能替代证据。
 
-核销前整批核验：没有 Held 或正在 Dispatch 的条目，所有 queued receipt 身份仍有效且已经 Release，Credit 全局 Held 为 0，released 总数与这批 receipt 一致。任一检查失败，两层元数据都保留。成功后永久清退本层与整个接收授信域的元数据，含已释放的 unknown receipt 和旧授权；过程不 post、不把 U 转为 F、不重授信，也不按猜测给 unknown 分配类别。等待 Lease、DeleteJfr/注销失败或其他未完成 M1 阶段都保留到重试成功；故障 CQ 的保留流程不支持此核销。远端关闭协议、来源退休和 Runtime 解绑仍是独立责任，不能由此接口自动推断。
+核销前整批核验：没有 Held 或正在 Dispatch 的条目，所有 queued receipt 身份仍有效且已经 Release，Credit 全局 Held 为 0，released 总数与这批 receipt 一致，且没有仍绑定的 PeerCreditControl。任一检查失败，两层元数据都保留。成功后永久清退本层与整个接收授信域的元数据，含已释放的 unknown receipt 和旧授权；过程不 post、不把 U 转为 F、不重授信，也不按猜测给 unknown 分配类别。等待 Lease、DeleteJfr/注销失败或其他未完成 M1 阶段都保留到重试成功；故障 CQ 的保留流程不支持此核销。授信撤回、来源退休和 Runtime 解绑仍是独立责任，不能由此接口自动推断。
 
 ## 宿主组合顺序与范围
 
@@ -124,4 +126,4 @@ M5.3.6 增加控制路径桥接 `EagerReceiveDomain::CloseDestroyed(const raw::R
 bazel test //kbsocket/connection:all --test_output=errors
 ```
 
-单元测试覆盖 wire 字节格式、身份/序号边界、部分接受、乱序/慢读/FIN、数据与控制授信、receipt 复用和隔离；`eager_primitives_test.cpp` 使用 Mock Slab 与这些原语组合验证。M5.1 的独立测试另行覆盖非阻塞握手；上述测试不代表已经有双机 Eager `Connection`、TCP 信用逃生、自动 Credit scheduler、应用 API 或完整 RNDV，也不构成本轮 UB 真机 PASS。
+单元测试覆盖 wire 字节格式、身份/序号边界、部分接受、乱序/慢读/FIN、数据与控制授信、receipt 复用和隔离；`eager_primitives_test.cpp` 使用 Mock Slab 与这些原语组合验证。M5 的独立测试另行覆盖非阻塞握手、Connection 和 Peer 授信撤回；上述原语测试不代表已经完成双机 Eager 真机验证、通用 TCP 信用逃生、自动 Credit scheduler、稳定应用 ABI 或完整 RNDV。
