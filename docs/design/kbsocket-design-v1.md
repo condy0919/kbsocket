@@ -303,7 +303,7 @@ stateDiagram-v2
 
 `JettyLane` 的身份由 pool 指针、池 epoch、Lane index、Lane generation 组成。每次 `Open` 使用新的 epoch，初代 Lane generation 为 1；`ReplaceDrainedLane(old_lane, quiescence)` 只更新目标 Lane generation，不使健康 Lane 的票据失效。epoch、generation、票据 sequence 耗尽时拒绝回绕；账本的单调 AttemptId 与提交序号规则保持不变。
 
-替换要求目标 Lane 已达到 `kDrained` 且无在途票据，并由调用方给出以下三项持续有效的事实。当前接口为同步控制原语，创建/删除可能阻塞；M3 再接入 `ControlExecutor`，数据面不能自行调用替换，也不自动重放旧请求。
+替换要求目标 Lane 已达到 `kDrained` 且无在途票据，并由调用方给出以下三项持续有效的事实。raw 接口仍为同步控制原语；M3 的 `RuntimeShard::RequestReplacement` 在取得显式证明后交给 `ControlExecutor`，执行期间暂停该 context 的全部 owner 访问，其他 context 继续推进。数据面不能自行调用创建/删除，也不自动重放旧请求。
 
 | `JettyLaneQuiescence` 字段 | 替换前及失败重试时必须成立的条件 |
 | --- | --- |
@@ -344,7 +344,7 @@ sequenceDiagram
 
 #### M1 raw 实现与调用责任
 
-当前入口为 [`ReceiveDomainCloser`](../../kbsocket/transport/raw/receive_domain_closer.hpp)。它是借用 `JettyPool` / `RxBufferPool` 的单 owner 控制对象，关闭过程中两池、context、MR 及本协调器必须持续存活；析构不自动推进硬件销毁。完整控制协议与事件引擎分别在 M5/M3 接入，本阶段不以空 CQ、断链或等待超时自动构造静默证明。
+当前入口为 [`ReceiveDomainCloser`](../../kbsocket/transport/raw/receive_domain_closer.hpp)。它是借用 `JettyPool` / `RxBufferPool` 的单 owner 控制对象，关闭过程中两池、context、MR 及本协调器必须持续存活；析构不自动推进硬件销毁。M3 已接入事件消费与异步控制执行器，`RuntimeShard::Close` 只解绑进度源，不替代接收域销毁协议。完整远端控制协议仍待 M5，不以空 CQ、断链或等待超时自动构造静默证明。
 
 1. `Begin(pool, buffers)` 取得该域的独占关闭权，只停止 TX `Reserve` / `ReserveOn` / `Get`。现存票据仍可 `Commit`、`Cancel`、`Complete`，TX poll/ERROR/flush 继续可用；RX `Poll` / `Release` / `Refill` 在确认远端静默前继续可用，避免关闭握手期间因提前停止补投而制造 RNR。这些操作由同一 owner 串行推进。
 2. `Advance(quiescence, events)` 首次收到 `peer_stopped = true` 后调用 RX `Stop`，该停止不可逆，远端静默须持续至关闭完成。在 `kDraining` 阶段每次执行一次有界 RX poll，最多消费 `RxBufferPool::kPollBatch` 项，并通过 `rx_events` 返回本次事件数。出现 RX 事件时当次不进入删除，调用方须处理每个返回事件，包括带错误但持有 lease 的事件。TX 票据退休和 ERROR/flush 完成仍由调用方负责。RX poll 失败则进入 `kRetained` 并封禁整个域的队列推进；后续 `Advance` 只报告保留错误，直接 TX/RX poll 也被禁止，仅允许已有 Held lease 归还。此阶段不继续 TX 退休或尝试故障 CQ 回收，整个依赖链保留至退出。
@@ -528,6 +528,8 @@ $$F_{\text{elastic}, j} + \sum_{i} \underbrace{(F_{\text{base}, ij} + G_{\text{b
 ---
 
 ## 9. 统一进度器（`ShardReactor`）：Busy-Poll 与事件模式
+
+**M3 实现边界**：[`runtime-shard.md`](../runtime-shard.md) 记录已落地的四 context 公平轮询、JFCE/async 消费、水线补投与控制任务所有权移交。实现借用已打开的 raw 资源，owner 线程由宿主提供；`ProgressSource` 为 mailbox/timer/retire 留出独立预算，后续连接调度、跨线程 LeaseReturn、NativeTCP/SHM 和协议级 credits 仍按 roadmap 接入。以下是完整目标模型，不能将 Mock 覆盖视为新硬件或端到端 Socket 验收。
 
 ### 9.1 单轮有界公平推进（Bounded Fair Progress）
 

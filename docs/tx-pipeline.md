@@ -87,7 +87,7 @@ TxSender 的 Close 只解除绑定，不退休账本请求；关闭提交器后�
 Poll 的 expected 错误表示本次未成功取得 CQE；成功结果包含 `count` 和 `retired`。每个已取出的 CQE 都对应一个输出事件，单条异常不会让后续有效 CQE 被丢弃。必须同时检查事件的 record 与 error：modify 失败时，合法的终结 CQE 仍返回退休记录，同时报告硬件状态转换错误。事件类型如下：
 
 - `kCompleted`：已按 user_ctx、local_id 和完整 lane 身份验证已提交记录归属，并执行 ledger.Complete 归还额度。record 保存原始连接、操作和资源引用；completion.status 区分成功和具体 WR 错误。仅此类事件增加 retired。
-- `kFlushDone` / `kSuspendDone`：公共 URMA 状态定义中的假 CQE 边界，user_ctx 无效；输出中将其清零，不查账本、不退休其他 WR。FLUSH_DONE 只接受本地 kError 状态；SUSPEND_DONE 只诊断已有 kFaulted/kError/kFlushReady 状态，不启动排空、不代替 FLUSH_DONE。
+- `kFlushDone` / `kSuspendDone`：公共 URMA 状态定义中的假 CQE 边界，user_ctx 无效；输出中将其清零，不查账本、不退休其他 WR。默认模式 FLUSH_DONE 只接受本地 kError 状态；延后排空模式还可为同代 kFaulted Lane 保存一次早到边界，Modify 成功前不能据此软件 flush；SUSPEND_DONE 只诊断已有 kFaulted/kError/kFlushReady 状态，不启动排空、不代替 FLUSH_DONE。
 - `kRejected`：方向/对象类型不符、未知队列、重复或未知 id、通道不匹配、未提交记录或不支持的状态。原始 CQE 与错误信息交给上层诊断，不猜测完成范围、不释放其资源。
 
 所有真实 WR 完成都先验证方向、终结状态、`LookupPosted(user_ctx)` 和 pool/index/epoch/generation，再允许改变 SQ 状态。未知、重复、Prepared 或跨 lane 的 CQE 不会仅凭 local_id 触发 BeginDrain。
@@ -96,9 +96,11 @@ Poll 的 expected 错误表示本次未成功取得 CQE；成功结果包含 `co
 
 其余可信普通终结错误（包括 ACK_TIMEOUT、本地访问错误和真实 `WR_FLUSH_ERR`）先隔离该 SQ，再主动 modify 为 ERROR。真实 `WR_FLUSH_ERR` 即使早于软件 ERROR 到达，仍是对应 WR 的终结证据，不能丢弃；BeginDrain 对 kError/kFlushReady 幂等，不重复 modify 或回退已取得的边界。只标记本地故障不足以停止 error continue 模式的硬件。其他在途 WR 仍需各自的终结证据，已隔离但尚未替换的队列仍可通过 local_id 查找并处理尾部完成。`FLUSH_ERR_DONE` 不能推导整个账本已经排空；`WR_UNHANDLED` 属于显式 urma_flush_jetty 返回语义，不作为普通 poll 的终结依据。
 
-用户于 2026-10-23 补充确认：status 9 后可删除旧 jetty 并重新创建，无需仅因这一错误重建整个 context；jetty 异常不影响正常 JFC 上的排空流程。因此 ACK_TIMEOUT 继续采用阻止新提交并排空旧请求的策略。M2 已提供显式 `JettyPool::ReplaceDrainedLane`，在旧队列排空、事件和使用者屏障成立后用新 generation 替换主动 jetty，不重放旧请求；自动替换调度尚未实现。该契约不覆盖 JFC 自身故障后的终结与回收，见 [单 lane 替换](jetty-pool.md#排空后的单-lane-替换)。
+用户于 2026-10-23 补充确认：status 9 后可删除旧 jetty 并重新创建，无需仅因这一错误重建整个 context；jetty 异常不影响正常 JFC 上的排空流程。因此 ACK_TIMEOUT 继续采用阻止新提交并排空旧请求的策略。M2 已提供显式 `JettyPool::ReplaceDrainedLane`，在旧队列排空、事件和使用者屏障成立后用新 generation 替换主动 jetty，不重放旧请求；M3 通过 `RuntimeShard::RequestReplacement` 调度显式请求，不自动推断替换屏障。该契约不覆盖 JFC 自身故障后的终结与回收，见 [单 lane 替换](jetty-pool.md#排空后的单-lane-替换)。
 
-收到合法 kFlushDone 后，owner 可调用 Flush(lane, events) 分批处理软件残留 WR，见下节。此层不调度后台排空、不处理异步事件或自动销毁故障队列。错误完成不是连接级 ACK，也不能自动宣称同 SQ 上其他连接全部失败或全部完成。
+`TxCompletionProcessor(ledger, true)` 为 M3 延后排空模式：可信致命完成只调用 `MarkFaulted`，由 `RawContextProgress` 安排控制线程执行 `BeginDrain`，避免在 CQ poll 内执行可能阻塞的 modify。同批早到 FLUSH_ERR_DONE 由 `RememberFlushDone` 保存，控制修改成功后进入 kFlushReady；修改失败仍隔离并保留证据。默认构造继续兼容显式工具的同步排空方式。
+
+收到合法 kFlushDone 且 Lane 已为 kFlushReady 后，owner 可调用 Flush(lane, events) 分批处理软件残留 WR，见下节。此层不调度后台排空、不处理异步事件或自动销毁故障队列。错误完成不是连接级 ACK，也不能自动宣称同 SQ 上其他连接全部失败或全部完成。
 
 正常发送闭环为 `TxSender.Send → provider → TxCompletionProcessor.Poll → ledger.Complete → pool 额度归还`。上层可在 retired 非零后推进发送等待队列；这只是资源变化，不保证某个 socket 已满足所有可写条件。当前未接 socket/epoll 的 NotifyWritable，也不自动释放 buffer/grant 或重试未提交工作。
 
@@ -110,7 +112,7 @@ Poll 的 expected 错误表示本次未成功取得 CQE；成功结果包含 `co
 
 1. `JettyPool::BeginDrain(lane)` 先阻断 Reserve/ReserveOn/Get，再调用 `ModifyJetty`，属性为 `mask=JETTY_STATE, state=URMA_JETTY_STATE_ERROR`。modify 失败保留隔离状态，owner 可显式重试；成功后重复调用不重复 modify。
 2. owner 继续 poll 共享 TX JFC。该 SQ 的 `WR_FLUSH_ERR` 是逐 WR 的终结错误，user_ctx 有效，照常核验身份并退休。
-3. 后续 `WR_FLUSH_ERR_DONE` 只标记硬件 FLUSH_ERR 的终结，user_ctx 无效，输出始终清零。只有本地已切 ERROR 才接受此边界；意外或重复边界返回拒绝事件，不清空任何记录。
+3. 后续 `WR_FLUSH_ERR_DONE` 只标记硬件 FLUSH_ERR 的终结，user_ctx 无效，输出始终清零。默认模式只有本地已切 ERROR 才接受此边界；延后模式允许 kFaulted 暂存一次边界，必须等控制修改成功后再 flush。意外或重复边界返回拒绝事件，不清空任何记录。
 4. owner 在收到 kFlushDone 后调用 `TxCompletionProcessor::Flush(lane, events)`。实际请求数量为 `min(events.size(), 64, tx_depth)`：liburma 要求 flush 数量不超过单个 SQ 深度，不能直接沿用共享 CQ 的 poll 缓冲大小；票据已清零时也用合法正数请求来确认软件队列为空。仅接受指定 SQ、TX jetty 方向、状态 `WR_UNHANDLED` 且匹配活跃已提交记录的返回项。普通 poll 中的 WR_UNHANDLED 仍不作为退休依据。
 5. 每条合法软件完成通过 ledger.Complete 归还额度并返回资源引用。重复、未知、错误通道或 Prepared 记录均拒绝；不会因为一条错误丢弃同批后续合法返回项。
 6. 持续 Flush，直到返回 count=0 且无错误。只有 provider 返回 0 且该 SQ 没有残留票据才标记排空；其他 SQ 仍有在途请求不会妨碍此 SQ 排空。旧 jetty 不再发送，后续仅可由控制路径在三项静默证明成立后显式替换。

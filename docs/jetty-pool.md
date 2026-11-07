@@ -8,11 +8,11 @@
 
 `JettyPool` 独占发送 JFC、接收 JFC、一个 JFR、一个固定被动接收 jetty 和若干主动发送 jetty。所有 jetty 引用同一个独立创建的 JFR；不创建独立 JFS。`Open(ctx, cap, config)` 借用已打开的 context，`cap` 必须来自同一设备的目录快照。先检查 `RM_CTP`、队列深度、SGE 和 inline 限制，再创建资源，全部成功才允许通过 `Reserve()` / `jfr()` 借用。生产端点通过 `rx_target_jetty_id()` 发布被动 jetty 的完整 ID（包含 EID），其请求发送深度为 1，不参与发送额度分配。`IsReceiveJetty(local_id)` 同时识别被动 jetty 和当前主动 jetty，以兼容现有工具的主动目标。
 
-使用 `//kbsocket/transport/raw:jetty_pool` Bazel 目标。配置默认发送/接收深度各 128，两个 JFC 深度各 256，SGE 各 1；不满足设备限制时显式失败，不自动裁剪。inline 为 0 遵循 URMA 的设备默认值语义。采用无 JFCE 的纯轮询模式，队列配置 `lock_free=1`，`non_blocking` 保持默认值 0；所有投递和轮询必须遵守同一 owner 约束。没有事件唤醒、远端导入或建链；RM_CTP 能力门禁不等于已完成 CTP 连接，远端导入时仍须指定正确的 TP 类型。JFR 暂用默认无 token 策略，后续建链认证需另行配置。
+使用 `//kbsocket/transport/raw:jetty_pool` Bazel 目标。配置默认发送/接收深度各 128，两个 JFC 深度各 256，SGE 各 1；不满足设备限制时显式失败，不自动裁剪。inline 为 0 遵循 URMA 的设备默认值语义。默认 `events=false` 采用纯轮询；`events=true` 先创建一个 JFCE，两个 JFC 绑定同一通知通道，队列配置 `lock_free=1`，`non_blocking` 保持默认值 0；所有投递和轮询必须遵守同一 owner 约束。事件消费交由 [RuntimeShard](runtime-shard.md) 或显式 owner；池不负责远端导入或建链；RM_CTP 能力门禁不等于已完成 CTP 连接，远端导入时仍须指定正确的 TP 类型。JFR 暂用默认无 token 策略，后续建链认证需另行配置。
 
 `PollSend` / `PollRecv` 接收调用方预分配的 `std::span<urma_cr_t>`，返回本批完成数量（0 为无完成），不分配内存或加锁。调用方继续检查每条完成的状态并回收对应请求，不能把轮询成功等同于每条 WR 成功。
 
-创建失败自动逆序回滚，`JettyPoolError.failure` 保存原始错误，`cleanup_error` 保存清理失败。JFC/JFR 创建后先创建被动 jetty，再创建主动 jetty；关闭时先逆序删除主动 jetty，再删除被动 jetty、JFR、接收 JFC、发送 JFC。任一删除失败即停止，保留其依赖资源，再次 Close 只处理尚未释放部分；开始删除后不再允许 post/poll。Open/Close 必须在使用者停止时执行，ready 标志不是并发停止协议。
+创建失败自动逆序回滚，`JettyPoolError.failure` 保存原始错误，`cleanup_error` 保存清理失败。JFC/JFR 创建后先创建被动 jetty，再创建主动 jetty；关闭时先逆序删除主动 jetty，再删除被动 jetty、JFR、接收 JFC、发送 JFC，最后删除可选 JFCE。任一删除失败即停止，保留其依赖资源，再次 Close 只处理尚未释放部分；开始删除后不再允许 post/poll。Open/Close 必须在使用者停止时执行，ready 标志不是并发停止协议。
 
 池当前独立于 RawRuntime，宿主必须在关闭 context 前成功关闭所有借用它的池。退出时若 bRPC worker 仍在访问，整个池、已注册内存及 context 都必须常驻，例如由 NoDestructor 持有上层资源容器；不能仅让 RawRuntime 常驻而让池自动析构。析构只作受控作用域的兜底，失败会记录错误并保留底层依赖资源，不替代显式停止与清理。
 
@@ -32,7 +32,7 @@ RM_CTP 每个 WR 自行指定 `tjetty`，连接不独占 jetty。`Reserve()` 轮
 
 `ReplaceDrainedLane(old_lane, quiescence)` 是同步控制路径 API，不在数据面 Tick 内调用，也不自动重放请求。仅在该 lane 为 kDrained、无票据，且调用方确认 `events_acked`、`queue_users_stopped`、`completions_drained` 三项证明后执行。证明分别覆盖事件 Get/Ack 与引用、旧队列使用者和缓存句柄停止、旧 CQE 全部消费；新 generation 不能替代这些屏障，尤其无 user_ctx 的边界 CQE 不能独自识别代次。
 
-替换先将槽位置为 kReplacing，使旧 ID 不再由 FindLane 路由，再删除旧 jetty，并按 Open 时的配置快照创建新 jetty。删除失败保留旧句柄；创建失败保留空槽位，两者都保持隔离，可携带同一旧 lane 和有效证明重试。仅创建成功才增加 generation 并发布 kReady，旧票据和旧控制句柄因此失效，即使 provider 复用了硬件 ID。被动端点、共享 JFR/JFC 和健康 lane 的票据不变。全接收域关闭开始后禁止替换，关闭路径可删除 kReplacing 中仍保留的句柄。自动排空调度和替换决策尚未实现。
+替换先将槽位置为 kReplacing，使旧 ID 不再由 FindLane 路由，再删除旧 jetty，并按 Open 时的配置快照创建新 jetty。删除失败保留旧句柄；创建失败保留空槽位，两者都保持隔离，可携带同一旧 lane 和有效证明重试。仅创建成功才增加 generation 并发布 kReady，旧票据和旧控制句柄因此失效，即使 provider 复用了硬件 ID。被动端点、共享 JFR/JFC 和健康 lane 的票据不变。全接收域关闭开始后禁止替换，关闭路径可删除 kReplacing 中仍保留的句柄。M3 已提供自动排空推进及显式 `RequestReplacement` 的控制线程调度；替换证明和业务连接决策仍由宿主提供。
 
 ## 通过 gflags 设置队列深度
 
@@ -53,5 +53,7 @@ TX JFC 的额外容量覆盖主动和被动 jetty 的 FLUSH_ERR_DONE 边界 CQE�
 `error_suspend` 保持默认值 0，采用 error continue。`MarkFaulted` 只禁止本地发送；`BeginDrain` 在隔离后主动 modify 为 ERROR，成功后幂等，失败保留隔离并允许重试。`lane_state` 区分 kReady、kFaulted、kError（等待边界）、kFlushReady、kDrained、kReplacing，只有 kReady 且池准入未停止时能预留与获取发送句柄。
 
 完成层消费 FLUSH_ERR_DONE 后调用 ObserveFlushDone，再通过 FlushSend 取得软件残留 WR；正常调用方使用封装了身份校验与账本退休的 `TxCompletionProcessor::Flush`。ERROR 状态下 post 可能仍返回成功，因此不得缓存 Get 的裸指针后绕过池状态继续投递。排空只终结在途请求，不恢复 jetty 可用性。
+
+`RetainDependencies()` 用于 CQ 故障等缺失终结证据的域：永久停止准入、post/poll、替换及删除；已有句柄仅用于身份识别和事件 Ack，不能继续数据访问。RX 池同步拒绝注销内存，已有 Held lease 仍可归还。此门禁不实现故障 CQ 回收。
 
 完整顺序、错误语义与验证范围见 [TX 故障排空](tx-pipeline.md#error-continue-与单-sq-故障排空)。

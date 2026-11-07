@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+cc_library(
+    name = "control_executor",
+    srcs = ["control_executor.cpp"],
+    hdrs = ["control_executor.hpp"],
+    linkopts = ["-pthread"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "control_executor_test",
+    srcs = ["control_executor_test.cpp"],
+    linkopts = [
+        "-Wl,--wrap=pthread_create",
+        "-Wl,--wrap=pthread_join",
+    ],
+    linkstatic = True,
+    deps = [
+        ":control_executor",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "progress_source",
+    hdrs = ["progress_source.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [":control_executor"],
+)
+
+cc_library(
+    name = "shard_reactor",
+    srcs = ["shard_reactor.cpp"],
+    hdrs = ["shard_reactor.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":control_executor",
+        ":progress_source",
+    ],
+)
+
+cc_test(
+    name = "shard_reactor_test",
+    srcs = ["shard_reactor_test.cpp"],
+    deps = [
+        ":control_executor",
+        ":progress_source",
+        ":shard_reactor",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "raw_context_progress",
+    srcs = ["raw_context_progress.cpp"],
+    hdrs = ["raw_context_progress.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":progress_source",
+        "//kbsocket/transport/raw:attempt_ledger",
+        "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:rx_buffer_pool",
+        "//kbsocket/transport/raw:tx_completion_processor",
+        "//kbsocket/transport/raw:urma_api",
+    ],
+)
+
+cc_test(
+    name = "raw_context_progress_test",
+    srcs = ["raw_context_progress_test.cpp"],
+    deps = [
+        ":raw_context_progress",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "runtime_shard",
+    srcs = ["runtime_shard.cpp"],
+    hdrs = ["runtime_shard.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":control_executor",
+        ":raw_context_progress",
+        ":shard_reactor",
+    ],
+)
+
+cc_test(
+    name = "runtime_shard_test",
+    srcs = ["runtime_shard_test.cpp"],
+    deps = [
+        ":runtime_shard",
+        "//kbsocket/transport/raw:receive_domain_closer",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)

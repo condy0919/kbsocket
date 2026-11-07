@@ -3,7 +3,7 @@
 > **对齐规范**：[kbsocket-design-v1.md](design/kbsocket-design-v1.md) · [hardware-observations.md](hardware-observations.md) · [hardware-validation-matrix.md](hardware-validation-matrix.md) · [OBSERVABILITY-DESIGN-GUIDE.md](OBSERVABILITY-DESIGN-GUIDE.md)
 > **最后更新**：2026-11-07
 
-本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语，验证状态分别见对应小节。M3–M7、L1/L2、O1/O2 仍为待交付计划，其中新类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
+本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语；M3 已实现借用 raw 资源的单 owner 进度器、四 context 调度、事件与有界控制执行器，验证状态分别见对应小节。M4–M7、L1/L2、O1/O2 仍为待交付计划，其中新类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
 
 ---
 
@@ -14,16 +14,17 @@
 | 模块 | 代码路径 | 已完成能力 | 遗留差距（待后续里程碑收口） |
 | :--- | :--- | :--- | :--- |
 | **错误与基础原语** | `kbsocket/base/`<br>`kbsocket/transport/raw/*_error.hpp` 及各组件头文件 | 已有日志、RAII 工具及基于 `std::expected` 的组件错误类型 | 尚无统一 `base/error.hpp`；统一应用层错误、控制面分类及 C ABI 映射时保留数据路径零分配，不新增自定义 expected 容器 |
-| **动态加载与拓扑发现** | `kbsocket/transport/raw/urma_api.*`<br>`device_catalog.*`<br>`urma_context.*`<br>`raw_runtime.*` | `liburma.so` 符号表加载、设备枚举、`RM_CTP` 能力校验、多 `UrmaContext` 初始化 | 尚未与 `RuntimeShard` 和 NUMA 亲和性调度绑定 |
-| **池化 Jetty 管理** | `kbsocket/transport/raw/jetty_pool.*`<br>`receive_domain_closer.*` | 共享 `JFR`、固定被动接收端点与主动 TX Lanes；Round-Robin、ERROR/边界/flush 排空、接收域分阶段关闭；M2 新增 Lane generation 与显式 `ReplaceDrainedLane` | 关闭/替换的远端静默、旧 CQE 和事件引用屏障仍由调用方证明；创建/删除为同步控制原语，M3/M5 接入自动调度与协调；不支持故障 JFC 在线恢复 |
-| **TX 发送与完成收敛** | `kbsocket/transport/raw/attempt_ledger.*`<br>`tx_sender.*`<br>`tx_completion_processor.*` | 单调 `AttemptId`、SEND/SEND_WITH_IMM/WRITE 提交与接受前缀入账；`LookupPosted` 核验已提交记录及完整 Lane 身份后再处理错误；8/10 逐 WR 退休，9 隔离排空 | 元数据仍为借用身份；结果分发至 Connection、自动 Lane 替换、WRITE Grant 与 DONE 通知协议分别待 M3–M6 接入；不自动重试或重放已接受 WR |
-| **RX 缓冲池** | `kbsocket/transport/raw/rx_buffer_pool.*` | 连续内存预分配、DMA 段注册、`Refill`/`Poll`/`Release`/`Stop`、`RxBufferLease` 借出与归还；M1 在 `DeleteJfr` 成功后内部清退残留 Posted，Held 归还后才注销内存 | 缺少 `JFR_LIMIT` 水位重设联动；独立 RMA Grant 生命周期属于 M4/M6，不能由 RX 关闭代为终结 |
+| **动态加载与拓扑发现** | `kbsocket/transport/raw/urma_api.*`<br>`device_catalog.*`<br>`urma_context.*`<br>`raw_runtime.*` | `liburma.so` 符号表加载、设备枚举、`RM_CTP` 能力校验、多 `UrmaContext` 初始化；M3 可显式绑定已创建的 context | 自动拓扑分片、资源创建与 NUMA 亲和性调度尚未接入 |
+| **池化 Jetty 管理** | `kbsocket/transport/raw/jetty_pool.*`<br>`receive_domain_closer.*` | 共享 `JFR`、固定被动接收端点与主动 TX Lanes；Round-Robin、ERROR/边界/flush 排空、接收域分阶段关闭；M2 新增 Lane generation 与显式 `ReplaceDrainedLane`；M3 将排空修改和显式替换交给控制线程 | 关闭/替换的远端静默、旧 CQE 和事件引用屏障仍由调用方证明；M1 关闭需宿主在控制路径推进，M5 远端关闭协议待实现；不支持故障 JFC 在线恢复 |
+| **TX 发送与完成收敛** | `kbsocket/transport/raw/attempt_ledger.*`<br>`tx_sender.*`<br>`tx_completion_processor.*` | 单调 `AttemptId`、SEND/SEND_WITH_IMM/WRITE 提交与接受前缀入账；`LookupPosted` 核验已提交记录及完整 Lane 身份后再处理错误；8/10 逐 WR 退休，9 隔离排空；M3 用 owner 回调交付结果 | 元数据仍为借用身份；Connection 路由、替换屏障的自动证明、WRITE Grant 与 DONE 协议待 M4–M6 接入；不自动重试或重放已接受 WR |
+| **RX 缓冲池** | `kbsocket/transport/raw/rx_buffer_pool.*` | 连续内存预分配、DMA 段注册、`Refill`/`Poll`/`Release`/`Stop`、`RxBufferLease` 借出与归还；M1 在 `DeleteJfr` 成功后内部清退残留 Posted，Held 归还后才注销内存；M3 联动补投与水线重写 | 跨线程归还队列及独立 RMA Grant 生命周期属于 M4/M6，不能由 RX 关闭代为终结 |
+| **单 owner 运行时进度** | `kbsocket/runtime/` | `RuntimeShard` 绑定最多四 context，`ShardReactor` 分类公平预算与事件等待，`RawContextProgress` 做通知/async 归属及错误隔离，`ControlExecutor` 执行慢控制任务 | 借用已有 raw 对象；不创建完整连接/runtime 资源，不实现 mailbox 队列、Grant 或远端关闭协议；接入约束见 [RuntimeShard](runtime-shard.md) |
 | **硬件实测工具集** | `tools/*_test` | 已记录 SEND/SGE、RMA、故障隔离、补投及多 context 通知等观测，另有人工确认的大小/生命周期/可见性契约 | 人工契约不等于测试 PASS；WN1–WN4 通知回归尚无真机日志，历史 ACK_TIMEOUT 根因仍待定位；按验证矩阵逐项回归 |
 
 ### 1.2 待建设模块（包括未创建目录与工作区接口草稿）
 
 - `kbsocket/memory/`：多上下文预注册 `Slab`、`BufferLease`、跨线程无锁归还队列、`QuarantineLedger`
-- `kbsocket/runtime/`：`RuntimeShard`、`ShardReactor`（Busy-Poll / Event 双模）、有界 `ControlExecutor`
+- `kbsocket/runtime/` 后续集成：自动资源创建、NUMA 亲和性、真实 mailbox/连接定时器与跨线程归还；当前已有有界 `ProgressSource` 接口
 - `kbsocket/control/`：非阻塞 TCP 握手状态机、`EndpointImportCache`（Single-Flight）、`HealthRegistry`
 - `kbsocket/connection/`：`Connection` 状态机、64-bit `IMM` 编解码、`ReorderWindow`、`CreditAccount`、`WriteRndvEngine`
 - `kbsocket/api/` 与 `kbsocket/socket/`：`kbsocket.h`、`buffer.h`、C++23 `execution` 封装、`FdTable`、`SocketAdapter`、`EpollMux`
@@ -39,7 +40,7 @@ flowchart TD
     M0["M0: 硬件契约摸底与 Raw 基础原语 (已完成)"]
     M1["M1: 残余 RX 安全关闭闭环<br/>(DeleteJetty -> DeleteJfr -> OnJfrDeleted)"]
     M2["M2: 共享 SQ 故障隔离、主被动 Jetty 解耦与 Lane 在线重建"]
-    M3["M3: RuntimeShard 反应堆、4-Context 轮询与异步事件引擎"]
+    M3["M3: RuntimeShard 反应堆、4-Context 轮询与异步事件引擎<br/>(已实现，真机待回归)"]
     M4["M4: MemoryManager、IMM 短帧/扩展帧、乱序重组与 Credit 流控"]
     M5["M5: Connection 状态机、非阻塞建链、Single-Flight 导入与显式 API"]
     M6["M6: WRITE RNDV 大包直写引擎与 Grant 隔离生命周期"]
@@ -68,7 +69,7 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 
 ### M1：残余 RX 安全关闭闭环 (`RxBufferPool` + `JettyPool`)
 
-- **当前交付**：已实现 `ReceiveDomainCloser` 与配套 Mock 用例；2026-11-07 运行 `bazel test //kbsocket/transport/raw:all --test_output=errors`，9 个测试目标、130 个用例通过，其中关闭协调器包含 22 个用例。UB 真机回归未执行。这里只交付可显式驱动的 raw 控制原语，M3 的 `ControlExecutor` 与事件消费、M5 的远端关闭协议尚未实现。
+- **当前交付**：已实现 `ReceiveDomainCloser` 与配套 Mock 用例；2026-11-07 运行 `bazel test //kbsocket/transport/raw:all --test_output=errors`，9 个测试目标、130 个用例通过，其中关闭协调器包含 22 个用例。UB 真机回归未执行。这里只交付可显式驱动的 raw 控制原语；M3 已有 `ControlExecutor` 与事件消费，但不会自动取得关闭证明或驱动域销毁，宿主仍须在控制路径推进，M5 的远端关闭协议尚未实现。
 - **目标**：扩展 `RxBufferPool` 与接收域关闭协调器，支持残留 Posted 在取得 DMA 终结证明后安全结账，落地 `H9` 硬件契约（`DeleteJfr` 可直接销毁未消费的 `kPosted` WR，无需 `ModifyJfr(ERROR)` 排空）。
 - **设计章节**：[§5.3 接收域安全关闭状态机](design/kbsocket-design-v1.md#53-接收域安全关闭状态机m1-核心规范)
 - **涉及代码**：
@@ -94,7 +95,7 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 
 ### M2：共享 SQ 故障隔离、主被动 Jetty 解耦与 Lane 在线重建
 
-- **当前交付**：已实现以下 raw 原语与对应 Mock 用例；2026-11-07 运行 `bazel test //kbsocket/transport/raw:all //tools/... --test_output=errors`，33 个测试目标、599 个用例通过（raw 核心 154 个、工具 445 个），UB 真机回归未执行。`ReplaceDrainedLane` 由调用方显式触发，旧事件/引用屏障也由调用方证明；M3 自动进度与 `ControlExecutor`、M5 Connection、M6 WRITE RNDV 仍未实现。
+- **当前交付**：已实现以下 raw 原语与对应 Mock 用例；2026-11-07 运行 `bazel test //kbsocket/transport/raw:all //tools/... --test_output=errors`，33 个测试目标、599 个用例通过（raw 核心 154 个、工具 445 个），UB 真机回归未执行。`ReplaceDrainedLane` 由调用方显式触发，旧事件/引用屏障也由调用方证明；M3 已接入进度器与 `ControlExecutor`，M5 Connection、M6 WRITE RNDV 仍未实现。
 - **目标**：根据逐 WR 错误、status 9 与共享队列的硬件契约，完成 `JettyPool`、`AttemptLedger`、`TxSender` 与 `TxCompletionProcessor` 的生产级加固。
 - **设计章节**：[§5 Raw URMA 资源池与故障处理](design/kbsocket-design-v1.md#5-raw-urma-资源池收发-jetty-解耦与故障自愈)、[§7.4 WRITE RNDV 状态机](design/kbsocket-design-v1.md#74-write-rndv-完整状态机与安全终结)
 - **涉及代码**：
@@ -133,26 +134,31 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 
 ### M3：`RuntimeShard` 反应堆、4-Context 轮询与异步事件引擎
 
-- **目标**：构建单线程 Owner 的 `RuntimeShard` 主循环与有界 `ControlExecutor`，把 4 个 `UrmaContext` 的数据面轮询、`JFR_LIMIT` 水位重设与阻塞控制面操作串成闭环。
+- **当前交付**：已实现 `RuntimeShard`、`RawContextProgress`、`ShardReactor` 和 `ControlExecutor`，接入已有 raw 资源的轮询、通知、async、水线重写及故障 Lane 控制进度。2026-11-07 运行 `bazel test //kbsocket/runtime:all //kbsocket/transport/raw:all //tools/... --test_output=errors`，37 个测试目标、657 个用例通过（runtime 48、raw 164、工具 445）；UB 真机回归未执行。使用与生命周期约束见 [RuntimeShard](runtime-shard.md)。
+- **范围**：单 owner 绑定 1–4 个已创建的 context，每 context 最多 8 个接收域、每域最多 64 条主动 Lane；进程内 async 消费者登记表最多 64 个 context。M3 不创建完整 runtime/连接资源，不实现 Connection、Grant、授信或 mailbox 队列，保留有界 `ProgressSource` hooks 供后续阶段接入。
 - **设计章节**：[§3.3 单 Owner 与控制执行器](design/kbsocket-design-v1.md#33-并发模型单-owner-完整资源闭环)、[§9 统一进度器](design/kbsocket-design-v1.md#9-统一进度器shardreactorbusy-poll-与事件模式)
 - **涉及代码**：
   - `kbsocket/runtime/runtime_shard.hpp` / `.cpp`
   - `kbsocket/runtime/shard_reactor.hpp` / `.cpp`
+  - `kbsocket/runtime/raw_context_progress.hpp` / `.cpp`
   - `kbsocket/runtime/control_executor.hpp` / `.cpp`
-  - `tests/unit/runtime/shard_reactor_test.cpp`
-  - `tests/unit/runtime/control_executor_test.cpp`
+  - `kbsocket/runtime/progress_source.hpp`
+  - `kbsocket/runtime/*_test.cpp`
 - **关键改动**：
-  1. **4-Context 有界公平轮询**：先单 context，再同 owner 管理两个裸设备各两 EID 的四 context。每 Tick 按预算轮转 TX、RX/refill、flush、mailbox、timer、retire 与控制进度，预算耗尽保留 runnable。TX 完成只释放本地额度，不产生远端 credits；refill 可批处理，但不足批量、失败重试与 Lease 归还必须由 debt/定时器在有限时间内推进，不等待新 CQE。
+  1. **4-Context 有界公平轮询**：同 owner 管理两个裸设备各两 EID 的四 context；每源、每进度类有独立预算，Tick 按 async、TX、RX、refill、flush、mailbox、timer、retire 推进并轮换起始源，预算耗尽保留 runnable。TX 完成只释放本地额度，RX 回调接收并负责归还 Lease；没有新 CQE 时仍检查补投余量及到期重试。
   2. **Busy-Poll / Event (`WaitJfc`) 双模切换**：
-     - 空转超过 `busy_poll_budget_us` 后，对全部需等待的 JFC 执行 `Poll -> Rearm -> Recheck`，再复查 mailbox/wake 状态；仅无 runnable 工作时进入有界 `epoll_wait`。JFCE readiness、`WaitJfc` 通知和 CQE 分账，取得的通知即使跳过睡眠也须 `AckJfc`。
+     - 默认纯轮询；事件模式空转超过 `busy_poll_ns` 后执行 `Poll -> Rearm -> Recheck`，仅无 runnable 工作时进入 `max_wait_ms` 限制的 `epoll_wait`。JFCE readiness、`WaitJfc` 通知和 CQE 分账，取得的每一项通知（包括重复项）都须 `AckJfc`，跳过睡眠也要收割。跨线程 `Notify` 仅唤醒，不代替 mailbox 的发布协议。
   3. **`JFAE` 异步事件处理**：
-     - 每 context 唯一 async 消费者负责 Get/Ack、复制事件语义并按对象路由，处理期间持有有效对象引用；
-     - `JFR_LIMIT` 后按实际账本补槽，只有 posted 高于水线时才 rewrite threshold；否则保留 `refill_debt`/`watermark_rearm_pending`，Lease 归还后重试（H10），不能漏 Ack；
-     - `JFC_ERR` 封禁该 CQ 依赖域并隔离未终结 DMA；`JETTY_ERR` 按所属对象处理，主动 Lane 故障不无条件扩大到健康共享域，被动端点或共享资源故障按实际依赖扩散。
+     - 每 context 唯一消费者在 async fd 可读后 Get，成功即恰好 Ack 一次；先核验 context 与对象指针再访问对应对象，不凭未知 union 指针判定故障归属；
+     - `JFR_LIMIT` 后保留 `watermark_pending`，posted 严格高于配置水线才在控制线程重写 threshold；Held 未归还时保持待处理，`Release` 后继续补投与重写。已知接受前缀的 refill `EAGAIN` 采用到期重试；
+     - `JFC_ERR`、`JFR_ERR`、被动端点错误及无法安全解释的 Poll/refill 失败保留整个关联域；停止该域 Poll/refill，不在线回收故障 CQ。主动 `JETTY_ERR` 先隔离所属 Lane，再由控制线程执行 `BeginDrain`，健康独立域继续推进。
   4. **有界 `ControlExecutor`**：
-     - 受容器 CPU 预算约束的固定线程数 + 固定容量 SPSC/MPSC 投递队列；满载时立即向调用方返回 `ErrorCode::kResourceExhausted`，绝不阻塞 Reactor 线程。owner 在移交前冻结目标操作并持有依赖，控制线程不得与 owner 并发操作同一资源；取消/关闭后返回的半成品也按生命周期回收。
-- **验收门禁**：
-  - 单测验证：① `RearmJfc` 后二次 `PollJfc` 发现新 CQE 时不进入阻塞等待（防丢唤醒测试）；② JFR_LIMIT 后不足水线时保留 pending，补足才重写，少量 refill debt 无新 CQE 也能推进；③ `ControlExecutor` 队列打满时立即返回 `kResourceExhausted`，Reactor 单 Tick 耗时不受慢速 Mock `ImportJetty` 影响；④ 通知合并/空唤醒、recheck 后未 Ack、mailbox 入睡竞争、热 TX/错误风暴和关闭时异步事件均不饿死其他进度类。
+     - 固定 1–4 个 worker、最多 4096 个原子状态槽位，排队/执行中/完成未收割共同占容量；单 owner 提交/收割零分配、无互斥锁，满额立即 `kResourceExhausted`。已接受任务即使取消仍执行，所有结果交回 owner，不能丢弃半成品；参数依赖持有至完成收割。
+     - 提交前暂停整个 raw context（含所有域与通知/async），暂移除等待 fd；控制线程执行 `ModifyJetty`、`ModifyJfr` 或显式 Lane 替换，完成收割后 owner 恢复。外部借用者也必须遵守暂停，其他 context 可继续推进。
+     - `RequestReplacement` 必须显式提供 `events_acked`、`queue_users_stopped`、`completions_drained` 证明；空 CQ 不代替屏障。`RuntimeShard::Close` 只解绑：有控制任务时返回 `kInUse`，继续 Tick 收割后重试；不删除借用的 Jetty/JFR/MR，不代替 M1 关闭协议。
+- **验证范围与后续门禁**：
+  - Mock 覆盖四 context 公平推进、Poll/Rearm/Recheck、通知 Ack、async 归属、水线待处理及 refill 重试、控制满额/慢任务隔离、取消后收割、Open 回滚和关闭重试；没有据此新增硬件 PASS。
+  - M4/M5 继续交付真实 mailbox/Lease 归还、Connection 与关闭协商；NativeTCP/SHM 双进程和真机回归分别报告实际结果，M3 hooks 的测试不代表这些协议已经实现。
 
 ---
 
