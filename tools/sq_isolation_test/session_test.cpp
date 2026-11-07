@@ -65,6 +65,7 @@ protected:
         std::array<urma_jfc_t, 4> cqs{};
         std::array<urma_jfr_t, 2> jfrs{};
         std::array<urma_jetty_t, 3> jetties{};
+        std::array<urma_jetty_t, 2> rx_targets{};
         std::array<urma_target_jetty_t, 3> imports{};
         std::array<Registration, 2> registrations{};
         std::deque<PostedBuffer> buffers;
@@ -75,6 +76,8 @@ protected:
         std::array<std::uint64_t, 3> sent{};
         std::array<std::uint64_t, 3> normal_sent{};
         std::array<bool, 3> deleted_jetties{};
+        std::array<bool, 2> created_rx_targets{};
+        std::array<bool, 2> deleted_rx_targets{};
         std::array<bool, 2> deleted_jfrs{};
         std::array<bool, 4> deleted_cqs{};
         std::size_t created_cqs = 0;
@@ -126,6 +129,11 @@ protected:
 
     Endpoint& Find(urma_jetty_t* jetty) {
         for (auto& endpoint : endpoints_) {
+            for (auto& candidate : endpoint.rx_targets) {
+                if (jetty == &candidate) {
+                    return endpoint;
+                }
+            }
             for (auto& candidate : endpoint.jetties) {
                 if (jetty == &candidate) {
                     return endpoint;
@@ -171,10 +179,15 @@ protected:
         cap_.max_msg_size = 4096;
         cap_.trans_mode = URMA_TM_RM;
         cap_.rm_tp_cap.bs.ctp = 1;
-        cap_.max_jetty = 3;
+        cap_.max_jetty = 5;
         cap_.max_jfs_depth = cap_.max_jfr_depth = cap_.max_jfc_depth = 256;
         cap_.max_jfs_sge = cap_.max_jfs_rsge = cap_.max_jfr_sge = 1;
         for (std::size_t side = 0; side < endpoints_.size(); ++side) {
+            for (std::size_t domain = 0; domain < 2; ++domain) {
+                auto& id = endpoints_[side].rx_targets[domain].jetty_id;
+                id.id = 20 + domain;
+                id.eid.raw[15] = side + 1;
+            }
             for (std::size_t lane = 0; lane < 3; ++lane) {
                 // 数字 ID 刻意跨端重复；只有完整 EID + jetty ID 才能定位对端。
                 auto& id = endpoints_[side].jetties[lane].jetty_id;
@@ -185,7 +198,7 @@ protected:
         EXPECT_CALL(*this, CreateJfc(_, _)).Times(AnyNumber()).WillRepeatedly([&](auto* ctx, auto* cfg) {
             auto& endpoint = Find(ctx);
             if (endpoint.created_cqs == 0) {
-                EXPECT_GE(cfg->depth, 2 * (options_.batch + 1));
+                EXPECT_GE(cfg->depth, 2 * (options_.batch + 1) + 1);
             }
             return &endpoint.cqs.at(endpoint.created_cqs++);
         });
@@ -196,12 +209,18 @@ protected:
         });
         EXPECT_CALL(*this, CreateJetty(_, _)).Times(AnyNumber()).WillRepeatedly([&](auto* ctx, auto* cfg) {
             auto& endpoint = Find(ctx);
-            const std::size_t domain = endpoint.created_jetties == 2;
+            const std::size_t domain = cfg->shared.jfr == &endpoint.jfrs[1];
             EXPECT_EQ(cfg->flag.bs.share_jfr, 1u);
             EXPECT_EQ(cfg->shared.jfr, &endpoint.jfrs[domain]);
             EXPECT_EQ(cfg->shared.jfc, &endpoint.cqs[2 * domain + 1]);
             EXPECT_EQ(cfg->jfs_cfg.jfc, &endpoint.cqs[2 * domain]);
             EXPECT_EQ(cfg->jfs_cfg.flag.bs.error_suspend, 0u);
+            // 每个域先创建独立被动端点；保留原 active 下标，使故障注入继续指向原 SQ。
+            if (!endpoint.created_rx_targets[domain]) {
+                endpoint.created_rx_targets[domain] = true;
+                endpoint.rx_targets[domain].jetty_cfg = *cfg;
+                return &endpoint.rx_targets[domain];
+            }
             auto& jetty = endpoint.jetties.at(endpoint.created_jetties++);
             jetty.jetty_cfg = *cfg;
             return &jetty;
@@ -419,9 +438,24 @@ protected:
             for (const auto& queue : endpoint.completions) {
                 EXPECT_TRUE(queue.empty());
             }
+            for (std::size_t domain = 0; domain < endpoint.rx_targets.size(); ++domain) {
+                if (jetty == &endpoint.rx_targets[domain]) {
+                    // 被动端点必须晚于本域全部主动 jetty、早于共享 JFR 删除。
+                    EXPECT_TRUE(endpoint.created_rx_targets[domain]);
+                    EXPECT_FALSE(endpoint.deleted_rx_targets[domain]);
+                    EXPECT_FALSE(endpoint.deleted_jfrs[domain]);
+                    EXPECT_TRUE(endpoint.deleted_jetties[domain == 0 ? 0 : 2]);
+                    if (domain == 0) {
+                        EXPECT_TRUE(endpoint.deleted_jetties[1]);
+                    }
+                    endpoint.deleted_rx_targets[domain] = true;
+                    return URMA_SUCCESS;
+                }
+            }
             for (std::size_t lane = 0; lane < endpoint.jetties.size(); ++lane) {
                 if (jetty == &endpoint.jetties[lane]) {
                     EXPECT_FALSE(endpoint.deleted_jetties[lane]);
+                    EXPECT_FALSE(endpoint.deleted_rx_targets[lane == 2]);
                     endpoint.deleted_jetties[lane] = true;
                     return URMA_SUCCESS;
                 }
@@ -435,6 +469,7 @@ protected:
                         continue;
                     }
                     EXPECT_FALSE(endpoint.deleted_jfrs[domain]);
+                    EXPECT_TRUE(endpoint.deleted_rx_targets[domain]);
                     if (domain == 0) {
                         EXPECT_TRUE(endpoint.deleted_jetties[0]);
                         EXPECT_TRUE(endpoint.deleted_jetties[1]);
@@ -484,6 +519,7 @@ protected:
     }
 
     void ExpectClosed(const Endpoint& endpoint) {
+        EXPECT_EQ(endpoint.deleted_rx_targets, endpoint.created_rx_targets);
         EXPECT_EQ(endpoint.unimported, endpoint.imported);
         EXPECT_EQ(static_cast<std::size_t>(
                       std::count(endpoint.deleted_jetties.begin(), endpoint.deleted_jetties.end(), true)),
@@ -522,6 +558,9 @@ protected:
                         endpoint.unregistered == 0 && stats.fault.accepted == options_.batch &&
                         stats.fault.flush_done == 0 && stats.accepted_known;
             for (bool deleted : endpoint.deleted_jetties) {
+                retained &= !deleted;
+            }
+            for (bool deleted : endpoint.deleted_rx_targets) {
                 retained &= !deleted;
             }
             for (bool deleted : endpoint.deleted_jfrs) {

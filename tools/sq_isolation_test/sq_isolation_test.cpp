@@ -85,7 +85,7 @@ std::expected<void, ToolError> SqIsolationSession::Open(urma_context_t* ctx, con
     config.jetty_count = 2;
     config.tx_depth = options.batch;
     config.rx_depth = total;
-    config.tx_cq_depth = 2 * (options.batch + 1);
+    config.tx_cq_depth = 2 * (options.batch + 1) + 1;
     config.rx_cq_depth = total;
     auto opened = pool_.Open(ctx, cap, config);
     if (!opened) {
@@ -108,7 +108,7 @@ std::expected<void, ToolError> SqIsolationSession::Open(urma_context_t* ctx, con
     config.jetty_count = 1;
     config.tx_depth = 1;
     config.rx_depth = 1;
-    config.tx_cq_depth = 2;
+    config.tx_cq_depth = 3;
     config.rx_cq_depth = 1;
     auto sink = sink_.Open(ctx, cap, config);
     if (!sink) {

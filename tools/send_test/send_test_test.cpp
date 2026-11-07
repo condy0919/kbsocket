@@ -143,7 +143,7 @@ protected:
         jetty_.jetty_id.id = 7;
         EXPECT_CALL(*this, CreateJfc(&ctx_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
         EXPECT_CALL(*this, CreateJfr(&ctx_, _)).WillOnce(Return(&jfr_));
-        EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce([&](auto*, auto* cfg) {
+        EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce(Return(&rx_target_)).WillOnce([&](auto*, auto* cfg) {
             EXPECT_EQ(cfg->jfs_cfg.max_sge, options_.sges);
             return &jetty_;
         });
@@ -162,7 +162,7 @@ protected:
         cap.max_msg_size = 4096;
         cap.trans_mode = URMA_TM_RM;
         cap.rm_tp_cap.bs.ctp = 1;
-        cap.max_jetty = 1;
+        cap.max_jetty = 2;
         cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 256;
         cap.max_jfs_sge = options_.sges;
         cap.max_jfs_rsge = cap.max_jfr_sge = 1;
@@ -178,6 +178,7 @@ protected:
             EXPECT_CALL(*this, Unregister(&seg_)).WillOnce(Return(URMA_SUCCESS));
         }
         EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(*this, DeleteJetty(&rx_target_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
@@ -197,7 +198,7 @@ protected:
     urma_context_t ctx_{};
     urma_jfc_t tx_{}, rx_{};
     urma_jfr_t jfr_{};
-    urma_jetty_t jetty_{};
+    urma_jetty_t jetty_{}, rx_target_{};
     urma_target_seg_t seg_{};
     std::array<urma_target_seg_t, kMaxSendSges - 1> extra_segments_{};
     urma_target_jetty_t remote_{};
@@ -567,7 +568,7 @@ TEST_F(SendTestHardware, LaterRegistrationFailureCleansOnlyThePreviouslyRegister
     options_.sges = 2;
     EXPECT_CALL(*this, CreateJfc(&ctx_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
     EXPECT_CALL(*this, CreateJfr(&ctx_, _)).WillOnce(Return(&jfr_));
-    EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce(Return(&jetty_));
+    EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce(Return(&rx_target_)).WillOnce(Return(&jetty_));
     EXPECT_CALL(*this, Register(&ctx_, _)).WillOnce(Return(&seg_)).WillOnce([](auto*, auto*) -> urma_target_seg_t* {
         errno = ENOMEM;
         return nullptr;
@@ -576,7 +577,7 @@ TEST_F(SendTestHardware, LaterRegistrationFailureCleansOnlyThePreviouslyRegister
     cap.max_msg_size = 4096;
     cap.trans_mode = URMA_TM_RM;
     cap.rm_tp_cap.bs.ctp = 1;
-    cap.max_jetty = 1;
+    cap.max_jetty = 2;
     cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 256;
     cap.max_jfs_sge = 2;
     cap.max_jfs_rsge = cap.max_jfr_sge = 1;
@@ -586,6 +587,7 @@ TEST_F(SendTestHardware, LaterRegistrationFailureCleansOnlyThePreviouslyRegister
     // 尚未提交 WR，失败的第二段无注销对象；第一段仍须显式注销后才释放其内存。
     ::testing::InSequence order;
     EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJetty(&rx_target_)).WillOnce(Return(URMA_SUCCESS));
     EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
     EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
     EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
@@ -600,7 +602,7 @@ TEST_F(SendTestHardware, RegisterFailureWithoutErrnoIsReportedAndCanCleanUp) {
     ::testing::Mock::VerifyAndClearExpectations(this);
     EXPECT_CALL(*this, CreateJfc(&ctx_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
     EXPECT_CALL(*this, CreateJfr(&ctx_, _)).WillOnce(Return(&jfr_));
-    EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce(Return(&jetty_));
+    EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce(Return(&rx_target_)).WillOnce(Return(&jetty_));
     // 重现 provider 返回 nullptr 但 errno 仍为 0；诊断不能将其显示为无错误。
     EXPECT_CALL(*this, Register(&ctx_, _)).WillOnce([](auto*, auto*) -> urma_target_seg_t* {
         errno = 0;
@@ -610,7 +612,7 @@ TEST_F(SendTestHardware, RegisterFailureWithoutErrnoIsReportedAndCanCleanUp) {
     cap.max_msg_size = 4096;
     cap.trans_mode = URMA_TM_RM;
     cap.rm_tp_cap.bs.ctp = 1;
-    cap.max_jetty = 1;
+    cap.max_jetty = 2;
     cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 256;
     cap.max_jfs_sge = cap.max_jfs_rsge = cap.max_jfr_sge = 1;
     auto opened = session_.Open(&ctx_, cap, options_);
@@ -618,6 +620,7 @@ TEST_F(SendTestHardware, RegisterFailureWithoutErrnoIsReportedAndCanCleanUp) {
     EXPECT_EQ(opened.error().code, EIO);
     EXPECT_THAT(opened.error().operation, ::testing::HasSubstr("without errno"));
     EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJetty(&rx_target_)).WillOnce(Return(URMA_SUCCESS));
     EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
     EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
     EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));

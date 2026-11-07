@@ -3,20 +3,20 @@
 > **对齐规范**：[kbsocket-design-v1.md](design/kbsocket-design-v1.md) · [hardware-observations.md](hardware-observations.md) · [hardware-validation-matrix.md](hardware-validation-matrix.md) · [OBSERVABILITY-DESIGN-GUIDE.md](OBSERVABILITY-DESIGN-GUIDE.md)
 > **最后更新**：2026-11-07
 
-本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已新增 raw 关闭协调器与 Mock 用例，验证状态见 M1 小节。M2–M7、L1/L2、O1/O2 仍为待交付计划，其中新类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
+本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语，验证状态分别见对应小节。M3–M7、L1/L2、O1/O2 仍为待交付计划，其中新类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
 
 ---
 
 ## 1. 现状盘点 (Baseline Audit)
 
-### 1.1 已落地的核心模块 (`M0` 基线)
+### 1.1 已落地的核心模块
 
 | 模块 | 代码路径 | 已完成能力 | 遗留差距（待后续里程碑收口） |
 | :--- | :--- | :--- | :--- |
 | **错误与基础原语** | `kbsocket/base/`<br>`kbsocket/transport/raw/*_error.hpp` 及各组件头文件 | 已有日志、RAII 工具及基于 `std::expected` 的组件错误类型 | 尚无统一 `base/error.hpp`；统一应用层错误、控制面分类及 C ABI 映射时保留数据路径零分配，不新增自定义 expected 容器 |
 | **动态加载与拓扑发现** | `kbsocket/transport/raw/urma_api.*`<br>`device_catalog.*`<br>`urma_context.*`<br>`raw_runtime.*` | `liburma.so` 符号表加载、设备枚举、`RM_CTP` 能力校验、多 `UrmaContext` 初始化 | 尚未与 `RuntimeShard` 和 NUMA 亲和性调度绑定 |
-| **池化 Jetty 管理** | `kbsocket/transport/raw/jetty_pool.*`<br>`receive_domain_closer.*` | 共享 `JFR` + 固定数量 `Jetty`、Round-Robin 分配、软件故障门禁与 ERROR/边界/flush 排空；M1 新增独立 TX 准入门禁及接收域分阶段关闭 | 1. 尚未分离被动 `rx_target_jetty` 与主动 `tx_lanes`（[设计文档 §5.1](design/kbsocket-design-v1.md#51-关键架构改进被动接收端点rx-endpoint与主动发送通道tx-lanes解耦)）；<br>2. 缺少 per-lane `lane_generation` 与 `status 9` 在线重建（`ReplaceDrainedLane`）；<br>3. 关闭所需远端静默与事件引用屏障仍由调用方证明，M3/M5 接入自动协调 |
-| **TX 发送与完成收敛** | `kbsocket/transport/raw/attempt_ledger.*`<br>`tx_sender.*`<br>`tx_completion_processor.*` | 64-bit 单调 `AttemptId` 写入 `user_ctx`、`SEND_WITH_IMM` 提交、接受前缀入账与 `AttemptLedger::Complete` 退休；元数据记录借用身份 | 1. `TxCompletionProcessor::Process` 在校验 `AttemptLedger::Lookup` 之前即调用 `FindLane`/`BeginDrain`；<br>2. `status 10` (`RNR`) 仍触发整条共享 SQ `BeginDrain`，需改为像 `status 8` 一样仅作废单连接/单 WR；<br>3. `TxSender` 尚未支持 `URMA_OPC_WRITE`（`WRITE RNDV` 所需） |
+| **池化 Jetty 管理** | `kbsocket/transport/raw/jetty_pool.*`<br>`receive_domain_closer.*` | 共享 `JFR`、固定被动接收端点与主动 TX Lanes；Round-Robin、ERROR/边界/flush 排空、接收域分阶段关闭；M2 新增 Lane generation 与显式 `ReplaceDrainedLane` | 关闭/替换的远端静默、旧 CQE 和事件引用屏障仍由调用方证明；创建/删除为同步控制原语，M3/M5 接入自动调度与协调；不支持故障 JFC 在线恢复 |
+| **TX 发送与完成收敛** | `kbsocket/transport/raw/attempt_ledger.*`<br>`tx_sender.*`<br>`tx_completion_processor.*` | 单调 `AttemptId`、SEND/SEND_WITH_IMM/WRITE 提交与接受前缀入账；`LookupPosted` 核验已提交记录及完整 Lane 身份后再处理错误；8/10 逐 WR 退休，9 隔离排空 | 元数据仍为借用身份；结果分发至 Connection、自动 Lane 替换、WRITE Grant 与 DONE 通知协议分别待 M3–M6 接入；不自动重试或重放已接受 WR |
 | **RX 缓冲池** | `kbsocket/transport/raw/rx_buffer_pool.*` | 连续内存预分配、DMA 段注册、`Refill`/`Poll`/`Release`/`Stop`、`RxBufferLease` 借出与归还；M1 在 `DeleteJfr` 成功后内部清退残留 Posted，Held 归还后才注销内存 | 缺少 `JFR_LIMIT` 水位重设联动；独立 RMA Grant 生命周期属于 M4/M6，不能由 RX 关闭代为终结 |
 | **硬件实测工具集** | `tools/*_test` | 已记录 SEND/SGE、RMA、故障隔离、补投及多 context 通知等观测，另有人工确认的大小/生命周期/可见性契约 | 人工契约不等于测试 PASS；WN1–WN4 通知回归尚无真机日志，历史 ACK_TIMEOUT 根因仍待定位；按验证矩阵逐项回归 |
 
@@ -79,7 +79,7 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
   - `kbsocket/transport/raw/rx_buffer_pool_test.cpp`
   - `kbsocket/transport/raw/jetty_pool_test.cpp`
 - **关键改动**：
-  1. **建立接收域关闭协调器**：先停止本地新准入/提交，在协调确认远端停止向该域发送之前继续 RX 消费、Lease 归还和补投，避免关闭握手期间人为制造 RNR；确认远端静默后才不可逆地停止补投。期间继续 TX 排空与通知确认。失联或空 CQ 不等于远端静默，无法建立销毁屏障时保留依赖；解除当前 RX owner 与 pool 互相等待的关闭依赖。保持已有先删所有关联 `Jetty`、再删 `JFR` 的顺序，M2 引入被动端点后将其一并纳入。
+  1. **建立接收域关闭协调器**：先停止本地新准入/提交，在协调确认远端停止向该域发送之前继续 RX 消费、Lease 归还和补投，避免关闭握手期间人为制造 RNR；确认远端静默后才不可逆地停止补投。期间继续 TX 排空与通知确认。失联或空 CQ 不等于远端静默，无法建立销毁屏障时保留依赖；解除当前 RX owner 与 pool 互相等待的关闭依赖。M2 拓扑下依次逆序删除主动 Jetty、删除固定被动端点，再删除共享 `JFR`。
   2. **新增 `RxBufferPool::OnJfrDeleted()`**：当底层 `DeleteJfr` 成功后调用该接口，将残留 `kPosted` 标记为 DMA 已终结并逐条结账；关闭域不再投递这些槽位，也不伪造成功 RX。此操作不撤销 `Held`、CPU 引用或独立 RMA Grant。
   3. **两阶段 `Close()` 校验**：
      - 若 `jfr_deleted_ == false` 且 `posted_ > 0`，`Close()` 拒绝注销 `segment_`（防止硬件仍在 DMA 写入时解除页表映射）；
@@ -94,6 +94,7 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 
 ### M2：共享 SQ 故障隔离、主被动 Jetty 解耦与 Lane 在线重建
 
+- **当前交付**：已实现以下 raw 原语与对应 Mock 用例；2026-11-07 运行 `bazel test //kbsocket/transport/raw:all //tools/... --test_output=errors`，33 个测试目标、599 个用例通过（raw 核心 154 个、工具 445 个），UB 真机回归未执行。`ReplaceDrainedLane` 由调用方显式触发，旧事件/引用屏障也由调用方证明；M3 自动进度与 `ControlExecutor`、M5 Connection、M6 WRITE RNDV 仍未实现。
 - **目标**：根据逐 WR 错误、status 9 与共享队列的硬件契约，完成 `JettyPool`、`AttemptLedger`、`TxSender` 与 `TxCompletionProcessor` 的生产级加固。
 - **设计章节**：[§5 Raw URMA 资源池与故障处理](design/kbsocket-design-v1.md#5-raw-urma-资源池收发-jetty-解耦与故障自愈)、[§7.4 WRITE RNDV 状态机](design/kbsocket-design-v1.md#74-write-rndv-完整状态机与安全终结)
 - **涉及代码**：
@@ -102,23 +103,28 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
   - `kbsocket/transport/raw/tx_sender.hpp` / `.cpp`
   - `kbsocket/transport/raw/tx_completion_processor.hpp` / `.cpp`
   - `kbsocket/transport/raw/jetty_pool_test.cpp`
+  - `kbsocket/transport/raw/attempt_ledger_test.cpp`
+  - `kbsocket/transport/raw/tx_sender_test.cpp`
   - `kbsocket/transport/raw/tx_completion_processor_test.cpp`
 - **关键改动**：
   1. **主被动 Jetty 角色解耦**：
      - 在 `JettyPool` 中创建 1 个被动 `rx_target_jetty`（绑定共享 `JFR` 与 `RX JFC`，永不投递 TX WR），通过 `JettyPool::rx_target_jetty_id()` 对外暴露，供对端 `ImportJetty` 使用；
-     - 原有 `lanes_` 专职作为主动 `tx_lanes`，仅用于向外发送 `SEND_WITH_IMM` 与 `WRITE`。
+     - `JettyPoolConfig::jetty_count` 只计主动 TX Lanes；实际创建数量为 `jetty_count + 1`，能力校验包含被动端点。被动 JFS 请求深度为 1，不向其提交 TX；TX CQ 至少为 `jetty_count * (tx_depth + 1) + 1`，最后一项预留被动端点边界。
+     - 被动端点先创建；全域关闭时先逆序删除主动 Lane，再删除被动端点和 JFR。`IsReceiveJetty` 接受固定端点及当前有效主动 Jetty，兼容旧工具目标；生产对端应只导入固定被动端点。
   2. **Per-Lane 代次 (`lane_generation`) 与真实 WR 身份校验前置**：
-     - 保留现有 pool epoch 和单调 `AttemptId`，另增每 Lane generation；单 Lane 重建不使其他 Lane 票据失效，任一身份计数耗尽均拒绝回绕复用；
-     - 真实 WR CQE 先 `ledger_.Lookup(cr.user_ctx)`，校验所属 pool/lane/generation 后才改变 Lane 状态；无可信 `user_ctx` 的 `FLUSH_ERR_DONE` 等边界事件单独处理，不能当作普通 WR 查询/退休。
+     - 保留现有 pool epoch 和单调 `AttemptId`，`JettyLane::generation` 初代为 1；单 Lane 替换不改变其他 Lane 票据，epoch/generation/票据序号耗尽均拒绝回绕复用；
+     - 真实 WR CQE 通过 `ledger_.LookupPosted(cr.user_ctx)` 取得已 Commit 记录，核对 pool、index、epoch、generation 后才允许改变 Lane 状态；未知、重复、未提交或错 Lane CQE 不得触发排空。无可信 `user_ctx` 的 `FLUSH_ERR_DONE` 等边界事件单独处理，不能当作普通 WR 查询/退休。
      - 硬件 ID 复用前建立旧对象、CQE 与异步事件终结屏障；不能凭软件 generation 推断无代次边界属于新对象，无法证明则隔离。
   3. **精细化 TX 错误分级处理**：
      - `URMA_CR_REM_ACCESS_ABORT_ERR (8)` 与 `URMA_CR_RNR_RETRY_CNT_EXC_ERR (10)`：**不调用 `BeginDrain`**，仅按可信完成调用 `ledger_.Complete` 退休该 WR 并将原始错误交给所属操作/连接；status 8 不一律解释为进程退出；同一 `tx_lane` 上的其他连接继续正常收发；
      - `URMA_CR_ACK_TIMEOUT_ERR (9)` 与本地致命错误：关闭准入，调用 `BeginDrain(lane)`/`ModifyJetty(ERROR)`；继续普通 JFC 退休真实完成与 `FLUSH_ERR`，取得 `FLUSH_ERR_DONE` 后以 `FlushJetty` 回收 `WR_UNHANDLED`，全部已接受 WR 恰好终结且边界处理完成后才可重建。
   4. **单条 `tx_lane` 在线重建 (`ReplaceDrainedLane`)**：
-     - 为满足逐 WR 排空和事件终结条件的 Lane 提供 `ReplaceDrainedLane(lane_index)`：`DeleteJetty(old_jetty)` -> `CreateJetty(new_jetty)` -> 发布新 `lane_generation` -> 恢复本地准入；创建失败保留不可用槽位，允许显式重试；
+     - `ReplaceDrainedLane(old_lane, quiescence)` 要求该 Lane 为 `kDrained`、票据归零，且 `JettyLaneQuiescence` 的 `events_acked`、`queue_users_stopped`、`completions_drained` 全部成立；先进入 `kReplacing` 并撤销旧 ID 路由，再删除旧对象、按 Open 参数快照创建新对象，成功后才递增 generation 并恢复准入。
+     - 删除失败保留旧句柄，创建失败保留空槽；两者都维持 `kReplacing` 与旧 generation，仅允许持匹配旧 Lane 和完整证明显式重试。成功阶段不重复删除；共享 JFC 仍服务健康 Lane，证明必须覆盖旧对象的全部 CQE、async 和软件引用。全域关闭开始后禁止替换；关闭可以继续销毁 `kReplacing` 的剩余句柄，不创建新对象。
      - 重建过程完全局部化，被动 `rx_target_jetty` 的 `jetty_id` 保持不变，健康连接无需仅因本地 TX Lane 替换重新 `ImportJetty`；已失败的旧连接仍显式失败，不自动续用或重放。若被动端点/接收域自身更换，必须重新发布代次并协商新连接。
   5. **`TxSender` 扩展 `URMA_OPC_WRITE` 支持**：
-     - 新增全 signal WRITE 提交原语，按已确认/实测的 SGE 能力写入单段远端 `tseg`（`max_rsge = 1`），保持部分接受前缀、接受未知及 Lease 引用规则。
+     - `TxSendRequest::remote` 为 WRITE 指定唯一远端 SGE，远端长度等于本地 SGE 总长；校验注册段、context 和导出 VA 区间，本地 SGE 数量受池创建配置限制，总长不超过 `min(200 MiB, max_write_size)`。全 signal、非 inline，保持部分接受前缀、接受未知及 Lease 引用规则。
+     - `Send` 可混合 SEND/SEND_WITH_IMM/WRITE，但混批不建立 WRITE 与通知的可见性依赖；调用方须等全部相关 WRITE 成功退休后再发通知。当前不自动发送 DONE，不管理完整 Grant/RNDV 生命周期。
      - 可能阻塞的创建/删除先提供可显式驱动的控制原语，M3 接入 `ControlExecutor`，不进入数据面热循环。
 - **验收门禁**：
   - 单测验证：① `status 10` (`RNR`) 与 `status 8` 注入时，同 Lane 旁路连接的 WR 继续 `SUCCESS (0)` 完成，Lane 保持可提交；② status 9 的普通完成、错误边界、软件 flush、删除/创建失败重试闭环；③ 旧/重复 WR CQE、无代次边界与硬件 ID 复用不能影响新 Lane；④ 健康 Lane 及被动端点保持可用，错误/关闭竞争和代次耗尽有明确结果。

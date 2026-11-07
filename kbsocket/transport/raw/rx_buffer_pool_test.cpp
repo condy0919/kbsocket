@@ -50,6 +50,7 @@ public:
     void SetUp() override {
         active_ = this;
         jetty_.jetty_id.id = 19;
+        rx_target_.jetty_id.id = 29;
         jfr_.jfr_id.id = 23;
         EXPECT_CALL(*this, Register(&ctx_, _)).WillRepeatedly([&](auto*, auto* cfg) {
             const auto page = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
@@ -68,15 +69,16 @@ public:
     void OpenPool(std::uint32_t depth) {
         EXPECT_CALL(*this, CreateJfc(_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
         EXPECT_CALL(*this, CreateJfr(_, _)).WillOnce(Return(&jfr_));
-        EXPECT_CALL(*this, CreateJetty(_, _)).WillOnce(Return(&jetty_));
+        EXPECT_CALL(*this, CreateJetty(_, _)).WillOnce(Return(&rx_target_)).WillOnce(Return(&jetty_));
         EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(*this, DeleteJetty(&rx_target_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
         urma_device_cap_t cap{};
         cap.trans_mode = URMA_TM_RM;
         cap.rm_tp_cap.bs.ctp = 1;
-        cap.max_jetty = 1;
+        cap.max_jetty = 2;
         cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 1024;
         cap.max_jfs_sge = cap.max_jfs_rsge = cap.max_jfr_sge = 1;
         JettyPoolConfig cfg;
@@ -121,7 +123,7 @@ public:
         urma_cr_t cr{};
         cr.flag.bs.s_r = 1;
         cr.flag.bs.jetty = 1;
-        cr.local_id = jetty_.jetty_id.id;
+        cr.local_id = rx_target_.jetty_id.id;
         cr.user_ctx = id;
         cr.completion_len = 17;
         cr.opcode = URMA_CR_OPC_SEND_WITH_IMM;
@@ -157,7 +159,7 @@ protected:
     urma_context_t ctx_{};
     urma_jfc_t tx_{}, rx_{};
     urma_jfr_t jfr_{};
-    urma_jetty_t jetty_{};
+    urma_jetty_t jetty_{}, rx_target_{};
     urma_target_seg_t segment_{};
     JettyPool pool_;
     RxBufferPool buffers_;

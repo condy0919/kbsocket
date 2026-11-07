@@ -103,7 +103,7 @@ std::expected<void, ToolError> TxDrainSession::Open(urma_context_t* ctx, const u
     raw::JettyPoolConfig config;
     config.tx_depth = server ? 1 : options.batch;
     config.rx_depth = 1;
-    config.tx_cq_depth = *config.tx_depth + 1;
+    config.tx_cq_depth = *config.tx_depth + 2;
     config.rx_cq_depth = 1;
     auto opened = pool_.Open(ctx, cap, config);
     if (!opened) {

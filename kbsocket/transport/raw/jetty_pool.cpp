@@ -66,7 +66,7 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
     const auto link_priority = FLAGS_kbsocket_link_priority;
 
     // 防止重复打开：已持有硬件队列资源或槽位时直接拒绝。
-    if (close_owner_ || send_jfc_ || recv_jfc_ || jfr_ || !slots_.empty()) {
+    if (close_owner_ || send_jfc_ || recv_jfc_ || jfr_ || rx_target_jetty_ || !slots_.empty()) {
         return std::unexpected(JettyPoolError{
             .failure =
                 {
@@ -93,7 +93,7 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
     if (!ctx || !(cap.trans_mode & URMA_TM_RM) || !cap.rm_tp_cap.bs.ctp) {
         return invalid_argument;
     }
-    if (!c.jetty_count || c.jetty_count > cap.max_jetty) {
+    if (!c.jetty_count || static_cast<std::uint64_t>(c.jetty_count) + 1 > cap.max_jetty) {
         return invalid_argument;
     }
 
@@ -106,11 +106,11 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
     }
 
     // 核心防 CQ 溢出公式校验：
-    // 要求 `jetty_count * (tx_depth + 1) <= tx_cq_depth`。
+    // 要求 `jetty_count * (tx_depth + 1) + 1 <= tx_cq_depth`，包含被动端点边界。
     // 保证池内全部 Jetty 并发打满发送队列时 CQ 亦绝不会溢出丢 CQE；
     // 公式中每个 jetty 额外预留 1 个条目用于接收驱动产生的 `FLUSH_ERR_DONE` 边界事件，不占用用户 WR 额度。
     const auto required_tx_cq_depth =
-        static_cast<std::uint64_t>(c.jetty_count) * (static_cast<std::uint64_t>(tx_depth) + 1);
+        static_cast<std::uint64_t>(c.jetty_count) * (static_cast<std::uint64_t>(tx_depth) + 1) + 1;
     if (required_tx_cq_depth > c.tx_cq_depth || rx_depth > c.rx_cq_depth) {
         return invalid_argument;
     }
@@ -216,6 +216,15 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
     };
     jetty.flag.bs.share_jfr = 1;
     jetty.jfs_cfg.flag.bs.lock_free = 1;
+    tx_jetty_cfg_ = jetty;
+    // 固定被动端点先创建，永不向其 JFS 投递；最小请求深度仅满足 provider 创建要求。
+    auto passive = jetty;
+    passive.jfs_cfg.depth = 1;
+    errno = 0;
+    rx_target_jetty_ = UrmaApi::CreateJetty(ctx, &passive);
+    if (!rx_target_jetty_) {
+        return Rollback(JettyPoolResource::kRxTargetJetty, errno);
+    }
     for (std::uint32_t i = 0; i < c.jetty_count; ++i) {
         auto cfg = jetty;
         errno = 0;
@@ -231,6 +240,8 @@ std::expected<void, JettyPoolError> JettyPool::Open(urma_context_t* ctx, const u
     tx_depth_ = tx_depth;
     rx_depth_ = rx_depth;
     ctx_ = ctx;
+    max_write_size_ = cap.max_write_size;
+    max_send_sge_ = c.send_sge;
     admission_stopped_ = false;
     ready_ = true;
     return {};
@@ -286,6 +297,19 @@ std::expected<void, JettyPoolFailure> JettyPool::CloseQueues() noexcept {
     }
     slots_.clear();
 
+    // 主动 Lane 全部销毁后再删除固定接收端点，最后才能销毁共享 JFR。
+    if (rx_target_jetty_) {
+        const auto status = UrmaApi::DeleteJetty(rx_target_jetty_);
+        if (status != URMA_SUCCESS) {
+            return std::unexpected(JettyPoolFailure{
+                .code = JettyPoolErrorCode::kDeleteFailed,
+                .resource = JettyPoolResource::kRxTargetJetty,
+                .provider_error = status,
+            });
+        }
+        rx_target_jetty_ = nullptr;
+    }
+
     // 本地 udma 普通 JFC 路径在删除 Jetty/JFR 时先清理其 CQE，再释放 provider 队列。
     // 成功删除 JFR 后由域关闭协调器终结残留 RX；其 MR 与 JFC 在这一阶段继续存活。
     if (jfr_) {
@@ -303,7 +327,7 @@ std::expected<void, JettyPoolFailure> JettyPool::CloseQueues() noexcept {
 }
 
 std::expected<void, JettyPoolFailure> JettyPool::CloseCompletionQueues() noexcept {
-    if (rx_owner_ || jfr_) {
+    if (rx_owner_ || jfr_ || rx_target_jetty_) {
         return std::unexpected(Failure(JettyPoolErrorCode::kInUse));
     }
     for (const auto& slot : slots_) {
@@ -369,9 +393,28 @@ std::expected<int, JettyPoolFailure> JettyPool::PollRecv(std::span<urma_cr_t> co
     return Poll(recv_jfc_, JettyPoolResource::kRecvJfc, completions);
 }
 
+std::expected<urma_jetty_id_t, JettyPoolFailure> JettyPool::rx_target_jetty_id() const noexcept {
+    if (!ready_ || !rx_target_jetty_) {
+        return std::unexpected(
+            JettyPoolFailure{.code = JettyPoolErrorCode::kNotReady, .resource = JettyPoolResource::kRxTargetJetty});
+    }
+    return rx_target_jetty_->jetty_id;
+}
+
+bool JettyPool::IsReceiveJetty(std::uint32_t local_id) const noexcept {
+    if (!ready_) {
+        return false;
+    }
+    if (rx_target_jetty_ && rx_target_jetty_->jetty_id.id == local_id) {
+        return true;
+    }
+    return FindLane(local_id).has_value();
+}
+
 std::expected<JettyPool::Slot*, JettyPoolFailure> JettyPool::Find(JettyLane lane) noexcept {
-    // 校验池就绪状态、所属指针、epoch 纪元匹配（防跨生命周期误用）及槽位索引边界。
-    if (!ready_ || lane.pool != this || lane.epoch != epoch_ || lane.index >= slots_.size()) {
+    // 校验池生命周期、单 Lane 代次和槽位边界，避免旧票据或控制操作命中替换后的对象。
+    if (!ready_ || lane.pool != this || lane.epoch != epoch_ || lane.index >= slots_.size() ||
+        lane.generation != slots_[lane.index].generation) {
         return std::unexpected(Failure(JettyPoolErrorCode::kInvalidLane, lane.index));
     }
     return &slots_[lane.index];
@@ -399,8 +442,9 @@ std::expected<JettyLane, JettyPoolFailure> JettyPool::FindLane(std::uint32_t loc
         return std::unexpected(Failure(JettyPoolErrorCode::kNotReady));
     }
     for (std::uint32_t i = 0; i < slots_.size(); ++i) {
-        if (slots_[i].jetty && slots_[i].jetty->jetty_id.id == local_id) {
-            return JettyLane{this, i, epoch_};
+        if (slots_[i].state != JettyLaneState::kReplacing && slots_[i].jetty &&
+            slots_[i].jetty->jetty_id.id == local_id) {
+            return JettyLane{this, i, epoch_, slots_[i].generation};
         }
     }
     return std::unexpected(Failure(JettyPoolErrorCode::kInvalidLane));
@@ -436,6 +480,7 @@ std::expected<JettyTicket, JettyPoolFailure> JettyPool::Reserve() noexcept {
                 .pool = this,
                 .index = index,
                 .epoch = epoch_,
+                .generation = slots_[index].generation,
             });
         }
     }
@@ -546,10 +591,59 @@ std::expected<void, JettyPoolFailure> JettyPool::MarkFaulted(JettyLane lane) noe
 }
 
 std::expected<JettyLaneState, JettyPoolFailure> JettyPool::lane_state(JettyLane lane) const noexcept {
-    if (!ready_ || lane.pool != this || lane.epoch != epoch_ || lane.index >= slots_.size()) {
+    if (!ready_ || lane.pool != this || lane.epoch != epoch_ || lane.index >= slots_.size() ||
+        lane.generation != slots_[lane.index].generation) {
         return std::unexpected(Failure(JettyPoolErrorCode::kInvalidLane, lane.index));
     }
     return slots_[lane.index].state;
+}
+
+std::expected<JettyLane, JettyPoolFailure>
+JettyPool::ReplaceDrainedLane(JettyLane lane, const JettyLaneQuiescence& quiescence) noexcept {
+    if (close_owner_ || admission_stopped_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kStopped, lane.index));
+    }
+    auto found = Find(lane);
+    if (!found) {
+        return std::unexpected(found.error());
+    }
+    auto& slot = **found;
+    if (slot.used || (slot.state != JettyLaneState::kDrained && slot.state != JettyLaneState::kReplacing)) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kInvalidState, lane.index));
+    }
+    if (!quiescence.events_acked || !quiescence.queue_users_stopped || !quiescence.completions_drained) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kInUse, lane.index));
+    }
+    if (slot.generation == std::numeric_limits<std::uint64_t>::max()) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kExhausted, lane.index));
+    }
+
+    // 在调用删除前撤销旧 ID 路由；失败也可能移除 provider 表项，旧对象只能继续删除。
+    // 共享 JFC 仍服务健康 Lane，调用方屏障必须保证其中不再出现旧对象的完成。
+    slot.state = JettyLaneState::kReplacing;
+    if (slot.jetty) {
+        const auto status = UrmaApi::DeleteJetty(slot.jetty);
+        if (status != URMA_SUCCESS) {
+            return std::unexpected(Failure(JettyPoolErrorCode::kDeleteFailed, lane.index, status));
+        }
+        slot.jetty = nullptr;
+    }
+    auto cfg = tx_jetty_cfg_;
+    errno = 0;
+    auto* replacement = UrmaApi::CreateJetty(ctx_, &cfg);
+    if (!replacement) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kCreateFailed, lane.index, errno ? errno : EIO));
+    }
+
+    // 只有新对象成功创建后才发布代次；旧票据和旧控制操作不能命中新对象，即使硬件 ID 被复用。
+    for (std::uint32_t i = 0; i < slot.entries.size(); ++i) {
+        slot.entries[i] = {.next = i + 1};
+    }
+    slot.free_head = 0;
+    slot.jetty = replacement;
+    ++slot.generation;
+    slot.state = JettyLaneState::kReady;
+    return JettyLane{this, lane.index, epoch_, slot.generation};
 }
 
 std::expected<void, JettyPoolFailure> JettyPool::BeginDrain(JettyLane lane) noexcept {
@@ -579,10 +673,7 @@ std::expected<void, JettyPoolFailure> JettyPool::ObserveFlushDone(JettyLane lane
     }
     auto& slot = **found;
     if (slot.state != JettyLaneState::kError) {
-        // 意外边界不能替代本地状态转换，但也不能继续向该 SQ 发送。
-        if (slot.state == JettyLaneState::kReady) {
-            slot.state = JettyLaneState::kFaulted;
-        }
+        // 无代次边界不能单凭 local_id 修改新对象；仅已进入 ERROR 的当前 Lane 接受边界。
         return std::unexpected(Failure(JettyPoolErrorCode::kInvalidState, lane.index));
     }
     slot.state = JettyLaneState::kFlushReady;

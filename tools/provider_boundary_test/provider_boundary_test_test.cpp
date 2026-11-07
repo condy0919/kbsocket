@@ -214,7 +214,15 @@ protected:
         EXPECT_CALL(*this, CreateJfr(_, _)).Times(2).WillRepeatedly([this](auto*, auto*) {
             return &jfrs_[jfr_count_++];
         });
-        EXPECT_CALL(*this, CreateJetty(_, _)).Times(2).WillRepeatedly([this](auto*, auto* cfg) {
+        EXPECT_CALL(*this, CreateJetty(_, _)).Times(4).WillRepeatedly([this](auto*, auto* cfg) {
+            const auto domain = cfg->shared.jfr == &jfrs_[1] ? 1u : 0u;
+            if (!rx_target_created_[domain]) {
+                rx_target_created_[domain] = true;
+                auto& passive = rx_targets_[domain];
+                passive.jetty_id.id = 80 + domain;
+                passive.jetty_cfg = *cfg;
+                return &passive;
+            }
             auto& jetty = jetties_[jetty_count_++];
             jetty.jetty_id.id = jetty_count_ == 1 ? 42 : 43;
             jetty.jetty_cfg = *cfg;
@@ -253,7 +261,7 @@ protected:
     }
     void ExpectCleanup(bool close) {
         // 未终结的 ERROR post 必须同时阻止两端队列拆除，不能仅保留客户端的 payload。
-        EXPECT_CALL(*this, DeleteJetty(_)).Times(close ? 2 : 0).WillRepeatedly(Return(URMA_SUCCESS));
+        EXPECT_CALL(*this, DeleteJetty(_)).Times(close ? 4 : 0).WillRepeatedly(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfr(_)).Times(close ? 2 : 0).WillRepeatedly(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(_)).Times(close ? 4 : 0).WillRepeatedly(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, Unimport(_)).Times(close ? 1 : 0).WillRepeatedly(Return(URMA_SUCCESS));
@@ -298,7 +306,8 @@ protected:
     urma_device_cap_t cap_{};
     std::array<urma_jfc_t, 4> cqs_{};
     std::array<urma_jfr_t, 2> jfrs_{};
-    std::array<urma_jetty_t, 2> jetties_{};
+    std::array<urma_jetty_t, 2> jetties_{}, rx_targets_{};
+    std::array<bool, 2> rx_target_created_{};
     urma_target_seg_t segment_{};
     urma_target_jetty_t remote_{};
     std::deque<urma_cr_t> completions_;

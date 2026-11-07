@@ -70,6 +70,7 @@ protected:
     void SetUp() override {
         ReceiveDomainUrmaMock::active = &api_;
         jfr_.jfr_id.id = 23;
+        rx_target_.jetty_id.id = 29;
         jetties_[0].jetty_id.id = 19;
         jetties_[1].jetty_id.id = 20;
         Open();
@@ -88,19 +89,22 @@ protected:
     void Open() {
         EXPECT_CALL(api_, CreateJfc(&ctx_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
         EXPECT_CALL(api_, CreateJfr(&ctx_, _)).WillOnce(Return(&jfr_));
-        EXPECT_CALL(api_, CreateJetty(&ctx_, _)).WillOnce(Return(&jetties_[0])).WillOnce(Return(&jetties_[1]));
+        EXPECT_CALL(api_, CreateJetty(&ctx_, _))
+            .WillOnce(Return(&rx_target_))
+            .WillOnce(Return(&jetties_[0]))
+            .WillOnce(Return(&jetties_[1]));
         EXPECT_CALL(api_, Register(&ctx_, _)).WillOnce(Return(&segment_));
         urma_device_cap_t cap{};
         cap.trans_mode = URMA_TM_RM;
         cap.rm_tp_cap.bs.ctp = 1;
-        cap.max_jetty = 2;
+        cap.max_jetty = 3;
         cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 1024;
         cap.max_jfs_sge = cap.max_jfs_rsge = cap.max_jfr_sge = 1;
         JettyPoolConfig config;
         config.jetty_count = 2;
         config.tx_depth = 3;
         config.rx_depth = 3;
-        config.tx_cq_depth = 8;
+        config.tx_cq_depth = 9;
         config.rx_cq_depth = 3;
         ASSERT_TRUE(pool_.Open(&ctx_, cap, config));
         ASSERT_TRUE(buffers_.Open(pool_, 5));
@@ -133,7 +137,7 @@ protected:
         urma_cr_t cr{};
         cr.flag.bs.s_r = 1;
         cr.flag.bs.jetty = 1;
-        cr.local_id = jetties_[index % jetties_.size()].jetty_id.id;
+        cr.local_id = rx_target_.jetty_id.id;
         cr.user_ctx = posted_[index].id;
         cr.completion_len = 17;
         cr.opcode = URMA_CR_OPC_SEND_WITH_IMM;
@@ -150,7 +154,7 @@ protected:
             });
     }
 
-    // 用同一顺序约束覆盖所有依赖边界，提前销毁或重复删除任何一个资源都会失败。
+    // 用同一顺序约束覆盖所有依赖边界；被动端点同样必须先于共享 JFR 删除。
     void ExpectDeleteStep(int step, urma_status_t status = URMA_SUCCESS) {
         switch (step) {
         case 0:
@@ -160,19 +164,22 @@ protected:
             EXPECT_CALL(api_, DeleteJetty(&jetties_[0])).InSequence(cleanup_).WillOnce(Return(status));
             break;
         case 2:
-            EXPECT_CALL(api_, DeleteJfr(&jfr_)).InSequence(cleanup_).WillOnce(Return(status));
+            EXPECT_CALL(api_, DeleteJetty(&rx_target_)).InSequence(cleanup_).WillOnce(Return(status));
             break;
         case 3:
+            EXPECT_CALL(api_, DeleteJfr(&jfr_)).InSequence(cleanup_).WillOnce(Return(status));
+            break;
+        case 4:
             EXPECT_CALL(api_, Unregister(&segment_)).InSequence(cleanup_).WillOnce([&, status](auto*) {
                 EXPECT_EQ(buffers_.posted(), 0u);
                 EXPECT_EQ(buffers_.held(), 0u);
                 return status;
             });
             break;
-        case 4:
+        case 5:
             EXPECT_CALL(api_, DeleteJfc(&rx_)).InSequence(cleanup_).WillOnce(Return(status));
             break;
-        case 5:
+        case 6:
             EXPECT_CALL(api_, DeleteJfc(&tx_)).InSequence(cleanup_).WillOnce(Return(status));
             break;
         default:
@@ -180,7 +187,7 @@ protected:
         }
     }
 
-    void ExpectDeleteSteps(int first = 0, int last = 6) {
+    void ExpectDeleteSteps(int first = 0, int last = 7) {
         for (int i = first; i < last; ++i) {
             ExpectDeleteStep(i);
         }
@@ -211,6 +218,7 @@ protected:
     urma_context_t ctx_{};
     urma_jfc_t tx_{}, rx_{};
     urma_jfr_t jfr_{};
+    urma_jetty_t rx_target_{};
     std::array<urma_jetty_t, 2> jetties_{};
     urma_target_seg_t segment_{};
     JettyPool pool_;
@@ -304,7 +312,7 @@ TEST_F(ReceiveDomainCloserTest, ACompletionAfterAnEmptyPollIsDeliveredBeforeDele
     EXPECT_EQ(events_[0].completion.imm_data, 0x123456789abcdef0u);
 
     ExpectRx();
-    ExpectDeleteSteps(0, 3);
+    ExpectDeleteSteps(0, 4);
     result = closer_.Advance(Quiesced(), events_);
     ASSERT_TRUE(result);
     EXPECT_EQ(result->stage, ReceiveDomainCloseStage::kWaitingForLeases);
@@ -322,7 +330,7 @@ TEST_F(ReceiveDomainCloserTest, ACompletionAfterAnEmptyPollIsDeliveredBeforeDele
     EXPECT_EQ(result->stage, ReceiveDomainCloseStage::kWaitingForLeases);
     ASSERT_TRUE(buffers_.Release(held));
     EXPECT_FALSE(buffers_.Release(held));
-    ExpectDeleteSteps(3, 6);
+    ExpectDeleteSteps(4, 7);
     result = closer_.Advance(Quiesced(), events_);
     ASSERT_TRUE(result);
     EXPECT_EQ(result->stage, ReceiveDomainCloseStage::kClosed);
@@ -412,7 +420,7 @@ TEST_P(ReceiveDomainDeleteRetryTest, FailurePreservesDependenciesAndRetriesOnlyR
     ExpectDeleteStep(failed_step, URMA_FAIL);
     auto result = closer_.Advance(Quiesced(), events_);
     ASSERT_FALSE(result);
-    if (failed_step == 3) {
+    if (failed_step == 4) {
         EXPECT_EQ(result.error().code, ReceiveDomainCloseErrorCode::kMemoryCloseFailed);
         ASSERT_TRUE(result.error().rx_error);
         EXPECT_EQ(result.error().rx_error->code, RxBufferErrorCode::kUnregisterFailed);
@@ -421,8 +429,9 @@ TEST_P(ReceiveDomainDeleteRetryTest, FailurePreservesDependenciesAndRetriesOnlyR
         EXPECT_EQ(result.error().code, ReceiveDomainCloseErrorCode::kQueueCloseFailed);
         ASSERT_TRUE(result.error().queue_error);
         const auto resource = failed_step < 2    ? JettyPoolResource::kJetty
-                              : failed_step == 2 ? JettyPoolResource::kJfr
-                              : failed_step == 4 ? JettyPoolResource::kRecvJfc
+                              : failed_step == 2 ? JettyPoolResource::kRxTargetJetty
+                              : failed_step == 3 ? JettyPoolResource::kJfr
+                              : failed_step == 5 ? JettyPoolResource::kRecvJfc
                                                  : JettyPoolResource::kSendJfc;
         EXPECT_EQ(result.error().queue_error->resource, resource);
         EXPECT_EQ(result.error().queue_error->code, JettyPoolErrorCode::kDeleteFailed);
@@ -431,16 +440,16 @@ TEST_P(ReceiveDomainDeleteRetryTest, FailurePreservesDependenciesAndRetriesOnlyR
             EXPECT_EQ(result.error().queue_error->jetty_index, 1u - failed_step);
         }
     }
-    const auto expected_stage = failed_step <= 2   ? ReceiveDomainCloseStage::kDeletingQueues
-                                : failed_step == 3 ? ReceiveDomainCloseStage::kWaitingForLeases
+    const auto expected_stage = failed_step <= 3   ? ReceiveDomainCloseStage::kDeletingQueues
+                                : failed_step == 4 ? ReceiveDomainCloseStage::kWaitingForLeases
                                                    : ReceiveDomainCloseStage::kDeletingCompletionQueues;
     EXPECT_EQ(closer_.stage(), expected_stage);
-    EXPECT_EQ(buffers_.posted(), failed_step <= 2 ? 3u : 0u);
-    EXPECT_EQ(buffers_.retired_on_delete(), failed_step <= 2 ? 0u : 3u);
+    EXPECT_EQ(buffers_.posted(), failed_step <= 3 ? 3u : 0u);
+    EXPECT_EQ(buffers_.retired_on_delete(), failed_step <= 3 ? 0u : 3u);
     auto pool_close = pool_.Close();
     ASSERT_FALSE(pool_close);
     EXPECT_EQ(pool_close.error().code, JettyPoolErrorCode::kInUse);
-    if (failed_step <= 2) {
+    if (failed_step <= 3) {
         // 删除已开始时 provider 可能移除了内部映射，所有直接轮询入口也必须失效。
         std::array<urma_cr_t, 2> completions{};
         EXPECT_FALSE(pool_.PollSend(completions));
@@ -449,14 +458,14 @@ TEST_P(ReceiveDomainDeleteRetryTest, FailurePreservesDependenciesAndRetriesOnlyR
     }
 
     // 一旦开始删除，失败重试不得再次 poll；已经成功删除的 Jetty/JFR/MR/JFC 不重复处理。
-    ExpectDeleteSteps(failed_step, 6);
+    ExpectDeleteSteps(failed_step, 7);
     result = closer_.Advance(Quiesced(), events_);
     ASSERT_TRUE(result);
     EXPECT_EQ(result->stage, ReceiveDomainCloseStage::kClosed);
     EXPECT_EQ(result->retired_rx, 3u);
 }
 
-INSTANTIATE_TEST_SUITE_P(EachDependency, ReceiveDomainDeleteRetryTest, ::testing::Range(0, 6));
+INSTANTIATE_TEST_SUITE_P(EachDependency, ReceiveDomainDeleteRetryTest, ::testing::Range(0, 7));
 
 TEST_F(ReceiveDomainCloserTest, UnknownRxPostBoundaryIsResolvedByActualJfrDeletion) {
     EXPECT_CALL(api_, Post(&jfr_, _, _)).WillOnce([&](auto*, auto* wr, auto**) {

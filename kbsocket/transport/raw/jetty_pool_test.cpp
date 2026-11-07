@@ -13,6 +13,23 @@
 
 namespace kbsocket {
 namespace raw {
+class JettyPoolTestAccess {
+public:
+    static void SetEpoch(JettyPool& pool, std::uint64_t epoch) {
+        pool.epoch_ = epoch;
+    }
+    static JettyLane SetGeneration(JettyPool& pool, JettyLane lane, std::uint64_t generation) {
+        pool.slots_[lane.index].generation = generation;
+        lane.generation = generation;
+        return lane;
+    }
+    static void SetSequence(JettyPool& pool, std::uint64_t sequence) {
+        pool.next_sequence_ = sequence;
+    }
+    static void StopAdmission(JettyPool& pool) {
+        pool.StopAdmission();
+    }
+};
 namespace {
 using ::testing::_;
 using ::testing::Return;
@@ -44,6 +61,10 @@ public:
         cap_.max_jfs_depth = cap_.max_jfr_depth = cap_.max_jfc_depth = 1024;
         cap_.max_jfs_sge = cap_.max_jfs_rsge = cap_.max_jfr_sge = 4;
         cap_.max_jfs_inline_len = 64;
+        cap_.max_write_size = 200 * 1024 * 1024;
+        passive_.jetty_id.id = 100;
+        passive_.jetty_id.eid.raw[0] = 42;
+        jetty_.jetty_id.id = 101;
     }
 
     void TearDown() override {
@@ -99,6 +120,21 @@ public:
         if (fail == 2) {
             return;
         }
+        EXPECT_CALL(mock_, CreateJetty(&ctx_, _)).WillOnce([this, fail](auto*, auto* cfg) -> urma_jetty_t* {
+            EXPECT_EQ(cfg->flag.bs.share_jfr, 1u);
+            EXPECT_EQ(cfg->shared.jfr, &jfr_);
+            EXPECT_EQ(cfg->shared.jfc, &recv_);
+            EXPECT_EQ(cfg->jfs_cfg.jfc, &send_);
+            EXPECT_EQ(cfg->jfs_cfg.depth, 1u);
+            if (fail == 3) {
+                errno = ENOMEM;
+                return nullptr;
+            }
+            return &passive_;
+        });
+        if (fail == 3) {
+            return;
+        }
         first_create_ = EXPECT_CALL(mock_, CreateJetty(&ctx_, _))
                             .WillOnce([this, fail, tx_depth, priority](auto*, auto* cfg) -> urma_jetty_t* {
                                 EXPECT_EQ(cfg->flag.bs.share_jfr, 1u);
@@ -112,7 +148,7 @@ public:
                                 EXPECT_EQ(cfg->jfs_cfg.rnr_retry, 6u);
                                 EXPECT_EQ(cfg->jfs_cfg.flag.bs.error_suspend, 0u);
                                 EXPECT_EQ(cfg->jfs_cfg.err_timeout, 2u);
-                                if (fail == 3) {
+                                if (fail == 4) {
                                     errno = ENOMEM;
                                     return nullptr;
                                 }
@@ -120,10 +156,13 @@ public:
                             });
     }
 
-    void ExpectDelete(int count = 4) {
+    void ExpectDelete(int count = 5) {
         ::testing::InSequence order;
-        if (count >= 4) {
+        if (count >= 5) {
             EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+        }
+        if (count >= 4) {
+            EXPECT_CALL(mock_, DeleteJetty(&passive_)).WillOnce(Return(URMA_SUCCESS));
         }
         if (count >= 3) {
             EXPECT_CALL(mock_, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
@@ -136,6 +175,19 @@ public:
         }
     }
 
+    void Drain(JettyPool& pool, JettyLane lane, urma_jetty_t* jetty) {
+        EXPECT_CALL(mock_, Modify(jetty, _)).WillOnce(Return(URMA_SUCCESS));
+        ASSERT_TRUE(pool.BeginDrain(lane));
+        ASSERT_TRUE(pool.ObserveFlushDone(lane));
+        urma_cr_t cr{};
+        EXPECT_CALL(mock_, Flush(jetty, 1, &cr)).WillOnce(Return(0));
+        ASSERT_EQ(pool.FlushSend(lane, std::span(&cr, 1)), 0);
+    }
+
+    static JettyLaneQuiescence LaneQuiesced() {
+        return {.events_acked = true, .queue_users_stopped = true, .completions_drained = true};
+    }
+
 protected:
     gflags::FlagSaver flag_saver_;
     ::testing::Expectation first_create_;
@@ -145,7 +197,7 @@ protected:
     urma_device_cap_t cap_{};
     urma_jfc_t send_{}, recv_{};
     urma_jfr_t jfr_{};
-    urma_jetty_t jetty_{};
+    urma_jetty_t jetty_{}, passive_{};
 };
 
 TEST_F(JettyPoolTest, LinksQueuesPollsAndClosesInDependencyOrder) {
@@ -158,6 +210,20 @@ TEST_F(JettyPoolTest, LinksQueuesPollsAndClosesInDependencyOrder) {
     EXPECT_EQ(pool.Get(lease->lane), &jetty_);
     ASSERT_TRUE(pool.Cancel(*lease));
     EXPECT_EQ(pool.jfr(), &jfr_);
+    auto target = pool.rx_target_jetty_id();
+    ASSERT_TRUE(target);
+    EXPECT_EQ(target->id, passive_.jetty_id.id);
+    EXPECT_EQ(target->eid.raw[0], 42);
+    EXPECT_EQ(lease->lane.generation, 1u);
+    EXPECT_TRUE(pool.IsReceiveJetty(passive_.jetty_id.id));
+    EXPECT_TRUE(pool.IsReceiveJetty(jetty_.jetty_id.id));
+    EXPECT_FALSE(pool.FindLane(passive_.jetty_id.id));
+    EXPECT_EQ(pool.max_write_size(), cap_.max_write_size);
+    EXPECT_EQ(pool.max_send_sge(), 1u);
+    EXPECT_EQ(pool.context(), &ctx_);
+    auto missing_generation = lease->lane;
+    missing_generation.generation = 0;
+    EXPECT_FALSE(pool.Get(missing_generation));
     EXPECT_FALSE(pool.Open(&ctx_, cap_));
     // 分别路由发送和接收完成，轮询使用调用方缓冲；0 表示无完成而非错误。
     urma_cr_t cr[2]{};
@@ -172,6 +238,9 @@ TEST_F(JettyPoolTest, LinksQueuesPollsAndClosesInDependencyOrder) {
     EXPECT_FALSE(pool.PollRecv({}));
     ExpectDelete();
     ASSERT_TRUE(pool.Close());
+    EXPECT_FALSE(pool.rx_target_jetty_id());
+    EXPECT_FALSE(pool.IsReceiveJetty(passive_.jetty_id.id));
+    EXPECT_EQ(pool.context(), nullptr);
     EXPECT_FALSE(pool.Reserve());
     EXPECT_FALSE(pool.PollSend(cr));
     EXPECT_TRUE(pool.Close());
@@ -180,8 +249,9 @@ TEST_F(JettyPoolTest, LinksQueuesPollsAndClosesInDependencyOrder) {
 TEST_F(JettyPoolTest, EveryCreationFailureRollsBackAndAllowsRetry) {
     test_support::ScopedUrmaOverride scope(MockedFunctions());
     constexpr JettyPoolResource resources[] = {JettyPoolResource::kSendJfc, JettyPoolResource::kRecvJfc,
-                                               JettyPoolResource::kJfr, JettyPoolResource::kJetty};
-    for (int fail = 0; fail < 4; ++fail) {
+                                               JettyPoolResource::kJfr, JettyPoolResource::kRxTargetJetty,
+                                               JettyPoolResource::kJetty};
+    for (int fail = 0; fail < 5; ++fail) {
         // 每个创建阶段均注入失败，只允许删除此前成功的资源，且不能发布半成品。
         SCOPED_TRACE(fail);
         ExpectCreate(fail);
@@ -203,7 +273,8 @@ TEST_F(JettyPoolTest, EveryCreationFailureRollsBackAndAllowsRetry) {
 
 TEST_F(JettyPoolTest, RollbackFailurePreservesOriginalErrorAndDependencies) {
     test_support::ScopedUrmaOverride scope(MockedFunctions());
-    ExpectCreate(3);
+    ExpectCreate(4);
+    EXPECT_CALL(mock_, DeleteJetty(&passive_)).WillOnce(Return(URMA_SUCCESS));
     EXPECT_CALL(mock_, DeleteJfr(&jfr_)).WillOnce(Return(URMA_EAGAIN));
     JettyPool pool;
     auto result = pool.Open(&ctx_, cap_);
@@ -226,6 +297,7 @@ TEST_F(JettyPoolTest, CloseFailureDoesNotRepeatSuccessfulDeletion) {
     {
         ::testing::InSequence order;
         EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, DeleteJetty(&passive_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(mock_, DeleteJfr(&jfr_)).WillOnce(Return(URMA_EAGAIN));
     }
     EXPECT_FALSE(pool.Close());
@@ -237,7 +309,7 @@ TEST_F(JettyPoolTest, CloseFailureDoesNotRepeatSuccessfulDeletion) {
 
 TEST_F(JettyPoolTest, EveryDeletionFailureStopsBeforeDependenciesAndCanRetry) {
     test_support::ScopedUrmaOverride scope(MockedFunctions());
-    for (int remaining = 4; remaining > 0; --remaining) {
+    for (int remaining = 5; remaining > 0; --remaining) {
         SCOPED_TRACE(remaining);
         ExpectCreate();
         JettyPool pool;
@@ -245,7 +317,11 @@ TEST_F(JettyPoolTest, EveryDeletionFailureStopsBeforeDependenciesAndCanRetry) {
         {
             // 任一删除失败都必须中止后续释放，StrictMock 会捕获越过失败节点的调用。
             ::testing::InSequence order;
-            EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(remaining == 4 ? URMA_EAGAIN : URMA_SUCCESS));
+            EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(remaining == 5 ? URMA_EAGAIN : URMA_SUCCESS));
+            if (remaining < 5) {
+                EXPECT_CALL(mock_, DeleteJetty(&passive_))
+                    .WillOnce(Return(remaining == 4 ? URMA_EAGAIN : URMA_SUCCESS));
+            }
             if (remaining < 4) {
                 EXPECT_CALL(mock_, DeleteJfr(&jfr_)).WillOnce(Return(remaining == 3 ? URMA_EAGAIN : URMA_SUCCESS));
             }
@@ -414,12 +490,12 @@ TEST_F(JettyPoolTest, PartialPostCommitsPrefixAndCancelsSuffix) {
 TEST_F(JettyPoolTest, RoundRobinSkipsFullAndFaultedLanesButAllowsDrain) {
     test_support::ScopedUrmaOverride scope(MockedFunctions());
     urma_jetty_t second{};
-    ExpectCreate(-1, 2, 128, 258);
+    ExpectCreate(-1, 2, 128, 259);
     EXPECT_CALL(mock_, CreateJetty(&ctx_, _)).After(first_create_).WillOnce(Return(&second));
     JettyPoolConfig config;
     config.jetty_count = 2;
     config.tx_depth = 2;
-    config.tx_cq_depth = 258;
+    config.tx_cq_depth = 259;
     JettyPool pool;
     ASSERT_TRUE(pool.Open(&ctx_, cap_, config));
     auto a = pool.Reserve();
@@ -460,6 +536,7 @@ TEST_F(JettyPoolTest, RoundRobinSkipsFullAndFaultedLanesButAllowsDrain) {
         ::testing::InSequence order;
         EXPECT_CALL(mock_, DeleteJetty(&second)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, DeleteJetty(&passive_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(mock_, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(mock_, DeleteJfc(&recv_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(mock_, DeleteJfc(&send_)).WillOnce(Return(URMA_SUCCESS));
@@ -469,7 +546,7 @@ TEST_F(JettyPoolTest, RoundRobinSkipsFullAndFaultedLanesButAllowsDrain) {
 
 TEST_F(JettyPoolTest, SecondJettyFailureRollsBackPoolBeforeSharedResources) {
     test_support::ScopedUrmaOverride scope(MockedFunctions());
-    ExpectCreate(-1, 128, 128, 258);
+    ExpectCreate(-1, 128, 128, 259);
     EXPECT_CALL(mock_, CreateJetty(&ctx_, _)).After(first_create_).WillOnce([](auto*, auto*) -> urma_jetty_t* {
         errno = ENOMEM;
         return nullptr;
@@ -477,7 +554,7 @@ TEST_F(JettyPoolTest, SecondJettyFailureRollsBackPoolBeforeSharedResources) {
     ExpectDelete();
     JettyPoolConfig config;
     config.jetty_count = 2;
-    config.tx_cq_depth = 258;
+    config.tx_cq_depth = 259;
     JettyPool pool;
     auto result = pool.Open(&ctx_, cap_, config);
     ASSERT_FALSE(result);
@@ -489,7 +566,7 @@ TEST_F(JettyPoolTest, SecondJettyFailureRollsBackPoolBeforeSharedResources) {
 
 TEST_F(JettyPoolTest, RollbackFailureRetainsJettyAndSharedParents) {
     test_support::ScopedUrmaOverride scope(MockedFunctions());
-    ExpectCreate(-1, 128, 128, 258);
+    ExpectCreate(-1, 128, 128, 259);
     EXPECT_CALL(mock_, CreateJetty(&ctx_, _)).After(first_create_).WillOnce([](auto*, auto*) -> urma_jetty_t* {
         errno = ENOMEM;
         return nullptr;
@@ -499,7 +576,7 @@ TEST_F(JettyPoolTest, RollbackFailureRetainsJettyAndSharedParents) {
     JettyPool pool;
     JettyPoolConfig config;
     config.jetty_count = 2;
-    config.tx_cq_depth = 258;
+    config.tx_cq_depth = 259;
     auto result = pool.Open(&ctx_, cap_, config);
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error().failure.jetty_index, 1u);
@@ -515,11 +592,11 @@ TEST_F(JettyPoolTest, RollbackFailureRetainsJettyAndSharedParents) {
 TEST_F(JettyPoolTest, PoolDeletionFailureRetainsSharedResourcesUntilRetry) {
     test_support::ScopedUrmaOverride scope(MockedFunctions());
     urma_jetty_t second{};
-    ExpectCreate(-1, 128, 128, 258);
+    ExpectCreate(-1, 128, 128, 259);
     EXPECT_CALL(mock_, CreateJetty(&ctx_, _)).After(first_create_).WillOnce(Return(&second));
     JettyPoolConfig config;
     config.jetty_count = 2;
-    config.tx_cq_depth = 258;
+    config.tx_cq_depth = 259;
     JettyPool pool;
     ASSERT_TRUE(pool.Open(&ctx_, cap_, config));
     {
@@ -602,16 +679,16 @@ TEST_F(JettyPoolTest, TxCqReservesFlushBoundaryWithoutIncreasingWrLimit) {
     JettyPool pool;
     JettyPoolConfig config;
     config.jetty_count = 2;
-    // 两个 jetty 各需要一个边界 CQE；旧容量 256 和仅多一个的 257 都不足。
-    for (unsigned depth : {256u, 257u}) {
+    // 两个主动 Jetty 与固定被动端点各需要一个边界 CQE，遗漏被动项的 258 也不足。
+    for (unsigned depth : {256u, 257u, 258u}) {
         config.tx_cq_depth = depth;
         auto result = pool.Open(&ctx_, cap_, config);
         ASSERT_FALSE(result);
         EXPECT_EQ(result.error().failure.code, JettyPoolErrorCode::kInvalidArgument);
     }
     config.jetty_count = 1;
-    config.tx_cq_depth = 129;
-    ExpectCreate(-1, 128, 128, 129);
+    config.tx_cq_depth = 130;
+    ExpectCreate(-1, 128, 128, 130);
     ExpectDelete();
     ASSERT_TRUE(pool.Open(&ctx_, cap_, config));
     // 额外 CQE 容量不能成为用户可投递的第 129 个 WR。
@@ -729,6 +806,9 @@ TEST_F(JettyPoolTest, InvalidLimitsNeverCallProvider) {
     test_support::ScopedUrmaOverride scope(MockedFunctions());
     JettyPool pool;
     EXPECT_FALSE(pool.Open(nullptr, cap_));
+    cap_.max_jetty = 1;
+    EXPECT_FALSE(pool.Open(&ctx_, cap_)); // 一个主动加一个被动，不能仅按主动数量校验。
+    cap_.max_jetty = 32;
     JettyPoolConfig config;
     config.jetty_count = 0;
     EXPECT_FALSE(pool.Open(&ctx_, cap_, config));
@@ -750,6 +830,215 @@ TEST_F(JettyPoolTest, InvalidLimitsNeverCallProvider) {
     EXPECT_FALSE(pool.Open(&ctx_, cap_, config));
     cap_.rm_tp_cap.bs.ctp = 0;
     EXPECT_FALSE(pool.Open(&ctx_, cap_));
+}
+
+TEST_F(JettyPoolTest, ReplacingOneLanePreservesPassiveTargetAndHealthyTickets) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    urma_jetty_t healthy{}, replacement{};
+    healthy.jetty_id.id = 102;
+    replacement.jetty_id = jetty_.jetty_id; // 故意复用硬件 ID，软件身份仍必须变化。
+    ExpectCreate(-1, 2, 128, 259);
+    EXPECT_CALL(mock_, CreateJetty(&ctx_, _)).After(first_create_).WillOnce(Return(&healthy));
+    JettyPoolConfig config;
+    config.jetty_count = 2;
+    config.tx_depth = 2;
+    config.tx_cq_depth = 259;
+    JettyPool pool;
+    ASSERT_TRUE(pool.Open(&ctx_, cap_, config));
+    auto failed = pool.Reserve();
+    auto live = pool.Reserve();
+    ASSERT_TRUE(failed);
+    ASSERT_TRUE(live);
+    ASSERT_TRUE(pool.Cancel(*failed));
+    ASSERT_TRUE(pool.Commit(*live));
+    Drain(pool, failed->lane, &jetty_);
+
+    // 替换必须使用 Open 参数快照，运行期 flags 改变不得改变队列配置。
+    FLAGS_kbsocket_tx_depth = 64;
+    FLAGS_kbsocket_link_priority = 15;
+    {
+        ::testing::InSequence order;
+        EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, CreateJetty(&ctx_, _)).WillOnce([&](auto*, auto* cfg) {
+            EXPECT_EQ(cfg->jfs_cfg.depth, 2u);
+            EXPECT_EQ(cfg->jfs_cfg.priority, 4u);
+            EXPECT_EQ(cfg->shared.jfr, &jfr_);
+            EXPECT_EQ(cfg->shared.jfc, &recv_);
+            EXPECT_EQ(cfg->jfs_cfg.jfc, &send_);
+            return &replacement;
+        });
+    }
+    auto next = pool.ReplaceDrainedLane(failed->lane, LaneQuiesced());
+    ASSERT_TRUE(next);
+    EXPECT_EQ(next->epoch, failed->lane.epoch);
+    EXPECT_EQ(next->generation, failed->lane.generation + 1);
+    EXPECT_EQ(next->index, failed->lane.index);
+    EXPECT_EQ(pool.Get(*next), &replacement);
+    EXPECT_EQ(pool.rx_target_jetty_id()->id, passive_.jetty_id.id);
+    EXPECT_TRUE(pool.IsReceiveJetty(passive_.jetty_id.id));
+    EXPECT_EQ(pool.FindLane(replacement.jetty_id.id)->generation, next->generation);
+    EXPECT_EQ(pool.Get(live->lane), &healthy);
+    ASSERT_TRUE(pool.Complete(*live));
+
+    // 旧控制操作和票据不能作用于新代次，迟到的无代次边界也不能从 READY 启动排空。
+    EXPECT_FALSE(pool.Get(failed->lane));
+    EXPECT_FALSE(pool.ReserveOn(failed->lane));
+    EXPECT_FALSE(pool.lane_state(failed->lane));
+    EXPECT_FALSE(pool.MarkFaulted(failed->lane));
+    EXPECT_FALSE(pool.BeginDrain(failed->lane));
+    EXPECT_FALSE(pool.ObserveFlushDone(failed->lane));
+    EXPECT_FALSE(pool.Commit(*failed));
+    EXPECT_FALSE(pool.Cancel(*failed));
+    EXPECT_FALSE(pool.Complete(*failed));
+    EXPECT_FALSE(pool.ReplaceDrainedLane(failed->lane, LaneQuiesced()));
+    EXPECT_FALSE(pool.ObserveFlushDone(*next));
+    EXPECT_EQ(pool.lane_state(*next), JettyLaneState::kReady);
+    auto fresh = pool.ReserveOn(*next);
+    ASSERT_TRUE(fresh);
+    EXPECT_GT(fresh->sequence, live->sequence);
+    ASSERT_TRUE(pool.Cancel(*fresh));
+    {
+        ::testing::InSequence order;
+        EXPECT_CALL(mock_, DeleteJetty(&healthy)).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(mock_, DeleteJetty(&replacement)).WillOnce(Return(URMA_SUCCESS));
+    }
+    ExpectDelete(4);
+    ASSERT_TRUE(pool.Close());
+}
+
+TEST_F(JettyPoolTest, ReplacementRequiresDrainedLaneAndEveryQuiescenceProof) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    ExpectCreate();
+    JettyPool pool;
+    ASSERT_TRUE(pool.Open(&ctx_, cap_));
+    auto ticket = pool.Reserve();
+    ASSERT_TRUE(ticket);
+    EXPECT_FALSE(pool.ReplaceDrainedLane(ticket->lane, LaneQuiesced()));
+    ASSERT_TRUE(pool.Cancel(*ticket));
+    EXPECT_FALSE(pool.ReplaceDrainedLane(ticket->lane, LaneQuiesced()));
+    Drain(pool, ticket->lane, &jetty_);
+    const std::array members{&JettyLaneQuiescence::events_acked, &JettyLaneQuiescence::queue_users_stopped,
+                             &JettyLaneQuiescence::completions_drained};
+    for (auto member : members) {
+        auto proof = LaneQuiesced();
+        proof.*member = false;
+        const auto result = pool.ReplaceDrainedLane(ticket->lane, proof);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, JettyPoolErrorCode::kInUse);
+        EXPECT_EQ(pool.lane_state(ticket->lane), JettyLaneState::kDrained);
+    }
+    // 全域准入停止后即使 Lane 与屏障均满足，也不能与域关闭竞争着创建新对象。
+    JettyPoolTestAccess::StopAdmission(pool);
+    auto result = pool.ReplaceDrainedLane(ticket->lane, LaneQuiesced());
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, JettyPoolErrorCode::kStopped);
+    ExpectDelete();
+    ASSERT_TRUE(pool.Close());
+}
+
+TEST_F(JettyPoolTest, ReplacementDeleteAndCreateFailuresKeepOldGenerationForRetry) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    ExpectCreate();
+    JettyPool pool;
+    ASSERT_TRUE(pool.Open(&ctx_, cap_));
+    auto ticket = pool.Reserve();
+    ASSERT_TRUE(ticket);
+    ASSERT_TRUE(pool.Cancel(*ticket));
+    Drain(pool, ticket->lane, &jetty_);
+    EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(URMA_EAGAIN));
+    auto next = pool.ReplaceDrainedLane(ticket->lane, LaneQuiesced());
+    ASSERT_FALSE(next);
+    EXPECT_EQ(next.error().code, JettyPoolErrorCode::kDeleteFailed);
+    EXPECT_EQ(next.error().provider_error, URMA_EAGAIN);
+    EXPECT_EQ(pool.lane_state(ticket->lane), JettyLaneState::kReplacing);
+    EXPECT_FALSE(pool.FindLane(jetty_.jetty_id.id));
+    EXPECT_FALSE(pool.IsReceiveJetty(jetty_.jetty_id.id));
+    EXPECT_FALSE(pool.Get(ticket->lane));
+    EXPECT_FALSE(pool.Reserve());
+    EXPECT_EQ(pool.rx_target_jetty_id()->id, passive_.jetty_id.id);
+    // 删除失败后可以 poll 共享健康 CQ，但旧 Lane 不能再次映射或投递。
+    urma_cr_t cr{};
+    EXPECT_CALL(mock_, Poll(&send_, 1, &cr)).WillOnce(Return(0));
+    EXPECT_EQ(pool.PollSend(std::span(&cr, 1)), 0);
+    EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(mock_, CreateJetty(&ctx_, _)).WillOnce([](auto*, auto*) -> urma_jetty_t* {
+        errno = ENOMEM;
+        return nullptr;
+    });
+    next = pool.ReplaceDrainedLane(ticket->lane, LaneQuiesced());
+    ASSERT_FALSE(next);
+    EXPECT_EQ(next.error().code, JettyPoolErrorCode::kCreateFailed);
+    EXPECT_EQ(next.error().provider_error, ENOMEM);
+    EXPECT_EQ(pool.lane_state(ticket->lane), JettyLaneState::kReplacing);
+    auto stale = ticket->lane;
+    ++stale.generation;
+    EXPECT_FALSE(pool.ReplaceDrainedLane(stale, LaneQuiesced()));
+
+    // 旧句柄已成功销毁，第二次创建不能重复 Delete；真实创建成功后才递增代次。
+    EXPECT_CALL(mock_, CreateJetty(&ctx_, _)).WillOnce(Return(&jetty_));
+    next = pool.ReplaceDrainedLane(ticket->lane, LaneQuiesced());
+    ASSERT_TRUE(next);
+    EXPECT_EQ(next->generation, ticket->lane.generation + 1);
+    EXPECT_EQ(pool.Get(*next), &jetty_);
+    ExpectDelete();
+    ASSERT_TRUE(pool.Close());
+}
+
+TEST_F(JettyPoolTest, WholePoolCloseCanFinishAnInterruptedReplacement) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    // 删除失败与创建失败都允许直接关闭整个域，关闭过程不得重新创建 Lane。
+    for (bool delete_failed : {true, false}) {
+        SCOPED_TRACE(delete_failed);
+        ExpectCreate();
+        JettyPool pool;
+        ASSERT_TRUE(pool.Open(&ctx_, cap_));
+        auto ticket = pool.Reserve();
+        ASSERT_TRUE(ticket);
+        ASSERT_TRUE(pool.Cancel(*ticket));
+        Drain(pool, ticket->lane, &jetty_);
+        EXPECT_CALL(mock_, DeleteJetty(&jetty_)).WillOnce(Return(delete_failed ? URMA_FAIL : URMA_SUCCESS));
+        if (!delete_failed) {
+            EXPECT_CALL(mock_, CreateJetty(&ctx_, _)).WillOnce(Return(nullptr));
+        }
+        EXPECT_FALSE(pool.ReplaceDrainedLane(ticket->lane, LaneQuiesced()));
+        ExpectDelete(delete_failed ? 5 : 4);
+        ASSERT_TRUE(pool.Close());
+        EXPECT_FALSE(pool.ReplaceDrainedLane(ticket->lane, LaneQuiesced()));
+    }
+}
+
+TEST_F(JettyPoolTest, IdentityCountersNeverWrapOrDeleteOnGenerationExhaustion) {
+    test_support::ScopedUrmaOverride scope(MockedFunctions());
+    {
+        // 无法通过循环遍历 uint64 耗尽，测试专用 friend 仅注入边界值，不暴露生产 setter。
+        JettyPool pool;
+        JettyPoolTestAccess::SetEpoch(pool, std::numeric_limits<std::uint64_t>::max());
+        const auto result = pool.Open(&ctx_, cap_);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().failure.code, JettyPoolErrorCode::kExhausted);
+    }
+    ExpectCreate();
+    JettyPool pool;
+    ASSERT_TRUE(pool.Open(&ctx_, cap_));
+    auto ticket = pool.Reserve();
+    ASSERT_TRUE(ticket);
+    ASSERT_TRUE(pool.Cancel(*ticket));
+    Drain(pool, ticket->lane, &jetty_);
+    const auto last = JettyPoolTestAccess::SetGeneration(pool, ticket->lane, std::numeric_limits<std::uint64_t>::max());
+    auto replacement = pool.ReplaceDrainedLane(last, LaneQuiesced());
+    ASSERT_FALSE(replacement);
+    EXPECT_EQ(replacement.error().code, JettyPoolErrorCode::kExhausted);
+    EXPECT_EQ(pool.lane_state(last), JettyLaneState::kDrained);
+    ExpectDelete();
+    ASSERT_TRUE(pool.Close());
+    ExpectCreate();
+    ASSERT_TRUE(pool.Open(&ctx_, cap_));
+    JettyPoolTestAccess::SetSequence(pool, std::numeric_limits<std::uint64_t>::max());
+    auto exhausted = pool.Reserve();
+    ASSERT_FALSE(exhausted);
+    EXPECT_EQ(exhausted.error().code, JettyPoolErrorCode::kExhausted);
+    ExpectDelete();
+    ASSERT_TRUE(pool.Close());
 }
 
 } // namespace

@@ -145,7 +145,7 @@ std::expected<void, ToolError> ProviderBoundarySession::Open(urma_context_t* ctx
     raw::JettyPoolConfig config;
     config.tx_depth = server ? 1 : options.tx_depth;
     config.rx_depth = 1;
-    config.tx_cq_depth = server ? 2 : options.attempts + 2;
+    config.tx_cq_depth = server ? 3 : options.attempts + 2;
     config.rx_cq_depth = 1;
     auto opened = pool_.Open(ctx, cap, config);
     if (!opened) {

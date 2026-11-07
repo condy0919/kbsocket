@@ -15,6 +15,7 @@ enum class JettyPoolResource : std::uint8_t {
     kRecvJfc,
     kJfr,
     kJetty,
+    kRxTargetJetty,
 };
 
 enum class JettyPoolErrorCode : std::uint8_t {

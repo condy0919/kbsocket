@@ -24,14 +24,14 @@ namespace kbsocket {
 namespace raw {
 /// Jetty 池硬件队列参数配置。
 struct JettyPoolConfig {
-    /// 池中创建的物理 Jetty 数量（每个 Jetty 包含独立的发送队列 JFS，共享公共接收队列 JFR）。
+    /// 主动发送 Jetty 数量；另创建一个固定被动接收端点，全部共享公共 JFR。
     std::uint32_t jetty_count = 1;
     /// 单个 Jetty JFS 的最大发送队列深度；未显式指定时在 `Open()` 中读取 `--kbsocket_tx_depth`。
     std::optional<std::uint32_t> tx_depth;
     /// 共享 JFR 的最大接收队列深度；未显式指定时在 `Open()` 中读取 `--kbsocket_rx_depth`。
     std::optional<std::uint32_t> rx_depth;
-    /// 发送完成队列（Send JFC）深度；必须满足 `jetty_count * (tx_depth + 1) <= tx_cq_depth`。
-    /// 公式中每个 jetty 额外预留一个 `FLUSH_ERR_DONE` 边界事件 CQE，不占用用户 WR 额度。
+    /// 发送完成队列深度；必须满足 `jetty_count * (tx_depth + 1) + 1 <= tx_cq_depth`。
+    /// 每个主动 Jetty 和被动端点各预留一个边界 CQE；被动端点不占用户 WR 额度。
     std::uint32_t tx_cq_depth = 256;
     /// 接收完成队列（Recv JFC）深度；必须满足 `rx_depth <= rx_cq_depth`。
     std::uint32_t rx_cq_depth = 256;
@@ -48,19 +48,30 @@ class ReceiveDomainCloser;
 /// 物理发送队列（SQ）的稳定通道身份。
 /// - 共享通道模型：同一物理 Jetty 通道在生命周期内可同时服务多个逻辑连接与远端目标。
 /// - 纪元校验（epoch）：仅在所属池的当前生命周期内有效，池对象重新 `Open()` 后历史通道引用立即失效。
+/// - 单通道代次（generation）：在线替换只更新该 Lane；其他 Lane 的身份保持有效。
 struct JettyLane {
     const JettyPool* pool = nullptr;
     std::uint32_t index = 0;
     std::uint64_t epoch = 0;
+    std::uint64_t generation = 0;
 };
 
-/// 故障通道只单向排空，不恢复为可发送状态。
+/// 同代故障通道只单向排空；必须替换底层 Jetty 并发布新代次才能恢复准入。
 enum class JettyLaneState : std::uint8_t {
     kReady,
     kFaulted,    // 已隔离，尚未确认 modify ERROR 成功。
     kError,      // 已切 ERROR，等待硬件 FLUSH_ERR_DONE。
     kFlushReady, // 已消费硬件边界，允许分批软件 flush。
     kDrained,    // 软件队列和本 SQ 票据均已排空，仍不可发送。
+    kReplacing,  // 旧对象已封禁，等待删除/创建成功；代次尚未发布。
+};
+
+/// 旧 Lane 的完成与事件终结证明；硬件边界不携带 generation，不能只靠软件代次避免 ID 复用。
+/// 首次替换及重试时均须成立；共享 JFC 仍可服务健康 Lane，但不再允许旧对象的 CQE/引用进入。
+struct JettyLaneQuiescence {
+    bool events_acked = false;
+    bool queue_users_stopped = false;
+    bool completions_drained = false;
 };
 
 /// 单个发送 WR 的预留额度票据。
@@ -76,7 +87,7 @@ struct JettyTicket {
 /// 基于 RM_CTP 传输模式的高性能共享发送队列（SQ）池。
 ///
 /// 架构拓扑与共享模型：
-/// - 内部独占两个完成队列（Send JFC、Recv JFC）、一个共享接收队列（JFR）以及固定数量的 Jetty（包含各自 JFS）。
+/// - 内部独占两个完成队列、一个共享 JFR、一个固定被动接收端点及固定数量的主动 TX Jetty。
 /// - 区别于连接独占 Jetty 模型，RM_CTP 模式下多个连接可并发复用同一组物理 SQ，每个 WR 在投递时自行指定目标远端 jetty。
 /// - 遵循单线程 Owner 推进模型：通道选择、票据流转与完成轮询零互斥锁，Fastpath 零动态内存分配。
 ///
@@ -119,6 +130,21 @@ public:
         return ready_ ? jfr_ : nullptr;
     }
 
+    /// 导出完整的固定被动接收端点身份，主动 Lane 替换不会改变它。
+    std::expected<urma_jetty_id_t, JettyPoolFailure> rx_target_jetty_id() const noexcept;
+    /// 接收身份校验兼容当前主动 Jetty；生产连接应只发布固定被动端点。
+    bool IsReceiveJetty(std::uint32_t local_id) const noexcept;
+
+    std::uint64_t max_write_size() const noexcept {
+        return max_write_size_;
+    }
+    std::uint8_t max_send_sge() const noexcept {
+        return max_send_sge_;
+    }
+    urma_context_t* context() const noexcept {
+        return ready_ ? ctx_ : nullptr;
+    }
+
     /// 轮转（Round-Robin）选择未故障且有空闲额度的 SQ，为一个 WR 预留额度票据。
     std::expected<JettyTicket, JettyPoolFailure> Reserve() noexcept;
 
@@ -158,6 +184,12 @@ public:
     /// 返回 0 且该 SQ 无残留票据才进入 kDrained；残留票据返回 kInUse，禁止推测释放。
     std::expected<int, JettyPoolFailure> FlushSend(JettyLane lane, std::span<urma_cr_t> completions) noexcept;
 
+    /// 控制路径同步重建已排空 Lane；删除/创建可阻塞，不得在数据面 Tick 中调用。
+    /// 仅替换该 Lane，不复用旧连接或重放 WR；失败保留 kReplacing，可持同一旧代次显式重试。
+    /// 成功发布下一代后旧 Lane/票据永久失效；全域关闭开始后禁止替换。
+    std::expected<JettyLane, JettyPoolFailure> ReplaceDrainedLane(JettyLane lane,
+                                                                  const JettyLaneQuiescence& quiescence) noexcept;
+
     std::expected<JettyLaneState, JettyPoolFailure> lane_state(JettyLane lane) const noexcept;
 
     /// 用 TX CQE 的本地 jetty id 查找当前通道，包括已隔离但仍需排空的 SQ。
@@ -169,7 +201,7 @@ public:
         return ready_;
     }
 
-    /// 获取池的总容量（配置的物理 Jetty 数量）。
+    /// 获取池的主动 TX Lane 数量，不包含固定被动接收端点。
     std::size_t capacity() const noexcept {
         return slots_.size();
     }
@@ -180,6 +212,8 @@ public:
 private:
     friend class RxBufferPool;
     friend class ReceiveDomainCloser;
+    // 仅允许单测构造不可实际遍历到的计数耗尽边界，不提供生产 setter。
+    friend class JettyPoolTestAccess;
 
     enum class TicketState : std::uint8_t {
         kFree,
@@ -198,6 +232,7 @@ private:
         std::vector<Entry> entries;
         std::uint32_t free_head = 0;
         std::uint32_t used = 0;
+        std::uint64_t generation = 1;
         JettyLaneState state = JettyLaneState::kReady;
     };
 
@@ -227,11 +262,16 @@ private:
     urma_jfc_t* send_jfc_ = nullptr;
     urma_jfc_t* recv_jfc_ = nullptr;
     urma_jfr_t* jfr_ = nullptr;
+    urma_jetty_t* rx_target_jetty_ = nullptr;
+    // 创建时参数快照：替换不重新读取 flags，也不复用 provider 可能改写的配置。
+    urma_jetty_cfg_t tx_jetty_cfg_{};
     std::vector<Slot> slots_;
     std::uint64_t epoch_ = 0;
     std::uint64_t next_sequence_ = 0;
     std::uint32_t next_lane_ = 0;
     std::uint32_t tx_depth_ = 0;
+    std::uint64_t max_write_size_ = 0;
+    std::uint8_t max_send_sge_ = 0;
     bool ready_ = false;
     bool admission_stopped_ = false;
 };

@@ -58,7 +58,7 @@ std::expected<void, ToolError> RunEndpoint(int fd, const char* library, const ch
     raw::JettyPoolConfig config;
     config.jetty_count = 1;
     config.tx_depth = config.rx_depth = config.rx_cq_depth = 1;
-    config.tx_cq_depth = 2;
+    config.tx_cq_depth = 3;
     auto opened = hardware->pool.Open(ctx, attributes.dev_cap, config);
     if (!opened) {
         return Error("open disposable endpoint pool", opened.error().failure.provider_error);

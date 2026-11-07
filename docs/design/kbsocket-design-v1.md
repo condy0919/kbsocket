@@ -1,7 +1,7 @@
 # kbsocket 架构设计 V1（基于 UB 硬件实测与契约修订版）
 
-> **状态**：M0 契约基线与待实现方案；主被动 Jetty 分离、线协议和运行时仍须按门禁验证，不能视为已交付能力
-> **修订日期**：2026-11-05（工作区改动复核）
+> **状态**：M0 契约基线、M1 raw 关闭原语与 M2 raw 加固已实现；M2 的 raw 与工具回归共 33 个测试目标通过，UB 真机回归未执行。运行时自动调度、连接线协议与完整 WRITE RNDV 仍为待实现方案
+> **修订日期**：2026-11-07（M2 实现对齐）
 > **设计目标**：替换 `ubs-comm/src/ubsocket`，在 4 CPU / 16 GiB 容器约束下支撑 **40k 常驻连接**、**40k 次建链/秒**，以及 **3000×3000 full-mesh（单客户端总 QPS=1000、总 QD=10）** 的生产负载。
 > **配套文档**：[实施 Roadmap](../roadmap.md) · [UB 硬件观测记录](../hardware-observations.md) · [UB 硬件验证矩阵](../hardware-validation-matrix.md) · [可观测性设计指南](../OBSERVABILITY-DESIGN-GUIDE.md) · [当前 Raw 传输流程](../raw-transport-flow.md)
 
@@ -265,6 +265,10 @@ flowchart TB
 
 容量预算必须包含新增被动 Jetty 的资源：TX CQ 至少覆盖所有主动 Lane 的软件票据上限与所有依赖 Jetty 可能产生的边界 CQE，不能遗漏被动端点；RX CQ 覆盖该域可在途 RQE 的最坏完成量及所需事件余量。按实际创建配置校验，不能用 provider 偶然多接受的容量扩大软件准入。
 
+M2 的 `JettyPoolConfig::jetty_count` 只表示主动 TX Lane 数量，实际创建数为 `jetty_count + 1`，须不超过 `cap.max_jetty`。固定被动端点请求 `JFS.depth = 1`，不提供发送票据，永不向其提交 TX WR；TX CQ 创建前校验 `jetty_count * (tx_depth + 1) + 1 <= tx_cq_depth`，为所有主动和被动 Jetty 分别预留边界 CQE。例如两个深度 128 的主动 Lane 至少需要 259 个 TX CQ 条目。provider 实际分配更大的 SQ 不扩大软件票据上限。
+
+`rx_target_jetty_id()` 导出包含 EID 等字段的完整 `urma_jetty_id_t`，仅在池就绪时有效；`IsReceiveJetty(local_id)` 同时识别固定端点及当前有效主动 Jetty，以兼容旧工具向主动 Jetty 发起的流量。生产连接只发布固定端点，不能依赖待替换主动 Lane 继续作为远端目标。创建顺序为 JFC/JFR、固定被动端点、主动 Lane；全域关闭时逆序删除主动 Lane，再删除被动端点、JFR 与后续依赖。主动 Lane 替换不删除被动端点、JFR 或 JFC。
+
 ### 5.2 发送完成处理与逐 WR 错误作用域（M2 核心规范）
 
 `TxCompletionProcessor` 在消费 `Send JFC` 时，必须严格遵守**先验明正身、再变更状态**的次序，并按硬件实测证据精确划分错误作用域：
@@ -280,18 +284,36 @@ stateDiagram-v2
     kError --> kFlushReady: 消费该 Lane 的 WR_FLUSH_ERR_DONE 边界
     kFlushReady --> kFlushReady: FlushJetty 返回 WR_UNHANDLED (逐条校验退休)
     kFlushReady --> kDrained: FlushJetty 返回 0 且 slot.used == 0
-    kDrained --> kRebuilding: 旧完成/通知/async 引用全部终结\n提交 ControlExecutor 执行 DeleteJetty + CreateJetty
-    kRebuilding --> kReady: 替换成功，发布新句柄并递增 lane_gen
+    kDrained --> kReplacing: 旧完成/通知/async 引用全部终结\n控制路径显式调用 ReplaceDrainedLane
+    kReplacing --> kReplacing: 删除/创建失败，保留旧代次并显式重试
+    kReplacing --> kReady: 替换成功，发布新句柄并递增 generation
 ```
 
 **关键实现不变量**：
 1. **身份校验优先于通道状态变更**：
-   - 对于普通 WR 完成事件（非 `FLUSH_ERR_DONE`/`SUSPEND_DONE`），必须先校验 TX 方向和所属完成域，通过 `ledger_.Lookup(cr.user_ctx)` 找到完整 `AttemptRecord`，再校验 pool epoch、lane index/generation 及提交状态，**通过后才允许根据错误码触发 `BeginDrain`**。不能由取模槽位或 `local_id` 单独确认真实 WR 身份。
+   - 对于普通 WR 完成事件（非 `FLUSH_ERR_DONE`/`SUSPEND_DONE`），先校验 TX 方向、终结类型和所属完成域，再通过 `ledger_.LookupPosted(cr.user_ctx)` 取得已 Commit 的完整 `AttemptRecord`，核对 pool、index、epoch、generation，**通过后才允许根据错误码触发 `BeginDrain`**。未知、重复、未提交或错 Lane 的 CQE 不改变 Lane 状态；不能由取模槽位或 `local_id` 单独确认真实 WR 身份。
 2. **边界事件的硬件 ID 复用屏障**：
    - `WR_FLUSH_ERR_DONE` / `SUSPEND_DONE` 的 `user_ctx` 无效，不能按普通 WR 查账或释放票据。除校验所属完成域、`local_id` 和允许接收该边界的状态外，替换前还必须证明旧边界、flush、JFCE/async 通知及其软件引用均已终结，或取得 provider 销毁会清理旧事件的明确保证；**仅按 `Drained -> DeleteJetty -> CreateJetty` 顺序执行不能自动证明硬件 ID 复用安全**。无法建立屏障时保留旧映射/隔离状态，不开放同 ID 新对象。
+   - 当前实现只在 `kError` 消费 `FLUSH_ERR_DONE` 并转入 `kFlushReady`；`SUSPEND_DONE` 仅作为已隔离 `kFaulted` / `kError` / `kFlushReady` Lane 的诊断，不触发 `BeginDrain`，也不替代 flush 边界。READY Lane 遇到这些无代次边界只报告异常，不能据此排空新对象。
 3. **`status 8` 与 `status 10`（RNR）不排空共享 SQ**：
-   - `URMA_CR_REM_ACCESS_ABORT_ERR`（8）与 `URMA_CR_RNR_RETRY_CNT_EXC_ERR`（10）均只调用 `ledger_.Complete(cr.user_ctx)` 归还 SQ 票据，并将错误连同 `AttemptRecord` 交由上层终止对应 `Connection`，`JettyLaneState` 保持 `kReady`。
-4. **适用边界**：上图仅用于健康 JFC 上的主动 ERROR/flush；`WR_FLUSH_ERR` 是该排空过程的逐 WR 终结，不重复启动排空。`JFC_ERR` 导致完成证明不全时转入依赖域隔离，不能套用 `FlushJetty == 0` 或软件计数清零推断安全。当前生产已支持 status 8 逐 WR 退休；status 10 策略调整、身份校验前移和在线替换属于 M2 待实现项。
+   - `URMA_CR_REM_ACCESS_ABORT_ERR`（8）与 `URMA_CR_RNR_RETRY_CNT_EXC_ERR`（10）均调用 `ledger_.Complete(cr.user_ctx)` 归还 SQ 票据，并将错误连同 `AttemptRecord` 交由上层处理对应操作/连接，不调用 `BeginDrain`；原本为 `kReady` 的 Lane 保持可提交。`ACK_TIMEOUT`（9）及其他需隔离错误在身份确认后启动 ERROR 排空；即使 Modify 失败，已获得可信终结证据的 WR 仍退休，并同时返回控制路径错误。
+4. **适用边界**：上图仅用于健康 JFC 上的主动 ERROR/flush；通过完整身份校验的真实 `WR_FLUSH_ERR` 同样是逐 WR 终结证据：在 `kReady` / `kFaulted` 中先隔离并尝试切 ERROR，Modify 失败也保留退休结果；在 `kError` / `kFlushReady` 中直接退休，不重复启动排空或回退阶段；`WR_UNHANDLED` 仅接受来自匹配 Lane 的软件 flush。`JFC_ERR` 导致完成证明不全时转入依赖域隔离，不能套用 `FlushJetty == 0` 或软件计数清零推断安全。M2 已实现上述完成处理与显式 Lane 替换；结果分发到 Connection、自动控制任务调度和完整故障 CQ 回收不在本次交付范围。
+
+#### M2 Lane 替换与调用责任
+
+`JettyLane` 的身份由 pool 指针、池 epoch、Lane index、Lane generation 组成。每次 `Open` 使用新的 epoch，初代 Lane generation 为 1；`ReplaceDrainedLane(old_lane, quiescence)` 只更新目标 Lane generation，不使健康 Lane 的票据失效。epoch、generation、票据 sequence 耗尽时拒绝回绕；账本的单调 AttemptId 与提交序号规则保持不变。
+
+替换要求目标 Lane 已达到 `kDrained` 且无在途票据，并由调用方给出以下三项持续有效的事实。当前接口为同步控制原语，创建/删除可能阻塞；M3 再接入 `ControlExecutor`，数据面不能自行调用替换，也不自动重放旧请求。
+
+| `JettyLaneQuiescence` 字段 | 替换前及失败重试时必须成立的条件 |
+| --- | --- |
+| `events_acked` | 旧对象的通知及 async 事件已 Get/Ack，没有待处理事件引用 |
+| `queue_users_stopped` | 旧对象不再被 post/poll、缓存句柄或其他软件引用访问；旧主动对象若曾作为接收目标，其入站访问也已停止 |
+| `completions_drained` | 旧 WR、边界与软件 flush 均已收敛，旧对象的 CQE 及已取出的软件完成不再进入共享 CQ 处理路径 |
+
+调用后先封禁为 `kReplacing`，旧 ID 不再通过 `FindLane` / `IsReceiveJetty` 路由；随后删除旧 Jetty，并用 Open 时保存的配置创建新 Jetty。删除失败保留句柄，创建失败保留空槽，两者都保持旧 generation；成功删除的句柄不会重复删除。显式重试必须仍携带匹配的旧 Lane 身份与三项证明，只有新对象创建成功才递增 generation 并恢复 `kReady`。旧票据或控制操作不能作用于新代次，即使 provider 复用了硬件 ID。
+
+共享 JFC 在局部替换期间仍服务健康 Lane，因此上述证明必须覆盖旧对象的全部 CQE/引用，不能仅靠停止旧 ID 的软件路由保证 provider 解析安全。全域关闭取得独占权或停止 TX 准入后禁止替换；域关闭可以继续删除 `kReplacing` 的剩余句柄，但不重新创建 Lane。固定被动端点始终保持原身份，直到整个接收域关闭。以上为 raw 实现及 Mock 覆盖范围，本轮 UB 真机回归尚未执行。
 
 ### 5.3 接收域安全关闭状态机（M1 核心规范）
 
@@ -421,6 +443,10 @@ flowchart LR
 
 阈值是待 benchmark 校准的策略参数，不是硬件能力边界；多 SGE 总长度及数量仍须满足设备限制。应用大于当前 staging/接收预算的写入允许分次接受，不要求一次性保留整个任意大请求。
 
+M2 已在 `TxSender` 提供非 inline、全 signal 的 WRITE raw 提交原语。`TxSendRequest::remote` 必须指定一个远端 SGE（`max_rsge = 1`），其长度等于本地 SGE 总长；本地 SGE 数量不超过创建配置，总长不超过 `min(200 MiB, JettyPool::max_write_size())`。提交前校验本地注册段、导入远端段与目标 Jetty 的 context，以及源/目标 VA 区间和地址算术溢出；远端地址使用对端导出的 VA，不使用 import 的本地 `mva` 或相对偏移。目标、注册段和 payload 由调用方保持至可信终结，buffer/grant 元数据不转移所有权。
+
+同批可以提交 SEND、SEND_WITH_IMM 和 WRITE，继续按 provider 的可信接受前缀入账；接受范围未知时保留整批依赖并停止发送。混批不建立 WRITE 与 SEND 通知的可见性依赖，调用方仍须等待全部相关 WRITE 成功退休再发送完成通知。当前没有自动 DONE、Grant 协商、分块调度或 RNDV 事务状态机；这些由 M6 按下一节协议实现。本轮 WRITE raw 改动尚无 UB 真机回归结果。
+
 ### 7.3 为什么剔除 `READ RNDV` 并唯一采用 `WRITE RNDV`
 
 基于第 2.1 节 **H4** 与 **H5**：
@@ -429,6 +455,8 @@ flowchart LR
 3. 剔除 `READ RNDV` 后，接收端无需在本地 `Send JFC` 上处理入站数据的 `READ` 完成并回跳接收状态机，收发数据流向在硬件队列上完全正交。
 
 ### 7.4 `WRITE RNDV` 完整状态机与安全终结
+
+本节为 M6 待实现协议；M2 的 WRITE 提交/完成原语只提供其底层 WR 能力，不代表完整 RNDV 已交付。
 
 ```mermaid
 sequenceDiagram

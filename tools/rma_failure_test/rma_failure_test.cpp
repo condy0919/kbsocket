@@ -89,7 +89,7 @@ std::expected<void, ToolError> RmaFailureResources::Open(urma_context_t* ctx, co
     config.jetty_count = 1;
     config.tx_depth = 2 * options.batch;
     config.rx_depth = 1;
-    config.tx_cq_depth = 2 * options.batch + 1;
+    config.tx_cq_depth = 2 * options.batch + 2;
     config.rx_cq_depth = 1;
     auto opened = pool_.Open(ctx, cap, config);
     if (!opened) {

@@ -89,6 +89,7 @@ protected:
         std::array<urma_jfc_t, 2> cqs{};
         urma_jfr_t jfr{};
         std::array<urma_jetty_t, 2> jetties{};
+        urma_jetty_t rx_target{};
         urma_target_jetty_t imported{};
         Registration registration;
         std::deque<PostedBuffer> buffers;
@@ -116,6 +117,8 @@ protected:
         std::size_t queries = 0;
         bool created_jfr = false;
         bool deleted_jfr = false;
+        bool created_rx_target = false;
+        bool deleted_rx_target = false;
     };
 
     static raw::UrmaFunctions MockedFunctions() {
@@ -174,10 +177,12 @@ protected:
         cap_.max_msg_size = 4096;
         cap_.trans_mode = URMA_TM_RM;
         cap_.rm_tp_cap.bs.ctp = 1;
-        cap_.max_jetty = 2;
+        cap_.max_jetty = 3;
         cap_.max_jfs_depth = cap_.max_jfr_depth = cap_.max_jfc_depth = 1024;
         cap_.max_jfs_sge = cap_.max_jfs_rsge = cap_.max_jfr_sge = 1;
         for (std::size_t side = 0; side < endpoints_.size(); ++side) {
+            endpoints_[side].rx_target.jetty_id.id = 20;
+            endpoints_[side].rx_target.jetty_id.eid.raw[15] = side + 1;
             for (std::size_t lane = 0; lane < 2; ++lane) {
                 // 数字 ID 跨端重复，目标查找必须使用 EID 与 ID 的组合。
                 endpoints_[side].jetties[lane].jetty_id.id = 10 + lane;
@@ -188,7 +193,7 @@ protected:
             auto& endpoint = Find(ctx);
             const auto lanes = options_.mode == BackpressureMode::kRxDelay ? 2u : 1u;
             const auto rx_depth = options_.tx_depth + (options_.mode == BackpressureMode::kTxQuota);
-            EXPECT_EQ(cfg->depth, endpoint.created_cqs == 0 ? lanes * (options_.tx_depth + 1) : rx_depth);
+            EXPECT_EQ(cfg->depth, endpoint.created_cqs == 0 ? lanes * (options_.tx_depth + 1) + 1 : rx_depth);
             return &endpoint.cqs.at(endpoint.created_cqs++);
         });
         EXPECT_CALL(*this, CreateJfr(_, _)).Times(AnyNumber()).WillRepeatedly([&](auto* ctx, auto* cfg) {
@@ -205,6 +210,12 @@ protected:
             EXPECT_EQ(cfg->shared.jfr, &endpoint.jfr);
             EXPECT_EQ(cfg->shared.jfc, &endpoint.cqs[1]);
             EXPECT_EQ(cfg->jfs_cfg.jfc, &endpoint.cqs[0]);
+            // 被动端点不参与原始/cleanup SQ 注入，单独记录创建与销毁。
+            if (!endpoint.created_rx_target) {
+                endpoint.created_rx_target = true;
+                endpoint.rx_target.jetty_cfg = *cfg;
+                return &endpoint.rx_target;
+            }
             EXPECT_EQ(cfg->jfs_cfg.depth, options_.tx_depth);
             EXPECT_EQ(cfg->jfs_cfg.flag.bs.error_suspend, 0u);
             auto& jetty = endpoint.jetties.at(endpoint.created_jetties++);
@@ -558,6 +569,16 @@ protected:
         });
         EXPECT_CALL(*this, DeleteJetty(_)).Times(AnyNumber()).WillRepeatedly([&](auto* jetty) {
             for (auto& endpoint : endpoints_) {
+                if (jetty == &endpoint.rx_target) {
+                    EXPECT_TRUE(endpoint.created_rx_target);
+                    EXPECT_FALSE(endpoint.deleted_rx_target);
+                    EXPECT_FALSE(endpoint.deleted_jfr);
+                    EXPECT_EQ(static_cast<std::size_t>(
+                                  std::count(endpoint.deleted_jetties.begin(), endpoint.deleted_jetties.end(), true)),
+                              endpoint.created_jetties);
+                    endpoint.deleted_rx_target = true;
+                    return URMA_SUCCESS;
+                }
                 for (std::size_t lane = 0; lane < endpoint.jetties.size(); ++lane) {
                     if (jetty == &endpoint.jetties[lane]) {
                         EXPECT_TRUE(endpoint.buffers.empty());
@@ -567,6 +588,10 @@ protected:
                         EXPECT_TRUE(endpoint.software[lane].empty());
                         EXPECT_TRUE(endpoint.deferred_rx.empty());
                         EXPECT_FALSE(endpoint.deleted_jetties[lane]);
+                        EXPECT_FALSE(endpoint.deleted_rx_target);
+                        for (std::size_t later = lane + 1; later < endpoint.created_jetties; ++later) {
+                            EXPECT_TRUE(endpoint.deleted_jetties[later]);
+                        }
                         endpoint.deleted_jetties[lane] = true;
                         return URMA_SUCCESS;
                     }
@@ -582,6 +607,7 @@ protected:
                           std::count(endpoint.deleted_jetties.begin(), endpoint.deleted_jetties.end(), true)),
                       endpoint.created_jetties);
             EXPECT_FALSE(endpoint.deleted_jfr);
+            EXPECT_TRUE(endpoint.deleted_rx_target);
             endpoint.deleted_jfr = true;
             return URMA_SUCCESS;
         });
@@ -643,6 +669,7 @@ protected:
     }
 
     void ExpectClosed(const Endpoint& endpoint) {
+        EXPECT_EQ(endpoint.deleted_rx_target, endpoint.created_rx_target);
         EXPECT_EQ(endpoint.unimported, endpoint.imports);
         EXPECT_EQ(endpoint.unregistered, endpoint.registered);
         EXPECT_EQ(endpoint.deleted_jfr, endpoint.created_jfr);
@@ -681,7 +708,7 @@ protected:
             const auto& endpoint = endpoints_[side];
             retained &=
                 !closed && closed.error().code == EBUSY && endpoint.registration.live && endpoint.unregistered == 0 &&
-                endpoint.unimported == 0 && !endpoint.deleted_jfr &&
+                endpoint.unimported == 0 && !endpoint.deleted_jfr && !endpoint.deleted_rx_target &&
                 std::none_of(endpoint.deleted_jetties.begin(), endpoint.deleted_jetties.end(),
                              [](bool x) { return x; }) &&
                 std::none_of(endpoint.deleted_cqs.begin(), endpoint.deleted_cqs.end(), [](bool x) { return x; });
@@ -735,8 +762,9 @@ protected:
             // 失败后没有双端静默证明；不能因本端账本为空就释放仍可能被 peer 使用的资源。
             retained &= !closed && closed.error().code == EBUSY && endpoint.registration.live &&
                         endpoint.unregistered == 0 && endpoint.unimported == 0 && !endpoint.deleted_jfr &&
-                        endpoint.created_jetties == 1 && !endpoint.deleted_jetties[0] && !endpoint.deleted_cqs[0] &&
-                        !endpoint.deleted_cqs[1] && !endpoint.modified[0] && endpoint.flush_calls[0] == 0;
+                        !endpoint.deleted_rx_target && endpoint.created_jetties == 1 && !endpoint.deleted_jetties[0] &&
+                        !endpoint.deleted_cqs[0] && !endpoint.deleted_cqs[1] && !endpoint.modified[0] &&
+                        endpoint.flush_calls[0] == 0;
         }
         const auto& client = sessions_[1].stats();
         retained &= client.accepted_known && client.traffic.accepted == options_.tx_depth &&
@@ -834,7 +862,7 @@ TEST_P(BackpressureRnrContinueTest, SameSqSendsNewMessagesAfterOriginalAttemptsR
     EXPECT_EQ(server.traffic.received, 0u);
     EXPECT_EQ(endpoints_[1].sends_before_rx, options_.tx_depth);
     EXPECT_EQ(endpoints_[1].rnr_polled, options_.tx_depth);
-    // 第二批是 round=1 的新消息；同一 jetty 成功收发，并且两端只创建过一个物理 jetty。
+    // 第二批是 round=1 的新消息；沿用同一主动 jetty，两端各另有一个不提交 TX 的被动端点。
     EXPECT_EQ(client.continuation.accepted, options_.tx_depth);
     EXPECT_EQ(client.continuation.retired, options_.tx_depth);
     EXPECT_EQ(client.continuation.success, options_.tx_depth);
@@ -846,6 +874,8 @@ TEST_P(BackpressureRnrContinueTest, SameSqSendsNewMessagesAfterOriginalAttemptsR
     EXPECT_EQ(endpoints_[1].submitted_frames.size(), 2 * options_.tx_depth);
     EXPECT_EQ(endpoints_[0].created_jetties, 1u);
     EXPECT_EQ(endpoints_[1].created_jetties, 1u);
+    EXPECT_TRUE(endpoints_[0].created_rx_target);
+    EXPECT_TRUE(endpoints_[1].created_rx_target);
     // 三个阶段都查询同一个对象；输出采用 provider 返回值，不能拿创建参数冒充硬件读回值。
     EXPECT_EQ(client.jetty_id, endpoints_[1].jetties[0].jetty_id.id);
     EXPECT_EQ(client.state_checks, 3u);

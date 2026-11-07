@@ -78,7 +78,7 @@ std::expected<void, ToolError> SharedQueueSession::Open(urma_context_t* ctx, con
     config.jetty_count = options.jetties;
     config.tx_depth = options.batch;
     config.rx_depth = total;
-    config.tx_cq_depth = options.jetties * (options.batch + 1);
+    config.tx_cq_depth = options.jetties * (options.batch + 1) + 1;
     config.rx_cq_depth = total;
     auto opened = pool_.Open(ctx, cap, config);
     if (!opened) {

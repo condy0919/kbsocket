@@ -244,8 +244,7 @@ RxBufferEvent RxBufferPool::Process(const urma_cr_t& cr) noexcept {
     if (cr.status == URMA_CR_WR_FLUSH_ERR_DONE || cr.status == URMA_CR_WR_SUSPEND_DONE) {
         event.completion.user_ctx = 0;
     }
-    const bool local =
-        cr.flag.bs.jetty ? pool_->FindLane(cr.local_id).has_value() : cr.local_id == pool_->jfr()->jfr_id.id;
+    const bool local = cr.flag.bs.jetty ? pool_->IsReceiveJetty(cr.local_id) : cr.local_id == pool_->jfr()->jfr_id.id;
     if (!cr.flag.bs.s_r || !local || !IsTerminal(cr.status) || cr.user_ctx < base_id_) {
         stopped_ = true;
         event.error = RxBufferError{.code = RxBufferErrorCode::kUnexpectedCompletion};

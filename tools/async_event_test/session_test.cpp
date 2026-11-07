@@ -58,6 +58,9 @@ protected:
         std::array<urma_jfc_t, 2> cqs{};
         urma_jfr_t jfr{};
         std::array<urma_jetty_t, 2> jetties{};
+        urma_jetty_t rx_target{};
+        bool rx_target_created = false;
+        bool rx_target_deleted = false;
         urma_target_seg_t segment{};
         urma_target_jetty_t target{};
         std::uint32_t threshold = 0;
@@ -144,6 +147,13 @@ protected:
         });
         EXPECT_CALL(*this, CreateJetty(_, _)).Times(AnyNumber()).WillRepeatedly([this](auto* ctx, auto* cfg) {
             auto& node = ByContext(ctx);
+            if (!node.rx_target_created) {
+                node.rx_target_created = true;
+                node.rx_target.urma_ctx = ctx;
+                node.rx_target.jetty_cfg = *cfg;
+                node.rx_target.jetty_id.id = node.jfr.jfr_id.id + 10;
+                return &node.rx_target;
+            }
             auto& jetty = node.jetties.at(node.created_jetties++);
             jetty.urma_ctx = ctx;
             jetty.jetty_cfg = *cfg;
@@ -317,12 +327,20 @@ protected:
             ++node.acknowledged;
         });
         EXPECT_CALL(*this, DeleteJetty(_)).Times(AnyNumber()).WillRepeatedly([this](auto* jetty) {
+            auto& node = ByContext(jetty->urma_ctx);
+            if (jetty == &node.rx_target) {
+                EXPECT_EQ(node.deleted_jetties, node.created_jetties);
+                EXPECT_FALSE(node.rx_target_deleted);
+                node.rx_target_deleted = true;
+                return URMA_SUCCESS;
+            }
             ++ByContext(jetty->urma_ctx).deleted_jetties;
             return URMA_SUCCESS;
         });
         EXPECT_CALL(*this, DeleteJfr(_)).Times(AnyNumber()).WillRepeatedly([this](auto* jfr) {
             auto& node = ByContext(jfr->urma_ctx);
             EXPECT_EQ(node.deleted_jetties, 2U);
+            EXPECT_TRUE(node.rx_target_deleted);
             node.deleted_jfr = true;
             return URMA_SUCCESS;
         });

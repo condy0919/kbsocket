@@ -88,7 +88,9 @@ protected:
     struct Queue {
         std::array<urma_jfc_t, 2> cqs{};
         urma_jfr_t jfr{};
-        urma_jetty_t jetty{};
+        urma_jetty_t jetty{}, rx_target{};
+        bool rx_target_created = false;
+        bool rx_target_deleted = false;
         std::deque<PostedBuffer> buffers;
         std::array<std::deque<urma_cr_t>, 2> completions;
         bool deleted_jetty = false;
@@ -182,7 +184,7 @@ protected:
             const auto index = endpoint.created_cqs++;
             const auto pool = index / 2;
             EXPECT_EQ(cfg->depth,
-                      index % 2 == 0 ? (pool == 0 ? 2 * options_.batch + 1 : 2) : (pool == 0 ? options_.batch : 1));
+                      index % 2 == 0 ? (pool == 0 ? 2 * options_.batch + 2 : 3) : (pool == 0 ? options_.batch : 1));
             return &endpoint.queues.at(pool).cqs[index % 2];
         });
         EXPECT_CALL(*this, CreateJfr(_, _)).Times(AnyNumber()).WillRepeatedly([&](auto* ctx, auto* cfg) {
@@ -195,8 +197,16 @@ protected:
         });
         EXPECT_CALL(*this, CreateJetty(_, _)).Times(AnyNumber()).WillRepeatedly([&](auto* ctx, auto* cfg) {
             auto& endpoint = Find(ctx);
-            const auto pool = endpoint.created_jetties++;
+            const auto pool = endpoint.created_jfrs - 1;
             auto& queue = endpoint.queues.at(pool);
+            if (!queue.rx_target_created) {
+                queue.rx_target_created = true;
+                queue.rx_target.jetty_id = queue.jetty.jetty_id;
+                queue.rx_target.jetty_id.id += 80;
+                queue.rx_target.jetty_cfg = *cfg;
+                return &queue.rx_target;
+            }
+            ++endpoint.created_jetties;
             EXPECT_EQ(cfg->flag.bs.share_jfr, 1u);
             EXPECT_EQ(cfg->shared.jfr, &queue.jfr);
             EXPECT_EQ(cfg->shared.jfc, &queue.cqs[1]);
@@ -473,6 +483,12 @@ protected:
         EXPECT_CALL(*this, DeleteJetty(_)).Times(AnyNumber()).WillRepeatedly([&](auto* jetty) {
             for (auto& endpoint : endpoints_) {
                 for (auto& queue : endpoint.queues) {
+                    if (jetty == &queue.rx_target) {
+                        EXPECT_TRUE(queue.deleted_jetty);
+                        EXPECT_FALSE(queue.rx_target_deleted);
+                        queue.rx_target_deleted = true;
+                        return URMA_SUCCESS;
+                    }
                     if (jetty == &queue.jetty) {
                         EXPECT_TRUE(queue.buffers.empty());
                         EXPECT_TRUE(queue.completions[0].empty());
@@ -490,6 +506,7 @@ protected:
             for (auto& endpoint : endpoints_) {
                 for (auto& queue : endpoint.queues) {
                     if (jfr == &queue.jfr) {
+                        EXPECT_TRUE(queue.rx_target_deleted);
                         EXPECT_TRUE(queue.deleted_jetty);
                         EXPECT_FALSE(queue.deleted_jfr);
                         queue.deleted_jfr = true;

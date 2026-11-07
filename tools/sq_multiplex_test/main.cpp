@@ -103,6 +103,8 @@ std::string_view LaneStateName(const kbsocket::tools::SqMultiplexStats& stats) {
         return "FLUSH_READY";
     case JettyLaneState::kDrained:
         return "DRAINED";
+    case JettyLaneState::kReplacing:
+        return "REPLACING";
     }
     return "unknown";
 }

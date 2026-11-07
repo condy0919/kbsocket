@@ -27,11 +27,11 @@ public:
         // 只 mock 控制路径硬件对象；票据与账本均使用真实实现，验证两者同步。
         EXPECT_CALL(*this, CreateJfc(_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
         EXPECT_CALL(*this, CreateJfr(_, _)).WillOnce(Return(&jfr_));
-        EXPECT_CALL(*this, CreateJetty(_, _)).WillOnce(Return(&jetty_));
+        EXPECT_CALL(*this, CreateJetty(_, _)).WillOnce(Return(&rx_target_)).WillOnce(Return(&jetty_));
         urma_device_cap_t cap{};
         cap.trans_mode = URMA_TM_RM;
         cap.rm_tp_cap.bs.ctp = 1;
-        cap.max_jetty = 1;
+        cap.max_jetty = 2;
         cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 256;
         cap.max_jfs_sge = cap.max_jfs_rsge = cap.max_jfr_sge = 1;
         JettyPoolConfig config;
@@ -45,6 +45,7 @@ public:
         EXPECT_EQ(ledger_.size(), 0u);
         EXPECT_TRUE(ledger_.Close());
         EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(*this, DeleteJetty(&rx_target_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
@@ -79,7 +80,7 @@ protected:
     urma_context_t ctx_{};
     urma_jfc_t tx_{}, rx_{};
     urma_jfr_t jfr_{};
-    urma_jetty_t jetty_{};
+    urma_jetty_t jetty_{}, rx_target_{};
     urma_target_jetty_t remote_a_{}, remote_b_{};
     JettyPool pool_;
     AttemptLedger ledger_;
@@ -113,6 +114,23 @@ TEST_F(AttemptLedgerTest, SharedLanePreservesConnectionOperationAndResourceIdent
     EXPECT_EQ(completed_a->metadata.opcode, URMA_OPC_SEND);
     EXPECT_EQ(completed_a->submission_sequence, 10u);
     EXPECT_EQ(ledger_.posted(), 0u);
+}
+
+TEST_F(AttemptLedgerTest, PostedLookupNeverTreatsReservationOrRetiredIdentityAsAccepted) {
+    auto id = ledger_.Prepare(Metadata(1));
+    ASSERT_TRUE(id);
+    // 提交层可以查看 Prepared 元数据，完成层却不能据此把未知/未投递工作判为硬件终结。
+    ASSERT_TRUE(ledger_.Lookup(*id));
+    auto prepared = ledger_.LookupPosted(*id);
+    ASSERT_FALSE(prepared);
+    EXPECT_EQ(prepared.error().code, AttemptLedgerErrorCode::kInvalidState);
+    ASSERT_TRUE(ledger_.Commit(*id, 11));
+    auto posted = ledger_.LookupPosted(*id);
+    ASSERT_TRUE(posted);
+    EXPECT_EQ(posted->ticket.lane.generation, 1u);
+    EXPECT_EQ(posted->submission_sequence, 11u);
+    ASSERT_TRUE(ledger_.Complete(*id));
+    EXPECT_FALSE(ledger_.LookupPosted(*id));
 }
 
 TEST_F(AttemptLedgerTest, PartialAcceptanceOnlyPostsPrefixAndReturnsRejectedResources) {

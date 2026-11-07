@@ -166,6 +166,7 @@ cc_test(
     deps = [
         ":attempt_ledger",
         ":jetty_pool",
+        ":tx_completion_processor",
         ":tx_sender",
         ":urma_test_support",
         "@googletest//:gtest_main",

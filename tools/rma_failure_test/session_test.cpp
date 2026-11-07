@@ -78,7 +78,9 @@ protected:
         urma_context_t ctx{};
         std::array<urma_jfc_t, 2> cqs{};
         urma_jfr_t jfr{};
-        urma_jetty_t jetty{};
+        urma_jetty_t jetty{}, rx_target{};
+        bool rx_target_created = false;
+        bool rx_target_deleted = false;
         urma_target_seg_t segment{};
         urma_seg_t exported{};
         std::array<urma_target_seg_t, 2> imported{};
@@ -121,7 +123,7 @@ protected:
         active_ = this;
         cap_.trans_mode = URMA_TM_RM;
         cap_.rm_tp_cap.bs.ctp = 1;
-        cap_.max_jetty = 1;
+        cap_.max_jetty = 2;
         cap_.max_jfs_depth = cap_.max_jfr_depth = 1024;
         cap_.max_jfc_depth = 1025;
         cap_.max_msg_size = 4096;
@@ -145,6 +147,15 @@ protected:
         });
         EXPECT_CALL(*this, CreateJetty(_, _)).Times(AnyNumber()).WillRepeatedly([this](auto* ctx, auto* cfg) {
             auto& node = Find(ctx);
+            // 被动接收端点独立计数，原 active jetty 的身份及故障注入保持不变。
+            if (!node.rx_target_created) {
+                node.rx_target_created = true;
+                node.rx_target.urma_ctx = ctx;
+                node.rx_target.jetty_cfg = *cfg;
+                node.rx_target.jetty_id.id = 900;
+                node.rx_target.jetty_id.eid = ctx->eid;
+                return &node.rx_target;
+            }
             node.jetty.urma_ctx = ctx;
             node.jetty.jetty_cfg = *cfg;
             node.jetty.jetty_id.eid = ctx->eid;
@@ -309,12 +320,20 @@ protected:
             return count;
         });
         EXPECT_CALL(*this, DeleteJetty(_)).Times(AnyNumber()).WillRepeatedly([this](auto* jetty) {
+            auto& endpoint = Find(jetty->urma_ctx);
+            if (jetty == &endpoint.rx_target) {
+                EXPECT_TRUE(endpoint.deleted_jetty);
+                EXPECT_FALSE(endpoint.rx_target_deleted);
+                endpoint.rx_target_deleted = true;
+                return URMA_SUCCESS;
+            }
             Find(jetty->urma_ctx).deleted_jetty = true;
             return URMA_SUCCESS;
         });
         EXPECT_CALL(*this, DeleteJfr(_)).Times(AnyNumber()).WillRepeatedly([this](auto* jfr) {
             auto& node = Find(jfr->urma_ctx);
             EXPECT_TRUE(node.deleted_jetty);
+            EXPECT_TRUE(node.rx_target_deleted);
             node.deleted_jfr = true;
             return URMA_SUCCESS;
         });

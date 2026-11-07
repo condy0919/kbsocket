@@ -107,7 +107,7 @@ std::expected<void, ToolError> BackpressureSession::Open(urma_context_t* ctx, co
     config.jetty_count = delay ? 2 : 1;
     config.tx_depth = options.tx_depth;
     config.rx_depth = rx_depth;
-    config.tx_cq_depth = config.jetty_count * (options.tx_depth + 1);
+    config.tx_cq_depth = config.jetty_count * (options.tx_depth + 1) + 1;
     config.rx_cq_depth = rx_depth;
     auto pool = pool_.Open(ctx, cap, config);
     if (!pool) {

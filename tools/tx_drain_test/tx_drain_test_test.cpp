@@ -119,12 +119,12 @@ protected:
     void Open(bool server = false) {
         EXPECT_CALL(*this, CreateJfc(&ctx_, _))
             .WillOnce([&](auto*, auto* cfg) {
-                EXPECT_EQ(cfg->depth, server ? 2u : options_.batch + 1);
+                EXPECT_EQ(cfg->depth, server ? 3u : options_.batch + 2);
                 return &tx_;
             })
             .WillOnce(Return(&rx_));
         EXPECT_CALL(*this, CreateJfr(&ctx_, _)).WillOnce(Return(&jfr_));
-        EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce([&](auto*, auto* cfg) {
+        EXPECT_CALL(*this, CreateJetty(&ctx_, _)).WillOnce(Return(&rx_target_)).WillOnce([&](auto*, auto* cfg) {
             EXPECT_EQ(cfg->jfs_cfg.flag.bs.error_suspend, 0u);
             EXPECT_EQ(cfg->jfs_cfg.depth, server ? 1u : options_.batch);
             jetty_.jetty_cfg = *cfg;
@@ -147,7 +147,7 @@ protected:
         cap.max_msg_size = 1048576;
         cap.trans_mode = URMA_TM_RM;
         cap.rm_tp_cap.bs.ctp = 1;
-        cap.max_jetty = 1;
+        cap.max_jetty = 2;
         cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 1024;
         cap.max_jfs_sge = cap.max_jfs_rsge = cap.max_jfr_sge = 1;
         ASSERT_TRUE(session_->Open(&ctx_, cap, options_, server));
@@ -200,6 +200,7 @@ protected:
             EXPECT_CALL(*this, Unimport(&remote_)).WillOnce(Return(URMA_SUCCESS));
         }
         EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+        EXPECT_CALL(*this, DeleteJetty(&rx_target_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
         EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
@@ -226,7 +227,7 @@ protected:
     urma_context_t ctx_{};
     urma_jfc_t tx_{}, rx_{};
     urma_jfr_t jfr_{};
-    urma_jetty_t jetty_{};
+    urma_jetty_t jetty_{}, rx_target_{};
     urma_target_seg_t segment_{};
     urma_target_jetty_t remote_{};
     std::array<raw::AttemptId, 256> ids_{};

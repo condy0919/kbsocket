@@ -2,7 +2,7 @@
 
 [文档入口](README.md)
 
-目前已实现显式裸设备选择、context 生命周期、共享队列池，SEND/SEND_WITH_IMM 的提交和 TX 完成回收，以及 RX buffer 池。双端工具把这些组件与测试用 TCP 控制协议、内存注册和接收循环串成了硬件验证闭环。正式连接协议与 socket/epoll 接入仍未实现；RX 内存管理已进入 raw 层，工具中的控制协议和 payload 校验仍属于测试逻辑。单 SQ TX 排空及同池 SQ 故障隔离已通过用户的硬件测试；共享 JFR 带未消费接收 WR 的显式关闭尚未实现，正常收发不依赖这项能力。
+目前已实现显式裸设备选择、context 生命周期、共享队列池，SEND/SEND_WITH_IMM/WRITE 的提交和 TX 完成回收，以及 RX buffer 池。M1/M2 还提供残留 RX 的显式接收域关闭、固定被动接收端点和排空后主动 jetty 替换原语。双端工具把组件与测试用 TCP 控制协议、内存注册和接收循环串成硬件验证闭环；正式连接协议、自动恢复调度与 socket/epoll 接入仍未实现。单 SQ TX 排空及同池 SQ 故障隔离已有用户硬件反馈，新增关闭与替换路径尚未完成真机回归。
 
 ## 组件与所有权
 
@@ -12,11 +12,12 @@
 | RawRuntime            | URMA 会话、DeviceCatalog、各设备/EID 端点的 UrmaContext         | 宿主已加载的库                        |
 | DeviceCatalog         | 设备属性、EID/index 快照                                        | URMA 会话中的 device 指针             |
 | UrmaContext           | 一个通过 EID/index 校验的 context；失败时可能保留待清理 context | 对应设备                              |
-| JettyPool             | TX JFC、RX JFC、共享 JFR、多个 jetty、票据槽                    | context                               |
+| JettyPool             | TX JFC、RX JFC、共享 JFR、固定被动 jetty、主动 jetty 和票据槽   | context                               |
 | AttemptLedger         | 固定容量的 attempt 记录                                         | pool、目标指针、buffer/grant 租约标识 |
 | TxSender              | 最多 256 条 WR 的固定描述符数组                                 | ledger                                |
 | TxCompletionProcessor | 最多 64 条 CQE 的固定轮询数组                                   | ledger 及其 pool                      |
 | RxBufferPool          | 4 KiB buffer slab、注册段、接收 WR 和 lease 状态                | JettyPool 及其 context               |
+| ReceiveDomainCloser   | 接收域关闭状态，不接管底层资源                                  | JettyPool、RxBufferPool               |
 | SendTestSession       | 池、账本、发送器、注册内存和远端导入等测试资源                  | runtime 提供的 context                |
 
 RawRuntime 不包含 JettyPool，账本也不会因保存租约标识而自动管理实际内存。宿主必须使被借用的资源活到最后一次访问和 DMA 终结之后。队列、账本、post 和 poll 由同一 owner 串行推进，不允许并发或重入。
@@ -44,8 +45,8 @@ flowchart TD
 
 以下对应 [send_test.cpp](../tools/send_test/send_test.cpp) 的现有实现，不是尚未完成的正式连接层。
 
-1. 两端准备一个 jetty、一个共享 JFR 和独立 TX/RX JFC，注册按系统页对齐的内存。工具显式将 TX/RX 深度设为 batch，TX CQ 设为 batch+1。
-2. TCP 交换 EID、jetty ID 和测试参数；发送端导入对端 RM_CTP jetty。TCP 地址用于控制通信，EID 用于 UB 数据传输。
+1. 两端准备一个主动 jetty、一个固定被动 jetty、共享 JFR 和独立 TX/RX JFC，注册按系统页对齐的内存。工具显式将主动 TX/RX 深度设为 batch，TX CQ 设为 batch+2。
+2. TCP 交换 EID、jetty ID 和测试参数；发送端导入对端 RM_CTP jetty。该工具仍使用主动 jetty 作为兼容目标；生产端点使用 `rx_target_jetty_id()` 发布固定被动 jetty。TCP 地址用于控制通信，EID 用于 UB 数据传输。
 3. 接收端通过 `RxBufferPool::Refill(count)` 向 JFR 投递本轮接收 buffer，然后经 TCP 发出 READY。
 4. 发送端填充 payload，`TxSender::Send` 通过账本预留整批额度，将 AttemptId 写入 WR 的 user_ctx，再 post 到同一 SQ。每条 WR 可独立指定目标；连接并不独占 jetty。
 5. 发送端用 `TxCompletionProcessor::Poll` 处理 TX CQE。合法终结完成通过账本归还池额度，并返回原操作和资源引用。
@@ -60,7 +61,7 @@ flowchart TD
 
 [背压工具](../tools/backpressure_test/README.md) 的 `tx_quota` 模式暂停 TX poll，填满软件 SQ 配额后检查额外 WR 被拒绝，再退休完成并仅重试此前未被接受的 WR；`rx_delay` 先发送再延迟投递 RX，区分原始数据全部成功与异步错误后的终结排空。后者使用另一条 SQ 发送具有独立身份的清理消息，消费剩余 RX 槽位；清理流量不计为原始数据恢复，已接受的原始 WR 不会重放。迟到的原始 RX 可能使清理 SQ 遇到 RNR，因此清理 SQ 也支持排空，只有全部 RX 槽位和 TX attempts 归还后才能关闭资源。软件配额拒绝、provider 的同步 EAGAIN 与远端缺 RX 的异步结果分别统计；provider EAGAIN 非零不是通过条件。
 
-`rnr_continue` 模式在首批 WR 全部返回 RNR 后才补投 RX，再用同一条 SQ 发送新消息。它在工具内消费完成并查询硬件状态，验证期间不调用 modify ERROR 或 flush，也不创建替代 SQ；用于区分 WR 终结错误与 SQ 不可用。用户已反馈 `rnr_continue_success`，表明本次硬件与配置下同一条 SQ 在 RNR 后仍可成功发送新消息；生产完成层的主动排空策略保持不变。
+`rnr_continue` 模式在首批 WR 全部返回 RNR 后才补投 RX，再用同一条 SQ 发送新消息。它在工具内消费完成并查询硬件状态，验证期间不调用 modify ERROR 或 flush，也不创建替代 SQ；用于区分 WR 终结错误与 SQ 不可用。用户已反馈 `rnr_continue_success`，表明本次硬件与配置下同一条 SQ 在 RNR 后仍可成功发送新消息。M2 生产完成层已将身份可信的 status 8/10 按逐 WR 错误退休，不因此主动排空 SQ；新实现的验证范围另见 roadmap。
 
 [同 SQ 多目标工具](../tools/sq_multiplex_test/README.md) 在一条 SQ 的同一次 post 中交替选择健康与缺 RX 的目标，两者使用独立 JFR。每轮对照混合流量前后的正常发送，逐条检查健康 SUCCESS、sink RNR、远端 payload 和同一 SQ 的 READY 状态，并记录软件消费 CQE 的顺序与耗时。工具不因普通 RNR 主动排空 SQ；时序统计用于硬件观测，不能单凭 CQE 顺序判断硬件执行是否阻塞。已有一次失败反馈：健康目标收到完整数据，但发送端出现 ACK timeout，详见[硬件观测记录](hardware-observations.md)。修正完成收集后的复测已双端 PASS：健康 before/mixed/after 各 256 条全部成功，sink 256 条全部 RNR，原 SQ 的 25 次状态检查均为 READY；前次 ACK_TIMEOUT 的根因仍未知。
 
@@ -70,7 +71,9 @@ flowchart TD
 
 正常顺序是停止新操作、排空在途收发、关闭发送器和账本、解除远端导入、关闭 RX buffer 池并注销接收内存、关闭队列池、注销发送内存，再关闭 runtime（context → Uninit），最后 Unload。具体子资源顺序由其依赖决定，不能只看到发送器 Close 就释放 buffer。
 
-出现无法确定接受范围、未终结 DMA 或清理失败时，必须保留依赖资源，不能强行清空账本。测试工具将这类情况判为失败；当前支持 modify ERROR、等待硬件边界、软件 flush 的单 SQ 排空，详见 [TX 故障排空](tx-pipeline.md#error-continue-与单-sq-故障排空)。不自动重放或在线恢复，接受范围不可信的 Prepared 记录仍保留。
+有残留 RX 时使用 `ReceiveDomainCloser`：Begin 停止 TX 准入，确认远端静默后才停止 RX 补投；TX 票据排空、正常 RX CQ 读空且事件/队列使用者屏障成立后，依次删除主动 jetty、被动 jetty 和 JFR。成功 DeleteJfr 后终结残留 Posted 记录，等待已有 Held lease 归还，再注销 RX MR、删除 JFC。该路径不是故障 CQ 回收；删除失败保留依赖供重试，RX poll 失败封禁整个域并保留资源。
+
+出现无法确定接受范围、未终结 DMA 或清理失败时，必须保留依赖资源，不能强行清空账本。测试工具将这类情况判为失败；当前支持 modify ERROR、等待硬件边界、软件 flush 的单 SQ 排空，以及证明旧事件、CQE 和使用者均已退出后的显式 lane 替换，详见 [TX 故障排空](tx-pipeline.md#error-continue-与单-sq-故障排空)。不自动重放或调度恢复，接受范围不可信的 Prepared 记录仍保留。
 
 对于不能确认 worker 已停止访问的进程退出路径，`GetRawRuntime()` 使用 NoDestructor 避免自动关闭 context。池、账本、注册内存和目标等关联资源也必须保持存活；仅让 runtime 常驻并不足够。显式 Close 仍要求调用方先完成停止和排空协议。
 
@@ -90,13 +93,13 @@ flowchart TD
 | 同 SQ status 8 隔离 | 原始 CQE 与正式 `TxCompletionProcessor` 路径均通过；失效目标逐 WR 报错，健康目标在前、中、后三阶段成功，正式完成层不因 status 8 调用整 SQ `BeginDrain`；见矩阵 Q1–Q4 |
 | 两裸设备×每设备两 EID | 四 context 持续收发、RX 补投、payload 与关闭通过，并观察到各 context 的 JFC 通知和 JFCE fd readiness；D2 首次 ACK_TIMEOUT/等待超时的历史保留，复测通过不证明该问题已修复 |
 | Provider 提交边界 | 已观测 `ENOMEM` 容量拒绝、部分接受前缀，以及 ERROR post 和非零软件 `WR_UNHANDLED`；失败返回不撤销已接受项，仍需逐 WR 退休 |
-| 残留 RX 的 JFR 删除 | 专项工具覆盖全部未消费、部分已消费的 RX；先删除依赖 jetty，再成功删除 JFR，随后释放 MR。它不代表生产 `RxBufferPool` 已支持带残留 RX 关闭 |
+| 残留 RX 的 JFR 删除 | 专项工具覆盖全部未消费、部分已消费的 RX；先删除依赖 jetty，再成功删除 JFR，随后释放 MR。M1 已实现生产接收域关闭原语，该新增路径仍待真机回归 |
 | JFR 水线 async | 已观测事件归属与 Get/Ack、重写 threshold 后的重复通知，以及持续收包时高位/低位重配；仅 Ack/补投不等于重新使能 |
 | RX/TX JFC 错误 | overflow 工具已观察 JFC_ERR 与关联 jetty 错误，独立健康队列继续成功；故障域终结证据不足时保留 DMA 依赖，工具 PASS 不代表坏 CQ 已安全排空或恢复 |
 | READ/WRITE 与多 SGE | 单 WR READ/WRITE、并发 READ 和 READ/SEND 混合、多 SGE SEND/IMM 均有通过记录；WRITE 失效目标 status 8 与同 SQ 健康写入共存。READ 故障后的 status 9 和 WRITE 首条基线的偶发 status 9 同样保留，不能由成功样本推断始终可靠 |
 
 用户另外确认：RM_CTP SEND 上限为 4096 字节，单边 READ/WRITE 上限为 200 MiB，WRITE 与 READ 的完成可见性一致；**status 9 后原 jetty 不可继续使用，即使查询仍 READY，需要删除并重新创建**。这些是[人工确认的硬件契约](hardware-observations.md#2026-10-23-人工确认的硬件契约)及同页后续补充，不等同于所有边界参数已有实测 PASS。WRITE 完成后 SEND/IMM 通知的工具已实现，WN1–WN4 仍待真机回归，软件实现不再被其可见性契约阻塞。
 
-仍需区分生产实现缺口：带残留 RX 的完整接收域关闭、在线 jetty 替换、统一 owner reactor/事件生命周期、连接级错误分发与 socket `EAGAIN → EPOLLOUT` 尚未完成，按 [roadmap](roadmap.md) 推进。故障 CQ 的完整回收/在线恢复暂缓。现有四 context 工具不证明多 owner 性能、四物理设备、跨设备故障隔离或物理带宽叠加。
+仍需区分生产实现缺口：统一 owner reactor/事件生命周期、自动排空与替换调度、连接级错误分发、WRITE DONE/RNDV 协议与 socket `EAGAIN → EPOLLOUT` 尚未完成，按 [roadmap](roadmap.md) 推进。故障 CQ 的完整回收/在线恢复暂缓。现有四 context 工具不证明多 owner 性能、四物理设备、跨设备故障隔离或物理带宽叠加。
 
 延迟 RX 后原始流量全部成功、实际 RNR 重试参数/窗口等硬件缺口仍按矩阵保留；RNR 后新消息成功不代表失败的原始消息被重放或恢复。单元测试中的故障注入验证代码契约，不能替代硬件专项测试；新增工具观测也不自动改变生产错误隔离、关闭或 socket 语义。

@@ -269,7 +269,7 @@ std::expected<void, ToolError> JfrLimitSession::Open(urma_context_t* ctx, const 
     raw::JettyPoolConfig config;
     config.jetty_count = 2;
     config.tx_depth = config.rx_depth = options.rx_depth;
-    config.tx_cq_depth = 2 * (options.rx_depth + 1);
+    config.tx_cq_depth = 2 * (options.rx_depth + 1) + 1;
     config.rx_cq_depth = options.rx_depth;
     auto opened = pool_.Open(ctx, cap, config);
     if (!opened) {

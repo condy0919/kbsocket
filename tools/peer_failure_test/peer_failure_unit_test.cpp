@@ -209,11 +209,13 @@ protected:
             jfr_.jfr_cfg = *cfg;
             return &jfr_;
         });
-        EXPECT_CALL(*this, CreateJetty(_, _)).WillOnce([&](urma_context_t*, urma_jetty_cfg_t* cfg) {
-            jetty_.jetty_cfg = *cfg;
-            jetty_.jetty_id.id = 17;
-            return &jetty_;
-        });
+        EXPECT_CALL(*this, CreateJetty(_, _))
+            .WillOnce(Return(&rx_target_))
+            .WillOnce([&](urma_context_t*, urma_jetty_cfg_t* cfg) {
+                jetty_.jetty_cfg = *cfg;
+                jetty_.jetty_id.id = 17;
+                return &jetty_;
+            });
         EXPECT_CALL(*this, Register(_, _)).WillOnce(Return(&segment_));
         EXPECT_CALL(*this, Import(_, _, _)).Times(AnyNumber()).WillRepeatedly(Return(&target_));
         EXPECT_CALL(*this, Modify(_, _)).Times(0);
@@ -281,7 +283,7 @@ protected:
     std::array<urma_jfc_t, 2> cqs_{};
     std::size_t cq_index_ = 0;
     urma_jfr_t jfr_{};
-    urma_jetty_t jetty_{};
+    urma_jetty_t jetty_{}, rx_target_{};
     urma_target_seg_t segment_{};
     urma_target_jetty_t target_{};
     std::deque<urma_cr_t> completions_;

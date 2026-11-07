@@ -13,6 +13,22 @@ auto Error(TxSendErrorCode code) noexcept {
         .code = code,
     });
 }
+
+// RM_CTP 使用注册/导出的 VA，不把 import 的本地映射地址 mva 当作远端授权范围。
+// 先用减法校验范围，避免畸形地址、长度或段描述导致整数回绕后被误判合法。
+bool Covers(const urma_sge_t& sge, const urma_context_t* context) noexcept {
+    if (!sge.tseg || !sge.addr || !sge.len || sge.tseg->urma_ctx != context) {
+        return false;
+    }
+    const auto& segment = sge.tseg->seg;
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    if (!segment.len || segment.ubva.va > maximum - segment.len || sge.addr > maximum - sge.len ||
+        sge.addr < segment.ubva.va) {
+        return false;
+    }
+    const auto offset = sge.addr - segment.ubva.va;
+    return offset <= segment.len && sge.len <= segment.len - offset;
+}
 } // namespace
 
 std::expected<void, TxSendError> TxSender::Open(AttemptLedger& ledger) noexcept {
@@ -64,15 +80,27 @@ std::expected<std::size_t, TxSendError> TxSender::Send(std::span<const TxSendReq
     std::ranges::fill(ids, 0);
     for (const auto& request : requests) {
         const auto opcode = request.metadata.opcode;
-        if (!request.metadata.target || (opcode != URMA_OPC_SEND && opcode != URMA_OPC_SEND_IMM) ||
-            !request.metadata.signaled || request.sges.empty() ||
-            request.sges.size() > std::numeric_limits<std::uint32_t>::max()) {
+        const bool write = opcode == URMA_OPC_WRITE;
+        if (!request.metadata.target || (opcode != URMA_OPC_SEND && opcode != URMA_OPC_SEND_IMM && !write) ||
+            !request.metadata.signaled || request.sges.empty() || request.sges.size() > pool_->max_send_sge() ||
+            request.remote.has_value() != write) {
             return Error(TxSendErrorCode::kInvalidArgument);
         }
+        std::uint64_t bytes = 0;
         for (const auto& sge : request.sges) {
             if (!sge.tseg || !sge.addr || !sge.len) {
                 return Error(TxSendErrorCode::kInvalidArgument);
             }
+            if (write &&
+                (!Covers(sge, pool_->context()) || sge.len > std::numeric_limits<std::uint64_t>::max() - bytes)) {
+                return Error(TxSendErrorCode::kInvalidArgument);
+            }
+            bytes += sge.len;
+        }
+        if (write &&
+            (request.metadata.target->urma_ctx != pool_->context() || !Covers(*request.remote, pool_->context()) ||
+             request.remote->len != bytes || bytes > std::min(kMaxWriteSize, pool_->max_write_size()))) {
+            return Error(TxSendErrorCode::kInvalidArgument);
         }
     }
     if (requests.size() > std::numeric_limits<std::uint64_t>::max() - next_sequence_) {
@@ -113,10 +141,15 @@ std::expected<std::size_t, TxSendError> TxSender::Send(std::span<const TxSendReq
         wr.flag.bs.complete_enable = 1;
         wr.tjetty = requests[i].metadata.target;
         wr.user_ctx = *id;
-        wr.send.src.sge = requests[i].sges.data();
-        wr.send.src.num_sge = static_cast<std::uint32_t>(requests[i].sges.size());
-        if (wr.opcode == URMA_OPC_SEND_IMM) {
-            wr.send.imm_data = requests[i].imm_data;
+        if (wr.opcode == URMA_OPC_WRITE) {
+            remote_sges_[i] = *requests[i].remote;
+            wr.rw.src = {requests[i].sges.data(), static_cast<std::uint32_t>(requests[i].sges.size())};
+            wr.rw.dst = {&remote_sges_[i], 1};
+        } else {
+            wr.send.src = {requests[i].sges.data(), static_cast<std::uint32_t>(requests[i].sges.size())};
+            if (wr.opcode == URMA_OPC_SEND_IMM) {
+                wr.send.imm_data = requests[i].imm_data;
+            }
         }
         wr.next = i + 1 < requests.size() ? &wrs_[i + 1] : nullptr;
     }

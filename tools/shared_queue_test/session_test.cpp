@@ -63,6 +63,7 @@ protected:
         std::array<urma_jfc_t, 2> cqs{};
         urma_jfr_t jfr{};
         std::array<urma_jetty_t, 2> jetties{};
+        urma_jetty_t rx_target{};
         std::array<urma_target_jetty_t, 2> imports{};
         std::array<Registration, 2> registrations{};
         std::deque<PostedBuffer> buffers;
@@ -81,6 +82,8 @@ protected:
         std::size_t recv_batches = 0;
         std::size_t send_batches = 0;
         std::size_t reversed_rx_batches = 0;
+        bool created_rx_target = false;
+        bool deleted_rx_target = false;
     };
 
     static raw::UrmaFunctions MockedFunctions() {
@@ -122,10 +125,12 @@ protected:
         cap_.max_msg_size = 4096;
         cap_.trans_mode = URMA_TM_RM;
         cap_.rm_tp_cap.bs.ctp = 1;
-        cap_.max_jetty = 2;
+        cap_.max_jetty = 3;
         cap_.max_jfs_depth = cap_.max_jfr_depth = cap_.max_jfc_depth = 256;
         cap_.max_jfs_sge = cap_.max_jfs_rsge = cap_.max_jfr_sge = 1;
         for (std::size_t side = 0; side < endpoints_.size(); ++side) {
+            endpoints_[side].rx_target.jetty_id.id = 20;
+            endpoints_[side].rx_target.jetty_id.eid.raw[15] = side + 1;
             for (std::size_t lane = 0; lane < 2; ++lane) {
                 // 故意让两端的数字 ID 相同而 EID 不同，接收源校验不能只比较数字 ID。
                 auto& id = endpoints_[side].jetties[lane].jetty_id;
@@ -136,7 +141,7 @@ protected:
         EXPECT_CALL(*this, CreateJfc(_, _)).Times(AnyNumber()).WillRepeatedly([&](auto* ctx, auto* cfg) {
             auto& endpoint = Find(ctx);
             EXPECT_LT(endpoint.created_cqs, 2u);
-            EXPECT_EQ(cfg->depth, endpoint.created_cqs == 0 ? 8u : 6u);
+            EXPECT_EQ(cfg->depth, endpoint.created_cqs == 0 ? 9u : 6u);
             return &endpoint.cqs.at(endpoint.created_cqs++);
         });
         EXPECT_CALL(*this, CreateJfr(_, _)).Times(AnyNumber()).WillRepeatedly([&](auto* ctx, auto* cfg) {
@@ -152,6 +157,12 @@ protected:
             EXPECT_EQ(cfg->shared.jfr, &endpoint.jfr);
             EXPECT_EQ(cfg->shared.jfc, &endpoint.cqs[1]);
             EXPECT_EQ(cfg->jfs_cfg.jfc, &endpoint.cqs[0]);
+            // 新增被动端点独立计数，不改变旧测试的 active SQ/目标下标语义。
+            if (!endpoint.created_rx_target) {
+                endpoint.created_rx_target = true;
+                endpoint.rx_target.jetty_cfg = *cfg;
+                return &endpoint.rx_target;
+            }
             EXPECT_EQ(cfg->jfs_cfg.depth, options_.batch);
             return &endpoint.jetties.at(endpoint.created_jetties++);
         });
@@ -305,11 +316,25 @@ protected:
         });
         EXPECT_CALL(*this, DeleteJetty(_)).Times(AnyNumber()).WillRepeatedly([&](auto* jetty) {
             for (auto& endpoint : endpoints_) {
+                if (jetty == &endpoint.rx_target) {
+                    EXPECT_TRUE(endpoint.created_rx_target);
+                    EXPECT_FALSE(endpoint.deleted_rx_target);
+                    EXPECT_EQ(endpoint.deleted_jetties, endpoint.created_jetties);
+                    EXPECT_EQ(endpoint.deleted_jfrs, 0u);
+                    endpoint.deleted_rx_target = true;
+                    return URMA_SUCCESS;
+                }
                 for (auto& local : endpoint.jetties) {
                     if (jetty == &local) {
                         EXPECT_TRUE(endpoint.buffers.empty());
                         EXPECT_TRUE(endpoint.completions[0].empty());
                         EXPECT_TRUE(endpoint.completions[1].empty());
+                        EXPECT_FALSE(endpoint.deleted_rx_target);
+                        EXPECT_LT(endpoint.deleted_jetties, endpoint.created_jetties);
+                        if (endpoint.deleted_jetties < endpoint.created_jetties) {
+                            EXPECT_EQ(jetty,
+                                      &endpoint.jetties[endpoint.created_jetties - endpoint.deleted_jetties - 1]);
+                        }
                         ++endpoint.deleted_jetties;
                         return URMA_SUCCESS;
                     }
@@ -321,6 +346,7 @@ protected:
         EXPECT_CALL(*this, DeleteJfr(_)).Times(AnyNumber()).WillRepeatedly([&](auto* jfr) {
             auto& endpoint = endpoints_[jfr == &endpoints_[1].jfr];
             EXPECT_EQ(endpoint.deleted_jetties, endpoint.created_jetties);
+            EXPECT_TRUE(endpoint.deleted_rx_target);
             ++endpoint.deleted_jfrs;
             return URMA_SUCCESS;
         });
@@ -351,6 +377,7 @@ protected:
     }
 
     void ExpectClosed(const Endpoint& endpoint) {
+        EXPECT_EQ(endpoint.deleted_rx_target, endpoint.created_rx_target);
         EXPECT_EQ(endpoint.unimported, endpoint.imported);
         EXPECT_EQ(endpoint.deleted_jetties, endpoint.created_jetties);
         EXPECT_EQ(endpoint.deleted_jfrs, endpoint.created_jfrs);
@@ -392,8 +419,9 @@ protected:
             const auto closed = sessions_[side].Close();
             const auto& endpoint = endpoints_[side];
             resources_retained &= !closed && closed.error().code == EBUSY && endpoint.unimported == 0 &&
-                                  endpoint.deleted_jetties == 0 && endpoint.deleted_jfrs == 0 &&
-                                  endpoint.deleted_cqs == 0 && endpoint.unregistered == 0 && endpoint.buffers.empty() &&
+                                  !endpoint.deleted_rx_target && endpoint.deleted_jetties == 0 &&
+                                  endpoint.deleted_jfrs == 0 && endpoint.deleted_cqs == 0 &&
+                                  endpoint.unregistered == 0 && endpoint.buffers.empty() &&
                                   endpoint.completions[0].empty() && endpoint.completions[1].empty();
         }
         // 一条损坏不影响同批其他消息的校验；退出子进程，模拟工具保留未确认资源至进程结束的契约。

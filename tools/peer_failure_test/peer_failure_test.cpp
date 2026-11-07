@@ -164,7 +164,7 @@ std::expected<void, ToolError> PeerFailureSession::Open(urma_context_t* ctx, con
     raw::JettyPoolConfig config;
     config.tx_depth = options.batch;
     config.rx_depth = server ? options.batch : 1;
-    config.tx_cq_depth = options.batch + 1;
+    config.tx_cq_depth = options.batch + 2;
     config.rx_cq_depth = *config.rx_depth;
     auto opened = pool_.Open(ctx, cap, config);
     if (!opened) {

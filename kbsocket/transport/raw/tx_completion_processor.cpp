@@ -29,6 +29,10 @@ bool IsWrCompletion(urma_cr_status_t status) noexcept {
         return false;
     }
 }
+
+bool SameLane(JettyLane lhs, JettyLane rhs) noexcept {
+    return lhs.pool == rhs.pool && lhs.index == rhs.index && lhs.epoch == rhs.epoch && lhs.generation == rhs.generation;
+}
 } // namespace
 
 std::expected<TxCompletionBatch, TxCompletionError>
@@ -105,6 +109,11 @@ TxCompletionEvent TxCompletionProcessor::Process(JettyPool& pool, const urma_cr_
         event.error = TxCompletionError{.code = TxCompletionErrorCode::kUnexpectedCompletion};
         return event;
     }
+    // 未知状态和普通 poll 中的 WR_UNHANDLED 没有可信终结语义，不能据其 local_id 隔离 SQ。
+    if (flushing_lane ? cr.status != URMA_CR_WR_UNHANDLED : !boundary && !IsWrCompletion(cr.status)) {
+        event.error = TxCompletionError{.code = TxCompletionErrorCode::kUnexpectedCompletion};
+        return event;
+    }
     auto lane = pool.FindLane(cr.local_id);
     if (!lane) {
         event.error = TxCompletionError{.code = TxCompletionErrorCode::kUnknownLane, .pool_error = lane.error()};
@@ -113,16 +122,13 @@ TxCompletionEvent TxCompletionProcessor::Process(JettyPool& pool, const urma_cr_
 
     event.lane = *lane;
     if (flushing_lane) {
-        if (lane->pool != flushing_lane->pool || lane->index != flushing_lane->index ||
-            lane->epoch != flushing_lane->epoch) {
+        if (!SameLane(*lane, *flushing_lane)) {
             event.error = TxCompletionError{.code = TxCompletionErrorCode::kWrongLane};
             return event;
         }
-        if (cr.status != URMA_CR_WR_UNHANDLED) {
-            event.error = TxCompletionError{.code = TxCompletionErrorCode::kUnexpectedCompletion};
-            return event;
-        }
-    } else {
+    } else if (boundary) {
+        // 无 user_ctx 的边界只能配合本地排空状态消费，不提供新代次故障证据。
+        // 替换前的旧边界清理仍依赖 ReplaceDrainedLane 的显式事件/队列屏障。
         if (cr.status == URMA_CR_WR_FLUSH_ERR_DONE) {
             auto observed = pool.ObserveFlushDone(*lane);
             if (!observed) {
@@ -133,19 +139,38 @@ TxCompletionEvent TxCompletionProcessor::Process(JettyPool& pool, const urma_cr_
             event.kind = TxCompletionKind::kFlushDone;
             return event;
         }
-        if (cr.status == URMA_CR_WR_FLUSH_ERR) {
-            auto state = pool.lane_state(*lane);
-            if (!state || *state != JettyLaneState::kError) {
-                auto isolated = pool.MarkFaulted(*lane);
-                (void)isolated;
-                event.error = TxCompletionError{.code = TxCompletionErrorCode::kUnexpectedCompletion};
-                return event;
-            }
+        auto state = pool.lane_state(*lane);
+        if (!state || (*state != JettyLaneState::kFaulted && *state != JettyLaneState::kError &&
+                       *state != JettyLaneState::kFlushReady)) {
+            event.error = TxCompletionError{.code = TxCompletionErrorCode::kUnexpectedCompletion};
+            return event;
         }
-        // 远端访问中止只终结对应 WR，不能据此判定共享 SQ 故障；原状态和连接身份仍交给上层。
-        // 其他错误沿用排空策略：error continue 不自动停止硬件，先封住软件提交，再显式切 ERROR。
-        // modify 失败仍处理当前可信终结 CQE，避免消耗了 CQE 却遗失其退休记录。
-        if (cr.status != URMA_CR_SUCCESS && cr.status != URMA_CR_REM_ACCESS_ABORT_ERR) {
+        // SUSPEND_DONE 只报告已经隔离的 SQ；不把它当作 FLUSH_DONE，也不自行切 ERROR。
+        event.kind = TxCompletionKind::kSuspendDone;
+        return event;
+    }
+    auto record = ledger_.LookupPosted(cr.user_ctx);
+    if (!record) {
+        event.error = TxCompletionError{
+            .code = TxCompletionErrorCode::kLedgerFailure,
+            .ledger_error = record.error(),
+        };
+        return event;
+    }
+    const auto& recorded_lane = record->ticket.lane;
+    if (!SameLane(recorded_lane, *lane)) {
+        event.error = TxCompletionError{.code = TxCompletionErrorCode::kWrongLane};
+        return event;
+    }
+
+    // 只有方向、终结类型、已提交身份及完整通道代次均可信后，才允许错误改变 SQ 状态。
+    if (!flushing_lane) {
+        if (cr.status != URMA_CR_SUCCESS && cr.status != URMA_CR_REM_ACCESS_ABORT_ERR &&
+            cr.status != URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
+            // 8/10 仅终结当前 WR；ACK_TIMEOUT 和其他 fatal 错误阻止 SQ 复用并启动 ERROR 排空。
+            // 真实 FLUSH_ERR 也可能先于本地 ERROR 转换到达，仍须隔离并退休，不能丢失终结证据。
+            // BeginDrain 对 Error/FlushReady 幂等，不重复 modify 或回退已取得的边界。
+            // modify 失败仍保留当前 WR 的退休记录，控制路径错误与终结证据同时返回。
             auto fault = pool.BeginDrain(*lane);
             if (!fault) {
                 event.error = TxCompletionError{
@@ -154,34 +179,6 @@ TxCompletionEvent TxCompletionProcessor::Process(JettyPool& pool, const urma_cr_
                 };
             }
         }
-        if (cr.status == URMA_CR_WR_SUSPEND_DONE) {
-            event.kind = TxCompletionKind::kSuspendDone;
-            return event;
-        }
-        if (!IsWrCompletion(cr.status)) {
-            event.error = TxCompletionError{
-                .code = TxCompletionErrorCode::kUnexpectedCompletion,
-                .pool_error = event.error ? event.error->pool_error : std::nullopt,
-            };
-            return event;
-        }
-    }
-    auto record = ledger_.Lookup(cr.user_ctx);
-    if (!record) {
-        event.error = TxCompletionError{
-            .code = TxCompletionErrorCode::kLedgerFailure,
-            .ledger_error = record.error(),
-            .pool_error = event.error ? event.error->pool_error : std::nullopt,
-        };
-        return event;
-    }
-    const auto& recorded_lane = record->ticket.lane;
-    if (recorded_lane.pool != lane->pool || recorded_lane.index != lane->index || recorded_lane.epoch != lane->epoch) {
-        event.error = TxCompletionError{
-            .code = TxCompletionErrorCode::kWrongLane,
-            .pool_error = event.error ? event.error->pool_error : std::nullopt,
-        };
-        return event;
     }
     auto retired = ledger_.Complete(cr.user_ctx);
     if (!retired) {

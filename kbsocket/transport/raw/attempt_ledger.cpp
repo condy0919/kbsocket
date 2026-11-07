@@ -111,6 +111,17 @@ std::expected<AttemptRecord, AttemptLedgerError> AttemptLedger::Lookup(AttemptId
     return entries_[*index].record;
 }
 
+std::expected<AttemptRecord, AttemptLedgerError> AttemptLedger::LookupPosted(AttemptId id) const noexcept {
+    auto index = Find(id);
+    if (!index) {
+        return std::unexpected(index.error());
+    }
+    if (entries_[*index].state != State::kPosted) {
+        return Error(AttemptLedgerErrorCode::kInvalidState);
+    }
+    return entries_[*index].record;
+}
+
 std::expected<void, AttemptLedgerError> AttemptLedger::Commit(AttemptId id,
                                                               std::uint64_t submission_sequence) noexcept {
     auto index = Find(id);

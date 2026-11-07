@@ -38,7 +38,7 @@ std::expected<void, SendTestError> SendTestSession::Open(urma_context_t* ctx, co
     ctx_ = ctx;
     raw::JettyPoolConfig config;
     config.tx_depth = config.rx_depth = options.batch;
-    config.tx_cq_depth = options.batch + 1;
+    config.tx_cq_depth = options.batch + 2;
     config.rx_cq_depth = options.batch;
     config.send_sge = static_cast<std::uint8_t>(options.sges);
     auto opened = pool_.Open(ctx, cap, config);

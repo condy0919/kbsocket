@@ -15,13 +15,17 @@
 
 namespace kbsocket {
 namespace raw {
-/// 支持非 inline、全 signal 的 SEND 和 SEND_WITH_IMM，SGE 必须引用已注册的本地内存。
-/// 描述符覆盖 Send 调用；目标、注册段和 payload 覆盖对应 attempt 的完整生命周期。
+/// 支持非 inline、全 signal 的 SEND、SEND_WITH_IMM 和 WRITE。
+/// 本地 SGE 必须引用已注册内存；描述符覆盖 Send 调用，目标、注册段和 payload 覆盖 attempt 生命周期。
 struct TxSendRequest {
     AttemptMetadata metadata;
     std::span<urma_sge_t> sges;
     /// 仅 URMA_OPC_SEND_IMM 使用，按 URMA 契约传递主机字节序的 64 位值。
     std::uint64_t imm_data = 0;
+    /// 仅 WRITE 使用且必须提供：单个已导入的远端段及目标地址，长度等于本地 SGE 总长。
+    /// addr 为对端导出的 VA，按 tseg->seg.ubva.va/len 校验；不接受本地 mva 或相对偏移。
+    /// 调用方保持 buffer/grant lease 至可信终结；WRITE 完成不自动发送通知或撤销远端授权。
+    std::optional<urma_sge_t> remote;
 };
 
 enum class TxSendErrorCode : std::uint8_t {
@@ -54,6 +58,8 @@ class TxSender {
 public:
     /// 对齐 UMQ_BATCH_SIZE；这是单次提交上限，不是 SQ 深度。
     static constexpr std::uint32_t kMaxBatch = 256;
+    /// 当前 RM_CTP 单边写入契约；同时受池创建时快照的 max_write_size 限制。
+    static constexpr std::uint64_t kMaxWriteSize = 200ULL * 1024 * 1024;
 
     TxSender() = default;
 
@@ -64,7 +70,8 @@ public:
     std::expected<void, TxSendError> Open(AttemptLedger& ledger) noexcept;
     std::expected<void, TxSendError> Close() noexcept;
 
-    /// 支持一条或多条 SEND/SEND_WITH_IMM 混合提交，同一批使用一个 SQ，可指定 lane 或由池选择。
+    /// 支持 SEND/SEND_WITH_IMM/WRITE 混合提交，同一批使用一个 SQ，可指定 lane 或由池选择。
+    /// 混批不建立 WRITE 与 SEND 通知的可见性依赖；需要通知时须先等全部关联 WRITE 成功退休。
     /// post 前预留整批；额度不足则全部撤销，不提交部分预留的请求。
     /// ids 至少与 requests 等长；有效输入下清零对应范围，仅保留未退休记录的 id。
     /// 成功返回请求数；部分失败返回 accepted，前缀 id 留在账本，已取消后缀 id 为 0。
@@ -79,6 +86,7 @@ private:
     AttemptLedger* ledger_ = nullptr;
     JettyPool* pool_ = nullptr;
     std::array<urma_jfs_wr_t, kMaxBatch> wrs_{};
+    std::array<urma_sge_t, kMaxBatch> remote_sges_{};
     std::uint64_t next_sequence_ = 0;
     bool blocked_ = false;
 };

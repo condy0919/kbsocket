@@ -82,7 +82,7 @@ std::expected<void, ToolError> RmaSession::Open(urma_context_t* ctx, const urma_
     const auto wr_count = options.window * (options.mixed_send ? 2U : 1U);
     config.tx_depth = wr_count;
     config.rx_depth = RmaHasSend(options) ? options.window : 1;
-    config.tx_cq_depth = wr_count + 1;
+    config.tx_cq_depth = wr_count + 2;
     config.rx_cq_depth = *config.rx_depth;
     auto opened = pool_.Open(ctx, cap, config);
     if (!opened) {

@@ -109,7 +109,7 @@ std::expected<void, ToolError> SqMultiplexSession::Open(urma_context_t* ctx, con
     config.jetty_count = 1;
     config.tx_depth = 2 * options.batch;
     config.rx_depth = options.batch;
-    config.tx_cq_depth = 2 * options.batch + 1;
+    config.tx_cq_depth = 2 * options.batch + 2;
     config.rx_cq_depth = options.batch;
     auto pool = pool_.Open(ctx, cap, config);
     if (!pool) {
@@ -128,7 +128,7 @@ std::expected<void, ToolError> SqMultiplexSession::Open(urma_context_t* ctx, con
             local_.endpoints[1] = fault_peer_->endpoint();
         } else {
             config.tx_depth = config.rx_depth = config.rx_cq_depth = 1;
-            config.tx_cq_depth = 2;
+            config.tx_cq_depth = 3;
             auto sink = sink_.Open(ctx, cap, config);
             if (!sink) {
                 return Error("create independent empty sink JFR", PoolError(sink.error().failure));

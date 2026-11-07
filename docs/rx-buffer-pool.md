@@ -18,6 +18,7 @@ stateDiagram-v2
     Free --> Posted: Refill 投递
     Posted --> Free: bad_wr 明确证明后缀未接受
     Posted --> Held: 可信逐 WR 终结 CQE
+    Posted --> Free: 接收域关闭中成功删除 JFR
     Held --> Free: Release
     Free --> [*]: 全部槽位空闲后 Close
 ```
@@ -38,14 +39,16 @@ Lease 是校验身份，不是 `shared_ptr`；复制不增加引用计数，只�
 
 - `Refill` 返回 0 表示没有空闲 buffer 或 JFR 已满。provider 返回有效 `bad_wr` 时，错误中的 `accepted` 给出已接受前缀，只回收拒绝后缀；EAGAIN 可以在后续进度后重试，其他 post 错误停止新投递。
 - 若返回值与 `bad_wr` 矛盾、缺少失败边界或指向批次外，返回 `kProviderContract`、`accepted=nullopt`，停止投递并保留整批内存。只有后续可信终结 CQE 才能使相应 buffer 进入 Held。
-- `Poll` 验证 RX 方向、所属 jetty/JFR、逐 WR 终结状态和 buffer 身份。fake CQE 不使用 `user_ctx`，不释放 buffer；未知或重复 CQE 同样不能产生 lease。
+- `Poll` 验证 RX 方向、所属 jetty/JFR、逐 WR 终结状态和 buffer 身份。jetty 归属通过 `IsReceiveJetty` 识别固定被动 jetty 与当前主动 jetty，兼容工具使用主动接收目标。fake CQE 不使用 `user_ctx`，不释放 buffer；未知或重复 CQE 同样不能产生 lease。
 - 可信错误完成仍交出 lease，但没有 payload；长度越界或不支持的接收 opcode 也不会暴露数据。调用方必须归还这些 lease。遇到异常会停止新投递，但继续处理同批其他 CQE，后续仍允许 poll/release。
 - `Stop()` 仅关闭软件投递入口。它不取消已投递 WR，也不自动切 JFR ERROR。
 - `Close()` 要求 `posted()==0 && held()==0`。内存注销成功后才释放 slab 并解绑 JettyPool；注销失败保留资源供重试，并禁止再次投递。JettyPool 在 RX 池仍绑定时返回 `kInUse`。
 
-**带未消费接收 WR 的共享 JFR 关闭尚未实现。** 正常收发持续 poll、归还并补投，单连接关闭不撤销 JFR 中的 buffer；该关闭能力用于整个接收域显式停用。空 CQ、对端断开或 TX 的 FLUSH_ERR_DONE 都不证明 RX buffer 安全；不能推测回收仍在 Posted 的槽位。若剩余 WR 没有终结证据，调用方须保留 RX 池、JettyPool、context 和 URMA 会话到进程退出。析构清理失败会记录日志并保留 DMA slab，但不代替让整个依赖链常驻的退出契约。
+带未消费 RX 的整个接收域关闭由 `ReceiveDomainCloser` 协调，普通 `RxBufferPool::Close()` 的零 Posted/零 Held 门禁不变。Begin 只停止 TX 准入；确认远端静默前仍可补投 RX。远端静默后停止补投，等待 TX 票据和排空边界完成，并有界消费正常 RX CQ。事件已 Get/Ack、外部队列使用者已停止且两个 CQ 正常后，先删除主动和被动 jetty，再删除 JFR，终结残留 Posted，等待 Held lease 全部归还，最后注销 RX MR 并删除 JFC。协调期间普通 Close/Open 不能绕过该顺序。
 
-2026-10-23 用户明确确认：**JFR 删除成功后，残留 RX 不再访问相关内存。** 结合已有依赖 jetty 先删除的生命周期测试，后续可以实现停止补投、删除依赖 jetty、成功删除 JFR 后终结残留 Posted 记录的关闭路径；删除失败仍须保留依赖。这个 DMA 停止保证不撤销上层仍持有的 Held lease，也不允许忽略尚待处理的 CQE/软件引用后直接释放 slab。当前 `Close()` 的 `posted()==0 && held()==0` 门禁及实现不变；新契约与实测证据见 [硬件观测记录](hardware-observations.md#2026-10-23-人工确认的硬件契约)。
+2026-10-23 用户明确确认：**JFR 删除成功后，残留 RX 不再访问相关内存。** 上述路径依赖这一保证以及当前 provider 在删除队列时清理关联普通 JFC 中迟到 CQE 的行为；由删除终结的 Posted 不计为成功接收，也不撤销已有 Held lease。删除/注销失败保留依赖并可重试；开始删除后不再 post/poll。RX poll 失败进入永久保留状态，封禁整个域的队列推进，仅允许归还已有 lease，不尝试故障 CQ 回收。M1 原语已实现并通过本地单测，尚无新增真机通过记录；硬件依据见 [硬件观测记录](hardware-observations.md#2026-10-23-人工确认的硬件契约)。
+
+单连接关闭不撤销共享 JFR 的 buffer。空 CQ、对端断开或 TX 的 FLUSH_ERR_DONE 都不能替代上述静默屏障和成功 DeleteJfr；未能取得终结证据时，RX 池、JettyPool、context、URMA 会话及关闭协调器必须继续存活。析构兜底不替代整个依赖链常驻的退出契约。
 
 ## 验证
 

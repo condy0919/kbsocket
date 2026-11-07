@@ -82,6 +82,9 @@ public:
     /// 返回副本供提交层读取目标和 ticket；副本不转移资源生命周期责任。
     std::expected<AttemptRecord, AttemptLedgerError> Lookup(AttemptId id) const noexcept;
 
+    /// 完成层的只读身份入口；仅返回已 Commit 的记录，禁止未提交 CQE 先触发队列故障处理。
+    std::expected<AttemptRecord, AttemptLedgerError> LookupPosted(AttemptId id) const noexcept;
+
     /// 仅取消未被 provider 接受的记录，返回记录供上层处理未提交资源。
     std::expected<AttemptRecord, AttemptLedgerError> Cancel(AttemptId id) noexcept;
 
