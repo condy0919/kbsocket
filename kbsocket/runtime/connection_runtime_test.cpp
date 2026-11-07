@@ -15,8 +15,10 @@
 #include <gtest/gtest.h>
 
 #include "kbsocket/connection/connection.hpp"
+#include "kbsocket/control/tx_lane_snapshot.hpp"
 #include "kbsocket/runtime/connection_io.hpp"
 #include "kbsocket/runtime/connection_progress.hpp"
+#include "kbsocket/runtime/handshake_rx_sources.hpp"
 #include "kbsocket/runtime/import_progress.hpp"
 #include "kbsocket/runtime/runtime_shard.hpp"
 #include "kbsocket/runtime/rx_source_registry.hpp"
@@ -42,7 +44,7 @@ protected:
         urma_context_t context{};
         std::array<urma_jfc_t, 2> cq{};
         urma_jfr_t jfr{};
-        std::array<urma_jetty_t, 2> jetty{};
+        std::array<urma_jetty_t, 4> jetty{};
         std::array<urma_target_seg_t, 2> segments{};
         urma_target_jetty_t target{};
         std::size_t cq_created = 0, jetty_created = 0, registered = 0;
@@ -60,11 +62,12 @@ protected:
         runtime::ConnectionProgress scheduler;
         runtime::ImportProgress imports;
         runtime::RxSourceRegistry sources;
+        runtime::HandshakeRxSources handshake_sources;
         runtime::ConnectionIoBinding io;
         runtime::ScheduledConnection scheduled;
-        runtime::RxSourceLease source_lease;
         runtime::RawQueueBinding binding;
         std::uint64_t polls = 0;
+        std::array<std::uint64_t, 4> posts_by_jetty{};
         std::uint64_t callback_tx_retired = 0, callback_closing_tx = 0, callback_failed_tx = 0;
         std::uint64_t callback_rx_changes = 0;
         std::size_t callback_rx_pending = 0;
@@ -148,6 +151,8 @@ protected:
             return &target;
         };
         f.unimport_jetty = [](auto*) { return URMA_SUCCESS; };
+        f.modify_jetty = [](auto*, auto*) { return URMA_SUCCESS; };
+        f.flush_jetty = [](auto*, int, auto*) { return 0; };
         f.delete_jetty = [](auto*) { return URMA_SUCCESS; };
         f.delete_jfr = [](auto*) { return URMA_SUCCESS; };
         f.delete_jfc = [](auto*) { return URMA_SUCCESS; };
@@ -164,6 +169,7 @@ protected:
             auto& e = Find(jetty->urma_ctx);
             *bad = nullptr;
             for (; wr; wr = wr->next) {
+                ++e.posts_by_jetty[jetty - e.jetty.data()];
                 Packet packet{wr->tjetty->id.id >= 110 ? 1u : 0u, jetty->jetty_id, wr->send.imm_data, {}};
                 for (std::uint32_t i = 0; i < wr->send.src.num_sge; ++i) {
                     const auto& sge = wr->send.src.sge[i];
@@ -206,6 +212,11 @@ protected:
         hello.credit_epoch = side + 301;
         hello.jetty_id = endpoints_[side].jetty[0].jetty_id.id;
         hello.eid[0] = std::byte(side + 1);
+        const auto lanes = control::CaptureTxLanes(endpoints_[side].pool);
+        EXPECT_TRUE(lanes);
+        if (lanes) {
+            hello.tx_lanes = *lanes;
+        }
         urma_rjetty_t remote{};
         remote.jetty_id.id = hello.jetty_id;
         std::memcpy(&remote.jetty_id.eid, hello.eid.data(), hello.eid.size());
@@ -216,6 +227,9 @@ protected:
         std::memcpy(hello.descriptor.data(), &remote, sizeof(remote));
         return hello;
     }
+    virtual std::uint32_t SourceCapacity(std::size_t) const {
+        return 8;
+    }
     void SetUp() override {
         self = this;
         override_.emplace(Functions());
@@ -223,7 +237,7 @@ protected:
         urma_device_cap_t cap{};
         cap.trans_mode = URMA_TM_RM;
         cap.rm_tp_cap.bs.ctp = 1;
-        cap.max_jetty = 2;
+        cap.max_jetty = 3;
         cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 256;
         cap.max_jfs_sge = cap.max_jfs_rsge = cap.max_jfr_sge = 1;
         int sockets[2];
@@ -232,6 +246,7 @@ protected:
             auto& e = endpoints_[i];
             e.context.async_fd = -1;
             raw::JettyPoolConfig config;
+            config.jetty_count = 2;
             config.tx_depth = 16;
             config.rx_depth = 8;
             ASSERT_TRUE(e.pool.Open(&e.context, cap, config));
@@ -264,7 +279,8 @@ protected:
             ASSERT_TRUE(attached);
             e.scheduled = *attached;
             ASSERT_TRUE(e.imports.Open(imports_, &e.context, 1));
-            ASSERT_TRUE(e.sources.Open({&e.buffers, 1, {i + 1, i + 101}, 8}));
+            ASSERT_TRUE(e.sources.Open({&e.buffers, 1, {i + 1, i + 101}, SourceCapacity(i)}));
+            ASSERT_TRUE(e.handshake_sources.Open(e.sources));
             ASSERT_TRUE(e.io.Open(e.scheduler, e.receive, e.sources));
             e.binding = {.pool = &e.pool,
                          .rx = &e.buffers,
@@ -278,14 +294,6 @@ protected:
         std::array<runtime::RawContextBinding, 2> contexts;
         for (std::size_t i = 0; i < 2; ++i) {
             auto& e = endpoints_[i];
-            // 独立可信测试拓扑注册主动发送 Lane；帧 token 不能代替 CQE 的实际来源。
-            auto source = e.sources.Register(
-                {.local_id = e.jetty[0].jetty_id.id,
-                 .remote_id = endpoints_[1 - i].jetty[1].jetty_id,
-                 .token = e.connection.handshake().local().identity.token,
-                 .source = {{i + 1, i + 101}, {kWireVersion, 2 - i, i + 101, i + 201}, e.credit_peer}});
-            ASSERT_TRUE(source);
-            e.source_lease = *source;
             contexts[i] = {.context = &e.context,
                            .queues = std::span(&e.binding, 1),
                            .connections = &e.scheduler,
@@ -312,7 +320,9 @@ protected:
                 .slab = &e.slab,
                 .sender_credits = &e.send_credits,
                 .connection_id = e.scheduled.id,
-                .tx_capacity = 8};
+                .tx_capacity = 8,
+                .sources = &e.handshake_sources,
+                .peer_lanes_authorized = true};
     }
     void Deliver() {
         while (!packets_.empty()) {
@@ -407,7 +417,11 @@ protected:
         for (auto& endpoint : endpoints_) {
             ASSERT_TRUE(endpoint.imports.Close());
             ASSERT_TRUE(endpoint.scheduler.Close());
-            ASSERT_TRUE(endpoint.sources.Remove(endpoint.source_lease, {1, true, true, true}));
+            // 双端停止且已排空真实 RX/CQE 后，才允许撤销 HELLO 自动登记的来源。
+            if (endpoint.handshake_sources.size() != 0) {
+                ASSERT_TRUE(endpoint.handshake_sources.Retire({1, true, true, true}));
+            }
+            ASSERT_TRUE(endpoint.handshake_sources.Close());
             ASSERT_TRUE(endpoint.sources.Close());
             ASSERT_TRUE(endpoint.receive.Close());
             ASSERT_TRUE(endpoint.credits.RetirePeer(endpoint.credit_peer, {true, true, true}));
@@ -429,6 +443,148 @@ protected:
         self = nullptr;
     }
 };
+
+TEST_F(ConnectionRuntimeTest, HelloAutomaticallyAdmitsBothActiveLanesBeforeReady) {
+    for (const auto& endpoint : endpoints_) {
+        EXPECT_EQ(endpoint.sources.size(), 0u);
+        EXPECT_EQ(endpoint.handshake_sources.size(), 0u);
+    }
+    Prepare();
+    // 准备阶段原子安装整份 HELLO 快照，尚未发布 READY 时已可识别两个主动来源。
+    for (const auto& endpoint : endpoints_) {
+        EXPECT_EQ(endpoint.sources.size(), 2u);
+        EXPECT_EQ(endpoint.handshake_sources.size(), 2u);
+        EXPECT_EQ(endpoint.connection.handshake().local_ready(), nullptr);
+    }
+    ASSERT_TRUE(Until([&] {
+        return endpoints_[0].connection.state() == ConnectionState::kRawActive &&
+               endpoints_[1].connection.state() == ConnectionState::kRawActive;
+    }));
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    // 两次独立投递触发真实 TxSender 的 Lane 轮转，CQE 携带实际 Jetty 来源，不能靠手工路由兜底。
+    for (unsigned round = 0; round < 2; ++round) {
+        const std::array<std::byte, 16> input{std::byte(round + 1)};
+        ASSERT_TRUE(sender.connection.Write(input));
+        ASSERT_TRUE(sender.scheduler.Wake(sender.scheduled));
+        ASSERT_TRUE(Until([&] { return receiver.connection.rx_pending() != 0; }));
+        std::array<std::byte, 16> output{};
+        const auto read = receiver.connection.Read(output, Now());
+        ASSERT_TRUE(read);
+        ASSERT_EQ(read->bytes, input.size());
+        EXPECT_EQ(output, input);
+        ASSERT_TRUE(receiver.scheduler.Wake(receiver.scheduled));
+        ASSERT_TRUE(Until([&] { return sender.slab.stats().local_dma == 0; }));
+    }
+    EXPECT_EQ(sender.posts_by_jetty[0], 0u);
+    EXPECT_GT(sender.posts_by_jetty[1], 0u);
+    EXPECT_GT(sender.posts_by_jetty[2], 0u);
+    EXPECT_FALSE(receiver.io.first_error());
+    EXPECT_EQ(receiver.io.stats().failures, 0u);
+}
+
+TEST_F(ConnectionRuntimeTest, BatchTimestampCannotRegressAfterReceiveOrApplicationRead) {
+    Activate();
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    const auto batch_started = Now();
+    const std::array payload{std::byte{0x42}};
+    ASSERT_EQ(sender.connection.Write(payload), payload.size());
+    ASSERT_TRUE(sender.scheduler.Wake(sender.scheduled));
+    ASSERT_TRUE(Until([&] { return receiver.connection.rx_pending() != 0; }));
+    std::array<std::byte, 1> output{};
+    ASSERT_TRUE(receiver.connection.Read(output, Now()));
+    EXPECT_EQ(output, payload);
+    // 批次开始之后已发生真实 RX/Read；强制复用旧批次时间，不能让 CheckTimeout 误报倒退。
+    ASSERT_TRUE(receiver.scheduler.Wake(receiver.scheduled));
+    ASSERT_TRUE(receiver.scheduler.Progress(runtime::ProgressKind::kMailbox, 8, batch_started));
+    EXPECT_EQ(receiver.connection.state(), ConnectionState::kRawActive);
+    EXPECT_FALSE(receiver.connection.failure());
+}
+
+class ConstrainedSourceRuntimeTest : public ConnectionRuntimeTest {
+protected:
+    std::uint32_t SourceCapacity(std::size_t side) const override {
+        return side == 0 ? 1 : 8;
+    }
+};
+
+TEST_F(ConstrainedSourceRuntimeTest, InsufficientRegistryCapacityRejectsWholeHelloBeforeReady) {
+    auto& endpoint = endpoints_[0];
+    // 远端两条 Lane 而本地仅一个空位；失败不能留下第一条来源或发布半准备的 READY。
+    auto prepared = endpoint.connection.PrepareRaw(Preparation(0));
+    ASSERT_FALSE(prepared);
+    EXPECT_EQ(prepared.error().code, ConnectionErrorCode::kSourceAdmission);
+    EXPECT_EQ(endpoint.connection.state(), ConnectionState::kFailed);
+    EXPECT_EQ(endpoint.connection.handshake().local_ready(), nullptr);
+    EXPECT_EQ(endpoint.sources.size(), 0u);
+    EXPECT_EQ(endpoint.handshake_sources.size(), 0u);
+    EXPECT_EQ(endpoint.connection.tx_stats().accepted, 0u);
+    EXPECT_TRUE(packets_.empty());
+}
+
+TEST_F(ConnectionRuntimeTest, ReplacingActiveLaneRejectsQueuedWriteUnderOldHello) {
+    Activate();
+    auto& endpoint = endpoints_[0];
+    const std::array<std::byte, 16> payload{};
+    ASSERT_TRUE(endpoint.connection.Write(payload));
+    ASSERT_TRUE(packets_.empty());
+    const auto old_lane = endpoint.pool.lane(0);
+    ASSERT_TRUE(old_lane);
+    const auto old_jetty_id = endpoint.pool.lane_jetty(0)->jetty_id.id;
+    // 尚无 WR 提交；控制路径真实完成 ERROR/边界/空 flush/替换，模拟 provider 已终结该空 SQ。
+    ASSERT_TRUE(endpoint.pool.BeginDrain(*old_lane));
+    ASSERT_TRUE(endpoint.pool.ObserveFlushDone(*old_lane));
+    std::array<urma_cr_t, 1> completions{};
+    auto flushed = endpoint.pool.FlushSend(*old_lane, completions);
+    ASSERT_TRUE(flushed);
+    ASSERT_EQ(*flushed, 0);
+    const auto replacement = endpoint.pool.ReplaceDrainedLane(*old_lane, {true, true, true});
+    ASSERT_TRUE(replacement);
+    EXPECT_NE(endpoint.pool.lane_jetty(0)->jetty_id.id, old_jetty_id);
+    EXPECT_EQ(replacement->generation, old_lane->generation + 1);
+
+    // 即使另一个 Lane 仍 READY，也不能绕过旧 HELLO 的完整快照校验继续发送。
+    auto progressed = endpoint.connection.Progress(Now());
+    ASSERT_FALSE(progressed);
+    EXPECT_EQ(progressed.error().code, ConnectionErrorCode::kLaneChanged);
+    EXPECT_EQ(endpoint.connection.state(), ConnectionState::kFailed);
+    EXPECT_EQ(endpoint.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(endpoint.slab.stats().local_dma, 0u);
+    EXPECT_TRUE(packets_.empty());
+    EXPECT_EQ(endpoint.sources.size(), 2u);
+}
+
+TEST_F(ConnectionRuntimeTest, CancelRetainsHelloSourcesUntilQueuedReceiveHasSettled) {
+    Activate();
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    const std::array<std::byte, 16> input{};
+    ASSERT_TRUE(sender.connection.Write(input));
+    ASSERT_TRUE(sender.scheduler.Wake(sender.scheduled));
+    ASSERT_TRUE(shard_.Tick());
+    Deliver();
+    ASSERT_EQ(receiver.completions[1].size(), 1u);
+    ASSERT_EQ(sender.slab.stats().local_dma, 1u);
+
+    // RX 已被硬件接受但 owner 尚未消费；撤逻辑路由必须保留来源表以完成旧 Peer 的物理账。
+    receiver.connection.Cancel();
+    ASSERT_TRUE(receiver.connection.Close());
+    EXPECT_EQ(receiver.sources.size(), 2u);
+    auto early_close = receiver.handshake_sources.Close();
+    ASSERT_FALSE(early_close);
+    EXPECT_EQ(early_close.error(), control::RawSourceAdmissionError::kRetained);
+    auto early_retire = receiver.handshake_sources.Retire({1, true, true, false});
+    EXPECT_FALSE(early_retire);
+    EXPECT_EQ(receiver.sources.size(), 2u);
+    ASSERT_TRUE(Until([&] { return receiver.completions[1].empty() && sender.slab.stats().local_dma == 0; }));
+    EXPECT_EQ(receiver.io.stats().stale_route_drops, 1u);
+    EXPECT_FALSE(receiver.io.first_error());
+    EXPECT_EQ(receiver.io.stats().failures, 0u);
+    EXPECT_FALSE(receiver.receive.frozen());
+    EXPECT_EQ(receiver.buffers.held(), 0u);
+    EXPECT_EQ(receiver.sources.size(), 2u);
+}
 
 TEST_F(ConnectionRuntimeTest, RuntimeOwnsHandshakeImportDataCreditAndOrderedFin) {
     Activate();

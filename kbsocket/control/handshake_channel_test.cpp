@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 
@@ -25,6 +26,9 @@ HandshakeMessage Hello() {
     message.hello.eid[15] = std::byte{31};
     message.hello.jetty_id = 432;
     message.hello.import_token = 0x01020304;
+    message.hello.tx_lanes.pool_epoch = 0x0102030405060708;
+    message.hello.tx_lanes.count = 1;
+    message.hello.tx_lanes.lanes[0] = {message.hello.eid, 0x11223344, 0x55667788, 0x1112131415161718};
     message.hello.descriptor_bytes = 4;
     message.hello.descriptor[0] = std::byte{0xff};
     message.hello.descriptor[3] = std::byte{0xee};
@@ -63,16 +67,28 @@ TEST(HandshakeCodec, HelloUsesCanonicalBigEndianAndCopiesOnlyDescriptorLength) {
     bytes.fill(std::byte{0xaa});
     const auto encoded = EncodeHandshakeMessage(message, bytes);
     ASSERT_TRUE(encoded);
-    ASSERT_EQ(*encoded, 104u);
+    ASSERT_EQ(*encoded, 152u);
     // 固定头与完整身份均逐字段大端编码，扩展 token 不允许截断成 8 bit generation。
     const std::array<std::byte, 12> header{std::byte{'K'}, std::byte{'B'}, std::byte{'S'}, std::byte{'H'},
-                                           std::byte{0},   std::byte{1},   std::byte{1},   std::byte{0},
-                                           std::byte{0},   std::byte{0},   std::byte{0},   std::byte{92}};
+                                           std::byte{0},   std::byte{2},   std::byte{1},   std::byte{0},
+                                           std::byte{0},   std::byte{0},   std::byte{0},   std::byte{140}};
     EXPECT_TRUE(std::equal(header.begin(), header.end(), bytes.begin()));
     for (unsigned i = 0; i < 8; ++i) {
         EXPECT_EQ(bytes[16 + i], static_cast<std::byte>(i + 1));
     }
-    EXPECT_EQ(bytes[104], std::byte{0xaa});
+    // 新增列表元数据及每项物理身份也按固定大端布局编码，不依赖结构体对齐。
+    for (unsigned i = 0; i < 8; ++i) {
+        EXPECT_EQ(bytes[100 + i], static_cast<std::byte>(i + 1));
+        EXPECT_EQ(bytes[140 + i], static_cast<std::byte>(0x11 + i));
+    }
+    EXPECT_EQ(bytes[111], std::byte{1});
+    EXPECT_EQ(bytes[112], std::byte{0});
+    EXPECT_EQ(bytes[131], std::byte{31});
+    EXPECT_EQ(bytes[132], std::byte{0x11});
+    EXPECT_EQ(bytes[135], std::byte{0x44});
+    EXPECT_EQ(bytes[136], std::byte{0x55});
+    EXPECT_EQ(bytes[139], std::byte{0x88});
+    EXPECT_EQ(bytes[152], std::byte{0xaa});
     const auto decoded = DecodeHandshakeMessage(std::span(bytes).first(*encoded));
     ASSERT_TRUE(decoded);
     EXPECT_EQ(decoded->hello.identity, message.hello.identity);
@@ -80,6 +96,7 @@ TEST(HandshakeCodec, HelloUsesCanonicalBigEndianAndCopiesOnlyDescriptorLength) {
     EXPECT_EQ(decoded->hello.jetty_id, 432u);
     EXPECT_EQ(decoded->hello.credit_epoch, 99u);
     EXPECT_EQ(decoded->hello.import_token, 0x01020304u);
+    EXPECT_EQ(decoded->hello.tx_lanes, message.hello.tx_lanes);
     EXPECT_EQ(decoded->hello.descriptor_bytes, 4u);
     EXPECT_EQ(decoded->hello.descriptor[0], std::byte{0xff});
     EXPECT_EQ(decoded->hello.descriptor[3], std::byte{0xee});
@@ -123,10 +140,12 @@ TEST(HandshakeCodec, RejectAndTcpOnlyMessagesRoundTrip) {
     message.hello.capabilities = kHandshakeCapabilityTcp;
     encoded = EncodeHandshakeMessage(message, bytes);
     ASSERT_TRUE(encoded);
+    EXPECT_EQ(*encoded, 116u);
     decoded = DecodeHandshakeMessage(std::span(bytes).first(*encoded));
     ASSERT_TRUE(decoded);
     EXPECT_EQ(decoded->hello.capabilities, kHandshakeCapabilityTcp);
     EXPECT_EQ(decoded->hello.descriptor_bytes, 0u);
+    EXPECT_EQ(decoded->hello.tx_lanes, HandshakeTxLanes{});
     message = Ready();
     message.ready.transport = HandshakeTransport::kTcp;
     message.ready.credit_epoch = 0;
@@ -159,7 +178,7 @@ TEST(HandshakeCodec, RejectsInvalidIdentityCapabilitiesAndSizesWithoutOutputMuta
     bad = good;
     bad.hello.wire_version = 2;
     ExpectError(EncodeHandshakeMessage(bad, bytes), HandshakeErrorCode::kVersionMismatch);
-    ExpectError(EncodeHandshakeMessage(good, std::span(bytes).first(103)), HandshakeErrorCode::kBufferTooSmall);
+    ExpectError(EncodeHandshakeMessage(good, std::span(bytes).first(151)), HandshakeErrorCode::kBufferTooSmall);
     EXPECT_EQ(bytes, unchanged);
 }
 
@@ -174,7 +193,7 @@ TEST(HandshakeCodec, RejectsMalformedHeaderBodyAndNonExactFrame) {
         ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
     }
     bytes = original;
-    bytes[5] = std::byte{2};
+    bytes[5] = std::byte{1};
     ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kVersionMismatch);
     bytes = original;
     ExpectError(DecodeHandshakeMessage(std::span(bytes).first(11)), HandshakeErrorCode::kInvalidFrame);
@@ -184,6 +203,11 @@ TEST(HandshakeCodec, RejectsMalformedHeaderBodyAndNonExactFrame) {
 
 TEST(HandshakeCodec, MaximumOpaqueDescriptorFitsAndSequenceUpperBoundIsFinite) {
     auto message = Hello();
+    message.hello.tx_lanes.count = kHandshakeMaxTxLanes;
+    for (std::uint32_t i = 1; i < message.hello.tx_lanes.count; ++i) {
+        message.hello.tx_lanes.lanes[i] = message.hello.tx_lanes.lanes[0];
+        message.hello.tx_lanes.lanes[i].jetty_id += i;
+    }
     message.hello.descriptor_bytes = kHandshakeMaxDescriptorBytes;
     message.hello.descriptor.back() = std::byte{0xbe};
     std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
@@ -193,11 +217,110 @@ TEST(HandshakeCodec, MaximumOpaqueDescriptorFitsAndSequenceUpperBoundIsFinite) {
     const auto decoded = DecodeHandshakeMessage(bytes);
     ASSERT_TRUE(decoded);
     EXPECT_EQ(decoded->hello.descriptor.back(), std::byte{0xbe});
+    EXPECT_EQ(decoded->hello.tx_lanes, message.hello.tx_lanes);
     message = Ready();
     message.ready.max_frame_seq = std::uint64_t{1} << 32;
     ASSERT_TRUE(EncodeHandshakeMessage(message, bytes));
     ++message.ready.max_frame_seq;
     ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+}
+
+TEST(HandshakeCodec, RejectsEmptyOversizedOrUnversionedRawLaneSnapshotsWithoutOutputMutation) {
+    const auto good = Hello();
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes;
+    bytes.fill(std::byte{0xcc});
+    const auto unchanged = bytes;
+    // 数量检查先于列表访问；空 RAW 快照和未声明代次都不能建立来源许可。
+    auto bad = good;
+    bad.hello.tx_lanes.count = 0;
+    ExpectError(ValidateHandshakeTxLanes(bad.hello.tx_lanes), HandshakeErrorCode::kInvalidFrame);
+    ExpectError(EncodeHandshakeMessage(bad, bytes), HandshakeErrorCode::kInvalidFrame);
+    bad = good;
+    bad.hello.tx_lanes.count = kHandshakeMaxTxLanes + 1;
+    ExpectError(ValidateHandshakeTxLanes(bad.hello.tx_lanes), HandshakeErrorCode::kInvalidFrame);
+    ExpectError(EncodeHandshakeMessage(bad, bytes), HandshakeErrorCode::kInvalidFrame);
+    bad = good;
+    bad.hello.tx_lanes.pool_epoch = 0;
+    ExpectError(EncodeHandshakeMessage(bad, bytes), HandshakeErrorCode::kInvalidFrame);
+    bad = good;
+    bad.hello.tx_lanes.lanes[0].generation = 0;
+    ExpectError(EncodeHandshakeMessage(bad, bytes), HandshakeErrorCode::kInvalidFrame);
+    EXPECT_EQ(bytes, unchanged);
+}
+
+TEST(HandshakeCodec, LaneIdentityRequiresUniquePhysicalSourceAndSeparatePassiveJetty) {
+    auto message = Hello();
+    auto& lanes = message.hello.tx_lanes;
+    lanes.count = 2;
+    lanes.lanes[1] = lanes.lanes[0];
+    ++lanes.lanes[1].generation;
+    // 即便软件 generation 不同，同一个 CQE 物理来源也不能声明两遍。
+    ExpectError(ValidateHandshakeTxLanes(lanes), HandshakeErrorCode::kInvalidFrame);
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+    ++lanes.lanes[1].uasid;
+    ASSERT_TRUE(ValidateHandshakeTxLanes(lanes));
+    ASSERT_TRUE(EncodeHandshakeMessage(message, bytes));
+    lanes.lanes[1].uasid = lanes.lanes[0].uasid;
+    lanes.lanes[1].eid[0] = std::byte{1};
+    ASSERT_TRUE(ValidateHandshakeTxLanes(lanes));
+    // 被动导入端点没有 uasid 字段，保守禁止相同 EID/id 被登记成主动来源。
+    lanes.count = 1;
+    lanes.lanes[0].jetty_id = message.hello.jetty_id;
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+}
+
+TEST(HandshakeCodec, TcpOnlyHelloRejectsActiveLaneMetadata) {
+    HandshakeMessage message;
+    message.hello.identity = Identity();
+    message.hello.capabilities = kHandshakeCapabilityTcp;
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
+    message.hello.tx_lanes.pool_epoch = 1;
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+    message.hello.tx_lanes.pool_epoch = 0;
+    message.hello.tx_lanes.count = 1;
+    ExpectError(EncodeHandshakeMessage(message, bytes), HandshakeErrorCode::kInvalidFrame);
+}
+
+TEST(HandshakeCodec, RejectsMalformedLaneMetadataBeforeReadingVariableList) {
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
+    const auto size = EncodeHandshakeMessage(Hello(), bytes);
+    ASSERT_TRUE(size);
+    const auto original = bytes;
+    // 越界数量、保留字段和非法代次必须在解码时同样拒绝。
+    bytes[111] = std::byte{65};
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
+    bytes = original;
+    bytes[115] = std::byte{1};
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
+    bytes = original;
+    std::fill_n(bytes.begin() + 140, 8, std::byte{0});
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
+    bytes = original;
+    std::fill_n(bytes.begin() + 100, 8, std::byte{0});
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
+    // 同时缩短帧头长度与输入，确保长度一致时也不会越界读取缺失的 Lane。
+    bytes = original;
+    bytes[11] = std::byte{104};
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(116)), HandshakeErrorCode::kInvalidFrame);
+    bytes = original;
+    bytes[111] = std::byte{0};
+    bytes[11] = std::byte{108};
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(120)), HandshakeErrorCode::kInvalidFrame);
+}
+
+TEST(HandshakeCodec, RejectsDuplicateDecodedLaneDespiteDistinctGeneration) {
+    auto message = Hello();
+    message.hello.tx_lanes.count = 2;
+    message.hello.tx_lanes.lanes[1] = message.hello.tx_lanes.lanes[0];
+    ++message.hello.tx_lanes.lanes[1].jetty_id;
+    ++message.hello.tx_lanes.lanes[1].generation;
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
+    const auto size = EncodeHandshakeMessage(message, bytes);
+    ASSERT_TRUE(size);
+    // 仅把第二项物理来源改为第一项，保留不同代次，覆盖不可信远端列表。
+    std::copy_n(bytes.begin() + 116, 24, bytes.begin() + 148);
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*size)), HandshakeErrorCode::kInvalidFrame);
 }
 
 class HandshakeChannelTest : public ::testing::Test {
@@ -278,7 +401,7 @@ TEST_F(HandshakeChannelTest, EmptySocketIsNonblockingAndRejectsQueueOverwrite) {
     ExpectError(channel.Queue(Ready()), HandshakeErrorCode::kInUse);
     const auto sent = channel.Progress(2);
     ASSERT_TRUE(sent);
-    EXPECT_EQ(sent->sent, 104u);
+    EXPECT_EQ(sent->sent, 152u);
     EXPECT_TRUE(channel.output_flushed());
     ASSERT_TRUE(channel.Queue(Ready()));
 }
@@ -436,7 +559,7 @@ TEST_F(HandshakeChannelTest, FullSocketSendBufferReturnsWithinBudget) {
     }
     const auto progress = channel.Progress(2);
     ASSERT_TRUE(progress);
-    EXPECT_EQ(progress->sent, 104u);
+    EXPECT_EQ(progress->sent, 152u);
     EXPECT_TRUE(channel.output_flushed());
 }
 

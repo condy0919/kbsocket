@@ -13,7 +13,7 @@ namespace kbsocket {
 namespace control {
 namespace {
 constexpr std::uint32_t kMagic = 0x4b425348; // KBSH
-constexpr std::size_t kHelloPrefix = 88, kReadyBytes = 144, kRejectBytes = 20;
+constexpr std::size_t kHelloPrefix = 104, kTxLaneBytes = 32, kReadyBytes = 144, kRejectBytes = 20;
 constexpr std::uint16_t kCapabilities = kHandshakeCapabilityRaw | kHandshakeCapabilityTcp;
 
 class Writer {
@@ -93,11 +93,23 @@ std::expected<std::size_t, HandshakeError> BodySize(const HandshakeMessage& mess
             if (hello.descriptor_bytes == 0 || hello.credit_epoch == 0) {
                 return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
             }
+            const auto valid = ValidateHandshakeTxLanes(hello.tx_lanes);
+            if (!valid) {
+                return std::unexpected(valid.error());
+            }
+            for (std::uint32_t i = 0; i < hello.tx_lanes.count; ++i) {
+                const auto& lane = hello.tx_lanes.lanes[i];
+                // 被动描述符没有 uasid，不能以另一 uasid 声明绕过端点角色隔离。
+                if (lane.eid == hello.eid && lane.jetty_id == hello.jetty_id) {
+                    return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+                }
+            }
         } else if (hello.descriptor_bytes != 0 || hello.credit_epoch != 0 || hello.jetty_id != 0 ||
-                   hello.import_token != 0 || hello.eid != std::array<std::byte, 16>{}) {
+                   hello.import_token != 0 || hello.eid != std::array<std::byte, 16>{} || hello.tx_lanes.count != 0 ||
+                   hello.tx_lanes.pool_epoch != 0) {
             return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
         }
-        return kHelloPrefix + hello.descriptor_bytes;
+        return kHelloPrefix + kTxLaneBytes * hello.tx_lanes.count + hello.descriptor_bytes;
     }
     case HandshakeMessageKind::kReady: {
         const auto& ready = message.ready;
@@ -132,16 +144,37 @@ std::expected<std::size_t, HandshakeError> ParseHeader(std::span<const std::byte
     const auto kind = static_cast<HandshakeMessageKind>(in.Get(1));
     const auto reserved = in.Get(1);
     const auto length = in.Get(4);
-    const bool valid_size = (kind == HandshakeMessageKind::kHello && length >= kHelloPrefix &&
-                             length <= kHelloPrefix + kHandshakeMaxDescriptorBytes) ||
-                            (kind == HandshakeMessageKind::kReady && length == kReadyBytes) ||
-                            (kind == HandshakeMessageKind::kReject && length == kRejectBytes);
+    const bool valid_size =
+        (kind == HandshakeMessageKind::kHello && length >= kHelloPrefix &&
+         length <= kHelloPrefix + kTxLaneBytes * kHandshakeMaxTxLanes + kHandshakeMaxDescriptorBytes) ||
+        (kind == HandshakeMessageKind::kReady && length == kReadyBytes) ||
+        (kind == HandshakeMessageKind::kReject && length == kRejectBytes);
     if (reserved != 0 || !valid_size) {
         return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
     }
     return kHandshakeHeaderBytes + length;
 }
 } // namespace
+
+std::expected<void, HandshakeError> ValidateHandshakeTxLanes(const HandshakeTxLanes& lanes) noexcept {
+    if (lanes.pool_epoch == 0 || lanes.count == 0 || lanes.count > kHandshakeMaxTxLanes) {
+        return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+    }
+    for (std::uint32_t i = 0; i < lanes.count; ++i) {
+        const auto& lane = lanes.lanes[i];
+        if (lane.generation == 0) {
+            return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+        }
+        // CQE 来源不能区分相同物理端点的两个软件代次，因此重复键不能只比较 generation。
+        for (std::uint32_t j = 0; j < i; ++j) {
+            const auto& previous = lanes.lanes[j];
+            if (lane.eid == previous.eid && lane.uasid == previous.uasid && lane.jetty_id == previous.jetty_id) {
+                return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+            }
+        }
+    }
+    return {};
+}
 
 std::expected<std::size_t, HandshakeError> EncodeHandshakeMessage(const HandshakeMessage& message,
                                                                   std::span<std::byte> output) noexcept {
@@ -170,6 +203,16 @@ std::expected<std::size_t, HandshakeError> EncodeHandshakeMessage(const Handshak
         out.Put(hello.jetty_id, 4);
         out.Put(hello.import_token, 4);
         out.Put(hello.descriptor_bytes, 4);
+        out.Put(hello.tx_lanes.pool_epoch, 8);
+        out.Put(hello.tx_lanes.count, 4);
+        out.Put(0, 4);
+        for (std::uint32_t i = 0; i < hello.tx_lanes.count; ++i) {
+            const auto& lane = hello.tx_lanes.lanes[i];
+            out.Copy(lane.eid);
+            out.Put(lane.uasid, 4);
+            out.Put(lane.jetty_id, 4);
+            out.Put(lane.generation, 8);
+        }
         out.Copy(std::span(hello.descriptor).first(hello.descriptor_bytes));
         break;
     }
@@ -217,9 +260,22 @@ std::expected<HandshakeMessage, HandshakeError> DecodeHandshakeMessage(std::span
         hello.jetty_id = static_cast<std::uint32_t>(in.Get(4));
         hello.import_token = static_cast<std::uint32_t>(in.Get(4));
         hello.descriptor_bytes = static_cast<std::uint32_t>(in.Get(4));
-        if (hello.descriptor_bytes > kHandshakeMaxDescriptorBytes ||
-            frame.size() != kHandshakeHeaderBytes + kHelloPrefix + hello.descriptor_bytes) {
+        hello.tx_lanes.pool_epoch = in.Get(8);
+        hello.tx_lanes.count = static_cast<std::uint32_t>(in.Get(4));
+        const auto reserved = in.Get(4);
+        // 先验证完整长度与数量，再读取可变列表；不能信任远端声明的 count。
+        if (hello.descriptor_bytes > kHandshakeMaxDescriptorBytes || hello.tx_lanes.count > kHandshakeMaxTxLanes ||
+            reserved != 0 ||
+            frame.size() !=
+                kHandshakeHeaderBytes + kHelloPrefix + kTxLaneBytes * hello.tx_lanes.count + hello.descriptor_bytes) {
             return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+        }
+        for (std::uint32_t i = 0; i < hello.tx_lanes.count; ++i) {
+            auto& lane = hello.tx_lanes.lanes[i];
+            in.Copy(lane.eid);
+            lane.uasid = static_cast<std::uint32_t>(in.Get(4));
+            lane.jetty_id = static_cast<std::uint32_t>(in.Get(4));
+            lane.generation = in.Get(8);
         }
         in.Copy(std::span(hello.descriptor).first(hello.descriptor_bytes));
         break;

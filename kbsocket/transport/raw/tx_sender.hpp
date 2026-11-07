@@ -75,6 +75,10 @@ public:
     urma_context_t* context() const noexcept {
         return pool_ ? pool_->context() : nullptr;
     }
+    // 只读借用，用于把建链公告绑定到实际提交器的 Lane 代次。
+    const JettyPool* pool() const noexcept {
+        return pool_;
+    }
     std::expected<void, TxSendError> Close() noexcept;
 
     /// 支持 SEND/SEND_WITH_IMM/WRITE 混合提交，同一批使用一个 SQ，可指定 lane 或由池选择。

@@ -43,6 +43,9 @@ HandshakeHello Hello(std::uint64_t runtime, bool raw = true) {
         hello.credit_epoch = runtime + 300;
         hello.eid[0] = std::byte(runtime);
         hello.jetty_id = static_cast<std::uint32_t>(runtime);
+        hello.tx_lanes.pool_epoch = 1;
+        hello.tx_lanes.count = 1;
+        hello.tx_lanes.lanes[0] = {hello.eid, 0, hello.jetty_id + 10, 1};
         urma_rjetty_t descriptor{};
         descriptor.jetty_id.id = hello.jetty_id;
         std::memcpy(&descriptor.jetty_id.eid, hello.eid.data(), hello.eid.size());

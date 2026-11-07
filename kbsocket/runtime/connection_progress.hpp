@@ -66,6 +66,7 @@ public:
     std::expected<void, ProgressError> Close() noexcept;
     const ConnectionProgressStats* stats() const noexcept;
 
+    // now_ns 为本轮调度时间下界；实际 Connection 访问刷新单调时钟，晚到 RX 不造成时间倒退。
     std::expected<ProgressBatch, ProgressError> Progress(ProgressKind, std::size_t, std::uint64_t) noexcept override;
     std::expected<ProgressBatch, ProgressError> CollectNotifications(std::size_t) noexcept override;
     std::expected<void, ProgressError> Rearm() noexcept override;

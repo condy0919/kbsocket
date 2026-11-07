@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include "kbsocket/runtime/connection_io.hpp"
+#include "kbsocket/runtime/handshake_rx_sources.hpp"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
 
 namespace {
@@ -153,6 +154,30 @@ protected:
     }
     static RxSourceRetireProof Proof() {
         return {101, true, true, true};
+    }
+    void HelloPair(control::HandshakeHello& local, control::HandshakeHello& peer) {
+        local.identity = {11, 33, 1, 9, 44, route_.token};
+        local.credit_epoch = 77;
+        local.jetty_id = passive_.jetty_id.id;
+        local.tx_lanes.pool_epoch = 1;
+        local.tx_lanes.count = 1;
+        local.tx_lanes.lanes[0].jetty_id = lane_.jetty_id.id;
+        local.tx_lanes.lanes[0].generation = 1;
+        peer.identity = {22, 66, 2, 9, 88, {4, 3}};
+        peer.credit_epoch = 99;
+        peer.jetty_id = 70;
+        peer.tx_lanes.pool_epoch = 3;
+        peer.tx_lanes.count = 2;
+        for (std::uint32_t i = 0; i < 2; ++i) {
+            peer.tx_lanes.lanes[i].eid[0] = std::byte{4};
+            peer.tx_lanes.lanes[i].uasid = 3;
+            peer.tx_lanes.lanes[i].jetty_id = 71 + i;
+            peer.tx_lanes.lanes[i].generation = 1 + i;
+        }
+    }
+    control::RawSourceAdmissionRequest Request(const control::HandshakeHello& local,
+                                               const control::HandshakeHello& peer) {
+        return {&local, &peer, &context_, &buffers_, 101, {11, 33}, route_.source.peer, true};
     }
     RxSourceLease Register(const RxSourceRoute& route) {
         auto result = registry_.Register(route);
@@ -620,6 +645,255 @@ TEST_F(RxSourceRegistryTest, BridgePropagatesStoppedRxToCreditWithoutReleasingHe
     ASSERT_TRUE(routes.Retire(*route));
     EXPECT_TRUE(progress.Close());
     EXPECT_TRUE(routes.Close());
+}
+
+TEST_F(RxSourceRegistryTest, BatchAdmissionRejectsInvalidSuffixWithoutMutation) {
+    std::array routes{route_, route_};
+    ++routes[1].remote_id.id;
+    routes[1].source.peer_context.session = 0;
+    const RxSourceLease sentinel{&registry_, 123, 456};
+    std::array output{sentinel, sentinel};
+    auto result = registry_.RegisterBatch(routes, output);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), RxSourceError::kInvalidArgument);
+    EXPECT_EQ(registry_.size(), 0u);
+    EXPECT_EQ(output[0], sentinel);
+    EXPECT_EQ(output[1], sentinel);
+
+    // 修复后一次提交成功，预检/链接均不分配；不能先插入合法前缀再伪造清理证据。
+    routes[1].source.peer_context.session = 44;
+    allocations = 0;
+    count_allocations = true;
+    result = registry_.RegisterBatch(routes, output);
+    count_allocations = false;
+    ASSERT_TRUE(result);
+    EXPECT_EQ(allocations, 0u);
+    handles_.insert(handles_.end(), output.begin(), output.end());
+    EXPECT_TRUE(registry_.Resolve(HeldEvent(routes[0])));
+    EXPECT_TRUE(registry_.Resolve(HeldEvent(routes[1])));
+}
+
+TEST_F(RxSourceRegistryTest, BatchAdmissionRejectsDuplicateAndConflictingSources) {
+    std::array routes{route_, route_};
+    std::array<RxSourceLease, 2> output{};
+    auto duplicate = registry_.RegisterBatch(routes, output);
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error(), RxSourceError::kDuplicate);
+    EXPECT_EQ(registry_.size(), 0u);
+    auto peer = credits_.Admit({99, 33, 78});
+    ASSERT_TRUE(peer);
+    peers_.push_back(*peer);
+    routes[1].token.slot = 2;
+    routes[1].source.peer_context.peer_runtime = 99;
+    routes[1].source.peer = *peer;
+    auto conflict = registry_.RegisterBatch(routes, output);
+    ASSERT_FALSE(conflict);
+    EXPECT_EQ(conflict.error(), RxSourceError::kIdentityConflict);
+    EXPECT_EQ(registry_.size(), 0u);
+
+    // 后一条与已在用表项重复时，前一条新来源也不能进入表。
+    Register(route_);
+    routes[1] = route_;
+    ++routes[0].remote_id.id;
+    EXPECT_FALSE(registry_.RegisterBatch(routes, output));
+    EXPECT_EQ(registry_.size(), 1u);
+    EXPECT_FALSE(registry_.Resolve(HeldEvent(routes[0])));
+}
+
+TEST_F(RxSourceRegistryTest, BatchCapacityAndRemovalAreAtomic) {
+    for (std::uint32_t i = 0; i < 7; ++i) {
+        auto route = route_;
+        route.token.slot = i;
+        Register(route);
+    }
+    std::array routes{route_, route_};
+    routes[0].token.slot = 100;
+    routes[1].token.slot = 101;
+    std::array<RxSourceLease, 2> output{};
+    auto full = registry_.RegisterBatch(routes, output);
+    ASSERT_FALSE(full);
+    EXPECT_EQ(full.error(), RxSourceError::kExhausted);
+    EXPECT_EQ(registry_.size(), 7u);
+    EXPECT_EQ(output[0].id, 0u);
+    EXPECT_FALSE(registry_.RegisterBatch({}, {}));
+    EXPECT_FALSE(registry_.RegisterBatch(routes, std::span(output).first(1)));
+
+    // 退休列表的无效后缀或不完整证明不能删除前缀。
+    std::array retiring{handles_[0], handles_[1]};
+    ++retiring[1].id;
+    EXPECT_FALSE(registry_.RemoveBatch(retiring, Proof()));
+    EXPECT_TRUE(registry_.Check(handles_[0]));
+    EXPECT_EQ(registry_.size(), 7u);
+    retiring[1] = handles_[0];
+    EXPECT_FALSE(registry_.RemoveBatch(retiring, Proof()));
+    retiring[1] = handles_[1];
+    EXPECT_FALSE(registry_.RemoveBatch(retiring, {}));
+    ASSERT_TRUE(registry_.RemoveBatch(retiring, Proof()));
+    EXPECT_EQ(registry_.size(), 5u);
+    EXPECT_FALSE(registry_.Check(handles_[0]));
+    ASSERT_TRUE(registry_.RegisterBatch(routes, output));
+    handles_.insert(handles_.end(), output.begin(), output.end());
+}
+
+TEST_F(RxSourceRegistryTest, HelloAdmissionRegistersEveryActiveLaneAndLocalSession) {
+    control::HandshakeHello local, peer;
+    HelloPair(local, peer);
+    HandshakeRxSources admission;
+    ASSERT_TRUE(admission.Open(registry_));
+    auto request = Request(local, peer);
+    allocations = 0;
+    count_allocations = true;
+    auto prepared = admission.Prepare(request);
+    count_allocations = false;
+    ASSERT_TRUE(prepared);
+    EXPECT_EQ(allocations, 0u);
+    EXPECT_EQ(admission.size(), 2u);
+    EXPECT_TRUE(admission.Check());
+    // 远端被动目标和 active Lane 分离，使用本地 token/session 与本地授信 epoch。
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        auto route = route_;
+        route.remote_id.id += i;
+        auto source = registry_.Resolve(HeldEvent(route));
+        ASSERT_TRUE(source);
+        EXPECT_EQ(source->peer_context.peer_runtime, 22u);
+        EXPECT_EQ(source->peer_context.session, 44u);
+        EXPECT_EQ(source->peer_context.receive_domain, 33u);
+        EXPECT_EQ(source->local_domain.runtime_instance, 11u);
+        EXPECT_EQ(source->peer.id, route_.source.peer.id);
+        EXPECT_EQ(source->peer.domain, &credits_);
+    }
+    auto passive_source = route_;
+    passive_source.remote_id.id = peer.jetty_id;
+    EXPECT_FALSE(registry_.Resolve(HeldEvent(passive_source)));
+    EXPECT_FALSE(admission.Prepare(request));
+    ASSERT_TRUE(admission.Retire(Proof()));
+    EXPECT_FALSE(admission.Check());
+    EXPECT_TRUE(admission.Close());
+    EXPECT_FALSE(admission.Open(registry_));
+}
+
+TEST_F(RxSourceRegistryTest, HelloAdmissionRejectsUntrustedAndMismatchedDependencies) {
+    control::HandshakeHello local, peer;
+    HelloPair(local, peer);
+    HandshakeRxSources admission;
+    EXPECT_FALSE(admission.Prepare(Request(local, peer)));
+    ASSERT_TRUE(admission.Open(registry_));
+    EXPECT_FALSE(admission.Open(registry_));
+    auto request = Request(local, peer);
+    request.peer_lanes_authorized = false;
+    auto untrusted = admission.Prepare(request);
+    ASSERT_FALSE(untrusted);
+    EXPECT_EQ(untrusted.error(), control::RawSourceAdmissionError::kUnauthorized);
+    // 相同 context 不代表同一物理 RX pool；不能借别的接收域通过 READY。
+    raw::RxBufferPool other_buffers;
+    request = Request(local, peer);
+    request.buffers = &other_buffers;
+    EXPECT_FALSE(admission.Prepare(request));
+    request = Request(local, peer);
+    urma_context_t other_context{};
+    request.context = &other_context;
+    EXPECT_FALSE(admission.Prepare(request));
+    request = Request(local, peer);
+    ++request.context_incarnation;
+    EXPECT_FALSE(admission.Prepare(request));
+    request = Request(local, peer);
+    ++request.local_domain.runtime_instance;
+    EXPECT_FALSE(admission.Prepare(request));
+    request = Request(local, peer);
+    ++local.credit_epoch;
+    EXPECT_FALSE(admission.Prepare(request));
+    --local.credit_epoch;
+    ++local.jetty_id;
+    EXPECT_FALSE(admission.Prepare(request));
+    --local.jetty_id;
+    peer.tx_lanes.lanes[1].generation = 0;
+    EXPECT_FALSE(admission.Prepare(request));
+    peer.tx_lanes.lanes[1].generation = 2;
+    peer.tx_lanes.lanes[1].jetty_id = peer.jetty_id;
+    peer.tx_lanes.lanes[1].eid = peer.eid;
+    EXPECT_FALSE(admission.Prepare(request));
+    EXPECT_EQ(registry_.size(), 0u);
+    // 所有未发布失败均可在可信配置纠正后重试，不消耗或残留来源槽。
+    HelloPair(local, peer);
+    ASSERT_TRUE(admission.Prepare(Request(local, peer)));
+    ASSERT_TRUE(admission.Retire(Proof()));
+    EXPECT_TRUE(admission.Close());
+}
+
+TEST_F(RxSourceRegistryTest, HelloAdmissionPreservesSourcesUntilExplicitQuiescence) {
+    control::HandshakeHello local, peer;
+    HelloPair(local, peer);
+    HandshakeRxSources admission;
+    ASSERT_TRUE(admission.Open(registry_));
+    ASSERT_TRUE(admission.Prepare(Request(local, peer)));
+    auto event = HeldEvent(route_);
+    // Close 不是控制对端停止发送的证明；已排队 CQE 必须继续找到原物理 Credit。
+    auto retained = admission.Close();
+    ASSERT_FALSE(retained);
+    EXPECT_EQ(retained.error(), control::RawSourceAdmissionError::kRetained);
+    EXPECT_FALSE(admission.Retire({}));
+    EXPECT_EQ(admission.size(), 2u);
+    EXPECT_TRUE(registry_.Resolve(event));
+    EXPECT_TRUE(admission.Check());
+    ASSERT_TRUE(admission.Retire(Proof()));
+    EXPECT_EQ(registry_.size(), 0u);
+    EXPECT_FALSE(registry_.Resolve(event));
+    EXPECT_TRUE(admission.Close());
+}
+
+TEST_F(RxSourceRegistryTest, HelloAdmissionCapacityFailureLeavesNoPrefix) {
+    control::HandshakeHello local, peer;
+    HelloPair(local, peer);
+    for (std::uint32_t i = 0; i < 7; ++i) {
+        auto route = route_;
+        route.token.slot = 100 + i;
+        Register(route);
+    }
+    HandshakeRxSources admission;
+    ASSERT_TRUE(admission.Open(registry_));
+    auto full = admission.Prepare(Request(local, peer));
+    ASSERT_FALSE(full);
+    EXPECT_EQ(full.error(), control::RawSourceAdmissionError::kRegistry);
+    EXPECT_EQ(admission.size(), 0u);
+    EXPECT_EQ(registry_.size(), 7u);
+    EXPECT_FALSE(registry_.Resolve(HeldEvent(route_)));
+    ASSERT_TRUE(registry_.Remove(handles_[0], Proof()));
+    ASSERT_TRUE(admission.Prepare(Request(local, peer)));
+    ASSERT_TRUE(admission.Retire(Proof()));
+    EXPECT_TRUE(admission.Close());
+}
+
+TEST_F(RxSourceRegistryTest, HelloAdmissionStoppedRxCannotRemainReady) {
+    control::HandshakeHello local, peer;
+    HelloPair(local, peer);
+    HandshakeRxSources admission;
+    ASSERT_TRUE(admission.Open(registry_));
+    ASSERT_TRUE(admission.Prepare(Request(local, peer)));
+    // raw RX 已停止但 Credit 冻结尚未传播时，也不能越过 READY 门禁。
+    buffers_.Stop();
+    EXPECT_FALSE(admission.Check());
+    EXPECT_TRUE(registry_.Resolve(HeldEvent(route_)));
+    ASSERT_TRUE(admission.Retire(Proof()));
+    EXPECT_TRUE(admission.Close());
+    HandshakeRxSources rejected;
+    ASSERT_TRUE(rejected.Open(registry_));
+    EXPECT_FALSE(rejected.Prepare(Request(local, peer)));
+    EXPECT_EQ(registry_.size(), 0u);
+    EXPECT_TRUE(rejected.Close());
+}
+
+TEST_F(RxSourceRegistryTest, HelloAdmissionFrozenCreditStopsReadinessButKeepsLateSources) {
+    control::HandshakeHello local, peer;
+    HelloPair(local, peer);
+    HandshakeRxSources admission;
+    ASSERT_TRUE(admission.Open(registry_));
+    ASSERT_TRUE(admission.Prepare(Request(local, peer)));
+    ASSERT_TRUE(credits_.FreezePeer(route_.source.peer));
+    EXPECT_FALSE(admission.Check());
+    EXPECT_TRUE(registry_.Resolve(HeldEvent(route_)));
+    EXPECT_FALSE(admission.Close());
+    ASSERT_TRUE(admission.Retire(Proof()));
+    EXPECT_TRUE(admission.Close());
 }
 
 } // namespace

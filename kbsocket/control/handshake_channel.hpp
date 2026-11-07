@@ -15,9 +15,11 @@ namespace kbsocket {
 namespace control {
 
 inline constexpr std::size_t kHandshakeMaxDescriptorBytes = 4096;
+inline constexpr std::size_t kHandshakeMaxTxLanes = 64;
 inline constexpr std::size_t kHandshakeHeaderBytes = 12;
-inline constexpr std::size_t kHandshakeMaxFrameBytes = kHandshakeHeaderBytes + 88 + kHandshakeMaxDescriptorBytes;
-inline constexpr std::uint16_t kHandshakeVersion = 1;
+inline constexpr std::size_t kHandshakeMaxFrameBytes =
+    kHandshakeHeaderBytes + 104 + 32 * kHandshakeMaxTxLanes + kHandshakeMaxDescriptorBytes;
+inline constexpr std::uint16_t kHandshakeVersion = 2;
 inline constexpr std::uint16_t kHandshakeCapabilityRaw = 1;
 inline constexpr std::uint16_t kHandshakeCapabilityTcp = 2;
 
@@ -35,6 +37,21 @@ struct HandshakeIdentity {
     connection::WireToken token;
     bool operator==(const HandshakeIdentity&) const = default;
 };
+/// 主动 TX Lane 的物理来源和软件代次；独立于供对端导入的被动接收 Jetty。
+struct HandshakeTxLane {
+    std::array<std::byte, 16> eid{};
+    std::uint32_t uasid = 0;
+    std::uint32_t jetty_id = 0;
+    std::uint64_t generation = 0;
+    bool operator==(const HandshakeTxLane&) const = default;
+};
+/// 握手绑定同一池代次的完整有界快照；仅前 count 项参与编码。
+struct HandshakeTxLanes {
+    std::uint64_t pool_epoch = 0;
+    std::uint32_t count = 0;
+    std::array<HandshakeTxLane, kHandshakeMaxTxLanes> lanes{};
+    bool operator==(const HandshakeTxLanes&) const = default;
+};
 struct HandshakeHello {
     std::uint16_t wire_version = connection::kWireVersion;
     std::uint16_t capabilities = kHandshakeCapabilityRaw;
@@ -45,6 +62,7 @@ struct HandshakeHello {
     std::uint32_t jetty_id = 0;
     std::uint32_t import_token = 0;
     std::uint32_t descriptor_bytes = 0;
+    HandshakeTxLanes tx_lanes;
     /// 只搬运 provider 导出的有界 opaque 描述符；宿主必须另行验证 ABI、来源与端点字段。
     std::array<std::byte, kHandshakeMaxDescriptorBytes> descriptor{};
 };
@@ -88,6 +106,9 @@ struct HandshakeError {
     HandshakeErrorCode code;
     int system_error = 0;
 };
+
+/// 验证 RAW 主动 Lane 快照的数量、代次和物理来源唯一性；无分配。
+std::expected<void, HandshakeError> ValidateHandshakeTxLanes(const HandshakeTxLanes& lanes) noexcept;
 
 /// 固定大端字段；失败不写 output。Decode 只接受恰好一帧，不读取 C++ 结构体布局。
 std::expected<std::size_t, HandshakeError> EncodeHandshakeMessage(const HandshakeMessage& message,

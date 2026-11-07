@@ -1,6 +1,6 @@
-# M5.3.1：连接接入 Runtime owner
+# M5.3：连接 Runtime 与主动 Lane 来源协商
 
-本阶段将已创建的 Connection、raw 队列、导入缓存和 RX 来源表接入同一个 `RuntimeShard`。owner 通过 `Tick`/`RunOnce` 推进 HELLO/READY、导入、TX/RX、物理补投、累计 Credit 和 FIN。资源创建、可信身份登记和应用调用仍由宿主负责；这不是完整的 Runtime 工厂或稳定应用 ABI。
+本阶段将已创建的 Connection、raw 队列、导入缓存和 RX 来源表接入同一个 `RuntimeShard`。owner 通过 `Tick`/`RunOnce` 推进 HELLO/READY、导入、TX/RX、物理补投、累计 Credit 和 FIN。M5.3.2 通过 HELLO 交换主动 Lane，并在 READY 前自动登记 RX 来源。资源创建、入口认证和应用调用仍由宿主负责；这不是完整的 Runtime 工厂或稳定应用 ABI。
 
 ## 组件与暂停范围
 
@@ -10,6 +10,7 @@
 | `ImportProgress` | 按 context 指针及 incarnation 过滤缓存操作，通过 Reactor 的唯一控制执行器提交和收割 |
 | `ConnectionProgress` | 固定容量连接槽、完整代次 TX 分发、就绪队列、周期巡检、外部 RX 补投和动态 fd 通知 |
 | `RxSourceRegistry` | 根据真实 CQE 的本地端点、远端主动发送端点和完整 token 查找已登记的可信会话来源 |
+| `HandshakeRxSources` | 把经过宿主授权的对端 HELLO Lane 快照一次性登记到对应 RX pool，保留绑定直至明确静默 |
 | `ConnectionIoBinding` | raw 回调到 Connection 的桥接；旧帧物理结账、未知来源冻结、错误记录与 Credit 冻结传播 |
 
 `RawContextBinding.connections` 和 `.control` 分别指向连接源及导入源。设备进度源声明 `exclusive_context()`；RuntimeShard 为每个 context 组装暂停组，拒绝归属不一致的源、跨 context 复用的 companion 以及访问 raw 的独立 hooks。现有 mailbox/内存归还 hooks 可继续独立接入；它们不能在 context 暂停期间操作该 context。无 raw context 时可以只注册 NativeTCP hooks。
@@ -23,8 +24,9 @@
 1. 在控制路径创建 raw context、JettyPool、AttemptLedger、`TxSender::Open(ledger, true)`、Slab、RX pool、Credit 总账、路由表及导入缓存。初始 RX 全部实际 post 并记账后打开 `EagerReceiveDomain`。
 2. 每个 context 打开 `ConnectionProgress`（指定同一个 context）和 `ImportProgress`（指定完整 incarnation）；每个 RX pool 打开独立 `RxSourceRegistry`。用 `ConnectionIoBinding::Open` 绑定三者，同时登记由连接源负责补投的接收域。
 3. `RawQueueBinding` 配置 `TxCallback`、`RxCallback`、`ErrorCallback`，cookie 指向对应 `ConnectionIoBinding`，并设置 `external_refill=true`。其余 CQ/async/通知仍由唯一 RawContextProgress 消费。
-4. 将连接源和导入源交给 `RawContextBinding`，打开 RuntimeShard。Connection 可在此前或运行期间 Attach；Attach 必须早于 PrepareRaw。把返回 `ScheduledConnection.id` 用作 `RawConnectionPreparation.connection_id`，以便真实 TX 完成直接校验槽位及代次。宿主在 Preparing 状态完成资源/授信准备，并在发送 READY 前登记所有允许的实际 RX 来源。
-5. 应用每次 Write、Read、Prepare、Shutdown 后调用 owner 侧 `Wake(handle)`。唯一 owner 反复 Tick/RunOnce，禁止同时手动驱动 Connection、导入 executor 或 raw CQ。跨线程业务命令仍需宿主 mailbox 转交 owner，不能跨线程调用 Wake 或 Connection。
+4. 将连接源和导入源交给 `RawContextBinding`，打开 RuntimeShard。使用 `CaptureTxLanes(pool)` 填充本端 HELLO，声明实际提交器的主动 Lane 快照。Connection 可在此前或运行期间 Attach；Attach 必须早于 PrepareRaw。把返回 `ScheduledConnection.id` 用作 `RawConnectionPreparation.connection_id`。
+5. 每条 raw 连接用 `HandshakeRxSources::Open(registry)` 打开独立准入器；Preparing 时完成资源/授信准备，将其作为 `RawConnectionPreparation.sources`。宿主认证并授权对端整份公告后才设置 `peer_lanes_authorized=true`。PrepareRaw 校验本地公告与实际池一致，初始化收发状态后自动一次性登记对端全部 Lane；未完成登记不能发送 READY。
+6. 应用每次 Write、Read、Prepare、Shutdown 后调用 owner 侧 `Wake(handle)`。唯一 owner 反复 Tick/RunOnce，禁止同时手动驱动 Connection、导入 executor 或 raw CQ。跨线程业务命令仍需宿主 mailbox 转交 owner，不能跨线程调用 Wake 或 Connection。
 
 初始资源创建和来源登记是控制路径工作，可分配内存。队列推进、fd 收割、TX 分发、RX 查表与补投使用预分配存储，不进行堆分配。当前 Attach/来源登记仍扫描已登记条目做冲突检查，不表示已经满足 40k/s 建链目标。
 
@@ -32,15 +34,21 @@
 
 CQE 不包含 PeerRuntime incarnation、逻辑 session 或 Credit epoch。`RxSourceRegistry::Register` 接收宿主经过可信控制路径确认的完整绑定，而不是从首个包自行学习。键包含本地接收端点 ID/type、CQE 的远端 EID/UASID/主动 Jetty 或 JFS ID，以及完整 slot/generation token。同一物理 Lane 可以登记多个逻辑 session，但不能在旧绑定存续时更换其 PeerRuntime/Credit 归属。
 
-**HELLO 中的 Jetty 是被动接收端点，不能作为远端主动 TX Lane 身份。** 当前 HELLO 尚未实现主动 Lane 集合交换；宿主必须另行提供可信绑定。自动 Lane 公告、替换换代和认证控制入口留待下一步，不以 Mock 中已知的 Lane ID 冒充线上自动发现。
+**HELLO 的单个 Jetty 字段仍是被动接收端点。** 握手 v2 另携带最多 64 条主动 Lane 的 EID/UASID/Jetty ID、pool epoch 和 Lane generation。两种端点不能混用；RAW 不接受空列表、重复物理来源、零代次或主动/被动身份冲突。v1 显式拒绝，双端需要同时升级。
+
+`HandshakeRxSources` 只接受匹配 registry 的真实 RX pool、context/incarnation、本地 token/domain/session 及 Peer Credit 身份。`RegisterBatch` 在写入任何条目前检查整批容量、重复键和物理来源归属冲突；失败不留下部分登记。HELLO 是公告载体，不能证明远端有权使用所列 Lane，`peer_lanes_authorized` 必须来自宿主可信控制入口。直接使用低层 `ConnectionHandshake` 的宿主仍须自行完成这一门禁，完整 `Connection` 已强制要求来源准入器。
+
+每次推进 READY 或提交 TX 前，Connection 校验本地实际 Lane 物理身份和代次，并检查已安装来源仍有效。单 Lane 故障而身份不变时由原发送器避开故障 Lane；任何 Lane 被替换或池被重开后，旧连接以 `kLaneChanged` 显式失败，禁止从未公告的新来源 post。新连接重新捕获和交换快照。当前尚无在线公告更新/确认协议，因此这一轮采用整份快照失效门禁；固定被动端点及导入缓存仍可保持不变。
 
 Resolve 校验真实 RX pool/Lease、接收方向、CQE 状态/标志、opcode、长度和物理端点，再解码 token 选择已登记会话；后续仍由 ConnectionTable 校验完整路由。旧 token 已撤路由时仍按旧 Peer 扣物理账、释放 Lease 并补投。来源未知或 CQE/帧无效时，桥接仍交付真实事件给接收域，使用 unknown 责任并冻结，不静默丢掉 RQE 消耗。
 
-逻辑连接关闭不立即删除来源。Remove 需要匹配 context incarnation，并明确证明远端发送停止、已接受流量终结和 RX 事件排空。当前证明仍由宿主取得，来源表本身不实现远端关闭协议。
+逻辑连接关闭不立即删除来源。`HandshakeRxSources::Close` 在绑定尚存时返回保留错误；宿主先取得匹配 context incarnation、远端发送停止、已接受流量终结和 RX 事件排空证明，再调用 `Retire` 一次性移除。控制 EOF、本地 Lane 重建和 Connection::Close 成功均不能替代该证明。来源表本身不实现远端关闭协议，借用的 registry/Credit/RX pool 必须覆盖全部旧绑定。
 
 ## 公平推进与通知
 
 ConnectionProgress 使用有界、去重的 ready 队列。每次 mailbox 预算最多访问相应数量的连接，每个访问最多推进一个已有 TX 批次；有进展且仍有数据的连接排回队尾。等待 Credit/资源时不持续自我唤醒。RX 和补投触发有预算的共账巡检，重复 eventfd 通知合并；周期巡检负责 pending import、握手超时和重排缺口超时。巡检间隔是目标周期，实际检查时延还受 Reactor 最大等待时间、连接数量及预算影响，尚未做大规模延迟验收。
+
+Reactor 提供的批次时间是调度时间下界；每次访问 Connection 时刷新同一单调时钟。RX 回调或应用 Read 可能晚于 Tick 开始，不能再把 Tick 的旧时间传给已观测较新时间的重排窗口，否则会误报时间倒退。独立显式驱动 Connection 的调用方仍须提供单调一致的时间。
 
 动态控制 fd 由内部 epoll 汇聚成一个固定等待 fd，避免直接占用外层 Reactor 的 80 个 fd 配额。握手只有输出尚未写完时订阅 EPOLLOUT；raw Active 只观察控制断连/协议错误。所有 watch 使用 oneshot，旧 fd 存在 dup/继承别名时也不能持续唤醒已退出的连接；代次失效事件直接丢弃。
 
@@ -60,4 +68,4 @@ Connection::Close 返回 Retained 时继续保留注册与全部借用资源。�
 
 新增测试覆盖超过外层 fd 数量的本地 TCP、oneshot 重订阅、旧 fd 别名、完整代次、预算/公平队列、零分配热路径、来源伪造/旧会话、多 context 暂停、控制背压、取消后 DMA 收敛，以及仅由 RuntimeShard 推进的 Mock raw 双端 DATA/Credit/补投/FIN。回归结果见 [roadmap](roadmap.md)。UB 真机和 40k 规模性能未执行。
 
-下一阶段继续补主动 Lane 交换及换代、Runtime 资源所有权与连接入口、完整业务 mailbox、远端关闭/授信撤回、冻结接收责任核销，再收口显式 C ABI 和零拷贝接口。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。
+M5.3.2 新增协议边界、原子登记、授权/来源就绪门禁、双主动 Lane 自动来源解析与旧绑定保留测试。下一阶段继续补在线 Lane 公告更新/确认、Runtime 资源所有权与连接入口、完整业务 mailbox、远端关闭/授信撤回、冻结接收责任核销，再收口显式 C ABI 和零拷贝接口。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。

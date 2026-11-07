@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 
+#include "kbsocket/control/tx_lane_snapshot.hpp"
 #include "kbsocket/transport/raw/receive_domain_closer.hpp"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
 
@@ -21,6 +22,27 @@ namespace connection {
 namespace {
 class ConnectionTest : public ::testing::Test {
 protected:
+    // 这里隔离验证 Connection 的准入时序；真实来源登记及 CQE 查表在 Runtime 双端测试覆盖。
+    struct Admission : control::RawSourceAdmission {
+        bool ready = false;
+        bool reject = false;
+        unsigned prepares = 0;
+        std::expected<void, control::RawSourceAdmissionError>
+        Prepare(const control::RawSourceAdmissionRequest& request) noexcept override {
+            ++prepares;
+            if (reject || !request.peer_lanes_authorized || !request.peer || !request.peer->tx_lanes.count) {
+                return std::unexpected(control::RawSourceAdmissionError::kUnauthorized);
+            }
+            ready = true;
+            return {};
+        }
+        std::expected<void, control::RawSourceAdmissionError> Check() const noexcept override {
+            if (!ready) {
+                return std::unexpected(control::RawSourceAdmissionError::kNotReady);
+            }
+            return {};
+        }
+    };
     struct Receive {
         std::uint64_t id;
         urma_sge_t sge;
@@ -49,6 +71,7 @@ protected:
         ConnectionTable routes;
         EagerReceiveDomain receive;
         Connection connection;
+        Admission admission;
         std::deque<Receive> posted;
         std::array<std::deque<urma_cr_t>, 2> completions;
     };
@@ -84,6 +107,7 @@ protected:
             jetty->urma_ctx = context;
             jetty->jetty_cfg = *config;
             jetty->jetty_id.id = 100 + (&e == &self->endpoints_[0] ? 0 : 10) + e.jetty_created;
+            jetty->jetty_id.eid.raw[0] = &e == &self->endpoints_[0] ? 1 : 2;
             return jetty;
         };
         f.register_seg = [](auto* context, auto* config) {
@@ -158,6 +182,11 @@ protected:
         hello.credit_epoch = side + 301;
         hello.jetty_id = endpoints_[side].jetty[0].jetty_id.id;
         hello.eid[0] = std::byte(side + 1);
+        const auto lanes = control::CaptureTxLanes(endpoints_[side].pool);
+        EXPECT_TRUE(lanes);
+        if (lanes) {
+            hello.tx_lanes = *lanes;
+        }
         urma_rjetty_t remote{};
         remote.jetty_id.id = hello.jetty_id;
         std::memcpy(&remote.jetty_id.eid, hello.eid.data(), hello.eid.size());
@@ -235,7 +264,9 @@ protected:
                 .slab = &e.slab,
                 .sender_credits = &e.send_credits,
                 .connection_id = i + 1,
-                .tx_capacity = 8};
+                .tx_capacity = 8,
+                .sources = &e.admission,
+                .peer_lanes_authorized = true};
     }
     void DriveCache() {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -386,6 +417,62 @@ TEST_F(ConnectionTest, GatesWritesUntilReadyAndRejectsWrongDomainBeforePublicati
     Activate();
     EXPECT_TRUE(endpoints_[0].connection.Write(byte));
     Step();
+}
+
+TEST_F(ConnectionTest, RequiresAuthorizedSourceAdmissionBeforeAnyReady) {
+    auto& e = endpoints_[0];
+    auto prep = Preparation(0);
+    prep.sources = nullptr;
+    ASSERT_FALSE(e.connection.PrepareRaw(prep));
+    prep = Preparation(0);
+    prep.peer_lanes_authorized = false;
+    auto denied = e.connection.PrepareRaw(prep);
+    ASSERT_FALSE(denied);
+    EXPECT_EQ(denied.error().code, ConnectionErrorCode::kSourceAdmission);
+    EXPECT_EQ(e.admission.prepares, 0u);
+    EXPECT_EQ(e.routes.published(), 0u);
+    EXPECT_EQ(e.connection.handshake().local_ready(), nullptr);
+    // 授权尚未满足时不改变握手，可在宿主完成验证后显式重试。
+    Activate();
+    EXPECT_EQ(e.admission.prepares, 1u);
+}
+
+TEST_F(ConnectionTest, FailedAtomicAdmissionClosesHandshakeWithoutReadyOrPost) {
+    auto& e = endpoints_[0];
+    e.admission.reject = true;
+    auto prepared = e.connection.PrepareRaw(Preparation(0));
+    ASSERT_FALSE(prepared);
+    EXPECT_EQ(prepared.error().code, ConnectionErrorCode::kSourceAdmission);
+    EXPECT_EQ(e.connection.state(), ConnectionState::kFailed);
+    EXPECT_EQ(e.routes.published(), 0u);
+    EXPECT_EQ(e.connection.handshake().local_ready(), nullptr);
+    EXPECT_TRUE(packets_.empty());
+}
+
+TEST_F(ConnectionTest, RechecksSourceBindingsBeforeReadyPublication) {
+    Prepare();
+    auto& e = endpoints_[0];
+    e.admission.ready = false;
+    auto progressed = e.connection.Progress(++now_);
+    ASSERT_FALSE(progressed);
+    EXPECT_EQ(progressed.error().code, ConnectionErrorCode::kSourceAdmission);
+    EXPECT_EQ(e.routes.published(), 0u);
+    EXPECT_EQ(e.connection.handshake().local_ready(), nullptr);
+}
+
+TEST_F(ConnectionTest, ChangedPhysicalLaneCannotPostQueuedData) {
+    Activate();
+    auto& e = endpoints_[0];
+    const std::array payload{std::byte{1}};
+    ASSERT_EQ(e.connection.Write(payload), 1u);
+    // 模拟池内实际端点身份变化，数据已复制进 Slab 但尚未提交 provider。
+    ++e.jetty[1].jetty_id.id;
+    auto progressed = e.connection.Progress(++now_);
+    ASSERT_FALSE(progressed);
+    EXPECT_EQ(progressed.error().code, ConnectionErrorCode::kLaneChanged);
+    EXPECT_TRUE(packets_.empty());
+    EXPECT_EQ(e.slab.stats().local_dma, 0u);
+    --e.jetty[1].jetty_id.id;
 }
 
 TEST_F(ConnectionTest, ReordersRealRxAndHoldsCreditUntilFullApplicationConsumption) {

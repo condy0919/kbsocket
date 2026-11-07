@@ -40,6 +40,8 @@ cc_library(
         ":eager_rx",
         ":eager_tx",
         "//kbsocket/control:connection_handshake",
+        "//kbsocket/control:raw_source_admission",
+        "//kbsocket/control:tx_lane_snapshot",
         "//kbsocket/transport/tcp:native_tcp_backend",
     ],
 )
@@ -78,6 +80,7 @@ cc_test(
     srcs = ["connection_test.cpp"],
     deps = [
         ":connection",
+        "//kbsocket/control:tx_lane_snapshot",
         "//kbsocket/transport/raw:receive_domain_closer",
         "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",

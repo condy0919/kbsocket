@@ -117,50 +117,80 @@ std::expected<void, RxSourceError> RxSourceRegistry::Open(const RxSourceRegistry
 }
 
 std::expected<RxSourceLease, RxSourceError> RxSourceRegistry::Register(const RxSourceRoute& route) noexcept {
+    RxSourceLease lease;
+    const auto added = RegisterBatch(std::span(&route, 1), std::span(&lease, 1));
+    if (!added) {
+        return Error(added.error());
+    }
+    return lease;
+}
+
+std::expected<void, RxSourceError> RxSourceRegistry::RegisterBatch(std::span<const RxSourceRoute> routes,
+                                                                   std::span<RxSourceLease> output) noexcept {
     if (!state_) {
         return Error(RxSourceError::kNotReady);
     }
+    if (routes.empty() || routes.size() != output.size()) {
+        return Error(RxSourceError::kInvalidArgument);
+    }
     auto& s = *state_;
-    const auto& source = route.source;
-    if (!s.Local(route.local_id, route.is_jetty) || !route.token.generation || !source.peer.domain || !source.peer.id ||
-        source.local_domain.runtime_instance != s.config.local_domain.runtime_instance ||
-        source.local_domain.receive_domain != s.config.local_domain.receive_domain ||
-        source.peer_context.version != connection::kWireVersion || !source.peer_context.peer_runtime ||
-        source.peer_context.receive_domain != s.config.local_domain.receive_domain || !source.peer_context.session) {
-        return Error(RxSourceError::kInvalidArgument);
-    }
-    const auto peer = source.peer.domain->PeerStats(source.peer);
-    if (!peer || peer->retired || peer->identity.peer_runtime != source.peer_context.peer_runtime ||
-        peer->identity.receive_domain != source.peer_context.receive_domain) {
-        return Error(RxSourceError::kInvalidArgument);
-    }
-    if (s.Find(route)) {
-        return Error(RxSourceError::kDuplicate);
-    }
-    // 注册在控制路径执行；允许共用物理 Lane 的会话各自有 token/session，禁止重解释旧物理来源。
-    for (std::uint32_t i = 0; i < s.config.capacity; ++i) {
-        const auto& entry = s.entries[i];
-        if (entry.live && entry.route.is_jetty == route.is_jetty &&
-            SameRemote(entry.route.remote_id, route.remote_id) &&
-            (entry.route.source.peer_context.peer_runtime != source.peer_context.peer_runtime ||
-             !SamePeer(entry.route.source.peer, source.peer))) {
-            return Error(RxSourceError::kIdentityConflict);
-        }
-    }
-    if (s.free == kEnd) {
+    if (routes.size() > s.config.capacity - s.live) {
         return Error(RxSourceError::kExhausted);
     }
-    if (next_id_ == std::numeric_limits<std::uint64_t>::max()) {
+    if (routes.size() > std::numeric_limits<std::uint64_t>::max() - next_id_) {
         return Error(RxSourceError::kSequenceExhausted);
     }
-    const auto slot = s.free;
-    auto& entry = s.entries[slot];
-    s.free = entry.next;
-    const auto bucket = s.Bucket(route);
-    entry = {.route = route, .id = ++next_id_, .next = s.buckets[bucket], .live = true};
-    s.buckets[bucket] = slot;
-    ++s.live;
-    return RxSourceLease{this, slot, entry.id};
+    // 全批预检后才链接表项；不通过逐条 Register 再伪造静默证明回滚。
+    for (std::size_t n = 0; n < routes.size(); ++n) {
+        const auto& route = routes[n];
+        const auto& source = route.source;
+        if (!s.Local(route.local_id, route.is_jetty) || !route.token.generation || !source.peer.domain ||
+            !source.peer.id || source.local_domain.runtime_instance != s.config.local_domain.runtime_instance ||
+            source.local_domain.receive_domain != s.config.local_domain.receive_domain ||
+            source.peer_context.version != connection::kWireVersion || !source.peer_context.peer_runtime ||
+            source.peer_context.receive_domain != s.config.local_domain.receive_domain ||
+            !source.peer_context.session) {
+            return Error(RxSourceError::kInvalidArgument);
+        }
+        const auto peer = source.peer.domain->PeerStats(source.peer);
+        if (!peer || peer->retired || peer->identity.peer_runtime != source.peer_context.peer_runtime ||
+            peer->identity.receive_domain != source.peer_context.receive_domain) {
+            return Error(RxSourceError::kInvalidArgument);
+        }
+        if (s.Find(route)) {
+            return Error(RxSourceError::kDuplicate);
+        }
+        const auto conflicts = [&route](const RxSourceRoute& existing) {
+            return existing.is_jetty == route.is_jetty && SameRemote(existing.remote_id, route.remote_id) &&
+                   (existing.source.peer_context.peer_runtime != route.source.peer_context.peer_runtime ||
+                    !SamePeer(existing.source.peer, route.source.peer));
+        };
+        // 注册在控制路径执行；共用 Lane 的会话不能重解释旧物理来源。
+        for (std::uint32_t i = 0; i < s.config.capacity; ++i) {
+            if (s.entries[i].live && conflicts(s.entries[i].route)) {
+                return Error(RxSourceError::kIdentityConflict);
+            }
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            if (SameKey(routes[i], route)) {
+                return Error(RxSourceError::kDuplicate);
+            }
+            if (conflicts(routes[i])) {
+                return Error(RxSourceError::kIdentityConflict);
+            }
+        }
+    }
+    for (std::size_t n = 0; n < routes.size(); ++n) {
+        const auto slot = s.free;
+        auto& entry = s.entries[slot];
+        s.free = entry.next;
+        const auto bucket = s.Bucket(routes[n]);
+        entry = {.route = routes[n], .id = ++next_id_, .next = s.buckets[bucket], .live = true};
+        s.buckets[bucket] = slot;
+        ++s.live;
+        output[n] = {this, slot, entry.id};
+    }
+    return {};
 }
 
 std::expected<connection::EagerReceiveSource, RxSourceError>
@@ -192,30 +222,58 @@ RxSourceRegistry::Resolve(const raw::RxBufferEvent& event) const noexcept {
     return entry->route.source;
 }
 
-std::expected<void, RxSourceError> RxSourceRegistry::Remove(RxSourceLease lease,
-                                                            const RxSourceRetireProof& proof) noexcept {
+std::expected<void, RxSourceError> RxSourceRegistry::Check(RxSourceLease lease) const noexcept {
     if (!state_) {
         return Error(RxSourceError::kNotReady);
     }
-    auto& s = *state_;
+    const auto& s = *state_;
     if (lease.owner != this || lease.slot >= s.config.capacity || !lease.id || !s.entries[lease.slot].live ||
         s.entries[lease.slot].id != lease.id) {
         return Error(RxSourceError::kInvalidLease);
+    }
+    return {};
+}
+
+std::expected<void, RxSourceError> RxSourceRegistry::Remove(RxSourceLease lease,
+                                                            const RxSourceRetireProof& proof) noexcept {
+    return RemoveBatch(std::span(&lease, 1), proof);
+}
+
+std::expected<void, RxSourceError> RxSourceRegistry::RemoveBatch(std::span<const RxSourceLease> leases,
+                                                                 const RxSourceRetireProof& proof) noexcept {
+    if (!state_) {
+        return Error(RxSourceError::kNotReady);
+    }
+    if (leases.empty()) {
+        return Error(RxSourceError::kInvalidArgument);
+    }
+    auto& s = *state_;
+    for (std::size_t n = 0; n < leases.size(); ++n) {
+        if (const auto checked = Check(leases[n]); !checked) {
+            return checked;
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            if (leases[i] == leases[n]) {
+                return Error(RxSourceError::kInvalidLease);
+            }
+        }
     }
     if (proof.context_incarnation != s.config.context_incarnation || !proof.remote_sender_stopped ||
         !proof.accepted_traffic_settled || !proof.receive_events_drained) {
         return Error(RxSourceError::kProofRequired);
     }
-    auto& entry = s.entries[lease.slot];
-    auto* link = &s.buckets[s.Bucket(entry.route)];
-    while (*link != lease.slot) {
-        link = &s.entries[*link].next;
+    for (const auto lease : leases) {
+        auto& entry = s.entries[lease.slot];
+        auto* link = &s.buckets[s.Bucket(entry.route)];
+        while (*link != lease.slot) {
+            link = &s.entries[*link].next;
+        }
+        *link = entry.next;
+        entry.live = false;
+        entry.next = s.free;
+        s.free = lease.slot;
+        --s.live;
     }
-    *link = entry.next;
-    entry.live = false;
-    entry.next = s.free;
-    s.free = lease.slot;
-    --s.live;
     return {};
 }
 
@@ -234,6 +292,9 @@ raw::RxBufferPool* RxSourceRegistry::buffers() const noexcept {
 }
 std::uint64_t RxSourceRegistry::context_incarnation() const noexcept {
     return state_ ? state_->config.context_incarnation : 0;
+}
+connection::TokenDomain RxSourceRegistry::local_domain() const noexcept {
+    return state_ ? state_->config.local_domain : connection::TokenDomain{};
 }
 
 } // namespace runtime

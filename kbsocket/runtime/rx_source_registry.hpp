@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <span>
 
 #include "kbsocket/connection/eager_rx.hpp"
 
@@ -70,13 +71,20 @@ public:
     RxSourceRegistry& operator=(const RxSourceRegistry&) = delete;
     std::expected<void, RxSourceError> Open(const RxSourceRegistryConfig& config) noexcept;
     std::expected<RxSourceLease, RxSourceError> Register(const RxSourceRoute& route) noexcept;
+    /// 控制路径原子准入：任一条失败时表和 output 都不改变；调用方提供等长输出。
+    std::expected<void, RxSourceError> RegisterBatch(std::span<const RxSourceRoute> routes,
+                                                     std::span<RxSourceLease> output) noexcept;
     std::expected<connection::EagerReceiveSource, RxSourceError>
     Resolve(const raw::RxBufferEvent& event) const noexcept;
     std::expected<void, RxSourceError> Remove(RxSourceLease lease, const RxSourceRetireProof& proof) noexcept;
+    std::expected<void, RxSourceError> RemoveBatch(std::span<const RxSourceLease> leases,
+                                                   const RxSourceRetireProof& proof) noexcept;
+    std::expected<void, RxSourceError> Check(RxSourceLease lease) const noexcept;
     std::expected<void, RxSourceError> Close() noexcept;
     std::size_t size() const noexcept;
     raw::RxBufferPool* buffers() const noexcept;
     std::uint64_t context_incarnation() const noexcept;
+    connection::TokenDomain local_domain() const noexcept;
 
 private:
     struct State;

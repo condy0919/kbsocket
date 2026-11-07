@@ -11,6 +11,7 @@
 #include "kbsocket/connection/eager_rx.hpp"
 #include "kbsocket/connection/eager_tx.hpp"
 #include "kbsocket/control/connection_handshake.hpp"
+#include "kbsocket/control/raw_source_admission.hpp"
 #include "kbsocket/transport/tcp/native_tcp_backend.hpp"
 
 namespace kbsocket {
@@ -42,7 +43,9 @@ enum class ConnectionErrorCode : std::uint8_t {
     kCancelled,
     kRetained,
     kControlClosed,
-    kControlProtocol
+    kControlProtocol,
+    kSourceAdmission,
+    kLaneChanged
 };
 struct ConnectionError {
     ConnectionErrorCode code;
@@ -63,6 +66,10 @@ struct RawConnectionPreparation {
     std::uint32_t tx_capacity = 256;
     // 同一 Peer 共账的连接须使用同一个控制配额；至少 4，初始实际授信不得少于该值。
     std::uint32_t control_credit_target = 4;
+    // 在 READY 前登记可信远端主动 Lane；对象及绑定覆盖连接和迟到 RX 的生命周期。
+    control::RawSourceAdmission* sources = nullptr;
+    // 宿主已认证并授权 peer HELLO 中的整份 Lane 公告；远端自报字段不构成认证。
+    bool peer_lanes_authorized = false;
 };
 
 /// 单 owner 的有界 copy-stream 接口；Write 返回的前缀可立即复用，Read 只交付连续字节。
@@ -125,6 +132,7 @@ private:
     ConnectionError Fail(ConnectionError error) noexcept;
     std::expected<void, ConnectionError> RefreshCredit() noexcept;
     std::expected<void, ConnectionError> ApplyPeerReady() noexcept;
+    std::expected<void, ConnectionError> CheckRawBindings() const noexcept;
     control::ConnectionHandshake handshake_;
     EagerTxStream tx_;
     EagerRxStream rx_;

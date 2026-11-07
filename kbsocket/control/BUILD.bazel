@@ -2,6 +2,18 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "raw_source_admission",
+    hdrs = ["raw_source_admission.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":handshake_channel",
+        "//kbsocket/connection:connection_tokens",
+        "//kbsocket/connection:credit_account",
+        "//kbsocket/transport/raw:urma_api",
+    ],
+)
+
+cc_library(
     name = "handshake_channel",
     srcs = ["handshake_channel.cpp"],
     hdrs = ["handshake_channel.hpp"],
@@ -64,6 +76,27 @@ cc_test(
         "//kbsocket/connection:credit_account",
         "//kbsocket/connection:wire_frame",
         "//kbsocket/runtime:control_executor",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "tx_lane_snapshot",
+    srcs = ["tx_lane_snapshot.cpp"],
+    hdrs = ["tx_lane_snapshot.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":handshake_channel",
+        "//kbsocket/transport/raw:jetty_pool",
+    ],
+)
+
+cc_test(
+    name = "tx_lane_snapshot_test",
+    srcs = ["tx_lane_snapshot_test.cpp"],
+    deps = [
+        ":tx_lane_snapshot",
         "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",
     ],

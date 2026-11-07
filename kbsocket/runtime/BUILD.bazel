@@ -87,10 +87,22 @@ cc_test(
     srcs = ["rx_source_registry_test.cpp"],
     deps = [
         ":connection_io",
+        ":handshake_rx_sources",
         ":rx_source_registry",
         "//kbsocket/connection:connection_table",
         "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "handshake_rx_sources",
+    srcs = ["handshake_rx_sources.cpp"],
+    hdrs = ["handshake_rx_sources.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":rx_source_registry",
+        "//kbsocket/control:raw_source_admission",
     ],
 )
 
@@ -200,10 +212,12 @@ cc_test(
     deps = [
         ":connection_io",
         ":connection_progress",
+        ":handshake_rx_sources",
         ":import_progress",
         ":runtime_shard",
         ":rx_source_registry",
         "//kbsocket/connection",
+        "//kbsocket/control:tx_lane_snapshot",
         "//kbsocket/transport/raw:receive_domain_closer",
         "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",

@@ -26,9 +26,9 @@ M5.1 将 M4 的身份、乱序窗口和授信原语接入建链准备流程：�
 
 ## 2. HELLO、READY 与两个方向的身份
 
-控制帧使用固定大端字段，不直接发送 C++ 结构体。12 字节帧头包含 `KBSH`、握手版本、消息类型、保留字节和正文长度；HELLO 正文为 88 字节固定字段加最多 4096 字节的 opaque 端点描述，READY 正文为 144 字节，REJECT 正文为 20 字节。
+控制帧使用固定大端字段，不直接发送 C++ 结构体。12 字节帧头包含 `KBSH`、握手版本、消息类型、保留字节和正文长度。M5.3.2 将握手版本升为 2：HELLO 正文为 104 字节固定字段、每条 32 字节的主动 Lane 列表以及最多 4096 字节的 opaque 端点描述；最多 64 条 Lane，整帧上限 6260 字节。READY 正文仍为 144 字节，REJECT 为 20 字节。旧 v1 显式拒绝，不能混用两版。
 
-每份 `HandshakeIdentity` 包含 runtime 实例、接收域、被动端点代次、授权策略身份、不可复用 session nonce 和完整 32-bit slot/generation。HELLO 另携带数据 wire 版本、能力位、本端接收授信 epoch、EID、Jetty ID、导入 token 及描述符。TCP-only HELLO 的 raw 字段必须为零。宿主负责生成不复用的 runtime/domain/session 身份；协调器不会生成随机身份，也不会把自报 `authorization` 当认证凭证。
+每份 `HandshakeIdentity` 包含 runtime 实例、接收域、被动端点代次、授权策略身份、不可复用 session nonce 和完整 32-bit slot/generation。HELLO 另携带数据 wire 版本、能力位、本端接收授信 epoch、被动 EID/Jetty ID、导入 token 及描述符，以及独立的主动 Lane pool epoch、数量和列表。每条 Lane 包含 EID/UASID/Jetty ID/generation。RAW 快照不能为空，不允许零代次、重复物理来源或主动/被动角色冲突；TCP-only 的 raw 字段及 Lane 数量/epoch 必须为零。宿主负责生成不复用的 runtime/domain/session 身份；协调器不会生成随机身份，也不会把自报 `authorization` 当认证凭证。
 
 READY 完整回显发送方和接收方各自的 identity，并携带所选传输、授信 epoch 以及数据、控制、帧序号和驻留字节的累计上界。raw READY 的这些额度必须有效且 epoch 与该发送方 HELLO 一致；TCP READY 不携带 raw 额度。重复 HELLO/READY、身份不一致、意外版本或错误传输选择会使握手显式失败。
 
@@ -88,4 +88,4 @@ Open 一次分配所有条目、引用票据和描述符存储。默认上限为
 
 当前测试覆盖协议分片与合并、有限 IO 预算、超时/取消、真实本机 TCP 协议交换、READY 前路由发布及首包竞态、相反方向的信用 epoch、1000 等待者单次导入、旧身份拒绝、部分准备失败、导入取消及清理重试。raw provider 由 Mock 替代；本机 TCP 握手测试不代表完整 NativeTCP 后端，也没有形成 UB 真机正确性、吞吐或 40k 建链性能结论。
 
-M5.2 已交付 connect/listener、NativeTCP 后端、有界 Connection copy-stream、RX/补投结账与发送共账接线。后续 M5.3 仍需交付 Runtime 级公平收发调度、业务 mailbox、实际 RX 来源映射、自动资源/拓扑管理、显式 C ABI/零拷贝 API，以及关闭协商与远端静默证明。M6 的 WRITE Grant/DONE 生命周期保持独立。
+M5.2 已交付 connect/listener、NativeTCP 后端、有界 Connection copy-stream、RX/补投结账与发送共账接线。M5.3.1/2 已增加 Runtime 公平推进、实际 RX 来源映射和 HELLO 主动 Lane 自动登记；完整 Connection 在来源安装之前禁止 READY，见 [连接 Runtime](connection-runtime.md)。低层 ConnectionHandshake 仍是可独立组合的原语，不替宿主消费 RX 或安装来源。业务 mailbox、在线 Lane 更新、自动资源/拓扑管理、显式 C ABI/零拷贝 API，以及关闭协商与远端静默证明仍待实现。M6 的 WRITE Grant/DONE 生命周期保持独立。

@@ -8,6 +8,8 @@
 #include <cerrno>
 #include <limits>
 
+#include "kbsocket/control/tx_lane_snapshot.hpp"
+
 namespace kbsocket {
 namespace connection {
 namespace {
@@ -66,10 +68,18 @@ std::expected<void, ConnectionError> Connection::PrepareRaw(const RawConnectionP
     }
     const auto* peer = handshake_.peer();
     if (!peer || !prep.receive || !prep.sender || !prep.slab || !prep.sender_credits || !prep.connection_id ||
-        !prep.handshake.credits || !prep.handshake.imports || prep.control_credit_target < 4 ||
-        !prep.receive->Matches(*prep.handshake.credits, *handshake_.route().owner) ||
+        !prep.handshake.credits || !prep.handshake.imports || !prep.sources || !prep.sender->pool() ||
+        prep.control_credit_target < 4 || !prep.receive->Matches(*prep.handshake.credits, *handshake_.route().owner) ||
         prep.receive->context() != prep.handshake.local_context) {
         return Error(ConnectionErrorCode::kInvalidArgument);
+    }
+    if (!prep.peer_lanes_authorized) {
+        return Error(ConnectionErrorCode::kSourceAdmission,
+                     static_cast<int>(control::RawSourceAdmissionError::kUnauthorized));
+    }
+    auto lanes = control::ValidateLocalTxLanes(*prep.sender->pool(), handshake_.local());
+    if (!lanes) {
+        return std::unexpected(Fail({ConnectionErrorCode::kLaneChanged, static_cast<int>(lanes.error().code)}));
     }
     auto credit = prep.handshake.credits->PeerStats(prep.handshake.credit_peer);
     // 固定 Peer 控制配额与低水线分离；重建逻辑连接不能把当时剩余额度误当新配额。
@@ -112,12 +122,43 @@ std::expected<void, ConnectionError> Connection::PrepareRaw(const RawConnectionP
         return std::unexpected(Fail(TxError(tx_open.error())));
     }
     tx_open_ = true;
+    // 最后一次性安装来源；任何失败都不能发布 READY 或留下已提交的业务 WR。
+    auto admitted = prep.sources->Prepare({.local = &local,
+                                           .peer = peer,
+                                           .context = prep.handshake.local_context,
+                                           .buffers = prep.receive->buffers(),
+                                           .context_incarnation = prep.handshake.local_context_incarnation,
+                                           .local_domain = handshake_.route().owner->domain(),
+                                           .credit_peer = prep.handshake.credit_peer,
+                                           .peer_lanes_authorized = prep.peer_lanes_authorized});
+    if (!admitted) {
+        return std::unexpected(Fail({ConnectionErrorCode::kSourceAdmission, static_cast<int>(admitted.error())}));
+    }
     const auto window = handshake_.receive_window().stats();
     last_data_ = credit->max_data;
     last_control_ = credit->max_control;
     control_target_ = prep.control_credit_target;
     last_frames_ = window.max_frame_seq;
     last_bytes_ = window.max_stream_bytes;
+    return {};
+}
+std::expected<void, ConnectionError> Connection::CheckRawBindings() const noexcept {
+    const auto credit = raw_.handshake.credits->PeerStats(raw_.handshake.credit_peer);
+    if (!credit || credit->frozen || credit->retired || raw_.handshake.credits->stats().frozen) {
+        return Error(ConnectionErrorCode::kCredit);
+    }
+    const auto* pool = raw_.sender->pool();
+    if (!pool) {
+        return Error(ConnectionErrorCode::kLaneChanged);
+    }
+    auto lanes = control::ValidateLocalTxLanes(*pool, handshake_.local());
+    if (!lanes) {
+        return Error(ConnectionErrorCode::kLaneChanged, static_cast<int>(lanes.error().code));
+    }
+    auto sources = raw_.sources->Check();
+    if (!sources) {
+        return Error(ConnectionErrorCode::kSourceAdmission, static_cast<int>(sources.error()));
+    }
     return {};
 }
 std::expected<void, ConnectionError> Connection::PrepareTcp() noexcept {
@@ -210,6 +251,13 @@ std::expected<std::size_t, ConnectionError> Connection::Progress(std::uint64_t n
     }
     if (state_ == ConnectionState::kIdle || state_ == ConnectionState::kClosed || state_ == ConnectionState::kClosing) {
         return Error(ConnectionErrorCode::kNotReady);
+    }
+    // 单 owner 保证此检查到 post 之间不会重建 Lane；新物理来源必须先完成新的协商。
+    if (raw_prepared_) {
+        auto bindings = CheckRawBindings();
+        if (!bindings) {
+            return std::unexpected(Fail(bindings.error()));
+        }
     }
     if (state_ != ConnectionState::kRawActive) {
         auto progressed = handshake_.Progress(now_ns);

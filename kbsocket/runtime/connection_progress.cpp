@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <limits>
 #include <new>
 
@@ -155,7 +156,12 @@ struct ConnectionProgress::State {
         std::size_t processed = 0;
         if (connection.state() != ConnectionState::kIdle && connection.state() != ConnectionState::kFailed &&
             connection.state() != ConnectionState::kClosing && connection.state() != ConnectionState::kClosed) {
-            const auto advanced = connection.Progress(now);
+            // Reactor 的批次时间可能早于本轮 RX 回调/应用 Read；每次访问刷新同一单调时钟，
+            // 防止把旧时间传入已见到较新 RX 的重排窗口。传入值仍作为测试/调度时间下界。
+            const auto current = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                                .count());
+            const auto advanced = connection.Progress(std::max(now, current));
             if (advanced) {
                 processed = *advanced;
             }

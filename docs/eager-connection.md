@@ -5,7 +5,7 @@
 ## 建链与接口边界
 
 - `Connection::Open` 接管明确支持本协议的已连接非阻塞控制 fd；`Progress` 推进 HELLO，进入 Preparing 后宿主提供已创建的 raw 资源，或调用 `PrepareTcp`。
-- `PrepareRaw` 将完整 Connection 作为 route owner；先初始化 RX/TX，再由握手协调器发布路由、发送 READY。TX 可绑定 pending import，首包与 Credit 可在本端等待 READY 时入账；应用读写和实际 post 仍等待双方 READY。
+- `PrepareRaw` 将完整 Connection 作为 route owner；先初始化 RX/TX，并通过 `sources` 原子安装已授权的远端主动 Lane 来源，再由握手协调器发布路由、发送 READY。HELLO 的本地 Lane 快照必须与实际 TxSender 池一致；`peer_lanes_authorized` 由宿主认证策略提供。TX 可绑定 pending import，首包与 Credit 可在本端等待 READY 时入账；应用读写和实际 post 仍等待双方 READY。
 - `Write(span)` 返回已复制到注册 Slab 的前缀，调用方可立即复用该前缀。大 write 按 4096 B RM_CTP 限制有界分片，扩展身份头计入上限。驻留/远端窗口不足时短写或 WouldBlock，不分配整次 write 的缓存。
 - `Read(span, now)` 复制连续字节并返回短读/EOF；无数据返回 WouldBlock。读到一帧中途继续持有原 RX Lease，完整消费后才归还物理责任和乱序窗口 receipt。已复制前缀之后发生错误，仍保留前缀返回，并锁存失败供下一次调用观察。
 - `ShutdownWrite` 把 FIN 排在已接受 write 之后；发送半关闭仍可发送 Credit，接收方向继续工作。FIN 通过相同 SN 重排，前面全部字节消费后才 EOF。
@@ -45,4 +45,4 @@
 
 测试覆盖双向短读写、真实 RX 乱序、调用方复用源缓冲、慢读持有、部分/未知 post、独立 DMA/import 引用、共享 SQ status 8、FIN、首包/READY 竞争、控制 EOF、双端延迟 Credit、共享 Peer 重复累计更新及热路径零分配。NativeTCP 包含真实 AF_INET 和 fork 双进程 echo；这些结果不替代 UB 真机或 40k 性能验证。
 
-M5.3.1 已完成借用资源的 runtime 进度接线、实际 CQE 来源登记校验、动态控制 fd 与有界公平连接调度，见 [连接 Runtime](connection-runtime.md)。自动资源装配、主动 Lane 交换、业务 mailbox、公平额度调度、显式 C ABI/零拷贝接口和关闭协议继续推进。当前代码不自动创建完整 Runtime、不探测远端静默，也不根据 Close 或控制断链撤销共账授信。工作区已有 API 草稿未作为稳定 ABI 发布。RNDV/Grant、主备选路、故障 CQ 回收和真实规模测试仍按原 roadmap 分期推进。
+M5.3.1/2 已完成借用资源的 runtime 进度接线、HELLO 主动 Lane 交换和原子来源登记、动态控制 fd 与有界公平连接调度，见 [连接 Runtime](connection-runtime.md)。旧连接发现任意 Lane 物理身份/代次变化后显式失败，不使用未经公告的新来源；在线 Lane 更新、自动资源装配、业务 mailbox、公平额度调度、显式 C ABI/零拷贝接口和关闭协议继续推进。当前代码不自动创建完整 Runtime、不探测远端静默，也不根据 Close 或控制断链撤销共账授信或旧来源绑定。工作区已有 API 草稿未作为稳定 ABI 发布。RNDV/Grant、主备选路、故障 CQ 回收和真实规模测试仍按原 roadmap 分期推进。
