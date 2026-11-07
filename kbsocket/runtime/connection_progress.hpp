@@ -56,6 +56,9 @@ public:
                                             ConnectionProgressCallback callback = nullptr,
                                             void* cookie = nullptr) noexcept;
     std::expected<ScheduledConnection, ProgressError> Attach(connection::Connection& connection) noexcept;
+    /// 控制路径检查当前已附加连接是否拥有相同 fd 数值，供先 Attach 空对象再接管 fd 的入口使用。
+    /// 单 owner 调用，不替代 fd 所有权协议，也不识别 dup 后不同数值的描述符别名。
+    bool HasFd(int fd) const noexcept;
     std::expected<void, ProgressError> Detach(ScheduledConnection connection) noexcept;
     std::expected<void, ProgressError> Wake(ScheduledConnection connection) noexcept;
     std::expected<void, ProgressError> WatchTcp(ScheduledConnection connection, bool read, bool write) noexcept;

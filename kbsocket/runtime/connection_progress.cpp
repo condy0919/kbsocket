@@ -306,6 +306,18 @@ ConnectionProgress::Attach(connection::Connection& connection) noexcept {
     }
     return ScheduledConnection{this, slot.id};
 }
+bool ConnectionProgress::HasFd(int fd) const noexcept {
+    if (!state_ || fd < 0) {
+        return false;
+    }
+    for (std::size_t i = 0; i < state_->stats.attached; ++i) {
+        const auto& slot = state_->slots[state_->dense[i]];
+        if (slot.connection->fd() == fd) {
+            return true;
+        }
+    }
+    return false;
+}
 std::expected<void, ProgressError> ConnectionProgress::Detach(ScheduledConnection handle) noexcept {
     if (!state_) {
         return Error(ProgressErrorCode::kNotReady);

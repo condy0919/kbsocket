@@ -47,4 +47,6 @@
 
 M5.3.1–3 已完成借用资源的 runtime 进度接线、HELLO 主动 Lane 交换和原子来源登记、动态控制 fd、有界公平连接调度及在线 UPDATE/ACK，见 [连接 Runtime](connection-runtime.md)。宿主须提供 `authorize_lane_update` 回调以显式启用在线更新；健康连接发现本地 Lane 换代后暂停投递，匹配 ACK 到达前不会使用新来源。未启用或更新失败时仍显式失败，已有失败连接不会被 ACK 恢复。旧来源继续保留供迟到 RX 记账。
 
-自动资源装配、业务 mailbox、公平额度调度、显式 C ABI/零拷贝接口和关闭协议继续推进。当前代码不自动创建完整 Runtime、不探测远端静默，也不根据 Close 或控制断链撤销共账授信或旧来源绑定。工作区已有 API 草稿未作为稳定 ABI 发布。RNDV/Grant、主备选路、故障 CQ 回收和真实规模测试仍按原 roadmap 分期推进。
+M5.3.4 的 `ConnectionOwner` 已统一拥有固定容量的连接对象及来源适配器，提供带代次句柄的建链、读写、准备及关闭入口，自动完成调度注册与 Wake。连接 Close、来源退休和槽释放分别执行，迟到 TX/RX 责任收敛前不复用槽；详细接线见 [连接 Runtime](connection-runtime.md#连接对象所有权与入口)。
+
+raw 资源自动装配、业务 mailbox、公平额度调度、显式 C ABI/零拷贝接口和关闭协议继续推进。当前代码不自动创建完整 raw Runtime、不探测远端静默，也不根据 Close 或控制断链撤销共账授信或旧来源绑定。工作区已有 API 草稿未作为稳定 ABI 发布。RNDV/Grant、主备选路、故障 CQ 回收和真实规模测试仍按原 roadmap 分期推进。

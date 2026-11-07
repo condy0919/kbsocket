@@ -1,6 +1,6 @@
 # M5.3：连接 Runtime 与主动 Lane 来源协商
 
-本阶段将已创建的 Connection、raw 队列、导入缓存和 RX 来源表接入同一个 `RuntimeShard`。owner 通过 `Tick`/`RunOnce` 推进 HELLO/READY、导入、TX/RX、物理补投、累计 Credit 和 FIN。M5.3.2 通过 HELLO 交换主动 Lane，并在 READY 前自动登记 RX 来源；M5.3.3 增加在线 Lane 公告与确认。资源创建、入口认证和应用调用仍由宿主负责；这不是完整的 Runtime 工厂或稳定应用 ABI。
+本阶段将 Connection、raw 队列、导入缓存和 RX 来源表接入同一个 `RuntimeShard`。owner 通过 `Tick`/`RunOnce` 推进 HELLO/READY、导入、TX/RX、物理补投、累计 Credit 和 FIN。M5.3.2 通过 HELLO 交换主动 Lane，并在 READY 前自动登记 RX 来源；M5.3.3 增加在线 Lane 公告与确认；M5.3.4 用 `ConnectionOwner` 统一拥有连接对象及其来源适配器，提供有界建链与读写入口。raw 物理资源、入口认证和跨线程命令仍由宿主负责；当前尚未形成完整 Runtime 工厂或稳定应用 ABI。
 
 ## 组件与暂停范围
 
@@ -9,6 +9,7 @@
 | `ContextProgressGroup` | 将同 context 的 raw、连接和导入源合为一个 Reactor source；任何成员的慢控制任务都暂停整个组 |
 | `ImportProgress` | 按 context 指针及 incarnation 过滤缓存操作，通过 Reactor 的唯一控制执行器提交和收割 |
 | `ConnectionProgress` | 固定容量连接槽、完整代次 TX 分发、就绪队列、周期巡检、外部 RX 补投和动态 fd 通知 |
+| `ConnectionOwner` | 拥有固定容量的 Connection 与来源适配器；接管 fd、注入真实调度身份，按关闭与来源退休两道门禁释放槽 |
 | `RxSourceRegistry` | 根据真实 CQE 的本地端点、远端主动发送端点和完整 token 查找已登记的可信会话来源 |
 | `HandshakeRxSources` | 把经过宿主授权的对端 HELLO Lane 快照一次性登记到对应 RX pool，保留绑定直至明确静默 |
 | `LaneControl` | 在双方 READY 后接管控制 fd；新 Lane 经远端登记并确认后才开放本端投递 |
@@ -30,6 +31,32 @@
 6. 应用每次 Write、Read、Prepare、Shutdown 后调用 owner 侧 `Wake(handle)`。唯一 owner 反复 Tick/RunOnce，禁止同时手动驱动 Connection、导入 executor 或 raw CQ。跨线程业务命令仍需宿主 mailbox 转交 owner，不能跨线程调用 Wake 或 Connection。
 
 初始资源创建和来源登记是控制路径工作，可分配内存。队列推进、fd 收割、TX 分发、RX 查表与补投使用预分配存储，不进行堆分配。当前 Attach/来源登记仍扫描已登记条目做冲突检查，不表示已经满足 40k/s 建链目标。
+
+## 连接对象所有权与入口
+
+`ConnectionOwner::Open(progress, config)` 借用已经打开的 `ConnectionProgress`，一次预分配连接槽，默认容量 256，上限 65536；调度器自身容量也是独立准入门禁。每槽拥有稳定地址的 `Connection` 和按需初始化的 `HandshakeRxSources`。队列、Slab、导入缓存、Peer 共账、路由表和共享来源表仍由宿主装配，必须覆盖占用槽和来源记录的生命周期。
+
+| 入口 | 行为 |
+| :--- | :--- |
+| `AdoptTcp(fd)` | 接管已连接的非阻塞 TCP，直接使用普通字节流，不发送私有握手 |
+| `AdoptProtocol(fd, routes, config, now)` | 接管明确支持本协议的流，沿用 HELLO/READY；宿主提供可信身份、策略和唯一会话 |
+| `Peer(handle)` / `PrepareRaw(handle, prep, registry)` | Preparing 时读取经校验的远端公告，完成授权与共账准备；自动填充真实 scheduling id 和槽内来源适配器 |
+| `PrepareTcp(handle)` | 协议协商选择 TCP 后完成准备，仍等待双方 READY |
+| `Write` / `Read` / `ShutdownWrite` / `Cancel` | 校验完整句柄并自动 Wake，应用无需再手工唤醒对应连接 |
+| `Inspect(handle)` / `WatchTcp(handle, read, write)` | 返回状态、失败原因、调度身份和保留来源数；按需求订阅一次性 TCP readiness |
+
+Adopt 先占槽、注册 Idle Connection，最后才 Open；成功才转移 fd 所有权。无效 fd、容量满或握手配置错误均回滚空槽并保留调用方 fd。入口先通过 `ConnectionProgress::HasFd` 检查整个共享调度器，拒绝同一描述符的重复接管；该检查不识别 `dup` 别名，宿主仍须保证独占使用。若异常回滚无法撤销注册，错误中的 `retained_handle` 交回保留槽供调用方处理。
+
+`OwnedConnection` 包含 owner、槽号及完整单调代次；Release 后旧句柄永久失效，序号耗尽停止准入。`Inspect` 返回的 `ScheduledConnection` 可关联既有 Runtime 回调。`Peer` 仅借用 HELLO 到 Release，不授予修改权或绕过认证的权限。普通 TCP 与协议入口可共用同一 owner；raw Prepare 的 context 必须匹配调度器。`prep.connection_id` 和 `prep.sources` 必须留空，来源适配器首次 Open 后固定 registry；授权等可修正的准备错误允许重试，换 registry 则重新建链。发送 Credit 和接收物理总账继续按 Peer/域共享。
+
+所有接口都由单 owner 调用，遵守 context 暂停屏障；业务线程仍需经宿主 mailbox 转交。Prepare 是允许分配的控制路径；正常 Read/Write/Inspect 和推进不分配。Read/Write 先 Wake 再接受/交付字节，避免信号错误覆盖已完成的字节前缀。`StopAccepting` 只关闭新 Adopt，不影响已接受连接的准备、收发和排空。
+
+关闭按以下顺序执行：
+
+1. `CloseConnection(handle)` 撤路由并收敛连接责任；返回 Retained 时槽及调度注册继续存活，由原 owner 交付真实 TX 终结后重试。
+2. Connection 已 Closed 后，来源仍保留用于迟到 RX 结账。宿主取得独立 `RxSourceRetireProof` 后调用 `RetireSources`；控制 EOF、Lane ACK 或 Close 成功均不替代此证明，也不自动撤回 Peer Credit。
+3. `Release(handle)` 要求连接已 Closed 且来源全部退休，随后 Detach 并重构槽。无来源的 TCP/未完成 raw 准备连接可直接 Release。等待证明的槽占用容量，耗尽时拒绝新入口，不淘汰旧责任。
+4. 全部槽释放后 `ConnectionOwner::Close` 成功；还有占用槽则返回 InUse。停止 Runtime 调度后再关闭借用的 scheduler、来源表、导入和 raw 资源。错误析构保留整份内部槽存储，宿主仍须保留外部依赖，不提供强制回收。
 
 ## 实际来源与旧帧
 
@@ -82,4 +109,6 @@ Connection::Close 返回 Retained 时继续保留注册与全部借用资源。�
 
 新增测试覆盖超过外层 fd 数量的本地 TCP、oneshot 重订阅、旧 fd 别名、完整代次、预算/公平队列、零分配热路径、来源伪造/旧会话、多 context 暂停、控制背压、取消后 DMA 收敛，以及仅由 RuntimeShard 推进的 Mock raw 双端 DATA/Credit/补投/FIN。回归结果见 [roadmap](roadmap.md)。UB 真机和 40k 规模性能未执行。
 
-M5.3.2/3 新增协议边界、原子登记/更新、授权和来源就绪门禁、双主动 Lane 自动来源解析、双向同时更新、ACK 前禁止投递和 ACK 后迟到旧 RX 测试。下一阶段继续补 Runtime 资源所有权与连接入口、完整业务 mailbox、远端关闭/授信撤回、冻结接收责任核销，再收口显式 C ABI 和零拷贝接口。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。
+M5.3.2/3 新增协议边界、原子登记/更新、授权和来源就绪门禁、双主动 Lane 自动来源解析、双向同时更新、ACK 前禁止投递和 ACK 后迟到旧 RX 测试。M5.3.4 增加 fd 接管回滚、重复 fd、带代次句柄复用、自动 Wake、TCP/协议 TCP、Owned raw DATA/Credit/FIN、关闭保留 DMA 和迟到来源的测试。
+
+下一阶段继续补完整业务 mailbox、远端关闭/授信撤回、冻结接收责任核销及 raw 资源装配，再收口显式 C ABI 和零拷贝接口。完整 raw 资源所有者仍须先闭合 DeleteJfr 后冻结/未补投 receipt 的核销流程，不能通过 ConnectionOwner 析构推断物理资源可释放。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。

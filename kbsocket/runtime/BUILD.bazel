@@ -3,6 +3,22 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "connection_owner",
+    srcs = ["connection_owner.cpp"],
+    hdrs = ["connection_owner.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":connection_progress",
+        ":handshake_rx_sources",
+        ":rx_source_registry",
+        "//kbsocket/connection",
+        "//kbsocket/connection:connection_table",
+        "//kbsocket/control:connection_handshake",
+        "//kbsocket/control:raw_source_admission",
+    ],
+)
+
+cc_library(
     name = "import_progress",
     srcs = ["import_progress.cpp"],
     hdrs = ["import_progress.hpp"],
@@ -41,6 +57,17 @@ cc_test(
     deps = [
         ":connection_progress",
         ":runtime_shard",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "connection_owner_test",
+    srcs = ["connection_owner_test.cpp"],
+    deps = [
+        ":connection_owner",
+        ":runtime_shard",
+        "//kbsocket/transport/tcp:native_tcp_backend",
         "@googletest//:gtest_main",
     ],
 )
@@ -211,6 +238,7 @@ cc_test(
     srcs = ["connection_runtime_test.cpp"],
     deps = [
         ":connection_io",
+        ":connection_owner",
         ":connection_progress",
         ":handshake_rx_sources",
         ":import_progress",

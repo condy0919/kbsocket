@@ -17,6 +17,7 @@
 #include "kbsocket/connection/connection.hpp"
 #include "kbsocket/control/tx_lane_snapshot.hpp"
 #include "kbsocket/runtime/connection_io.hpp"
+#include "kbsocket/runtime/connection_owner.hpp"
 #include "kbsocket/runtime/connection_progress.hpp"
 #include "kbsocket/runtime/handshake_rx_sources.hpp"
 #include "kbsocket/runtime/import_progress.hpp"
@@ -65,6 +66,7 @@ protected:
         runtime::HandshakeRxSources handshake_sources;
         runtime::ConnectionIoBinding io;
         runtime::ScheduledConnection scheduled;
+        bool original_attached = false;
         runtime::RawQueueBinding binding;
         std::uint64_t polls = 0;
         std::array<std::uint64_t, 4> posts_by_jetty{};
@@ -294,6 +296,7 @@ protected:
             auto attached = e.scheduler.Attach(e.connection);
             ASSERT_TRUE(attached);
             e.scheduled = *attached;
+            e.original_attached = true;
             ASSERT_TRUE(e.imports.Open(imports_, &e.context, 1));
             ASSERT_TRUE(e.sources.Open({&e.buffers, 1, {i + 1, i + 101}, SourceCapacity(i)}));
             ASSERT_TRUE(e.handshake_sources.Open(e.sources));
@@ -437,7 +440,9 @@ protected:
         ASSERT_TRUE(Until([&] { return !shard_.paused(0) && !shard_.paused(1); }));
         for (auto& endpoint : endpoints_) {
             endpoint.connection.Cancel();
-            ASSERT_TRUE(endpoint.scheduler.Wake(endpoint.scheduled));
+            if (endpoint.original_attached) {
+                ASSERT_TRUE(endpoint.scheduler.Wake(endpoint.scheduled));
+            }
         }
         Deliver();
         ASSERT_TRUE(Until([&] {
@@ -446,13 +451,18 @@ protected:
         }));
         for (auto& endpoint : endpoints_) {
             ASSERT_TRUE(endpoint.connection.Close());
-            ASSERT_TRUE(endpoint.scheduler.Wake(endpoint.scheduled));
+            if (endpoint.original_attached) {
+                ASSERT_TRUE(endpoint.scheduler.Wake(endpoint.scheduled));
+            }
         }
         ASSERT_TRUE(Until([&] {
             return endpoints_[0].receive.pending_refill() == 0 && endpoints_[1].receive.pending_refill() == 0;
         }));
         for (auto& endpoint : endpoints_) {
-            ASSERT_TRUE(endpoint.scheduler.Detach(endpoint.scheduled));
+            if (endpoint.original_attached) {
+                ASSERT_TRUE(endpoint.scheduler.Detach(endpoint.scheduled));
+                endpoint.original_attached = false;
+            }
         }
         imports_.StopAccepting();
         ASSERT_TRUE(Until([&] { return imports_.entries() == 0; }));
@@ -487,6 +497,276 @@ protected:
         self = nullptr;
     }
 };
+
+class OwnedConnectionRuntimeTest : public ConnectionRuntimeTest {
+protected:
+    std::array<runtime::ConnectionOwner, 2> owners_;
+    std::array<runtime::OwnedConnection, 2> owned_{};
+    std::array<bool, 2> owner_open_{};
+    std::array<bool, 2> adopted_{};
+
+    void SetUp() override {
+        ConnectionRuntimeTest::SetUp();
+        if (HasFatalFailure()) {
+            return;
+        }
+        // 基础 fixture 的连接尚未 PrepareRaw；先撤销空握手，再复用同一组真实队列与 Runtime。
+        for (auto& endpoint : endpoints_) {
+            ASSERT_TRUE(endpoint.connection.Close());
+            ASSERT_TRUE(endpoint.scheduler.Detach(endpoint.scheduled));
+            endpoint.original_attached = false;
+        }
+        int sockets[2];
+        ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sockets), 0);
+        for (std::size_t side = 0; side < owners_.size(); ++side) {
+            auto& endpoint = endpoints_[side];
+            ASSERT_TRUE(owners_[side].Open(endpoint.scheduler, {.capacity = 1}));
+            owner_open_[side] = true;
+            auto hello = Hello(side);
+            hello.identity.session += 1000;
+            const auto adopted = owners_[side].AdoptProtocol(sockets[side], endpoint.routes,
+                                                             {.local = hello,
+                                                              .expected_peer_authorization = 7,
+                                                              .compatible_peer = true,
+                                                              .deadline_ns = Now() + 10'000'000'000ull},
+                                                             Now());
+            ASSERT_TRUE(adopted);
+            owned_[side] = *adopted;
+            adopted_[side] = true;
+            const auto status = owners_[side].Inspect(owned_[side]);
+            ASSERT_TRUE(status);
+            endpoint.scheduled = status->scheduled;
+        }
+        ASSERT_TRUE(Until([&] {
+            const auto left = owners_[0].Inspect(owned_[0]);
+            const auto right = owners_[1].Inspect(owned_[1]);
+            return left && right && left->state == ConnectionState::kPreparing &&
+                   right->state == ConnectionState::kPreparing;
+        }));
+    }
+
+    RawConnectionPreparation OwnedPreparation(std::size_t side) {
+        auto preparation = Preparation(side);
+        preparation.connection_id = 0;
+        preparation.sources = nullptr;
+        return preparation;
+    }
+
+    void ActivateOwned() {
+        for (std::size_t side = 0; side < owners_.size(); ++side) {
+            ASSERT_TRUE(owners_[side].PrepareRaw(owned_[side], OwnedPreparation(side), endpoints_[side].sources));
+        }
+        ASSERT_TRUE(Until([&] {
+            const auto left = owners_[0].Inspect(owned_[0]);
+            const auto right = owners_[1].Inspect(owned_[1]);
+            return left && right && left->state == ConnectionState::kRawActive &&
+                   right->state == ConnectionState::kRawActive;
+        }));
+    }
+
+    void RetireOwned(std::size_t side) {
+        const auto status = owners_[side].Inspect(owned_[side]);
+        ASSERT_TRUE(status);
+        ASSERT_EQ(status->state, ConnectionState::kClosed);
+        if (status->retained_sources != 0) {
+            ASSERT_TRUE(owners_[side].RetireSources(owned_[side], {1, true, true, true}));
+        }
+        ASSERT_TRUE(owners_[side].Release(owned_[side]));
+        adopted_[side] = false;
+    }
+
+    void TearDown() override {
+        if (shard_open_) {
+            ASSERT_TRUE(Until([&] { return !shard_.paused(0) && !shard_.paused(1); }));
+            for (std::size_t side = 0; side < owners_.size(); ++side) {
+                if (adopted_[side]) {
+                    const auto status = owners_[side].Inspect(owned_[side]);
+                    ASSERT_TRUE(status);
+                    if (status->state != ConnectionState::kClosed) {
+                        ASSERT_TRUE(owners_[side].Cancel(owned_[side]));
+                    }
+                }
+            }
+            // 关闭请求不替代真实 CQE；保留 owner 槽到 Runtime 退休 DMA、归还并补投所有 RX。
+            ASSERT_TRUE(Until([&] {
+                bool closed = true;
+                for (std::size_t side = 0; side < owners_.size(); ++side) {
+                    if (adopted_[side]) {
+                        closed &= owners_[side].CloseConnection(owned_[side]).has_value();
+                    }
+                }
+                return closed && endpoints_[0].slab.stats().local_dma == 0 &&
+                       endpoints_[1].slab.stats().local_dma == 0 && endpoints_[0].completions[1].empty() &&
+                       endpoints_[1].completions[1].empty() && endpoints_[0].receive.pending_refill() == 0 &&
+                       endpoints_[1].receive.pending_refill() == 0 && packets_.empty();
+            }));
+            for (std::size_t side = 0; side < owners_.size(); ++side) {
+                if (adopted_[side]) {
+                    RetireOwned(side);
+                }
+            }
+        }
+        for (std::size_t side = 0; side < owners_.size(); ++side) {
+            if (owner_open_[side]) {
+                ASSERT_TRUE(owners_[side].Close());
+                owner_open_[side] = false;
+            }
+        }
+        ConnectionRuntimeTest::TearDown();
+    }
+};
+
+TEST_F(OwnedConnectionRuntimeTest, OwnedRawConnectionsUseRuntimeForBidirectionalDataRefillAndFin) {
+    ActivateOwned();
+    EXPECT_EQ(shard_.stats()->controls_completed, 2u);
+    std::array<std::vector<std::byte>, 2> payloads{std::vector<std::byte>(4096, std::byte{0x31}),
+                                                   std::vector<std::byte>(4096, std::byte{0x72})};
+    for (std::size_t side = 0; side < owners_.size(); ++side) {
+        const auto peer = owners_[side].Peer(owned_[side]);
+        ASSERT_TRUE(peer);
+        EXPECT_EQ((*peer)->identity.runtime, 2 - side);
+        ASSERT_EQ(owners_[side].Write(owned_[side], payloads[side]), payloads[side].size());
+        std::fill(payloads[side].begin(), payloads[side].end(), std::byte{0});
+    }
+    // 所有入口由 owner 自动 Wake；应用无需接触底层 Connection 或手工推进 import/CQ。
+    ASSERT_TRUE(Until([&] {
+        const auto left = owners_[0].Inspect(owned_[0]);
+        const auto right = owners_[1].Inspect(owned_[1]);
+        return left && right && left->rx_pending != 0 && right->rx_pending != 0;
+    }));
+    for (std::size_t side = 0; side < owners_.size(); ++side) {
+        std::vector<std::byte> output(4096);
+        const auto first = owners_[side].Read(owned_[side], std::span(output).first(17), Now());
+        ASSERT_TRUE(first);
+        ASSERT_EQ(first->bytes, 17u);
+        EXPECT_NE(endpoints_[side].buffers.held(), 0u);
+        std::size_t offset = first->bytes;
+        ASSERT_TRUE(Until([&] {
+            const auto read = owners_[side].Read(owned_[side], std::span(output).subspan(offset), Now());
+            if (read) {
+                offset += read->bytes;
+            }
+            return offset == output.size();
+        }));
+        const auto expected = side == 0 ? std::byte{0x72} : std::byte{0x31};
+        EXPECT_TRUE(std::all_of(output.begin(), output.end(), [&](auto byte) { return byte == expected; }));
+    }
+    ASSERT_TRUE(Until([&] {
+        return endpoints_[0].receive.pending_refill() == 0 && endpoints_[1].receive.pending_refill() == 0 &&
+               endpoints_[0].send_credits.available(CreditClass::kData) == 4 &&
+               endpoints_[1].send_credits.available(CreditClass::kData) == 4;
+    }));
+    for (std::size_t side = 0; side < owners_.size(); ++side) {
+        ASSERT_TRUE(owners_[side].ShutdownWrite(owned_[side]));
+    }
+    std::array<bool, 2> eof{};
+    ASSERT_TRUE(Until([&] {
+        for (std::size_t side = 0; side < owners_.size(); ++side) {
+            std::array<std::byte, 1> output{};
+            const auto read = owners_[side].Read(owned_[side], output, Now());
+            if (read) {
+                EXPECT_EQ(read->bytes, 0u);
+                eof[side] = read->eof;
+            }
+        }
+        return eof[0] && eof[1];
+    }));
+    for (const auto& endpoint : endpoints_) {
+        EXPECT_FALSE(endpoint.callback_bad_id);
+        EXPECT_FALSE(endpoint.io.first_error());
+        EXPECT_GT(endpoint.callback_tx_retired, 0u);
+    }
+}
+
+TEST_F(OwnedConnectionRuntimeTest, ClosingOwnedConnectionsRetainsDmaAndLateReceiveSourcesUntilProof) {
+    ActivateOwned();
+    const std::array payload{std::byte{0x42}, std::byte{0x53}};
+    ASSERT_EQ(owners_[0].Write(owned_[0], payload), payload.size());
+    ASSERT_TRUE(shard_.Tick());
+    ASSERT_EQ(endpoints_[0].slab.stats().local_dma, 1u);
+    ASSERT_EQ(packets_.size(), 1u);
+    auto delayed = std::move(packets_.front());
+    packets_.pop_front();
+
+    // 发送已接受但尚未 poll CQE，不能 Release 槽或删除调度身份；远端尚无 RX，因此可先 Close。
+    const auto sender_close = owners_[0].CloseConnection(owned_[0]);
+    ASSERT_FALSE(sender_close);
+    EXPECT_EQ(sender_close.error().code, runtime::ConnectionOwnerErrorCode::kRetained);
+    ASSERT_FALSE(owners_[0].Release(owned_[0]));
+    EXPECT_EQ(endpoints_[0].scheduler.stats()->attached, 1u);
+    ASSERT_TRUE(owners_[1].CloseConnection(owned_[1]));
+    const auto receiver_status = owners_[1].Inspect(owned_[1]);
+    ASSERT_TRUE(receiver_status);
+    EXPECT_EQ(receiver_status->state, ConnectionState::kClosed);
+    EXPECT_EQ(receiver_status->retained_sources, 2u);
+    EXPECT_FALSE(owners_[1].Release(owned_[1]));
+    EXPECT_FALSE(owners_[1].RetireSources(owned_[1], {1, true, true, false}));
+    EXPECT_EQ(endpoints_[1].sources.size(), 2u);
+    ASSERT_TRUE(Until([&] { return endpoints_[0].slab.stats().local_dma == 0; }));
+    EXPECT_EQ(endpoints_[0].callback_tx_retired, 1u);
+    EXPECT_EQ(endpoints_[0].callback_closing_tx, 1u);
+    ASSERT_TRUE(owners_[0].CloseConnection(owned_[0]));
+
+    // 控制 fd 和逻辑路由已关闭，延迟到达的真实 RX 仍归原 Peer 结账，而不是 unknown 冻结。
+    packets_.push_back(std::move(delayed));
+    Deliver();
+    ASSERT_TRUE(
+        Until([&] { return endpoints_[1].completions[1].empty() && endpoints_[1].receive.pending_refill() == 0; }));
+    EXPECT_EQ(endpoints_[1].io.stats().stale_route_drops, 1u);
+    EXPECT_FALSE(endpoints_[1].io.first_error());
+    EXPECT_FALSE(endpoints_[1].receive.frozen());
+    EXPECT_EQ(endpoints_[1].buffers.held(), 0u);
+    EXPECT_EQ(endpoints_[1].sources.size(), 2u);
+    for (std::size_t side = 0; side < owners_.size(); ++side) {
+        RetireOwned(side);
+        EXPECT_EQ(owners_[side].stats().occupied, 0u);
+        EXPECT_EQ(endpoints_[side].scheduler.stats()->attached, 0u);
+        EXPECT_EQ(endpoints_[side].sources.size(), 0u);
+        EXPECT_FALSE(owners_[side].Inspect(owned_[side]));
+    }
+}
+
+TEST_F(OwnedConnectionRuntimeTest, RawPreparationRejectsInjectedBindingsAndUnauthorizedSources) {
+    auto preparation = OwnedPreparation(0);
+    preparation.connection_id = endpoints_[0].scheduled.id;
+    auto rejected = owners_[0].PrepareRaw(owned_[0], preparation, endpoints_[0].sources);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code, runtime::ConnectionOwnerErrorCode::kInvalidArgument);
+    preparation.connection_id = 0;
+    preparation.sources = &endpoints_[0].handshake_sources;
+    rejected = owners_[0].PrepareRaw(owned_[0], preparation, endpoints_[0].sources);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code, runtime::ConnectionOwnerErrorCode::kInvalidArgument);
+    EXPECT_EQ(endpoints_[0].sources.size(), 0u);
+
+    // 来源授权仍由宿主提供；自动接线不能把存在 owner handle 当作远端公告已经获准。
+    preparation.sources = nullptr;
+    preparation.peer_lanes_authorized = false;
+    rejected = owners_[0].PrepareRaw(owned_[0], preparation, endpoints_[0].sources);
+    ASSERT_FALSE(rejected);
+    ASSERT_TRUE(rejected.error().connection);
+    EXPECT_EQ(rejected.error().connection->code, ConnectionErrorCode::kSourceAdmission);
+    EXPECT_EQ(rejected.error().connection->detail, static_cast<int>(control::RawSourceAdmissionError::kUnauthorized));
+    const auto status = owners_[0].Inspect(owned_[0]);
+    ASSERT_TRUE(status);
+    EXPECT_EQ(status->state, ConnectionState::kPreparing);
+    EXPECT_EQ(status->retained_sources, 0u);
+    EXPECT_EQ(status->tx.accepted, 0u);
+    EXPECT_TRUE(packets_.empty());
+
+    // 授权属于 Prepare 前置条件，尚未发布 READY；纠正后须复用已经打开的来源适配器正常建链。
+    preparation.peer_lanes_authorized = true;
+    ASSERT_TRUE(owners_[0].PrepareRaw(owned_[0], preparation, endpoints_[0].sources));
+    ASSERT_TRUE(owners_[1].PrepareRaw(owned_[1], OwnedPreparation(1), endpoints_[1].sources));
+    ASSERT_TRUE(Until([&] {
+        const auto left = owners_[0].Inspect(owned_[0]);
+        const auto right = owners_[1].Inspect(owned_[1]);
+        return left && right && left->state == ConnectionState::kRawActive &&
+               right->state == ConnectionState::kRawActive;
+    }));
+    EXPECT_EQ(endpoints_[0].sources.size(), 2u);
+    EXPECT_EQ(endpoints_[1].sources.size(), 2u);
+}
 
 TEST_F(ConnectionRuntimeTest, HelloAutomaticallyAdmitsBothActiveLanesBeforeReady) {
     for (const auto& endpoint : endpoints_) {

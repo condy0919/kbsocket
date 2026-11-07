@@ -188,6 +188,45 @@ TEST(ConnectionProgress, BoundedFairQueueAndStaleHandleRejection) {
     EXPECT_TRUE(progress.Close());
 }
 
+TEST(ConnectionProgress, CurrentFdLookupIncludesExternalAndInitiallyIdleConnections) {
+    TcpPair first, second;
+    ASSERT_TRUE(first.Open());
+    ASSERT_TRUE(second.Open());
+    Connection external, delayed;
+    ConnectionProgress progress;
+    EXPECT_FALSE(progress.HasFd(first.right));
+    ASSERT_TRUE(progress.Open({.capacity = 2}));
+    EXPECT_FALSE(progress.HasFd(-1));
+    ASSERT_TRUE(external.OpenTcp(first.right));
+    first.right = -1;
+    const auto existing = progress.Attach(external);
+    ASSERT_TRUE(existing);
+    EXPECT_TRUE(progress.HasFd(external.fd()));
+    EXPECT_FALSE(progress.HasFd(first.left));
+
+    // 入口先 Attach 空 Connection，后接管 fd；查询必须读当前对象而非 Attach 时的缓存。
+    const auto pending = progress.Attach(delayed);
+    ASSERT_TRUE(pending);
+    EXPECT_FALSE(progress.HasFd(second.right));
+    ASSERT_TRUE(delayed.OpenTcp(second.right));
+    second.right = -1;
+    const int owned_fd = delayed.fd();
+    allocations = 0;
+    count_allocations = true;
+    const bool found = progress.HasFd(owned_fd);
+    count_allocations = false;
+    EXPECT_TRUE(found);
+    EXPECT_EQ(allocations, 0u);
+
+    // Closed 槽尚未 Detach，原 fd 已失去所有权，不能继续阻止其数值被正常复用。
+    ASSERT_TRUE(delayed.Close());
+    EXPECT_FALSE(progress.HasFd(owned_fd));
+    ASSERT_TRUE(progress.Detach(*pending));
+    ASSERT_TRUE(external.Close());
+    ASSERT_TRUE(progress.Detach(*existing));
+    EXPECT_TRUE(progress.Close());
+}
+
 TEST(ConnectionProgress, NativeTcpOneShotReadinessDoesNotBusyLoopAndCanRearmExistingData) {
     TcpPair pair;
     ASSERT_TRUE(pair.Open());
