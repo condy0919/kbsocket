@@ -22,6 +22,24 @@ std::expected<void, ProgressError> ConnectionIoBinding::Open(ConnectionProgress&
     progress_ = &progress;
     receive_ = &receive;
     sources_ = &sources;
+    stats_ = {};
+    first_error_.reset();
+    return {};
+}
+
+std::expected<void, ProgressError> ConnectionIoBinding::Close(bool callbacks_stopped) noexcept {
+    if (!progress_) {
+        return {};
+    }
+    if (!callbacks_stopped) {
+        return std::unexpected(ProgressError{ProgressErrorCode::kInUse});
+    }
+    if (const auto removed = progress_->RemoveReceiveDomain(*receive_); !removed) {
+        return removed;
+    }
+    progress_ = nullptr;
+    receive_ = nullptr;
+    sources_ = nullptr;
     return {};
 }
 

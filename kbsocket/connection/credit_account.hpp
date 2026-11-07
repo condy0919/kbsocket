@@ -132,6 +132,9 @@ struct CreditDomainStats {
     std::uint64_t physical_posted = 0;
     std::uint64_t held = 0, released = 0, unattributed = 0;
     std::uint32_t active_peers = 0, tombstones = 0;
+    // Peer 已退休仍可能被撤回控制器借用；物理域关闭前必须解除全部绑定。
+    std::uint32_t withdrawal_bindings = 0;
+    bool admission_stopped = false;
     bool frozen = false;
 };
 struct CreditPeerStats {
@@ -182,6 +185,9 @@ public:
     std::expected<RxCreditReceipt, CreditError> ConsumeUnknown() noexcept;
     std::expected<void, CreditError> Release(RxCreditReceipt receipt) noexcept;
     std::expected<void, CreditError> RecordRefillAccepted(std::span<const RxCreditReceipt> receipts) noexcept;
+    /// 停止新 Peer 准入和授信，但不冻结物理接收域；已有授权的 RX、Release 和补投继续推进。
+    /// 用于正常关闭前的撤回阶段，不回收未撤回授权，也不提供 DMA 静默证明。
+    void StopAdmission() noexcept;
     /// 仅冻结新准入/授信，不假造 RQE 消耗。refill 接受未知等外部故障通过此处停用域，
     /// 仍可记录既有可信 accepted 前缀；未知 raw DMA 责任继续由宿主保留，不能猜测记账。
     void Freeze() noexcept;

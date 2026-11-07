@@ -410,6 +410,23 @@ ConnectionProgress::AddReceiveDomain(connection::EagerReceiveDomain& domain) noe
     state_->domains[state_->domain_count++] = &domain;
     return {};
 }
+std::expected<void, ProgressError>
+ConnectionProgress::RemoveReceiveDomain(connection::EagerReceiveDomain& domain) noexcept {
+    if (!state_) {
+        return {};
+    }
+    for (std::size_t i = 0; i < state_->domain_count; ++i) {
+        if (state_->domains[i] != &domain) {
+            continue;
+        }
+        state_->domains[i] = state_->domains[--state_->domain_count];
+        state_->domains[state_->domain_count] = nullptr;
+        // 下一次轮询从有效成员起步；只解绑借用，不触碰域的 Held/补投/关闭状态。
+        state_->next_domain = 0;
+        return {};
+    }
+    return Error(ProgressErrorCode::kInvalidArgument);
+}
 std::expected<ProgressBatch, ProgressError> ConnectionProgress::Progress(ProgressKind kind, std::size_t budget,
                                                                          std::uint64_t now) noexcept {
     if (!state_) {

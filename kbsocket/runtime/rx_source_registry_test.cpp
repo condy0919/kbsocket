@@ -576,6 +576,129 @@ TEST_F(RxSourceRegistryTest, BridgeAccountsUnknownSourceAndFreezesDomain) {
     EXPECT_TRUE(routes.Close());
 }
 
+TEST_F(RxSourceRegistryTest, BridgeDetachRequiresCallbackBarrierAndPreservesPendingRefill) {
+    Register(route_);
+    connection::ConnectionTable routes;
+    ASSERT_TRUE(routes.Open({11, 33}, 2));
+    connection::EagerReceiveDomain receive;
+    ASSERT_TRUE(receive.Open(buffers_, credits_, routes));
+    ConnectionProgress progress;
+    ASSERT_TRUE(progress.Open({.context = &context_}));
+    ConnectionIoBinding io;
+    ASSERT_TRUE(io.Open(progress, receive, registry_));
+    ASSERT_TRUE(credits_.Grant(route_.source.peer, connection::CreditClass::kData, 2));
+    ASSERT_TRUE(io.OnRx(Event(route_), 100));
+    const auto denied = io.Close(false);
+    ASSERT_FALSE(denied);
+    EXPECT_EQ(denied.error().code, ProgressErrorCode::kInUse);
+    // 未证明回调停用时注册必须原封不动，原 owner 仍可完成真实补投。
+    ASSERT_TRUE(progress.Progress(ProgressKind::kRefill, 8, 200));
+    EXPECT_EQ(receive.pending_refill(), 0u);
+    EXPECT_EQ(credits_.stats().physical_posted, 16u);
+
+    ASSERT_TRUE(io.OnRx(Event(route_), 300));
+    ASSERT_EQ(receive.pending_refill(), 1u);
+    ASSERT_TRUE(io.Close(true));
+    ASSERT_TRUE(io.Close(false));
+    EXPECT_EQ(io.stats().stale_route_drops, 2u);
+    // 解绑只撤销调度借用，不把 Release 当作已 post，也不能清退仍然欠补投的 receipt。
+    const auto detached = progress.Progress(ProgressKind::kRefill, 8, 400);
+    ASSERT_TRUE(detached);
+    EXPECT_EQ(detached->processed, 0u);
+    EXPECT_EQ(receive.pending_refill(), 1u);
+    EXPECT_EQ(credits_.stats().physical_posted, 15u);
+    const auto late_rx = io.OnRx({}, 500);
+    ASSERT_FALSE(late_rx);
+    EXPECT_EQ(late_rx.error().code, ConnectionIoErrorCode::kNotReady);
+    const auto late_tx = io.OnTx({});
+    ASSERT_FALSE(late_tx);
+    EXPECT_EQ(late_tx.error().code, ConnectionIoErrorCode::kNotReady);
+
+    // 新绑定重新开始诊断，保留的真实补投责任仍由同一域结清。
+    ASSERT_TRUE(io.Open(progress, receive, registry_));
+    EXPECT_FALSE(io.first_error());
+    EXPECT_EQ(io.stats().failures, 0u);
+    EXPECT_EQ(io.stats().rx_events, 0u);
+    ASSERT_TRUE(progress.Progress(ProgressKind::kRefill, 8, 600));
+    EXPECT_EQ(receive.pending_refill(), 0u);
+    EXPECT_EQ(credits_.stats().physical_posted, 16u);
+    EXPECT_TRUE(io.Close(true));
+    EXPECT_TRUE(receive.Close());
+    EXPECT_TRUE(progress.Progress(ProgressKind::kRefill, 8, 700));
+    EXPECT_TRUE(progress.Close());
+    EXPECT_TRUE(routes.Close());
+}
+
+TEST_F(RxSourceRegistryTest, BridgeCanDetachAfterSchedulerCloseWithoutTouchingDomain) {
+    connection::ConnectionTable routes;
+    ASSERT_TRUE(routes.Open({11, 33}, 2));
+    connection::EagerReceiveDomain receive;
+    ASSERT_TRUE(receive.Open(buffers_, credits_, routes));
+    ConnectionProgress progress;
+    ASSERT_TRUE(progress.Open({.context = &context_}));
+    ConnectionIoBinding io;
+    ASSERT_TRUE(io.Open(progress, receive, registry_));
+    ASSERT_TRUE(progress.Close());
+    // scheduler 关闭已撤掉注册，但并不自行证明 raw callback 退出，桥接器仍需显式屏障。
+    EXPECT_FALSE(io.Close(false));
+    EXPECT_TRUE(io.Close(true));
+    EXPECT_EQ(buffers_.posted(), 16u);
+    EXPECT_FALSE(credits_.stats().frozen);
+    EXPECT_TRUE(receive.Close());
+    EXPECT_TRUE(routes.Close());
+}
+
+TEST_F(RxSourceRegistryTest, RemovingUnregisteredDomainPreservesRegisteredRefill) {
+    Register(route_);
+    connection::ConnectionTable routes;
+    ASSERT_TRUE(routes.Open({11, 33}, 2));
+    connection::EagerReceiveDomain receive, other;
+    ASSERT_TRUE(receive.Open(buffers_, credits_, routes));
+    ConnectionProgress progress;
+    ASSERT_TRUE(progress.Open({.context = &context_}));
+    ConnectionIoBinding io;
+    ASSERT_TRUE(io.Open(progress, receive, registry_));
+    ASSERT_TRUE(credits_.Grant(route_.source.peer, connection::CreditClass::kData, 1));
+    ASSERT_TRUE(io.OnRx(Event(route_), 100));
+    const auto removed = progress.RemoveReceiveDomain(other);
+    ASSERT_FALSE(removed);
+    EXPECT_EQ(removed.error().code, ProgressErrorCode::kInvalidArgument);
+    // 指针身份不匹配不能清除合法成员；同一个接收域也不能重复登记来绕过独占补投。
+    EXPECT_FALSE(progress.AddReceiveDomain(receive));
+    ASSERT_TRUE(progress.Progress(ProgressKind::kRefill, 8, 200));
+    EXPECT_EQ(receive.pending_refill(), 0u);
+    EXPECT_EQ(credits_.stats().physical_posted, 16u);
+    ASSERT_TRUE(io.Close(true));
+    EXPECT_FALSE(progress.RemoveReceiveDomain(receive));
+    EXPECT_TRUE(receive.Close());
+    EXPECT_TRUE(progress.Close());
+    EXPECT_TRUE(progress.RemoveReceiveDomain(receive));
+    EXPECT_TRUE(routes.Close());
+}
+
+TEST_F(RxSourceRegistryTest, BridgeDetachDoesNotAllocateOrCloseRawResources) {
+    connection::ConnectionTable routes;
+    ASSERT_TRUE(routes.Open({11, 33}, 2));
+    connection::EagerReceiveDomain receive;
+    ASSERT_TRUE(receive.Open(buffers_, credits_, routes));
+    ConnectionProgress progress;
+    ASSERT_TRUE(progress.Open({.context = &context_}));
+    ConnectionIoBinding io;
+    ASSERT_TRUE(io.Open(progress, receive, registry_));
+    allocations = 0;
+    count_allocations = true;
+    const auto closed = io.Close(true);
+    count_allocations = false;
+    ASSERT_TRUE(closed);
+    EXPECT_EQ(allocations, 0u);
+    EXPECT_EQ(buffers_.posted(), 16u);
+    EXPECT_TRUE(pool_.ready());
+    EXPECT_FALSE(credits_.stats().frozen);
+    EXPECT_TRUE(receive.Close());
+    EXPECT_TRUE(progress.Close());
+    EXPECT_TRUE(routes.Close());
+}
+
 TEST_F(RxSourceRegistryTest, BridgeRejectsUnpreparedAndMismatchedDependencies) {
     ConnectionIoBinding io;
     auto missing = io.OnRx({}, 0);

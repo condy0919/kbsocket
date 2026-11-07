@@ -66,6 +66,9 @@ public:
     // RX/Credit 和补投影响共享 Peer 共账，启动一轮有预算的巡检，合并重复请求。
     std::expected<void, ProgressError> RequestSweep() noexcept;
     std::expected<void, ProgressError> AddReceiveDomain(connection::EagerReceiveDomain& domain) noexcept;
+    /// 控制路径移除同一对象的补投注册，不关闭域或结清 Lease；调用方先停用 raw 回调和相关借用。
+    /// 调度器已 Close 时注册表已清空，允许最终解绑；调度器仍开着但未登记该对象则拒绝。
+    std::expected<void, ProgressError> RemoveReceiveDomain(connection::EagerReceiveDomain& domain) noexcept;
     std::expected<void, ProgressError> Close() noexcept;
     const ConnectionProgressStats* stats() const noexcept;
 

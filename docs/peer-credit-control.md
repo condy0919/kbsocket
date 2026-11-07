@@ -77,8 +77,10 @@ Begin 的 fd 必须由宿主独占，不能复用 Connection/LaneControl fd 或�
 
 Release/Abort 解除绑定不代表可以销毁账本背后的 raw 资源。宿主仍须汇总整个域的所有 Peer 关系和独立 TX、来源、Held、通知/async 责任，停止相关进度绑定后在控制路径推进 M1；正常关闭与故障保留分别遵守原证明门禁。RuntimeShard Close 仅解绑 source，不自动 Close/Abort 这些控制器。
 
+M5.3.9 的 [RawDomain](raw-domain.md) 提供单域资源所有权。BeginClose 使用接收账本的 StopAdmission 关闭新 Admit/Grant，同时保持 Consume/Release/真实 refill，供撤回继续收敛。AdvanceClose 要求 `withdrawal_bindings==0` 才能进入物理删除；Peer 已退休不代表控制器已解绑。宿主必须先 Release/Abort，且另行满足 TX、来源、进度及 M1 门禁，不能把账本冻结或协议失败当作静默证明。
+
 ## 验证与后续范围
 
 控制帧及协调器已通过 Mock 账本、非阻塞 socketpair 和本地 IPv4 TCP 验证。协调器 30 项测试涵盖停止/计数/迟到 RX/超时/身份、发送背压与最终 ACK/EOF 竞态；与真实 Mock RxBufferPool/EagerReceiveDomain 的组合还验证了 Held 归还、实际 refill 和独立 M1 关闭的顺序。完整回归结果见 [roadmap](roadmap.md)。这些测试不构成 UB 真机观测。
 
-M5.3.8 的调度验证覆盖 fd 接管回滚、容量与代次、定时结账、独立 Peer 失败、终态绑定和暂停屏障；完整结果见 roadmap。建立/认证专用连接、整个 Peer 生命周期、raw 资源工厂及 M1 自动编排仍待后续，不实现透明重连、业务重放、RMA Grant 撤销或故障 CQ 在线恢复。
+M5.3.8 的调度验证覆盖 fd 接管回滚、容量与代次、定时结账、独立 Peer 失败、终态绑定和暂停屏障；完整结果见 roadmap。M5.3.9 已有单域资源所有者，建立/认证专用连接、整个 Peer 生命周期及跨域关闭编排仍待后续，不实现透明重连、业务重放、RMA Grant 撤销或故障 CQ 在线恢复。

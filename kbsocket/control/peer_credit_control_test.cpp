@@ -347,12 +347,16 @@ TEST_F(PeerCreditControlTest, ControlEofRetainsOutstandingGrantsAndStopsNewSends
 
 TEST_F(PeerCreditControlTest, AbortUnbindsControlWithoutReturningUnverifiedCredits) {
     OpenBoth();
+    EXPECT_EQ(left_.receive.stats().withdrawal_bindings, 1u);
     EXPECT_FALSE(left_.sender.Close());
     EXPECT_FALSE(left_.sender.Open({right_.identity.runtime, right_.identity.receive_domain, right_.epoch + 1}));
     const auto retired = left_.receive.RetirePeer(left_.peer, {true, true, true});
     ASSERT_FALSE(retired);
     EXPECT_EQ(retired.error().code, CreditErrorCode::kInUse);
     ASSERT_TRUE(left_.controller.Close());
+    EXPECT_EQ(left_.receive.stats().withdrawal_bindings, 0u);
+    ASSERT_TRUE(left_.controller.Close());
+    EXPECT_EQ(left_.receive.stats().withdrawal_bindings, 0u);
     ExpectUnretired();
     EXPECT_TRUE(left_.sender.stats().stopped);
     EXPECT_EQ(left_.controller.fd(), -1);
@@ -361,14 +365,43 @@ TEST_F(PeerCreditControlTest, AbortUnbindsControlWithoutReturningUnverifiedCredi
 }
 
 TEST_F(PeerCreditControlTest, BindingSurvivesRetirementUntilControlClose) {
+    EXPECT_EQ(left_.receive.stats().withdrawal_bindings, 0u);
     OpenBoth();
+    EXPECT_EQ(left_.receive.stats().withdrawal_bindings, 1u);
     Pump();
     ASSERT_TRUE(left_.controller.stats().complete);
+    // active_peers 清零只证明授权已撤回，控制器仍借用账本，关闭屏障必须独立计数。
+    EXPECT_EQ(left_.receive.stats().active_peers, 0u);
+    EXPECT_EQ(left_.receive.stats().withdrawal_bindings, 1u);
     EXPECT_FALSE(left_.receive.Close());
     EXPECT_FALSE(left_.sender.Close());
     ASSERT_TRUE(left_.controller.Close());
+    EXPECT_EQ(left_.receive.stats().withdrawal_bindings, 0u);
     EXPECT_TRUE(left_.receive.Close());
     EXPECT_TRUE(left_.sender.Close());
+}
+
+TEST_F(PeerCreditControlTest, AdmissionStopStillAllowsWithdrawalOfExistingPeers) {
+    Accept(left_, CreditClass::kData, 1);
+    left_.receive.StopAdmission();
+    right_.receive.StopAdmission();
+    // 停准入后仍能绑定撤回控制器；旧 SEND 的 RX 到达前，不能提前释放已发布授权。
+    OpenBoth();
+    Pump();
+    EXPECT_FALSE(right_.controller.stats().complete);
+    EXPECT_EQ(right_.receive.stats().withdrawal_bindings, 1u);
+    const auto receipt = Consume(right_, CreditClass::kData);
+    ASSERT_TRUE(right_.receive.Release(receipt));
+    Pump();
+    EXPECT_FALSE(right_.controller.stats().complete);
+    ASSERT_TRUE(right_.receive.RecordRefillAccepted(std::span(&receipt, 1)));
+    Pump();
+    EXPECT_TRUE(left_.controller.stats().complete);
+    EXPECT_TRUE(right_.controller.stats().complete);
+    EXPECT_TRUE(right_.receive.stats().admission_stopped);
+    EXPECT_FALSE(right_.receive.stats().frozen);
+    EXPECT_EQ(right_.receive.stats().active_peers, 0u);
+    EXPECT_EQ(right_.receive.stats().withdrawal_bindings, 1u);
 }
 
 TEST_F(PeerCreditControlTest, IndependentPeerCanStillConsumeRefillAndReceiveGrants) {
@@ -556,7 +589,22 @@ TEST_F(PeerCreditControlTest, InvalidOpenKeepsFdAndDoesNotFreezeOrStopLedgers) {
     EXPECT_GE(::fcntl(fds_[0], F_GETFD), 0);
     EXPECT_FALSE(left_.sender.stats().stopped);
     EXPECT_FALSE(left_.receive.PeerStats(left_.peer)->frozen);
+    EXPECT_EQ(left_.receive.stats().withdrawal_bindings, 0u);
     OpenBoth();
+    Pump();
+    EXPECT_TRUE(left_.controller.stats().complete);
+}
+
+TEST_F(PeerCreditControlTest, ChannelOpenFailureRollsBackWithdrawalBindingCount) {
+    // channel Open 失败发生在两份账本均已绑定之后，必须撤销计数且保留重试能力。
+    const auto opened = left_.controller.Open(-1, Config(left_, right_), 0);
+    ASSERT_FALSE(opened);
+    EXPECT_EQ(opened.error().code, Code::kChannel);
+    EXPECT_EQ(left_.receive.stats().withdrawal_bindings, 0u);
+    EXPECT_FALSE(left_.sender.stats().stopped);
+    EXPECT_FALSE(left_.receive.PeerStats(left_.peer)->frozen);
+    OpenBoth();
+    EXPECT_EQ(left_.receive.stats().withdrawal_bindings, 1u);
     Pump();
     EXPECT_TRUE(left_.controller.stats().complete);
 }
@@ -572,10 +620,12 @@ TEST_F(PeerCreditControlTest, ReceiverBindingFailureRollsBackNewSenderBinding) {
     config.sender = &alternate_sender;
     const auto opened = duplicate.Open(additional_fds[0], config, 0);
     EXPECT_FALSE(opened);
+    EXPECT_EQ(left_.receive.stats().withdrawal_bindings, 1u);
     EXPECT_GE(::fcntl(additional_fds[0], F_GETFD), 0);
     EXPECT_FALSE(alternate_sender.stats().stopped);
     EXPECT_TRUE(alternate_sender.Close());
     EXPECT_TRUE(duplicate.Close());
+    EXPECT_EQ(left_.receive.stats().withdrawal_bindings, 1u);
     ::close(additional_fds[0]);
     ::close(additional_fds[1]);
 }

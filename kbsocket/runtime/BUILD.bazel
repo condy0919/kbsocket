@@ -3,6 +3,44 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "raw_domain",
+    srcs = ["raw_domain.cpp"],
+    hdrs = ["raw_domain.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":connection_io",
+        ":raw_context_progress",
+        ":rx_source_registry",
+        "//kbsocket/connection:connection_table",
+        "//kbsocket/connection:credit_account",
+        "//kbsocket/connection:eager_rx",
+        "//kbsocket/transport/raw:attempt_ledger",
+        "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:receive_domain_closer",
+        "//kbsocket/transport/raw:rx_buffer_pool",
+        "//kbsocket/transport/raw:tx_sender",
+    ],
+)
+
+cc_test(
+    name = "raw_domain_test",
+    srcs = ["raw_domain_test.cpp"],
+    deps = [
+        ":connection_progress",
+        ":raw_domain",
+        ":runtime_shard",
+        ":rx_source_registry",
+        "//kbsocket/connection:connection_table",
+        "//kbsocket/connection:credit_account",
+        "//kbsocket/connection:eager_rx",
+        "//kbsocket/connection:wire_frame",
+        "//kbsocket/control:peer_credit_control",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "peer_credit_progress",
     srcs = ["peer_credit_progress.cpp"],
     hdrs = ["peer_credit_progress.hpp"],

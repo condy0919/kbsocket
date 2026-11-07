@@ -33,6 +33,10 @@ class ConnectionIoBinding {
 public:
     std::expected<void, ProgressError> Open(ConnectionProgress& progress, connection::EagerReceiveDomain& receive,
                                             RxSourceRegistry& sources) noexcept;
+    /// 宿主已解绑全部 raw 回调且停止相关外部访问后，在 owner 控制路径移除补投注册和借用。
+    /// false 不能由空 CQ/空账本代替；Close 不归还 Lease、不撤回授信、不关闭 raw 资源。
+    /// 已解绑时幂等；成功后可重新 Open，新绑定重新开始诊断计数。
+    std::expected<void, ProgressError> Close(bool callbacks_stopped) noexcept;
     std::expected<void, ConnectionIoError> OnRx(const raw::RxBufferEvent& event, std::uint64_t now_ns) noexcept;
     std::expected<void, ConnectionIoError> OnTx(const raw::TxCompletionEvent& event) noexcept;
     /// raw 域停止/隔离必须同步冻结物理 Credit，不能仅停止底层 refill 而继续给对端授信。

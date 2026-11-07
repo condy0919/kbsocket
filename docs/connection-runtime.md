@@ -1,6 +1,6 @@
 # M5.3：连接 Runtime 与主动 Lane 来源协商
 
-本阶段将 Connection、raw 队列、导入缓存和 RX 来源表接入同一个 `RuntimeShard`。owner 通过 `Tick`/`RunOnce` 推进 HELLO/READY、导入、TX/RX、物理补投、累计 Credit 和 FIN。M5.3.2 通过 HELLO 交换主动 Lane，并在 READY 前自动登记 RX 来源；M5.3.3 增加在线 Lane 公告与确认；M5.3.4 用 `ConnectionOwner` 统一拥有连接对象及其来源适配器，提供有界建链与读写入口。M5.3.5 增加 `ConnectionMailbox`，把业务线程的读写等命令交给唯一 owner。M5.3.7–8 提供 [Peer 授信撤回协调器及其 Runtime 调度](peer-credit-control.md)。raw 物理资源与入口认证仍由宿主负责；当前尚未形成完整 Runtime 工厂或稳定应用 ABI。
+本阶段将 Connection、raw 队列、导入缓存和 RX 来源表接入同一个 `RuntimeShard`。owner 通过 `Tick`/`RunOnce` 推进 HELLO/READY、导入、TX/RX、物理补投、累计 Credit 和 FIN。M5.3.2 通过 HELLO 交换主动 Lane，并在 READY 前自动登记 RX 来源；M5.3.3 增加在线 Lane 公告与确认；M5.3.4 用 `ConnectionOwner` 统一拥有连接对象及其来源适配器，提供有界建链与读写入口。M5.3.5 增加 `ConnectionMailbox`，把业务线程的读写等命令交给唯一 owner。M5.3.7–8 提供 [Peer 授信撤回协调器及其 Runtime 调度](peer-credit-control.md)。M5.3.9 的 [RawDomain](raw-domain.md) 拥有单接收域资源并协调物理关闭及元数据清退；context、Slab、导入及入口认证仍由宿主负责，当前尚未形成完整 Runtime 工厂或稳定应用 ABI。
 
 ## 组件与暂停范围
 
@@ -16,6 +16,7 @@
 | `HandshakeRxSources` | 把经过宿主授权的对端 HELLO Lane 快照一次性登记到对应 RX pool，保留绑定直至明确静默 |
 | `LaneControl` | 在双方 READY 后接管控制 fd；新 Lane 经远端登记并确认后才开放本端投递 |
 | `ConnectionIoBinding` | raw 回调到 Connection 的桥接；旧帧物理结账、未知来源冻结、错误记录与 Credit 冻结传播 |
+| `RawDomain` | 拥有单域队列/RX/TX/授信/路由/来源/桥接，真实初始 post 后发布视图，独立屏障满足后按 M1 顺序关闭 |
 
 `RawContextBinding.connections`、`.control`、`.mailbox` 和 `.peers` 分别指向连接源、导入源、业务命令源及 Peer 撤回源。设备进度源声明 `exclusive_context()`；RuntimeShard 为每个 context 组装暂停组，拒绝归属不一致的源、跨 context 复用的 companion 以及访问 raw 的独立 hooks。内存归还 hooks 可继续独立接入；它们不能在 context 暂停期间操作该 context。raw mailbox 从 ConnectionOwner 继承 context 身份，必须加入对应暂停组。无 raw context 时，可把 NativeTCP 的 ConnectionProgress 与 ConnectionMailbox 合为一个 ContextProgressGroup 后作为 hooks 接入。
 
@@ -24,6 +25,8 @@
 导入缓存新增 `PrepareOperation`、`CommitOperation`、`DiscardOperation`：Prepare 只固定参数并占用 context/并发槽，不调用 provider；执行器接受后 Commit 仅写 owner 元数据，不读取 worker 输出。执行器队列满时保留同一准备任务重试。已提交任务即使被取消也必须收割，未提交任务才可以 Discard。原 `StartOperation` 显式暂停接口继续可用；注册至 RuntimeShard 后禁止额外执行器并行驱动同一缓存/context。
 
 ## 装配顺序
+
+M5.3.9 可用 `RawDomain::Open` 代替以下手工创建的单域队列、RX、TX 账本、接收 Credit、路由及来源表，再以 `Bind(ConnectionProgress&)` 生成第 2–3 步的桥接和 RawQueueBinding。context、Slab、导入、逻辑连接及 Peer 发送账本仍独立装配；具体失败与关闭契约见 [raw 接收域所有权](raw-domain.md)。
 
 1. 在控制路径创建 raw context、JettyPool、AttemptLedger、`TxSender::Open(ledger, true)`、Slab、RX pool、Credit 总账、路由表及导入缓存。初始 RX 全部实际 post 并记账后打开 `EagerReceiveDomain`。
 2. 每个 context 打开 `ConnectionProgress`（指定同一个 context）和 `ImportProgress`（指定完整 incarnation）；每个 RX pool 打开独立 `RxSourceRegistry`。用 `ConnectionIoBinding::Open` 绑定三者，同时登记由连接源负责补投的接收域。
@@ -136,7 +139,7 @@ M5.3.6 增加 `EagerReceiveDomain::CloseDestroyed(const raw::ReceiveDomainCloser
 
 M5.3.7 的 `PeerCreditControl` 用另一条已认证的专用非阻塞 fd 处理整个 Peer 共账撤回，不接管 Connection/LaneControl 的控制 fd，也不由 Connection Close 自动启动。成功 Open 后停止新的 Sender Reserve、冻结对应接收 Peer 的 Grant；同 Peer 的所有连接共用这个发送账本，因此都会停止发送。已有 Connection 发现冻结账本会显式失败，宿主必须继续推进 Close 以归还缓冲 Held；这一过程不保证未提交的应用数据发完。其他 Peer 可继续工作。
 
-协议推进必须与账本同 owner，并遵守对应 context 暂停屏障。宿主继续处理真实 TX 终结与迟到 RX、Release 和实际 refill，直到接收端逐类消费计数等于对端固定的最终接受量且全部 receipt 结清；不要提前 Freeze 整个 Eager RX 域。协调器在核实后退休 Peer 并 ACK，双方确认完成也不替代 TX DMA、来源、通知/async 引用或 M1 证明。M5.3.8 的 PeerCreditProgress 已接入 Runtime 调度和专用 fd 管理：BeginWithdrawal 显式发起，终态回调后 Release；主动 Abort 仅解除绑定并保留未证实责任。完整关闭编排仍待后续，接线步骤见 [Peer 授信撤回](peer-credit-control.md#宿主推进顺序)。
+协议推进必须与账本同 owner，并遵守对应 context 暂停屏障。宿主继续处理真实 TX 终结与迟到 RX、Release 和实际 refill，直到接收端逐类消费计数等于对端固定的最终接受量且全部 receipt 结清；不要提前 Freeze 整个 Eager RX 域。协调器在核实后退休 Peer 并 ACK，双方确认完成也不替代 TX DMA、来源、通知/async 引用或 M1 证明。M5.3.8 的 PeerCreditProgress 已接入 Runtime 调度和专用 fd 管理：BeginWithdrawal 显式发起，终态回调后 Release；主动 Abort 仅解除绑定并保留未证实责任。RawDomain::BeginClose 只停止新准入和授信，保留 RX 收敛路径；其 AdvanceClose 在撤回绑定等责任解除后推进单域关闭。跨域编排仍由宿主完成，接线步骤见 [Peer 授信撤回](peer-credit-control.md#宿主推进顺序)。
 
 控制器绑定期间拒绝直接关闭 Sender、外部 RetirePeer 以及整域 CloseDestroyed。错误或超时保留冻结账本；控制器 Close 解除绑定后才可继续真实 M1 关闭与 M5.3.6 清退，但不会替宿主补足关闭证明。`complete` 与历史统计不能用于删除资源或自动退休来源。
 
@@ -148,4 +151,6 @@ M5.3.2/3 新增协议边界、原子登记/更新、授权和来源就绪门禁�
 
 M5.3.5 增加并发提交/领取、完成背压、有限预算、缓冲复制、陈旧句柄、一次执行与零分配测试；Mock raw 闭环还覆盖 mailbox Read/FIN、Credit 补投以及慢导入期间同 context 暂停、另一 context 继续执行。
 
-下一阶段继续补 raw 资源装配与全域关闭编排，再收口显式 C ABI 和零拷贝接口。M5.3.6 已提供 M1 完整关闭后冻结/未补投 receipt 的核销入口，M5.3.7–8 已有独立授信撤回协调器及其 Runtime source；完整 raw 资源所有者仍须组织此前的静默、来源退休与进度解绑，不能通过 ConnectionOwner 析构或授信 ACK 推断物理资源可释放。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。
+M5.3.9 已交付 RawDomain 单域所有者。Runtime 解绑后，`ConnectionIoBinding::Close(true)` 从 ConnectionProgress 的固定补投数组移除本域再清除借用；未停止回调时拒绝，不分配、不调用 provider。ConnectionProgress 可先 Close，但对象必须存活且不得重开，直到桥接解绑。单独使用桥接的宿主也须遵守这一顺序。
+
+下一阶段继续补多 context 顶层装配及 Slab/导入/ConnectionOwner 的关闭编排，再收口显式 C ABI 和零拷贝接口。宿主仍须组织静默、来源退休与进度解绑，不能通过 ConnectionOwner 析构或授信 ACK 推断物理资源可释放。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。

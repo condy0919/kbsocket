@@ -121,6 +121,10 @@ public:
     /// 若仍绑定 RX buffer 池、有票据或尚未完成 ERROR 排空，返回 `kInUse` 并保持轮询可用；删除失败保留句柄供重试。
     std::expected<void, JettyPoolFailure> Close() noexcept;
 
+    /// 无副作用地确认全部 TX 票据和 ERROR/软件 flush 边界已排空。
+    /// 控制路径在解绑进度源前调用；成功不替代远端静默、事件确认或外部使用者退出证明。
+    std::expected<void, JettyPoolFailure> CheckTxDrained() const noexcept;
+
     /// 永久隔离整个 CQ 依赖域，禁止 post/poll、替换及删除；只能保留依赖至进程退出。
     /// 不是故障恢复；调用方仍须让池、RX 内存、账本、context 和事件引用一起存活。
     void RetainDependencies() noexcept;
@@ -283,7 +287,6 @@ private:
 
     // 停止新的发送准入，但保留已有票据、CQ 轮询与 ERROR 排空能力。
     void StopAdmission() noexcept;
-    std::expected<void, JettyPoolFailure> CheckTxDrained() const noexcept;
     // 仅由具备远端静默和事件屏障的域关闭协调器跨越 RX owner 绑定销毁队列。
     std::expected<void, JettyPoolFailure> CloseQueues() noexcept;
     std::expected<void, JettyPoolFailure> CloseCompletionQueues() noexcept;

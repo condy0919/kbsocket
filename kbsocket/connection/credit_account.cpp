@@ -232,13 +232,9 @@ std::expected<void, CreditError> ReceiveCreditDomain::Close() noexcept {
     if (state_->stats.unattributed) {
         return Error(CreditErrorCode::kRetained);
     }
-    if (state_->stats.active_peers || state_->stats.held || state_->stats.released) {
+    if (state_->stats.active_peers || state_->stats.held || state_->stats.released ||
+        state_->stats.withdrawal_bindings) {
         return Error(CreditErrorCode::kInUse);
-    }
-    for (std::uint32_t i = 0; i < state_->peer_slots; ++i) {
-        if (state_->peers[i].withdrawal_owner) {
-            return Error(CreditErrorCode::kInUse);
-        }
     }
     state_.reset();
     return {};
@@ -294,10 +290,8 @@ std::expected<void, CreditError> ReceiveCreditDomain::CloseDestroyed(const Eager
     if (state_->stats.held || state_->stats.released != released_receipts) {
         return Error(CreditErrorCode::kRetained);
     }
-    for (std::uint32_t i = 0; i < state_->peer_slots; ++i) {
-        if (state_->peers[i].withdrawal_owner) {
-            return Error(CreditErrorCode::kInUse);
-        }
+    if (state_->stats.withdrawal_bindings) {
+        return Error(CreditErrorCode::kInUse);
     }
     // 物理域已永久销毁，且桥接器已核验全部 receipt；整体终结元数据，不做 U->F 或重新授信。
     // 未归属的旧 RQE 无需猜测其 Peer/类别，不能把本路径用于仍存活的接收域。
@@ -359,7 +353,7 @@ std::expected<CreditPeerHandle, CreditError> ReceiveCreditDomain::Admit(CreditId
     if (!state_) {
         return Error(CreditErrorCode::kNotReady);
     }
-    if (state_->stats.frozen) {
+    if (state_->stats.admission_stopped || state_->stats.frozen) {
         return Error(CreditErrorCode::kStopped);
     }
     if (!Valid(identity) || identity.receive_domain != state_->config.receive_domain) {
@@ -402,7 +396,7 @@ std::expected<std::uint64_t, CreditError> ReceiveCreditDomain::Grant(CreditPeerH
         return Error(CreditErrorCode::kInvalidArgument);
     }
     auto& peer = state_->peers[*index].stats;
-    if (state_->stats.frozen || peer.frozen || peer.retired) {
+    if (state_->stats.admission_stopped || state_->stats.frozen || peer.frozen || peer.retired) {
         return Error(CreditErrorCode::kStopped);
     }
     auto& maximum = kind == CreditClass::kData ? peer.max_data : peer.max_control;
@@ -591,6 +585,11 @@ ReceiveCreditDomain::RecordRefillAccepted(std::span<const RxCreditReceipt> recei
     }
     return {};
 }
+void ReceiveCreditDomain::StopAdmission() noexcept {
+    if (state_) {
+        state_->stats.admission_stopped = true;
+    }
+}
 void ReceiveCreditDomain::Freeze() noexcept {
     if (state_) {
         state_->stats.frozen = true;
@@ -618,6 +617,7 @@ std::expected<void, CreditError> ReceiveCreditDomain::BindWithdrawal(const contr
         return Error(CreditErrorCode::kStopped);
     }
     peer.withdrawal_owner = &owner;
+    ++state_->stats.withdrawal_bindings;
     return {};
 }
 std::expected<void, CreditError> ReceiveCreditDomain::UnbindWithdrawal(const control::PeerCreditControl& owner,
@@ -630,7 +630,11 @@ std::expected<void, CreditError> ReceiveCreditDomain::UnbindWithdrawal(const con
     if (peer.withdrawal_owner != &owner) {
         return Error(CreditErrorCode::kWrongIdentity);
     }
+    if (!state_->stats.withdrawal_bindings) {
+        return Error(CreditErrorCode::kRetained);
+    }
     peer.withdrawal_owner = nullptr;
+    --state_->stats.withdrawal_bindings;
     return {};
 }
 std::expected<void, CreditError> ReceiveCreditDomain::RetireWithdrawn(const control::PeerCreditControl& owner,

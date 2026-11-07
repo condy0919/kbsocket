@@ -488,6 +488,76 @@ TEST_F(ReceiveCreditDomainTest, ClosingStopsNewAuthorizationButLeavesReceiptsPro
     peer_count_ = 0;
 }
 
+TEST_F(ReceiveCreditDomainTest, StopAdmissionPreservesAuthorizedReceivesAndTrustedRefills) {
+    PostAll();
+    const auto peer = Admit(1);
+    ASSERT_TRUE(peer);
+    ASSERT_TRUE(domain_.Grant(*peer, CreditClass::kData, 2));
+    ASSERT_TRUE(domain_.Grant(*peer, CreditClass::kControl, 1));
+    const auto before = domain_.stats();
+
+    // 正常关闭先停准入，不能冻结接收桥接器，否则旧授权的 RX 无法补投并完成撤回。
+    domain_.StopAdmission();
+    domain_.StopAdmission();
+    EXPECT_TRUE(domain_.stats().admission_stopped);
+    EXPECT_FALSE(domain_.stats().frozen);
+    EXPECT_FALSE(domain_.PeerStats(*peer)->frozen);
+    const auto rejected = Admit(2);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code, CreditErrorCode::kStopped);
+    for (const auto kind : {CreditClass::kData, CreditClass::kControl}) {
+        const auto grant = domain_.Grant(*peer, kind, 1);
+        ASSERT_FALSE(grant);
+        EXPECT_EQ(grant.error().code, CreditErrorCode::kStopped);
+    }
+    EXPECT_EQ(domain_.stats().active_peers, before.active_peers);
+    EXPECT_EQ(domain_.stats().physical_posted, before.physical_posted);
+    EXPECT_EQ(domain_.stats().data.granted, before.data.granted);
+    EXPECT_EQ(domain_.stats().control.granted, before.control.granted);
+
+    // 已接受发送的控制额度发布以及迟到 data/control RX 仍按原授权结账。
+    ASSERT_TRUE(domain_.RecordPublishedControl(*peer, 1));
+    for (const auto kind : {CreditClass::kData, CreditClass::kControl}) {
+        const auto receipt = Consume(*peer, kind);
+        ASSERT_TRUE(receipt);
+        ASSERT_TRUE(domain_.Release(*receipt));
+        ASSERT_TRUE(domain_.RecordRefillAccepted(std::span(&*receipt, 1)));
+    }
+    EXPECT_EQ(domain_.stats().physical_posted, before.physical_posted);
+    EXPECT_EQ(domain_.stats().held, 0u);
+    EXPECT_EQ(domain_.stats().released, 0u);
+    EXPECT_FALSE(domain_.stats().frozen);
+    ASSERT_TRUE(domain_.RetirePeer(*peer, kProof));
+    CheckConservation();
+}
+
+TEST_F(ReceiveCreditDomainTest, AdmissionStopResetsOnlyWhenNewDomainOpens) {
+    // 初始 post 的可信结果即使在停准入后到达也必须入账；Stop 本身不改变物理责任。
+    domain_.StopAdmission();
+    PostAll();
+    EXPECT_EQ(domain_.stats().physical_posted, 16u);
+    EXPECT_FALSE(Admit(1));
+    EXPECT_FALSE(domain_.stats().frozen);
+    domain_.Freeze();
+    domain_.StopAdmission();
+    EXPECT_TRUE(domain_.stats().frozen);
+    ASSERT_TRUE(domain_.Close());
+    domain_.StopAdmission();
+    EXPECT_FALSE(domain_.stats().admission_stopped);
+
+    // 新 incarnation 不能继承旧域的停准入状态，旧域也不能靠再次 Open 原身份恢复。
+    EXPECT_FALSE(domain_.Open(Config()));
+    ASSERT_TRUE(domain_.Open(Config(11)));
+    EXPECT_FALSE(domain_.stats().admission_stopped);
+    EXPECT_FALSE(domain_.stats().frozen);
+    EXPECT_EQ(domain_.stats().withdrawal_bindings, 0u);
+    PostAll();
+    const auto peer = Admit(1, 1, 11);
+    ASSERT_TRUE(peer);
+    ASSERT_TRUE(domain_.Grant(*peer, CreditClass::kData, 1));
+    CheckConservation();
+}
+
 TEST_F(ReceiveCreditDomainTest, FreezeDoesNotInventRxAndStillRecordsTrustedRefillPrefix) {
     PostAll();
     auto peer = Admit(1);
