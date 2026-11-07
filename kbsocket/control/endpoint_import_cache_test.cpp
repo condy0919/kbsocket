@@ -596,6 +596,124 @@ TEST_F(ImportCacheTest, CloseStopsAdmissionAndCannotResetTicketGeneration) {
     ExpectError(cache_.Open(), ImportCacheErrorCode::kInUse);
 }
 
+TEST_F(ImportCacheTest, PreparedReservationSurvivesCancellationUntilDiscarded) {
+    auto lease = Acquire();
+    ASSERT_TRUE(lease);
+    auto next = cache_.NextOperation(&context_, 1);
+    ASSERT_TRUE(next && *next);
+    auto prepared = cache_.PrepareOperation(**next);
+    ASSERT_TRUE(prepared);
+    EXPECT_EQ(cache_.in_flight(), 1u);
+    EXPECT_EQ(provider_.imports.load(), 0u);
+
+    // 任务尚未提交，取消最后一份引用也不能提前回收已准备的工作参数。
+    ASSERT_TRUE(cache_.Release(*lease));
+    cache_.StopAccepting();
+    EXPECT_EQ(cache_.entries(), 1u);
+    ExpectError(cache_.Close(), ImportCacheErrorCode::kInUse);
+    ASSERT_TRUE(cache_.DiscardOperation(*prepared));
+    EXPECT_EQ(cache_.entries(), 0u);
+    EXPECT_EQ(cache_.in_flight(), 0u);
+}
+
+TEST_F(ImportCacheTest, OldPreparedTicketCannotDiscardOrCommitNewReservation) {
+    ASSERT_TRUE(Acquire());
+    auto next = cache_.NextOperation();
+    ASSERT_TRUE(next && *next);
+    auto first = cache_.PrepareOperation(**next);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(cache_.DiscardOperation(*first));
+    auto second = cache_.PrepareOperation(**next);
+    ASSERT_TRUE(second);
+    EXPECT_NE(first->reservation, second->reservation);
+    ExpectError(cache_.DiscardOperation(*first), ImportCacheErrorCode::kInvalidOperation);
+    ExpectError(cache_.CommitOperation(*first, {&executor_, 0, 1}), ImportCacheErrorCode::kInvalidOperation);
+    EXPECT_EQ(cache_.in_flight(), 1u);
+    ASSERT_TRUE(cache_.DiscardOperation(*second));
+}
+
+TEST_F(ImportCacheTest, PreparedTaskCanCompleteBeforeOwnerCommitsItsId) {
+    auto lease = Acquire();
+    ASSERT_TRUE(lease);
+    auto next = cache_.NextOperation();
+    ASSERT_TRUE(next && *next);
+    auto prepared = cache_.PrepareOperation(**next);
+    ASSERT_TRUE(prepared);
+    auto submitted = executor_.TrySubmit(prepared->task);
+    ASSERT_TRUE(submitted);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!provider_.imports.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    // worker 可能已经发布结果，Commit 只能操作 owner 元数据，不能覆写工作参数。
+    ASSERT_TRUE(cache_.CommitOperation(*prepared, *submitted));
+    ExpectError(cache_.DiscardOperation(*prepared), ImportCacheErrorCode::kInvalidOperation);
+    ExpectError(cache_.CommitOperation(*prepared, *submitted), ImportCacheErrorCode::kInvalidOperation);
+    ASSERT_TRUE(CompleteOne());
+    EXPECT_TRUE(cache_.Get(*lease));
+}
+
+TEST_F(ImportCacheTest, PreparedImportCancelledBeforeSubmissionStillHarvestsAndUnimports) {
+    auto lease = Acquire();
+    ASSERT_TRUE(lease);
+    auto next = cache_.NextOperation();
+    ASSERT_TRUE(next && *next);
+    auto prepared = cache_.PrepareOperation(**next);
+    ASSERT_TRUE(prepared);
+    ASSERT_TRUE(cache_.Release(*lease));
+    auto submitted = executor_.TrySubmit(prepared->task);
+    ASSERT_TRUE(submitted);
+    ASSERT_TRUE(cache_.CommitOperation(*prepared, *submitted));
+    ASSERT_TRUE(CompleteOne());
+    EXPECT_EQ(cache_.entries(), 1u);
+    auto cleanup = cache_.NextOperation();
+    ASSERT_TRUE(cleanup && *cleanup);
+    EXPECT_EQ((**cleanup).kind, ImportOperationKind::kUnimport);
+    ASSERT_TRUE(Start(**cleanup));
+    ASSERT_TRUE(CompleteOne());
+    EXPECT_EQ(cache_.entries(), 0u);
+    EXPECT_EQ(provider_.unimports.load(), 1u);
+}
+
+TEST_F(ImportCacheTest, ContextFilterAndPreparedReservationExcludeOtherContextWork) {
+    ASSERT_TRUE(Acquire());
+    key_.local_context = &second_context_;
+    key_.local_context_incarnation = 2;
+    ASSERT_TRUE(Acquire());
+    ExpectError(cache_.NextOperation(&context_, 0), ImportCacheErrorCode::kInvalidArgument);
+    ExpectError(cache_.NextOperation(nullptr, 1), ImportCacheErrorCode::kInvalidArgument);
+    auto absent = cache_.NextOperation(&context_, 2);
+    ASSERT_TRUE(absent);
+    EXPECT_FALSE(*absent);
+    auto first = cache_.NextOperation(&context_, 1);
+    ASSERT_TRUE(first && *first);
+    auto reserved = cache_.PrepareOperation(**first);
+    ASSERT_TRUE(reserved);
+    auto busy = cache_.NextOperation(&context_, 1);
+    ASSERT_TRUE(busy);
+    EXPECT_FALSE(*busy);
+    auto second = cache_.NextOperation(&second_context_, 2);
+    ASSERT_TRUE(second && *second);
+    EXPECT_EQ((**second).context, &second_context_);
+    ASSERT_TRUE(cache_.DiscardOperation(*reserved));
+}
+
+TEST_F(ImportCacheTest, PreparedTaskRejectsAlteredWorkIdentity) {
+    ASSERT_TRUE(Acquire());
+    auto next = cache_.NextOperation();
+    ASSERT_TRUE(next && *next);
+    auto prepared = cache_.PrepareOperation(**next);
+    ASSERT_TRUE(prepared);
+    auto altered = *prepared;
+    altered.operation.context_incarnation++;
+    ExpectError(cache_.DiscardOperation(altered), ImportCacheErrorCode::kInvalidOperation);
+    altered = *prepared;
+    altered.task.token++;
+    ExpectError(cache_.CommitOperation(altered, {&executor_, 0, 1}), ImportCacheErrorCode::kInvalidOperation);
+    ExpectError(cache_.CommitOperation(*prepared, {}), ImportCacheErrorCode::kInvalidOperation);
+    ASSERT_TRUE(cache_.DiscardOperation(*prepared));
+}
+
 } // namespace
 } // namespace control
 } // namespace kbsocket

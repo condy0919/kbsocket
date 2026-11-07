@@ -68,7 +68,7 @@ Open 一次分配所有条目、引用票据和描述符存储。默认上限为
 3. 执行器 worker 调用 Import/Unimport。缓存内同一 context 至多一个任务在途，独立 context 可并行。
 4. 唯一执行器 owner 收割完成，根据 `OwnsCompletion` 路由给缓存的 `HandleCompletion`；其他任务仍交给它们各自的所有者。暂停屏障保持至该完成已收割，不能仅因 completion fd 可读就恢复访问。
 
-这是显式控制协作接口，尚未自动接入 `RuntimeShard` 的暂停和任务路由。所有引用、任务参数、本地 context、URMA 函数表及执行器必须维持有效生命周期。
+上述显式控制接口继续保留。M5.3.1 新增 `ImportProgress` 和缓存 Prepare/Commit/Discard，通过 `ContextProgressGroup` 接入 `RuntimeShard` 的完整 context 暂停和任务路由，见 [连接 Runtime](connection-runtime.md)。所有引用、任务参数、本地 context、URMA 函数表及执行器必须维持有效生命周期。
 
 ## 5. 引用、取消与关闭
 

@@ -44,6 +44,11 @@ public:
     virtual std::expected<void, ProgressError> Rearm() noexcept = 0;
     // fds 在注册期间保持有效和不变；只观察 readiness，不由 reactor 读取 provider fd。
     virtual std::span<const int> wait_fds() const noexcept = 0;
+    // 需要独占暂停的设备 context 身份；nullptr 表示不访问设备（例如 CPU mailbox 或普通 TCP）。
+    // 身份在注册期间保持不变；访问 raw 的实现必须声明，不能以独立 hooks 绕过暂停屏障。
+    virtual const void* exclusive_context() const noexcept {
+        return nullptr;
+    }
     // 保持 fd 身份不变，允许故障域退出等待集合；暂停期间 reactor 不调用此方法。
     virtual bool WaitFdEnabled(int) const noexcept {
         return true;

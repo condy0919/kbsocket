@@ -88,6 +88,7 @@ public:
     std::size_t pending_refill() const noexcept;
     bool Matches(const ReceiveCreditDomain& credits, const ConnectionTable& routes) const noexcept;
     urma_context_t* context() const noexcept;
+    raw::RxBufferPool* buffers() const noexcept;
 
 private:
     struct State;

@@ -53,7 +53,16 @@ std::expected<void, ImportCacheError> Validate(const EndpointImportRequest& requ
 } // namespace
 
 struct EndpointImportCache::State {
-    enum class Phase : std::uint8_t { kFree, kPending, kImporting, kReady, kFailed, kUnimporting };
+    enum class Phase : std::uint8_t {
+        kFree,
+        kPending,
+        kPreparedImport,
+        kImporting,
+        kReady,
+        kFailed,
+        kPreparedUnimport,
+        kUnimporting
+    };
     struct Work {
         ImportOperationKind kind = ImportOperationKind::kImport;
         urma_context_t* context = nullptr;
@@ -73,6 +82,8 @@ struct EndpointImportCache::State {
         urma_target_jetty_t* target = nullptr;
         int provider_error = 0;
         runtime::ControlTaskId task;
+        std::uint64_t reservation = 0;
+        Phase prepared_from = Phase::kFree;
         Work work;
     };
     struct Reference {
@@ -118,7 +129,8 @@ struct EndpointImportCache::State {
     }
     void FreeIfUnused(Entry& entry) noexcept {
         if (entry.references || entry.target || entry.phase == Phase::kImporting ||
-            entry.phase == Phase::kUnimporting || entry.phase == Phase::kFree) {
+            entry.phase == Phase::kUnimporting || entry.phase == Phase::kPreparedImport ||
+            entry.phase == Phase::kPreparedUnimport || entry.phase == Phase::kFree) {
             return;
         }
         entry.phase = Phase::kFree;
@@ -234,7 +246,8 @@ EndpointImportCache::Acquire(const EndpointImportRequest& request) noexcept {
             std::memcmp(entry.descriptor.data(), request.descriptor.data(), entry.descriptor_size)) {
             return Error(ImportCacheErrorCode::kDescriptorConflict);
         }
-        if (entry.invalidated || entry.phase == State::Phase::kUnimporting) {
+        if (entry.invalidated || entry.phase == State::Phase::kUnimporting ||
+            entry.phase == State::Phase::kPreparedUnimport) {
             return Error(ImportCacheErrorCode::kInvalidated);
         }
         if (entry.phase == State::Phase::kFailed) {
@@ -328,7 +341,8 @@ std::expected<void, ImportCacheError> EndpointImportCache::Release(ImportLease l
     state_->references[lease.slot].active = false;
     --state_->lease_count;
     --entry->references;
-    if (!entry->references && entry->phase == State::Phase::kImporting) {
+    if (!entry->references &&
+        (entry->phase == State::Phase::kImporting || entry->phase == State::Phase::kPreparedImport)) {
         // 所有建链者都取消时仍收割已接受任务，再清理其结果，不发布半成品。
         entry->invalidated = true;
     }
@@ -378,11 +392,15 @@ std::size_t EndpointImportCache::EvictUnused() noexcept {
     return count;
 }
 
-std::expected<std::optional<ImportOperation>, ImportCacheError> EndpointImportCache::NextOperation() noexcept {
+std::expected<std::optional<ImportOperation>, ImportCacheError>
+EndpointImportCache::NextOperation(urma_context_t* context, std::uint64_t incarnation) noexcept {
     if (!state_) {
         return Error(ImportCacheErrorCode::kNotReady);
     }
     auto& state = *state_;
+    if ((context == nullptr) != (incarnation == 0)) {
+        return Error(ImportCacheErrorCode::kInvalidArgument);
+    }
     if (state.outstanding == state.config.in_flight) {
         return std::nullopt;
     }
@@ -390,6 +408,9 @@ std::expected<std::optional<ImportOperation>, ImportCacheError> EndpointImportCa
         const auto slot = state.next_operation;
         state.next_operation = (slot + 1) % state.config.entries;
         auto& entry = state.entries[slot];
+        if (context && (entry.key.local_context != context || entry.key.local_context_incarnation != incarnation)) {
+            continue;
+        }
         const auto operation = state.Operation(entry);
         if (operation && !state.Busy(entry.key.local_context)) {
             return ImportOperation{
@@ -399,9 +420,8 @@ std::expected<std::optional<ImportOperation>, ImportCacheError> EndpointImportCa
     return std::nullopt;
 }
 
-std::expected<runtime::ControlTaskId, ImportCacheError>
-EndpointImportCache::StartOperation(const ImportOperation& operation, runtime::ControlExecutor& executor,
-                                    const ImportContextPause& pause) noexcept {
+std::expected<ImportPreparedOperation, ImportCacheError>
+EndpointImportCache::PrepareOperation(const ImportOperation& operation) noexcept {
     if (!state_) {
         return Error(ImportCacheErrorCode::kNotReady);
     }
@@ -416,28 +436,101 @@ EndpointImportCache::StartOperation(const ImportOperation& operation, runtime::C
         operation.context_incarnation != entry.key.local_context_incarnation) {
         return Error(ImportCacheErrorCode::kInvalidOperation);
     }
-    if (!pause.users_paused || !pause.exclusive_control || pause.context != operation.context ||
-        pause.incarnation != operation.context_incarnation) {
-        return Error(ImportCacheErrorCode::kInvalidArgument);
-    }
     if (state.Busy(entry.key.local_context)) {
         return Error(ImportCacheErrorCode::kInUse);
     }
     if (state.outstanding == state.config.in_flight) {
         return Error(ImportCacheErrorCode::kResourceExhausted);
     }
+    if (next_reservation_ == std::numeric_limits<std::uint64_t>::max()) {
+        return Error(ImportCacheErrorCode::kSequenceExhausted);
+    }
     entry.work.kind = *kind;
     entry.work.context = entry.key.local_context;
     entry.work.token = entry.token;
     entry.work.target = entry.target;
     std::memcpy(entry.work.descriptor.data(), entry.descriptor.data(), entry.descriptor_size);
-    auto submitted = executor.TrySubmit({.function = &State::Run, .argument = &entry.work, .token = entry.generation});
+    entry.reservation = ++next_reservation_;
+    entry.prepared_from = entry.phase;
+    entry.phase =
+        *kind == ImportOperationKind::kImport ? State::Phase::kPreparedImport : State::Phase::kPreparedUnimport;
+    state.busy_contexts[state.outstanding++] = entry.key.local_context;
+    return ImportPreparedOperation{
+        operation, entry.reservation, {.function = &State::Run, .argument = &entry.work, .token = entry.reservation}};
+}
+
+std::expected<void, ImportCacheError> EndpointImportCache::CommitOperation(const ImportPreparedOperation& prepared,
+                                                                           runtime::ControlTaskId id) noexcept {
+    if (!state_) {
+        return Error(ImportCacheErrorCode::kNotReady);
+    }
+    const auto& operation = prepared.operation;
+    if (operation.owner != this || operation.entry >= state_->config.entries || !id.executor || !id.sequence) {
+        return Error(ImportCacheErrorCode::kInvalidOperation);
+    }
+    auto& entry = state_->entries[operation.entry];
+    const auto phase = operation.kind == ImportOperationKind::kImport ? State::Phase::kPreparedImport
+                                                                      : State::Phase::kPreparedUnimport;
+    if (entry.phase != phase || entry.generation != operation.generation || entry.reservation != prepared.reservation ||
+        !prepared.reservation || entry.key.local_context != operation.context ||
+        entry.key.local_context_incarnation != operation.context_incarnation || prepared.task.function != &State::Run ||
+        prepared.task.argument != &entry.work || prepared.task.token != entry.reservation || prepared.task.cancelled) {
+        return Error(ImportCacheErrorCode::kInvalidOperation);
+    }
+    entry.task = id;
+    entry.phase =
+        operation.kind == ImportOperationKind::kImport ? State::Phase::kImporting : State::Phase::kUnimporting;
+    return {};
+}
+
+std::expected<void, ImportCacheError>
+EndpointImportCache::DiscardOperation(const ImportPreparedOperation& prepared) noexcept {
+    if (!state_) {
+        return Error(ImportCacheErrorCode::kNotReady);
+    }
+    const auto& operation = prepared.operation;
+    if (operation.owner != this || operation.entry >= state_->config.entries) {
+        return Error(ImportCacheErrorCode::kInvalidOperation);
+    }
+    auto& entry = state_->entries[operation.entry];
+    const auto phase = operation.kind == ImportOperationKind::kImport ? State::Phase::kPreparedImport
+                                                                      : State::Phase::kPreparedUnimport;
+    if (entry.phase != phase || entry.generation != operation.generation || entry.reservation != prepared.reservation ||
+        !prepared.reservation || entry.key.local_context != operation.context ||
+        entry.key.local_context_incarnation != operation.context_incarnation || prepared.task.function != &State::Run ||
+        prepared.task.argument != &entry.work || prepared.task.token != entry.reservation || prepared.task.cancelled) {
+        return Error(ImportCacheErrorCode::kInvalidOperation);
+    }
+    entry.phase = entry.prepared_from;
+    state_->CompleteContext(entry.key.local_context);
+    state_->FreeIfUnused(entry);
+    return {};
+}
+
+std::expected<runtime::ControlTaskId, ImportCacheError>
+EndpointImportCache::StartOperation(const ImportOperation& operation, runtime::ControlExecutor& executor,
+                                    const ImportContextPause& pause) noexcept {
+    if (!state_) {
+        return Error(ImportCacheErrorCode::kNotReady);
+    }
+    if (!pause.users_paused || !pause.exclusive_control || pause.context != operation.context ||
+        pause.incarnation != operation.context_incarnation) {
+        return Error(ImportCacheErrorCode::kInvalidArgument);
+    }
+    auto prepared = PrepareOperation(operation);
+    if (!prepared) {
+        return std::unexpected(prepared.error());
+    }
+    auto submitted = executor.TrySubmit(prepared->task);
     if (!submitted) {
+        if (auto discarded = DiscardOperation(*prepared); !discarded) {
+            return std::unexpected(discarded.error());
+        }
         return Error(ImportCacheErrorCode::kExecutorError, submitted.error().system_error);
     }
-    entry.task = *submitted;
-    entry.phase = *kind == ImportOperationKind::kImport ? State::Phase::kImporting : State::Phase::kUnimporting;
-    state.busy_contexts[state.outstanding++] = entry.key.local_context;
+    if (auto committed = CommitOperation(*prepared, *submitted); !committed) {
+        return std::unexpected(committed.error());
+    }
     return *submitted;
 }
 
@@ -467,7 +560,7 @@ EndpointImportCache::HandleCompletion(const runtime::ControlTaskCompletion& comp
             entry.task != completion.id) {
             continue;
         }
-        if (completion.argument != &entry.work || completion.token != entry.generation) {
+        if (completion.argument != &entry.work || completion.token != entry.reservation) {
             return Error(ImportCacheErrorCode::kInvalidCompletion);
         }
         // Executor 的 Poll 已通过 acquire 收割 worker 发布；此前 owner 不读取 work 输出。

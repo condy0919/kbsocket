@@ -2,17 +2,17 @@
 
 `RuntimeShard` 将已经创建的 raw context、队列池、RX 缓冲池和 TX 账本绑定到一个 owner，统一推进收发、补投、事件和慢控制任务。它拥有反应堆与控制执行器，借用全部 URMA/DMA 对象；`Open` 不负责创建连接、分配 Grant、授信或创建完整 raw runtime。
 
-本实现对应 [roadmap M3](roadmap.md#m3runtimeshard-反应堆4-context-轮询与异步事件引擎)。M4.1 已通过可选 hooks 接入 [LeaseReturnProgress](memory-leases.md)，负责注册 Slab 的跨线程 CPU Lease 归还；M5.2 已提供 [Eager Connection](eager-connection.md) 与物理 Credit 接线；自动 runtime 装配、完整 MemoryManager 和 WRITE RNDV 仍按后续阶段交付。当前无 UB 真机回归，也未据 Mock 结果新增硬件 PASS。
+本实现对应 [roadmap M3](roadmap.md#m3runtimeshard-反应堆4-context-轮询与异步事件引擎)。M4.1 已通过可选 hooks 接入 [LeaseReturnProgress](memory-leases.md)，负责注册 Slab 的跨线程 CPU Lease 归还；M5.2 已提供 [Eager Connection](eager-connection.md) 与物理 Credit 接线；M5.3.1 已通过 [连接 Runtime](connection-runtime.md) 接通 context 暂停组、连接进度、导入和动态 fd；自动资源创建、完整 MemoryManager 和 WRITE RNDV 仍按后续阶段交付。当前无 UB 真机回归，也未据 Mock 结果新增硬件 PASS。
 
 ## 组件与容量
 
 | 组件 | 责任 | 当前边界 |
 | --- | --- | --- |
-| [`RuntimeShard`](../kbsocket/runtime/runtime_shard.hpp) | 绑定 raw context，组合反应堆与控制执行器 | 每 shard 1–4 个 context；可承载两个裸设备各两个 EID |
+| [`RuntimeShard`](../kbsocket/runtime/runtime_shard.hpp) | 绑定 raw context，组合反应堆与控制执行器 | 每 shard 1–4 个 raw context；可承载两个裸设备各两个 EID；仅 TCP 时允许 0 个 raw context 加 hooks |
 | [`RawContextProgress`](../kbsocket/runtime/raw_context_progress.hpp) | 一个 context 的唯一 async 消费者；驱动绑定域的 TX/RX/refill/flush 与通知 | 每 context 1–8 个独立接收域、每域最多 64 条主动 Lane；进程内 async 消费者登记表最多 64 个 context |
-| [`ShardReactor`](../kbsocket/runtime/shard_reactor.hpp) | 公平预算、轮询/事件双模式、控制提交和完成收割 | 最多 8 个 source、80 个 source fd；RuntimeShard 使用最多 4 个 raw source 和 1 个可选 hooks source |
+| [`ShardReactor`](../kbsocket/runtime/shard_reactor.hpp) | 公平预算、轮询/事件双模式、控制提交和完成收割 | 最多 8 个 source、80 个 source fd；RuntimeShard 使用最多 4 个 context group 和 1 个可选 hooks source；动态连接 fd 在组内汇聚 |
 | [`ControlExecutor`](../kbsocket/runtime/control_executor.hpp) | 执行可能阻塞的控制函数，将结果交回 owner | 固定 1–4 个 worker、1–4096 个槽位，worker 数不得大于槽位数 |
-| [`ProgressSource`](../kbsocket/runtime/progress_source.hpp) | 宿主接入有界 mailbox/timer/retire 等进度 | M4.1 的 `LeaseReturnProgress` 使用 mailbox 预算处理 CPU 归还；没有通用业务 mailbox、连接定时器或 Grant 协议实现 |
+| [`ProgressSource`](../kbsocket/runtime/progress_source.hpp) | 宿主接入有界 mailbox/timer/retire 等进度 | M4.1 的 `LeaseReturnProgress` 使用 mailbox 预算处理 CPU 归还；M5.3.1 的 ConnectionProgress 使用 mailbox/timer 预算推进连接；没有通用业务 mailbox 或 Grant 协议实现 |
 
 配置的上限是显式资源限制，不能据此推断吞吐或 40k 连接容量已经通过验收。`ControlExecutorConfig` 默认 1 个 worker、64 个槽位；所有排队、执行中以及完成但尚未被收割的任务都占用槽位。`ReactorConfig` 默认 `events=false`、`budget=32`、`busy_poll_ns=50000`、`max_wait_ms=10`；预算允许 1–64，单次等待允许 0–1000 ms。
 
@@ -107,4 +107,4 @@ Mock 能检查调用顺序、资源身份与安全门禁，不能证明真机延
 
 ## M5.2 连接层接线
 
-绑定 `EagerReceiveDomain` 的队列必须设置 `RawQueueBinding.external_refill=true`，由宿主在相同 owner 上有界推进该域的 `Refill`，确保可信 post 前缀与物理 Credit 同时结账；原源继续独占 CQ 和通知消费。连接发送使用 `TxSender::Open(ledger, true)`，post 接受未知或账务错误仅 `MarkFaulted`，由既有控制任务执行 `BeginDrain`，不能在数据推进中同步 ModifyJetty。Connection/Credit 调度与控制 fd 的 Reactor 注册尚待 M5.3 自动装配。
+绑定 `EagerReceiveDomain` 的队列必须设置 `RawQueueBinding.external_refill=true`，由宿主在相同 owner 上有界推进该域的 `Refill`，确保可信 post 前缀与物理 Credit 同时结账；原源继续独占 CQ 和通知消费。连接发送使用 `TxSender::Open(ledger, true)`，post 接受未知或账务错误仅 `MarkFaulted`，由既有控制任务执行 `BeginDrain`，不能在数据推进中同步 ModifyJetty。M5.3.1 已由 `ConnectionProgress` / `ConnectionIoBinding` 接入 Connection/Credit 调度与动态控制 fd，`ImportProgress` 与其共享完整 context 暂停范围；来源登记、接线与关闭顺序见 [连接 Runtime](connection-runtime.md)。

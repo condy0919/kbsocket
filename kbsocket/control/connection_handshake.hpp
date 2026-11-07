@@ -127,6 +127,9 @@ public:
     int fd() const noexcept {
         return channel_.fd();
     }
+    bool output_pending() const noexcept {
+        return !channel_.output_flushed();
+    }
     const std::optional<ConnectionHandshakeError>& failure() const noexcept {
         return failure_;
     }

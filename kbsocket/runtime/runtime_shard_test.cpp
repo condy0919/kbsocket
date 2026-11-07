@@ -18,6 +18,40 @@
 namespace kbsocket {
 namespace runtime {
 namespace {
+class Companion final : public ProgressSource {
+public:
+    std::expected<ProgressBatch, ProgressError> Progress(ProgressKind, std::size_t, std::uint64_t) noexcept override {
+        ++calls;
+        return ProgressBatch{1, false};
+    }
+    std::expected<ProgressBatch, ProgressError> CollectNotifications(std::size_t) noexcept override {
+        ++notifications;
+        return ProgressBatch{};
+    }
+    std::expected<void, ProgressError> Rearm() noexcept override {
+        return {};
+    }
+    std::span<const int> wait_fds() const noexcept override {
+        return {};
+    }
+    const void* exclusive_context() const noexcept override {
+        return context;
+    }
+    std::optional<ControlTask> PendingControl() noexcept override {
+        return pending;
+    }
+    void ControlSubmitted(ControlTaskId) noexcept override {
+        ++submitted;
+        pending.reset();
+    }
+    void ControlCompleted(const ControlTaskCompletion&) noexcept override {
+        ++completed;
+    }
+    std::size_t calls = 0, notifications = 0, submitted = 0, completed = 0;
+    std::optional<ControlTask> pending;
+    const void* context = nullptr;
+};
+
 class RuntimeShardTest : public ::testing::Test {
 protected:
     struct Domain {
@@ -42,6 +76,7 @@ protected:
     raw::test_support::ScopedUrmaOverride override_{Functions()};
     std::array<Domain, 4> domains_;
     std::array<RawContextBinding, 4> bindings_{};
+    std::array<Companion, 4> companions_;
     RuntimeShard shard_;
     std::atomic<bool> control_entered_{false}, control_release_{false};
 
@@ -200,6 +235,12 @@ protected:
         control_release_.store(true, std::memory_order_release);
         control_release_.notify_one();
     }
+    static ControlTaskResult RunCompanionControl(void* argument, std::uint64_t) noexcept {
+        auto& fixture = *static_cast<RuntimeShardTest*>(argument);
+        fixture.control_entered_.store(true, std::memory_order_release);
+        fixture.control_release_.wait(false, std::memory_order_acquire);
+        return {};
+    }
     void TearDown() override {
         ReleaseControl();
         // 先收割控制任务再解绑，域实际销毁另走 M1 证明门禁；shard.Close 本身不删除 URMA。
@@ -295,6 +336,9 @@ TEST_F(RuntimeShardTest, FourContextsProgressRefillAndDetachWithoutDeletingResou
 
 TEST_F(RuntimeShardTest, SlowControlPausesOneContextAndCloseWaitsForItsCompletion) {
     domains_[0].queue.watermark_threshold = 1;
+    for (std::size_t i = 0; i < bindings_.size(); ++i) {
+        bindings_[i].connections = &companions_[i];
+    }
     RuntimeShardConfig config;
     config.reactor.budget = 2;
     ASSERT_TRUE(shard_.Open(bindings_, config));
@@ -306,14 +350,19 @@ TEST_F(RuntimeShardTest, SlowControlPausesOneContextAndCloseWaitsForItsCompletio
     }
     ASSERT_TRUE(control_entered_.load(std::memory_order_acquire));
     const auto polls = domains_[0].polls;
+    const auto connection_calls = companions_[0].calls;
+    const auto connection_notifications = companions_[0].notifications;
     for (std::size_t i = 1; i < domains_.size(); ++i) {
         CompleteOne(i);
     }
     ASSERT_TRUE(shard_.Tick());
     EXPECT_EQ(domains_[0].polls, polls);
+    EXPECT_EQ(companions_[0].calls, connection_calls);
+    EXPECT_EQ(companions_[0].notifications, connection_notifications);
     EXPECT_EQ(shard_.domain_stats(0, 0), nullptr);
     for (std::size_t i = 1; i < domains_.size(); ++i) {
         EXPECT_EQ(domains_[i].received, 1u);
+        EXPECT_GT(companions_[i].calls, connection_calls);
     }
     auto closed = shard_.Close();
     ASSERT_FALSE(closed);
@@ -329,6 +378,77 @@ TEST_F(RuntimeShardTest, SlowControlPausesOneContextAndCloseWaitsForItsCompletio
     EXPECT_EQ(shard_.domain_stats(0, 0)->watermark_rearms, 1u);
     EXPECT_EQ(shard_.stats()->controls_completed, 1u);
     ASSERT_TRUE(shard_.Close());
+}
+
+TEST_F(RuntimeShardTest, CompanionControlPausesRawPollAndConnectionWork) {
+    bindings_[0].connections = &companions_[0];
+    bindings_[0].control = &companions_[1];
+    companions_[1].pending =
+        ControlTask{.function = &RuntimeShardTest::RunCompanionControl, .argument = this, .token = 1};
+    ASSERT_TRUE(shard_.Open(bindings_));
+    ASSERT_TRUE(shard_.Tick());
+    ASSERT_TRUE(shard_.paused(0));
+    const auto polls = domains_[0].polls;
+    const auto calls = companions_[0].calls;
+    // 暂停必须双向生效：连接导入任务同样禁止 RawContextProgress 在该 context 上轮询。
+    CompleteOne(1);
+    ASSERT_TRUE(shard_.Tick());
+    EXPECT_EQ(domains_[0].polls, polls);
+    EXPECT_EQ(companions_[0].calls, calls);
+    EXPECT_EQ(domains_[1].received, 1u);
+    EXPECT_EQ(companions_[1].submitted, 1u);
+    EXPECT_FALSE(shard_.Close());
+    ReleaseControl();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (shard_.paused(0) && std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(shard_.Tick());
+        std::this_thread::yield();
+    }
+    EXPECT_FALSE(shard_.paused(0));
+    EXPECT_EQ(companions_[1].completed, 1u);
+    EXPECT_EQ(companions_[0].completed, 0u);
+    EXPECT_TRUE(shard_.Close());
+}
+
+TEST_F(RuntimeShardTest, RejectsCompanionSharedAcrossPauseDomainsOrHooks) {
+    bindings_[0].connections = &companions_[0];
+    bindings_[1].control = &companions_[0];
+    EXPECT_FALSE(shard_.Open(bindings_));
+    bindings_[1].control = nullptr;
+    EXPECT_FALSE(shard_.Open(bindings_, {}, &companions_[0]));
+    bindings_[0].control = &companions_[0];
+    EXPECT_FALSE(shard_.Open(bindings_));
+    // 注册失败前不能泄漏任何 raw owner 登记，修正后可以完整打开。
+    bindings_[0].control = &companions_[1];
+    EXPECT_TRUE(shard_.Open(bindings_));
+    EXPECT_TRUE(shard_.Close());
+}
+
+TEST_F(RuntimeShardTest, RejectsWrongContextCompanionAndDeviceHooksBeforeBindingOwners) {
+    bindings_[0].connections = &companions_[0];
+    companions_[0].context = &domains_[1].context;
+    EXPECT_FALSE(shard_.Open(bindings_));
+    bindings_[0].connections = nullptr;
+    // 有设备关联的源必须进入所属 context 的组，不能单独注册为 hooks 或伪装纯 TCP shard。
+    EXPECT_FALSE(shard_.Open(bindings_, {}, &companions_[0]));
+    EXPECT_FALSE(shard_.Open({}, {}, &companions_[0]));
+    bindings_[1].connections = &companions_[0];
+    ASSERT_TRUE(shard_.Open(bindings_));
+    EXPECT_TRUE(shard_.Tick());
+    EXPECT_TRUE(shard_.Close());
+}
+
+TEST(RuntimeShardStandaloneTest, TcpHooksOnlyNeedsNoRawContext) {
+    Companion connections;
+    RuntimeShard shard;
+    EXPECT_FALSE(shard.Open({}));
+    ASSERT_TRUE(shard.Open({}, {.reactor = {.events = true}}, &connections));
+    auto tick = shard.RunOnce();
+    ASSERT_TRUE(tick);
+    EXPECT_EQ(connections.calls, 8u);
+    EXPECT_FALSE(shard.paused(0));
+    EXPECT_EQ(shard.domain_stats(0, 0), nullptr);
+    EXPECT_TRUE(shard.Close());
 }
 
 TEST_F(RuntimeShardTest, PartialOpenFailureUnregistersOwnersAndRejectsSecondShard) {

@@ -16,13 +16,17 @@ namespace runtime {
 struct RawContextBinding {
     urma_context_t* context = nullptr;
     std::span<const RawQueueBinding> queues;
+    // 同 context 的连接/导入与 raw 轮询构成一个暂停单元；不能再作为独立 hooks 注册。
+    ProgressSource* connections = nullptr;
+    ProgressSource* control = nullptr;
 };
 struct RuntimeShardConfig {
     ReactorConfig reactor;
     ControlExecutorConfig control;
 };
 
-/// 将一至四个 raw context 绑定至一个 owner，拥有反应堆/控制线程，但借用全部 URMA/DMA 资源。
+/// 将最多四个 raw context 及其连接/控制源绑定至一个 owner，拥有反应堆/控制线程，借用 URMA/DMA。
+/// 纯 TCP 可用空 contexts 加独立 hooks；raw 模式下同 context 的全部访问必须加入其暂停单元。
 /// 宿主在控制路径 Open 后由同一 owner 推进；回调、raw 句柄与控制任务不得并发或重入。
 /// Open 不创建连接、不授信；完成只归还本地配额，RX lease 由调用方消费并归还。
 /// 析构前须 Close 成功；若仍有控制任务，只保留内部状态，宿主仍须保留借用的 raw/context/回调依赖。
@@ -33,7 +37,7 @@ public:
     ~RuntimeShard();
     RuntimeShard(const RuntimeShard&) = delete;
     RuntimeShard& operator=(const RuntimeShard&) = delete;
-    // hooks 为可选 mailbox/timer/retire 进度源，由宿主提供固定预算实现；不能与 raw 共享 fd 或 owner。
+    // hooks 为独立 TCP/mailbox/timer/retire 进度源；不得访问任一 raw context 或重复其成员/fd。
     std::expected<void, ProgressError> Open(std::span<const RawContextBinding> contexts,
                                             const RuntimeShardConfig& config = {},
                                             ProgressSource* hooks = nullptr) noexcept;

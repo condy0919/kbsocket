@@ -110,6 +110,16 @@ public:
         return tx_.stats();
     }
     int fd() const noexcept;
+    // Reactor 用于身份分发和 context 暂停约束，不转移底层资源所有权。
+    std::uint64_t connection_id() const noexcept {
+        return raw_prepared_ ? raw_.connection_id : 0;
+    }
+    urma_context_t* raw_context() const noexcept {
+        return raw_prepared_ ? raw_.handshake.local_context : nullptr;
+    }
+    std::size_t rx_pending() const noexcept {
+        return rx_.pending();
+    }
 
 private:
     ConnectionError Fail(ConnectionError error) noexcept;

@@ -61,6 +61,13 @@ struct ImportOperation {
     bool operator==(const ImportOperation&) const = default;
 };
 
+/// Prepare 后参数被独占保留，排队失败可重试同一 task；reservation 防止旧撤销误伤重新准备的操作。
+struct ImportPreparedOperation {
+    ImportOperation operation;
+    std::uint64_t reservation = 0;
+    runtime::ControlTask task;
+};
+
 /// 宿主先暂停该 context 全部 post/poll/事件访问，并排除其他慢控制操作；
 /// 屏障保持至 HandleCompletion 收割，不能仅凭任务已完成或 fd 可读恢复。
 struct ImportContextPause {
@@ -125,7 +132,18 @@ public:
     std::size_t EvictUnused() noexcept;
 
     /// 返回下一项可调度操作，不代表已经提交；同一 context 在本缓存内至多一个在途任务。
-    std::expected<std::optional<ImportOperation>, ImportCacheError> NextOperation() noexcept;
+    /// context 非空时只选择该实例的操作，供每 context 共享暂停屏障的调度源使用。
+    std::expected<std::optional<ImportOperation>, ImportCacheError>
+    NextOperation(urma_context_t* context = nullptr, std::uint64_t incarnation = 0) noexcept;
+    /// 只准备 owner 数据，不调用 provider；保留容量与参数直到 Commit 后收割，或 Discard。
+    std::expected<ImportPreparedOperation, ImportCacheError>
+    PrepareOperation(const ImportOperation& operation) noexcept;
+    /// 调用方须在提交 task 前暂停该 context 的全部使用者，屏障保持到 HandleCompletion。
+    /// worker 可已开始，Commit 仅访问 owner 元数据。已提交任务必须 Commit，绝不能 Discard。
+    std::expected<void, ImportCacheError> CommitOperation(const ImportPreparedOperation& prepared,
+                                                          runtime::ControlTaskId id) noexcept;
+    /// 仅用于确认 task 从未被执行器接受；恢复待调度状态，不销毁已接受操作的依赖。
+    std::expected<void, ImportCacheError> DiscardOperation(const ImportPreparedOperation& prepared) noexcept;
     std::expected<runtime::ControlTaskId, ImportCacheError> StartOperation(const ImportOperation& operation,
                                                                            runtime::ControlExecutor& executor,
                                                                            const ImportContextPause& pause) noexcept;
@@ -144,6 +162,7 @@ private:
     std::unique_ptr<State> state_;
     std::uint64_t next_entry_ = 0;
     std::uint64_t next_lease_ = 0;
+    std::uint64_t next_reservation_ = 0;
     bool opened_once_ = false;
 };
 

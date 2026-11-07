@@ -3,6 +3,8 @@
 
 #include <new>
 
+#include "kbsocket/runtime/context_progress_group.hpp"
+
 namespace kbsocket {
 namespace runtime {
 namespace {
@@ -12,6 +14,7 @@ auto Error(ProgressErrorCode code, int detail = 0) noexcept {
 } // namespace
 struct RuntimeShard::State {
     std::array<RawContextProgress, kMaxContexts> contexts;
+    std::array<ContextProgressGroup, kMaxContexts> groups;
     ControlExecutor executor;
     ShardReactor reactor;
     std::size_t count = 0;
@@ -29,8 +32,28 @@ std::expected<void, ProgressError> RuntimeShard::Open(std::span<const RawContext
     if (state_) {
         return Error(ProgressErrorCode::kInUse);
     }
-    if (contexts.empty() || contexts.size() > kMaxContexts) {
+    if ((contexts.empty() && !hooks) || contexts.size() > kMaxContexts || (hooks && hooks->exclusive_context())) {
         return Error(ProgressErrorCode::kInvalidArgument);
+    }
+    // 成员不能横跨 context 或同时成为 hooks，否则一个暂停屏障之外仍会推进同一份状态。
+    std::array<ProgressSource*, kMaxContexts * 2> companions{};
+    std::size_t companion_count = 0;
+    for (const auto& context : contexts) {
+        for (auto* companion : {context.connections, context.control}) {
+            if (!companion) {
+                continue;
+            }
+            if (companion == hooks ||
+                (companion->exclusive_context() && companion->exclusive_context() != context.context)) {
+                return Error(ProgressErrorCode::kInvalidArgument);
+            }
+            for (std::size_t i = 0; i < companion_count; ++i) {
+                if (companions[i] == companion) {
+                    return Error(ProgressErrorCode::kInvalidArgument);
+                }
+            }
+            companions[companion_count++] = companion;
+        }
     }
     auto state = std::unique_ptr<State>(new (std::nothrow) State);
     if (!state) {
@@ -48,6 +71,17 @@ std::expected<void, ProgressError> RuntimeShard::Open(std::span<const RawContext
         if (!opened) {
             return opened;
         }
+        std::array<ProgressSource*, 3> members{&state->contexts[state->count]};
+        std::size_t member_count = 1;
+        if (context.connections) {
+            members[member_count++] = context.connections;
+        }
+        if (context.control) {
+            members[member_count++] = context.control;
+        }
+        if (auto grouped = state->groups[state->count].Open(std::span(members).first(member_count)); !grouped) {
+            return grouped;
+        }
         ++state->count;
     }
     if (auto opened = state->executor.Open(config.control); !opened) {
@@ -55,7 +89,7 @@ std::expected<void, ProgressError> RuntimeShard::Open(std::span<const RawContext
     }
     std::array<ProgressSource*, kMaxContexts + 1> sources{};
     for (std::size_t i = 0; i < state->count; ++i) {
-        sources[i] = &state->contexts[i];
+        sources[i] = &state->groups[i];
     }
     auto count = state->count;
     if (hooks) {
@@ -101,6 +135,9 @@ std::expected<void, ProgressError> RuntimeShard::Close() noexcept {
     }
     // 控制任务都已收割；未提交的水线/替换意图由源解绑放弃，不代表其 raw 资源已释放。
     for (std::size_t i = state_->count; i > 0; --i) {
+        if (auto closed = state_->groups[i - 1].Close(); !closed) {
+            return closed;
+        }
         if (auto closed = state_->contexts[i - 1].Close(); !closed) {
             return closed;
         }

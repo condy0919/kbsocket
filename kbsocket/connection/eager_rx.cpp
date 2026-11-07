@@ -286,6 +286,9 @@ bool EagerReceiveDomain::Matches(const ReceiveCreditDomain& credits, const Conne
 urma_context_t* EagerReceiveDomain::context() const noexcept {
     return state_ && state_->buffers->pool() ? state_->buffers->pool()->context() : nullptr;
 }
+raw::RxBufferPool* EagerReceiveDomain::buffers() const noexcept {
+    return state_ ? state_->buffers : nullptr;
+}
 std::expected<void, EagerRxError> EagerReceiveDomain::Close() noexcept {
     if (!state_) {
         return {};

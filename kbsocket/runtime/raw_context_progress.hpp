@@ -82,6 +82,9 @@ public:
     std::span<const int> wait_fds() const noexcept override {
         return std::span(fds_).first(fd_count_);
     }
+    const void* exclusive_context() const noexcept override {
+        return context_;
+    }
     bool WaitFdEnabled(int fd) const noexcept override;
     std::optional<ControlTask> PendingControl() noexcept override;
     void ControlSubmitted(ControlTaskId id) noexcept override;

@@ -3,6 +3,98 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "import_progress",
+    srcs = ["import_progress.cpp"],
+    hdrs = ["import_progress.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":progress_source",
+        "//kbsocket/control:endpoint_import_cache",
+    ],
+)
+
+cc_test(
+    name = "import_progress_test",
+    srcs = ["import_progress_test.cpp"],
+    deps = [
+        ":import_progress",
+        ":shard_reactor",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "connection_progress",
+    srcs = ["connection_progress.cpp"],
+    hdrs = ["connection_progress.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":progress_source",
+        "//kbsocket/connection",
+    ],
+)
+
+cc_test(
+    name = "connection_progress_test",
+    srcs = ["connection_progress_test.cpp"],
+    deps = [
+        ":connection_progress",
+        ":runtime_shard",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "connection_io",
+    srcs = ["connection_io.cpp"],
+    hdrs = ["connection_io.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":connection_progress",
+        ":rx_source_registry",
+    ],
+)
+
+cc_library(
+    name = "context_progress_group",
+    srcs = ["context_progress_group.cpp"],
+    hdrs = ["context_progress_group.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [":progress_source"],
+)
+
+cc_test(
+    name = "context_progress_group_test",
+    srcs = ["context_progress_group_test.cpp"],
+    deps = [
+        ":context_progress_group",
+        ":shard_reactor",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "rx_source_registry",
+    srcs = ["rx_source_registry.cpp"],
+    hdrs = ["rx_source_registry.hpp"],
+    visibility = ["//visibility:public"],
+    deps = ["//kbsocket/connection:eager_rx"],
+)
+
+cc_test(
+    name = "rx_source_registry_test",
+    srcs = ["rx_source_registry_test.cpp"],
+    deps = [
+        ":connection_io",
+        ":rx_source_registry",
+        "//kbsocket/connection:connection_table",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "control_executor",
     srcs = ["control_executor.cpp"],
     hdrs = ["control_executor.hpp"],
@@ -84,6 +176,7 @@ cc_library(
     hdrs = ["runtime_shard.hpp"],
     visibility = ["//visibility:public"],
     deps = [
+        ":context_progress_group",
         ":control_executor",
         ":raw_context_progress",
         ":shard_reactor",
@@ -95,6 +188,22 @@ cc_test(
     srcs = ["runtime_shard_test.cpp"],
     deps = [
         ":runtime_shard",
+        "//kbsocket/transport/raw:receive_domain_closer",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "connection_runtime_test",
+    srcs = ["connection_runtime_test.cpp"],
+    deps = [
+        ":connection_io",
+        ":connection_progress",
+        ":import_progress",
+        ":runtime_shard",
+        ":rx_source_registry",
+        "//kbsocket/connection",
         "//kbsocket/transport/raw:receive_domain_closer",
         "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",
