@@ -15,6 +15,7 @@
 
 namespace kbsocket {
 namespace api {
+class RawStreamRuntime;
 struct StreamBindingConfig {
     // 宿主保证进程内跨表/生命周期不复用；0 无效，不能只用对象地址或 fd。
     std::uint64_t table_id = 0;
@@ -66,6 +67,9 @@ public:
     std::expected<void, kbs_stream_error> Release(kbs_stream_handle stream) noexcept;
 
 private:
+    friend class RawStreamRuntime;
+    std::expected<runtime::OwnedConnection, kbs_stream_error> Resolve(kbs_stream_handle stream) noexcept;
+    std::expected<void, kbs_stream_error> CanPublish() noexcept;
     struct State;
     std::unique_ptr<State> state_;
     bool opened_once_ = false;

@@ -101,3 +101,32 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "raw_stream_runtime",
+    srcs = ["raw_stream_runtime.cpp"],
+    hdrs = ["raw_stream_runtime.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":stream_binding",
+        ":stream_error",
+        "//kbsocket/connection",
+        "//kbsocket/connection:credit_account",
+        "//kbsocket/connection:reorder_window",
+        "//kbsocket/control:handshake_channel",
+        "//kbsocket/control:tx_lane_snapshot",
+        "//kbsocket/runtime:raw_stack",
+        "//kbsocket/transport/raw:urma_api",
+    ],
+)
+
+cc_test(
+    name = "raw_stream_runtime_test",
+    srcs = ["raw_stream_runtime_test.cpp"],
+    deps = [
+        ":raw_stream_runtime",
+        "//kbsocket/connection:wire_frame",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)

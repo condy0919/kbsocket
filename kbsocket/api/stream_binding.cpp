@@ -272,6 +272,32 @@ std::expected<void, kbs_stream_error> StreamBinding::OpenRaw(runtime::RawStack& 
     }
     return Open(*resources->connections, &stack, context, config);
 }
+std::expected<runtime::OwnedConnection, kbs_stream_error> StreamBinding::Resolve(kbs_stream_handle stream) noexcept {
+    if (!state_) {
+        return Error(KBS_STREAM_NOT_READY);
+    }
+    const auto slot = state_->Find(stream);
+    if (!slot) {
+        return std::unexpected(slot.error());
+    }
+    return (*slot)->connection;
+}
+std::expected<void, kbs_stream_error> StreamBinding::CanPublish() noexcept {
+    if (!state_) {
+        return Error(KBS_STREAM_NOT_READY);
+    }
+    auto& s = *state_;
+    if (const auto ready = s.Gate(); !ready) {
+        return std::unexpected(ready.error());
+    }
+    if (!s.accepting) {
+        return Error(KBS_STREAM_STOPPED);
+    }
+    if (s.count == s.config.capacity || s.next_generation == std::numeric_limits<std::uint64_t>::max()) {
+        return Error(KBS_STREAM_EXHAUSTED);
+    }
+    return {};
+}
 std::expected<kbs_stream_handle, kbs_stream_error>
 StreamBinding::Publish(runtime::OwnedConnection connection) noexcept {
     if (!state_) {
