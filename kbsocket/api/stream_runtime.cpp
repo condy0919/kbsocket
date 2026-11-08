@@ -3,6 +3,7 @@
 
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -12,11 +13,14 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <span>
 
+#include "kbsocket/api/listener_events.hpp"
 #include "kbsocket/api/stream_binding.hpp"
 #include "kbsocket/api/stream_error.hpp"
 #include "kbsocket/runtime/connection_owner.hpp"
 #include "kbsocket/runtime/connection_progress.hpp"
+#include "kbsocket/runtime/context_progress_group.hpp"
 #include "kbsocket/runtime/runtime_shard.hpp"
 #include "kbsocket/transport/tcp/native_tcp_backend.hpp"
 
@@ -56,6 +60,8 @@ struct kbs_runtime {
     kbsocket::runtime::ConnectionProgress progress;
     kbsocket::runtime::ConnectionOwner owner;
     kbsocket::api::StreamBinding binding;
+    kbsocket::api::ListenerEvents listener_events;
+    kbsocket::runtime::ContextProgressGroup hooks;
     kbsocket::runtime::RuntimeShard shard;
     kbs_runtime_config config{};
     std::unique_ptr<Listener[]> listeners;
@@ -95,16 +101,27 @@ struct kbs_runtime {
             !result) {
             return result;
         }
+        if (const auto result = listener_events.Open(config.table_id, config.listener_capacity); !result) {
+            return std::unexpected(MapStreamError(result.error()));
+        }
+        // 独立 TCP 两类源共用原等待循环，各自取得有界预算，不改变 raw 暂停组语义。
+        const std::array<kbsocket::runtime::ProgressSource*, 2> members{&progress, &listener_events};
+        if (const auto result = hooks.Open(members); !result) {
+            return std::unexpected(MapStreamError(result.error()));
+        }
         const kbsocket::runtime::RuntimeShardConfig shard_config{
             .reactor = {.events = config.events != 0,
                         .budget = config.progress_budget,
                         .busy_poll_ns = 0,
                         .max_wait_ms = static_cast<int>(config.max_wait_ms)},
             .control = {}};
-        if (const auto result = shard.Open({}, shard_config, &progress); !result) {
+        if (const auto result = shard.Open({}, shard_config, &hooks); !result) {
             return std::unexpected(MapStreamError(result.error()));
         }
         return {};
+    }
+    bool EventsPending() const noexcept {
+        return binding.events_pending() || listener_events.pending();
     }
     std::expected<void, kbs_stream_error> Admit(bool stream) noexcept {
         if (closed) {
@@ -182,6 +199,7 @@ struct kbs_runtime {
             return {};
         }
         accepting = false;
+        listener_events.Stop();
         binding.StopAccepting();
         owner.StopAccepting();
         if (const auto cleanup = CleanUnpublished(); !cleanup) {
@@ -191,6 +209,12 @@ struct kbs_runtime {
             return Error(KBS_STREAM_BUSY);
         }
         if (const auto result = shard.Close(); !result) {
+            return std::unexpected(MapStreamError(result.error()));
+        }
+        if (const auto result = hooks.Close(); !result) {
+            return std::unexpected(MapStreamError(result.error()));
+        }
+        if (const auto result = listener_events.Close(); !result) {
             return std::unexpected(MapStreamError(result.error()));
         }
         if (const auto result = binding.Close(); !result) {
@@ -260,14 +284,14 @@ int32_t kbs_runtime_step(kbs_runtime* runtime, uint32_t wait, kbs_runtime_progre
         return Report(StreamError(KBS_STREAM_NOT_READY), error);
     }
     // 前一次 Tick 或同步 Watch 产生的应用事件不在 reactor 的 runnable 中，必须单独禁止等待。
-    const auto result = wait && !runtime->binding.events_pending() ? runtime->shard.RunOnce() : runtime->shard.Tick();
+    const auto result = wait && !runtime->EventsPending() ? runtime->shard.RunOnce() : runtime->shard.Tick();
     if (!result) {
         return Report(MapStreamError(result.error()), error);
     }
     if (runtime->callback_error) {
         return Report(*runtime->callback_error, error);
     }
-    const bool pending = runtime->binding.events_pending();
+    const bool pending = runtime->EventsPending();
     *out = {result->processed, result->runnable || pending ? 1u : 0u, pending ? 1u : 0u};
     return Report({}, error);
 }
@@ -332,9 +356,15 @@ int32_t kbs_runtime_listen_tcp(kbs_runtime* runtime, const sockaddr* address, so
         slot.socket.reset();
         return Report(MapStreamError(result.error()), error);
     }
+    const kbs_listener_handle handle{runtime->config.table_id, runtime->listener_generation + 1, index, 0};
+    if (const auto result = runtime->listener_events.Attach(handle, slot.socket->fd()); !result) {
+        // 尚未发布，借用注册失败不占用监听槽，也不把内部 fd 交给应用。
+        slot.socket.reset();
+        return Report(MapStreamError(result.error()), error);
+    }
     slot.generation = ++runtime->listener_generation;
     ++runtime->listener_count;
-    *out = {runtime->config.table_id, slot.generation, index, 0};
+    *out = handle;
     return Report({}, error);
 }
 int32_t kbs_runtime_accept_tcp(kbs_runtime* runtime, kbs_listener_handle listener, kbs_stream_handle* out,
@@ -378,6 +408,41 @@ int32_t kbs_runtime_listener_address(kbs_runtime* runtime, kbs_listener_handle l
     }
     return Report({}, error);
 }
+int32_t kbs_runtime_watch_listener(kbs_runtime* runtime, kbs_listener_handle listener, uint32_t enabled,
+                                   kbs_stream_error* error) {
+    if (!runtime || enabled > 1) {
+        return Invalid(error);
+    }
+    const auto slot = runtime->Find(listener);
+    if (!slot) {
+        return Report(slot.error(), error);
+    }
+    if (enabled) {
+        if (const auto allowed = runtime->Admit(false); !allowed) {
+            return Report(allowed.error(), error);
+        }
+    }
+    const auto result = runtime->listener_events.Watch(listener, enabled != 0);
+    return Report(result ? kbs_stream_error{} : MapStreamError(result.error()), error);
+}
+int32_t kbs_runtime_poll_listener_events(kbs_runtime* runtime, kbs_listener_event* events, size_t capacity,
+                                         size_t* count, kbs_stream_error* error) {
+    if (count) {
+        *count = 0;
+    }
+    if (!runtime || !events || !count || !capacity || capacity > KBS_LISTENER_MAX_EVENT_BATCH) {
+        return Invalid(error);
+    }
+    if (runtime->closed) {
+        return Report(StreamError(KBS_STREAM_NOT_READY), error);
+    }
+    const auto result = runtime->listener_events.Poll(std::span(events, capacity));
+    if (!result) {
+        return Report(MapStreamError(result.error()), error);
+    }
+    *count = *result;
+    return Report({}, error);
+}
 int32_t kbs_runtime_close_listener(kbs_runtime* runtime, kbs_listener_handle listener, kbs_stream_error* error) {
     if (!runtime) {
         return Invalid(error);
@@ -385,6 +450,10 @@ int32_t kbs_runtime_close_listener(kbs_runtime* runtime, kbs_listener_handle lis
     const auto slot = runtime->Find(listener);
     if (!slot) {
         return Report(slot.error(), error);
+    }
+    // DEL 必须作用于仍由本槽拥有的原 fd，不能在 close 后针对可能复用的整数操作。
+    if (const auto detached = runtime->listener_events.Detach(listener); !detached) {
+        return Report(MapStreamError(detached.error()), error);
     }
     const auto result = (*slot)->socket->Close();
     (*slot)->socket.reset();

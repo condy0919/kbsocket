@@ -71,16 +71,44 @@ cc_test(
 cc_library(
     name = "stream_runtime",
     srcs = ["stream_runtime.cpp"],
-    hdrs = ["stream_runtime.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":listener_events",
         ":stream",
         ":stream_binding",
         ":stream_error",
+        ":stream_runtime_headers",
         "//kbsocket/runtime:connection_owner",
         "//kbsocket/runtime:connection_progress",
+        "//kbsocket/runtime:context_progress_group",
         "//kbsocket/runtime:runtime_shard",
         "//kbsocket/transport/tcp:native_tcp_backend",
+    ],
+)
+
+cc_library(
+    name = "listener_events",
+    srcs = ["listener_events.cpp"],
+    hdrs = ["listener_events.hpp"],
+    deps = [
+        ":stream_runtime_headers",
+        "//kbsocket/runtime:progress_source",
+    ],
+)
+
+cc_library(
+    name = "stream_runtime_headers",
+    hdrs = ["stream_runtime.h"],
+    deps = [":stream"],
+)
+
+cc_test(
+    name = "listener_events_test",
+    srcs = ["listener_events_test.cpp"],
+    deps = [
+        ":listener_events",
+        "//kbsocket/transport/tcp:native_tcp_backend",
+        "@googletest//:gtest_main",
     ],
 )
 

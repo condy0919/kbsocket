@@ -15,6 +15,7 @@
 #include <limits>
 #include <new>
 #include <span>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -210,6 +211,36 @@ bool ConnectPair(Runtime& server, Runtime& client, kbs_listener_handle listener,
     });
 }
 
+// 外部 TCP 客户端只产生内核 backlog，不向被测 Runtime 混入 stream 状态事件。
+bool ConnectSocket(Fd& socket, const sockaddr_in& address) {
+    socket.value = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
+    if (socket.value < 0 || (::connect(socket.value, Address(address), sizeof(address)) < 0 && errno != EINPROGRESS) ||
+        !Wait(socket.value, POLLOUT)) {
+        return false;
+    }
+    int error = 0;
+    socklen_t length = sizeof(error);
+    return ::getsockopt(socket.value, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error == 0;
+}
+bool PendingListener(Runtime& runtime) {
+    const auto deadline = Now() + 3'000'000'000ull;
+    do {
+        kbs_runtime_progress progress{};
+        if (kbs_runtime_step(runtime.value, 0, &progress, nullptr) != 0) {
+            return false;
+        }
+        if (progress.pending_events) {
+            return true;
+        }
+    } while (Now() < deadline);
+    return false;
+}
+std::size_t PollListeners(Runtime& runtime, std::span<kbs_listener_event> events) {
+    std::size_t count = 0;
+    EXPECT_EQ(kbs_runtime_poll_listener_events(runtime.value, events.data(), events.size(), &count, nullptr), 0);
+    return count;
+}
+
 TEST(StreamRuntimeCAbiTest, CompilesAndLinksAllRuntimeFunctionsAsC) {
     EXPECT_EQ(KbsStreamRuntimeCHeaderTest(), 0);
 }
@@ -344,11 +375,17 @@ TEST(StreamRuntimeTest, CapacityRejectsAcceptBeforeTakingQueuedConnection) {
     ASSERT_TRUE(server.Listen(listener, address));
     kbs_stream_handle first{}, accepted{}, second{};
     ASSERT_TRUE(ConnectPair(server, client, listener, address, first, accepted));
+    ASSERT_EQ(kbs_runtime_watch_listener(server.value, listener, 1, nullptr), 0);
     ASSERT_TRUE(client.Connect(address, second));
     ASSERT_TRUE(Until(server, client, [&] { return client.Active(second); }));
+    std::array<kbs_listener_event, 1> ready{};
+    ASSERT_EQ(PollListeners(server, ready), 1u);
+    EXPECT_EQ(ready[0].listener.generation, listener.generation);
     kbs_stream_handle rejected{99, 99, 99, 99};
     EXPECT_EQ(kbs_runtime_accept_tcp(server.value, listener, &rejected, nullptr), KBS_STREAM_EXHAUSTED);
     EXPECT_EQ(rejected.generation, 0u);
+    ASSERT_TRUE(server.Step());
+    EXPECT_EQ(PollListeners(server, ready), 0u);
     // 满表不应 accept 后关掉连接；释放一个槽后仍可取得原先排队的第二条连接。
     ASSERT_TRUE(server.Release(accepted));
     ASSERT_TRUE(Until(server, client, [&] {
@@ -601,6 +638,328 @@ TEST(StreamRuntimeTest, RuntimeStepAndCopyEventPathAllocateNothing) {
     EXPECT_EQ(output, payload);
     EXPECT_EQ(allocations, 0u);
 }
+TEST(StreamRuntimeTest, ListenerWatchIsExplicitOneshotAndRearmSeesExistingBacklog) {
+    Runtime runtime;
+    ASSERT_TRUE(runtime.Open());
+    kbs_listener_handle listener{};
+    sockaddr_in address{};
+    ASSERT_TRUE(runtime.Listen(listener, address));
+    Fd client;
+    ASSERT_TRUE(ConnectSocket(client, address));
+    std::array<kbs_listener_event, 2> events{};
+    ASSERT_TRUE(runtime.Step());
+    EXPECT_EQ(PollListeners(runtime, events), 0u);
+
+    // 连接已经排入 backlog 后才订阅，必须仍能唤醒；未 Accept 的 backlog 不能重复消耗一次订阅。
+    ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 1, nullptr), 0);
+    ASSERT_TRUE(PendingListener(runtime));
+    ASSERT_EQ(PollListeners(runtime, events), 1u);
+    EXPECT_EQ(events[0].listener.runtime_id, listener.runtime_id);
+    EXPECT_EQ(events[0].listener.generation, listener.generation);
+    EXPECT_EQ(events[0].flags, KBS_LISTENER_EVENT_ACCEPTABLE);
+    EXPECT_EQ(events[0].reserved, 0u);
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(runtime.Step());
+        EXPECT_EQ(PollListeners(runtime, events), 0u);
+    }
+    ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 1, nullptr), 0);
+    ASSERT_TRUE(PendingListener(runtime));
+    ASSERT_EQ(PollListeners(runtime, events), 1u);
+    kbs_stream_handle stream{};
+    ASSERT_EQ(kbs_runtime_accept_tcp(runtime.value, listener, &stream, nullptr), 0);
+    runtime.streams.push_back(stream);
+    // Accept 和 Poll 都不重新订阅；下一条连接只有显式 Watch 才应报告。
+    Fd second;
+    ASSERT_TRUE(ConnectSocket(second, address));
+    ASSERT_TRUE(runtime.Step());
+    EXPECT_EQ(PollListeners(runtime, events), 0u);
+}
+
+TEST(StreamRuntimeTest, ListenerCancellationAndRewatchReplacePendingHintWithoutDuplicates) {
+    Runtime runtime;
+    ASSERT_TRUE(runtime.Open());
+    kbs_listener_handle listener{};
+    sockaddr_in address{};
+    ASSERT_TRUE(runtime.Listen(listener, address));
+    ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 1, nullptr), 0);
+    Fd client;
+    ASSERT_TRUE(ConnectSocket(client, address));
+    ASSERT_TRUE(PendingListener(runtime));
+    std::array<kbs_listener_event, 4> events{};
+    // 尚未领取的事件由取消删除，重新订阅也先撤掉同一槽的旧提示。
+    ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 0, nullptr), 0);
+    EXPECT_EQ(PollListeners(runtime, events), 0u);
+    ASSERT_TRUE(runtime.Step());
+    EXPECT_EQ(PollListeners(runtime, events), 0u);
+    ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 1, nullptr), 0);
+    ASSERT_TRUE(PendingListener(runtime));
+    ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 1, nullptr), 0);
+    EXPECT_EQ(PollListeners(runtime, events), 0u);
+    ASSERT_TRUE(PendingListener(runtime));
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(runtime.Step());
+    }
+    ASSERT_EQ(PollListeners(runtime, events), 1u);
+    EXPECT_EQ(events[0].listener.generation, listener.generation);
+}
+
+TEST(StreamRuntimeTest, ListenerQueuesRemainIndependentAndClosingPendingSlotDropsOldGeneration) {
+    Runtime runtime;
+    ASSERT_TRUE(runtime.Open(Runtime::Config(2, 2)));
+    std::array<kbs_listener_handle, 2> listeners{};
+    std::array<sockaddr_in, 2> addresses{};
+    std::array<Fd, 2> clients;
+    for (std::size_t i = 0; i < listeners.size(); ++i) {
+        ASSERT_TRUE(runtime.Listen(listeners[i], addresses[i]));
+        ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, listeners[i], 1, nullptr), 0);
+    }
+    // 分别推进两次产生确定的入队顺序，Poll(1) 不丢掉另一个监听器的提示。
+    ASSERT_TRUE(ConnectSocket(clients[1], addresses[1]));
+    ASSERT_TRUE(PendingListener(runtime));
+    ASSERT_TRUE(ConnectSocket(clients[0], addresses[0]));
+    ASSERT_TRUE(runtime.Step());
+    std::array<kbs_listener_event, 1> event{};
+    ASSERT_EQ(PollListeners(runtime, event), 1u);
+    EXPECT_EQ(event[0].listener.generation, listeners[1].generation);
+    ASSERT_EQ(kbs_runtime_close_listener(runtime.value, listeners[0], nullptr), 0);
+    EXPECT_EQ(PollListeners(runtime, event), 0u);
+    kbs_listener_handle replacement{};
+    sockaddr_in address{};
+    ASSERT_TRUE(runtime.Listen(replacement, address));
+    EXPECT_EQ(replacement.slot, listeners[0].slot);
+    EXPECT_NE(replacement.generation, listeners[0].generation);
+    EXPECT_EQ(kbs_runtime_watch_listener(runtime.value, listeners[0], 1, nullptr), KBS_STREAM_INVALID_HANDLE);
+    ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, replacement, 1, nullptr), 0);
+    ASSERT_TRUE(runtime.Step());
+    EXPECT_EQ(PollListeners(runtime, event), 0u);
+    Fd replacement_client;
+    ASSERT_TRUE(ConnectSocket(replacement_client, address));
+    ASSERT_TRUE(PendingListener(runtime));
+    ASSERT_EQ(PollListeners(runtime, event), 1u);
+    EXPECT_EQ(event[0].listener.generation, replacement.generation);
+}
+
+TEST(StreamRuntimeTest, ListenerReadinessIsCollectedInPollingMode) {
+    Runtime runtime;
+    auto config = Runtime::Config();
+    config.events = 0;
+    ASSERT_TRUE(runtime.Open(config));
+    kbs_listener_handle listener{};
+    sockaddr_in address{};
+    ASSERT_TRUE(runtime.Listen(listener, address));
+    ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 1, nullptr), 0);
+    Fd client;
+    ASSERT_TRUE(ConnectSocket(client, address));
+    ASSERT_TRUE(PendingListener(runtime));
+    std::array<kbs_listener_event, 1> event{};
+    ASSERT_EQ(PollListeners(runtime, event), 1u);
+    EXPECT_EQ(event[0].flags, KBS_LISTENER_EVENT_ACCEPTABLE);
+}
+
+TEST(StreamRuntimeTest, ListenerArrivalWakesRuntimeAndPendingHintPreventsAnotherWait) {
+    Runtime runtime;
+    auto config = Runtime::Config();
+    config.max_wait_ms = 1000;
+    ASSERT_TRUE(runtime.Open(config));
+    kbs_listener_handle listener{};
+    sockaddr_in address{};
+    ASSERT_TRUE(runtime.Listen(listener, address));
+    ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 1, nullptr), 0);
+    ASSERT_TRUE(runtime.Step());
+    Fd client;
+    std::atomic<bool> connected{false};
+    // 只有外部 socket 在另一线程；Runtime 始终由当前 owner 使用。
+    std::jthread connector([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        connected.store(ConnectSocket(client, address));
+    });
+    kbs_runtime_progress progress{};
+    const auto begin = Now();
+    do {
+        ASSERT_EQ(kbs_runtime_step(runtime.value, 1, &progress, nullptr), 0);
+    } while (!progress.pending_events && Now() - begin < 2'000'000'000ull);
+    connector.join();
+    EXPECT_TRUE(connected.load());
+    ASSERT_EQ(progress.pending_events, 1u);
+    EXPECT_EQ(progress.more_work, 1u);
+    EXPECT_LT(Now() - begin, 700'000'000ull);
+    // 内核 oneshot 已消耗，保留在应用队列的提示仍必须禁止下次 RunOnce 再睡满 1s。
+    const auto pending_begin = Now();
+    ASSERT_EQ(kbs_runtime_step(runtime.value, 1, &progress, nullptr), 0);
+    EXPECT_LT(Now() - pending_begin, 500'000'000ull);
+    EXPECT_EQ(progress.pending_events, 1u);
+    std::array<kbs_listener_event, 1> event{};
+    EXPECT_EQ(PollListeners(runtime, event), 1u);
+}
+
+TEST(StreamRuntimeTest, ListenerPollBatchIsBoundedWithoutDroppingOverflow) {
+    constexpr std::size_t kListeners = KBS_LISTENER_MAX_EVENT_BATCH + 1;
+    Runtime runtime;
+    auto config = Runtime::Config(2, kListeners);
+    config.progress_budget = 1;
+    ASSERT_TRUE(runtime.Open(config));
+    std::array<kbs_listener_handle, kListeners> listeners{};
+    std::array<Fd, kListeners> clients;
+    for (std::size_t i = 0; i < kListeners; ++i) {
+        sockaddr_in address{};
+        ASSERT_TRUE(runtime.Listen(listeners[i], address));
+        ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, listeners[i], 1, nullptr), 0);
+        ASSERT_TRUE(ConnectSocket(clients[i], address));
+    }
+    // 每次最小 budget 推进，所有就绪最终各占一个固定槽，不依赖一次 epoll_wait 全部返回。
+    for (std::size_t i = 0; i < kListeners; ++i) {
+        ASSERT_TRUE(runtime.Step());
+    }
+    std::array<kbs_listener_event, kListeners> events{};
+    std::size_t count = 99;
+    EXPECT_EQ(kbs_runtime_poll_listener_events(runtime.value, events.data(), events.size(), &count, nullptr),
+              KBS_STREAM_INVALID_ARGUMENT);
+    EXPECT_EQ(count, 0u);
+    ASSERT_EQ(PollListeners(runtime, std::span(events).first(KBS_LISTENER_MAX_EVENT_BATCH)),
+              KBS_LISTENER_MAX_EVENT_BATCH);
+    std::array<bool, kListeners> observed{};
+    for (std::size_t i = 0; i < KBS_LISTENER_MAX_EVENT_BATCH; ++i) {
+        ASSERT_LT(events[i].listener.slot, observed.size());
+        EXPECT_FALSE(observed[events[i].listener.slot]);
+        observed[events[i].listener.slot] = true;
+        EXPECT_EQ(events[i].listener.generation, listeners[events[i].listener.slot].generation);
+    }
+    ASSERT_EQ(PollListeners(runtime, std::span(events).first(1)), 1u);
+    ASSERT_LT(events[0].listener.slot, observed.size());
+    EXPECT_FALSE(observed[events[0].listener.slot]);
+    observed[events[0].listener.slot] = true;
+    EXPECT_TRUE(std::all_of(observed.begin(), observed.end(), [](bool value) { return value; }));
+    EXPECT_EQ(PollListeners(runtime, std::span(events).first(1)), 0u);
+}
+
+TEST(StreamRuntimeTest, ClosingRuntimeStopsListenerWatchesAndDropsPendingHints) {
+    Runtime runtime;
+    ASSERT_TRUE(runtime.Open());
+    kbs_listener_handle listener{};
+    sockaddr_in address{};
+    ASSERT_TRUE(runtime.Listen(listener, address));
+    ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 1, nullptr), 0);
+    Fd client;
+    ASSERT_TRUE(ConnectSocket(client, address));
+    ASSERT_TRUE(PendingListener(runtime));
+    EXPECT_EQ(kbs_runtime_close(runtime.value, nullptr), KBS_STREAM_BUSY);
+    std::array<kbs_listener_event, 1> event{};
+    EXPECT_EQ(PollListeners(runtime, event), 0u);
+    EXPECT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 1, nullptr), KBS_STREAM_STOPPED);
+    EXPECT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 0, nullptr), 0);
+    kbs_runtime_progress progress{};
+    ASSERT_EQ(kbs_runtime_step(runtime.value, 0, &progress, nullptr), 0);
+    EXPECT_EQ(progress.pending_events, 0u);
+    ASSERT_EQ(kbs_runtime_close_listener(runtime.value, listener, nullptr), 0);
+    ASSERT_EQ(kbs_runtime_close(runtime.value, nullptr), 0);
+    std::size_t count = 99;
+    EXPECT_EQ(kbs_runtime_poll_listener_events(runtime.value, event.data(), event.size(), &count, nullptr),
+              KBS_STREAM_NOT_READY);
+    EXPECT_EQ(count, 0u);
+    EXPECT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 0, nullptr), KBS_STREAM_NOT_READY);
+}
+
+TEST(StreamRuntimeTest, ListenerWatchStepAndPollAllocateNothing) {
+    Runtime runtime;
+    ASSERT_TRUE(runtime.Open());
+    kbs_listener_handle listener{};
+    sockaddr_in address{};
+    ASSERT_TRUE(runtime.Listen(listener, address));
+    Fd client;
+    ASSERT_TRUE(ConnectSocket(client, address));
+    std::array<kbs_listener_event, 1> event{};
+    bool good = true;
+    std::size_t received = 0;
+    kbs_runtime_progress progress{};
+    allocations = 0;
+    count_allocations = true;
+    // 不把 socket/Runtime 创建、断言或测试容器增长计入数据路径；同一 backlog 连续 rearm 八次。
+    for (unsigned n = 0; n < 8; ++n) {
+        good &= kbs_runtime_watch_listener(runtime.value, listener, 1, nullptr) == 0;
+        const auto deadline = Now() + 1'000'000'000ull;
+        std::size_t count = 0;
+        do {
+            good &= kbs_runtime_step(runtime.value, 0, &progress, nullptr) == 0;
+            good &= kbs_runtime_poll_listener_events(runtime.value, event.data(), event.size(), &count, nullptr) == 0;
+        } while (good && !count && Now() < deadline);
+        received += count;
+        good &= kbs_runtime_watch_listener(runtime.value, listener, 0, nullptr) == 0;
+    }
+    count_allocations = false;
+    EXPECT_TRUE(good);
+    EXPECT_EQ(received, 8u);
+    EXPECT_EQ(allocations, 0u);
+}
+
+TEST(StreamRuntimeTest, ListenerEventArgumentsAndForeignHandlesAreRejected) {
+    Runtime runtime, other;
+    ASSERT_TRUE(runtime.Open());
+    ASSERT_TRUE(other.Open());
+    kbs_listener_handle listener{};
+    sockaddr_in address{};
+    ASSERT_TRUE(runtime.Listen(listener, address));
+    EXPECT_EQ(kbs_runtime_watch_listener(other.value, listener, 1, nullptr), KBS_STREAM_INVALID_HANDLE);
+    EXPECT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 2, nullptr), KBS_STREAM_INVALID_ARGUMENT);
+    auto malformed = listener;
+    malformed.reserved = 1;
+    EXPECT_EQ(kbs_runtime_watch_listener(runtime.value, malformed, 1, nullptr), KBS_STREAM_INVALID_HANDLE);
+    std::array<kbs_listener_event, 1> event{};
+    std::size_t count = 99;
+    EXPECT_EQ(kbs_runtime_poll_listener_events(runtime.value, event.data(), 0, &count, nullptr),
+              KBS_STREAM_INVALID_ARGUMENT);
+    EXPECT_EQ(count, 0u);
+    count = 99;
+    EXPECT_EQ(kbs_runtime_poll_listener_events(runtime.value, nullptr, 1, &count, nullptr),
+              KBS_STREAM_INVALID_ARGUMENT);
+    EXPECT_EQ(count, 0u);
+    EXPECT_EQ(kbs_runtime_poll_listener_events(runtime.value, event.data(), 1, nullptr, nullptr),
+              KBS_STREAM_INVALID_ARGUMENT);
+    EXPECT_EQ(PollListeners(runtime, event), 0u);
+}
+
+TEST(StreamRuntimeTest, BusyListenerDoesNotStarveEstablishedStreamAtSmallBudget) {
+    Runtime runtime;
+    auto config = Runtime::Config();
+    config.progress_budget = 1;
+    ASSERT_TRUE(runtime.Open(config));
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    kbs_stream_handle stream{};
+    ASSERT_TRUE(runtime.Adopt(pair.right.value, stream));
+    ASSERT_TRUE(runtime.Step());
+    std::array<kbs_stream_event, 2> streams{};
+    std::size_t stream_count = 0;
+    ASSERT_EQ(kbs_stream_poll_events(runtime.table, streams.data(), streams.size(), &stream_count, nullptr), 0);
+    kbs_listener_handle listener{};
+    sockaddr_in address{};
+    ASSERT_TRUE(runtime.Listen(listener, address));
+    Fd queued;
+    ASSERT_TRUE(ConnectSocket(queued, address));
+    ASSERT_EQ(kbs_stream_watch(runtime.table, stream, 1, 0, nullptr), 0);
+    const std::byte payload{0x71};
+    ASSERT_EQ(::send(pair.left.value, &payload, 1, MSG_NOSIGNAL), 1);
+    bool stream_ready = false, listener_ready = false;
+    const auto deadline = Now() + 3'000'000'000ull;
+    // backlog 保持未接收且每轮重订阅，使监听源持续有事可做；stream 源仍应获得独立预算。
+    do {
+        ASSERT_EQ(kbs_runtime_watch_listener(runtime.value, listener, 1, nullptr), 0);
+        ASSERT_TRUE(runtime.Step());
+        std::array<kbs_listener_event, 1> events{};
+        listener_ready |= PollListeners(runtime, events) == 1;
+        ASSERT_EQ(kbs_stream_poll_events(runtime.table, streams.data(), streams.size(), &stream_count, nullptr), 0);
+        for (std::size_t i = 0; i < stream_count; ++i) {
+            stream_ready |= (streams[i].flags & KBS_STREAM_EVENT_READABLE) != 0;
+        }
+    } while ((!stream_ready || !listener_ready) && Now() < deadline);
+    EXPECT_TRUE(stream_ready);
+    EXPECT_TRUE(listener_ready);
+    kbs_stream_io io{};
+    std::byte output{};
+    ASSERT_EQ(kbs_stream_read(runtime.table, stream, &output, 1, Now(), &io, nullptr), 0);
+    EXPECT_EQ(io.bytes, 1u);
+    EXPECT_EQ(output, payload);
+}
+
 TEST(StreamRuntimeTest, InvalidCallsDoNotConsumeDescriptorsOrRuntime) {
     Runtime runtime;
     ASSERT_TRUE(runtime.Open());

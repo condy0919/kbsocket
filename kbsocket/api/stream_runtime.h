@@ -33,6 +33,18 @@ typedef struct kbs_listener_handle {
     uint32_t slot;
     uint32_t reserved;
 } kbs_listener_handle;
+
+#define KBS_LISTENER_EVENT_ACCEPTABLE (1u << 0)
+#define KBS_LISTENER_EVENT_ERROR (1u << 1)
+#define KBS_LISTENER_EVENT_HANGUP (1u << 2)
+#define KBS_LISTENER_MAX_EVENT_BATCH 64u
+
+// 就绪提示不保证下一次 Accept 成功；ERROR/HANGUP 不猜测 errno，由实际操作报告错误。
+typedef struct kbs_listener_event {
+    kbs_listener_handle listener;
+    uint32_t flags;
+    uint32_t reserved;
+} kbs_listener_event;
 typedef struct kbs_runtime_progress {
     uint64_t processed;
     uint32_t more_work;
@@ -45,7 +57,7 @@ int32_t kbs_runtime_create(const kbs_runtime_config* config, kbs_runtime** out, 
 // 表借用至 Destroy；Runtime Close 后旧表指针仍可安全返回 NOT_READY，Destroy 后不得访问。
 int32_t kbs_runtime_streams(kbs_runtime* runtime, kbs_stream_table** out, kbs_stream_error* error);
 // wait=0 为非阻塞 Tick；wait=1 最多等待配置的 max_wait_ms。已有应用事件时绝不再次睡眠。
-// 只推进 stream；监听器由应用显式 Accept，不自动接收也不产生监听就绪事件。
+// 推进 stream 和已订阅监听器；pending_events 覆盖两类待取事件，不自动 Accept。
 int32_t kbs_runtime_step(kbs_runtime* runtime, uint32_t wait, kbs_runtime_progress* out, kbs_stream_error* error);
 uint64_t kbs_runtime_now_ns(void);
 
@@ -61,12 +73,21 @@ int32_t kbs_runtime_listen_tcp(kbs_runtime* runtime, const struct sockaddr* addr
 // 每次最多接收一个连接；WOULD_BLOCK 不分配 stream，容量不足不取走内核排队连接。
 int32_t kbs_runtime_accept_tcp(kbs_runtime* runtime, kbs_listener_handle listener, kbs_stream_handle* out,
                                kbs_stream_error* error);
+// 新监听器默认不订阅。enabled=1 重新订阅一次，enabled=0 取消；成功均撤销该监听器未取的旧提示。
+// 一次就绪整体消耗订阅；Poll/Accept/Step 不自动 rearm。Runtime 停准入后只允许取消。
+int32_t kbs_runtime_watch_listener(kbs_runtime* runtime, kbs_listener_handle listener, uint32_t enabled,
+                                   kbs_stream_error* error);
+// 独立有界队列，每监听器最多一个合并事件；capacity 为 1..64，无事件成功返回 count=0。
+int32_t kbs_runtime_poll_listener_events(kbs_runtime* runtime, kbs_listener_event* events, size_t capacity,
+                                         size_t* count, kbs_stream_error* error);
 // 与 getsockname 相同的地址容量规则，可取得绑定端口 0 后的实际地址。
 int32_t kbs_runtime_listener_address(kbs_runtime* runtime, kbs_listener_handle listener, struct sockaddr* address,
                                      socklen_t* length, kbs_stream_error* error);
 // 有效监听句柄一经关闭即失效，即使 Linux close 报错也不重试同一 fd。
+// 先撤销监听通知；若撤销失败，保留句柄/socket 并返回错误，供显式重试。
 int32_t kbs_runtime_close_listener(kbs_runtime* runtime, kbs_listener_handle listener, kbs_stream_error* error);
 // 停止新准入；仍有已发布 stream 或 listener 返回 BUSY，保留 Step/关闭/Release 能力。
+// 同时停止监听订阅并清除未取监听提示，已有流事件继续可取。
 // 不强制关闭应用连接。全部责任已显式释放后可重试，成功后不允许继续 Step。
 int32_t kbs_runtime_close(kbs_runtime* runtime, kbs_stream_error* error);
 // 仅 Closed 可销毁；失败保留指针，成功写回 NULL。NULL 指针值允许重复销毁。
