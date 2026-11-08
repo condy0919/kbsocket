@@ -306,7 +306,8 @@ ConnectionOwner::Inspect(OwnedConnection handle) const noexcept {
                                  connection.tx_stats(),
                                  connection.rx_pending(),
                                  (*slot)->sources ? (*slot)->sources->size() : 0,
-                                 connection.lane_update_pending()};
+                                 connection.lane_update_pending(),
+                                 connection.readiness()};
 }
 std::expected<const control::HandshakeHello*, ConnectionOwnerError>
 ConnectionOwner::Peer(OwnedConnection handle) const noexcept {
@@ -396,6 +397,9 @@ ConnectionOwnerStats ConnectionOwner::stats() const noexcept {
 }
 const void* ConnectionOwner::exclusive_context() const noexcept {
     return state_ ? state_->progress->exclusive_context() : nullptr;
+}
+std::uint32_t ConnectionOwner::scheduler_capacity() const noexcept {
+    return state_ ? state_->progress->capacity() : 0;
 }
 
 } // namespace runtime

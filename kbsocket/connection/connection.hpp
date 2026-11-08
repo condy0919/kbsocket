@@ -58,6 +58,13 @@ struct ConnectionReadResult {
     std::size_t bytes = 0;
     bool eof = false;
 };
+struct ConnectionReadiness {
+    bool readable = false;
+    bool writable = false;
+    bool read_eof = false;
+    bool write_closed = false;
+    bool operator==(const ConnectionReadiness&) const = default;
+};
 using LaneUpdateAuthorizer = control::LaneUpdateAuthorizer;
 struct RawConnectionPreparation {
     control::RawHandshakePreparation handshake;
@@ -146,6 +153,8 @@ public:
     std::size_t rx_pending() const noexcept {
         return rx_.pending();
     }
+    /// O(1) 快照，不消费数据、不查询 provider；TCP IN/OUT 由宿主 fd 通知提供。
+    ConnectionReadiness readiness() const noexcept;
 
 private:
     ConnectionError Fail(ConnectionError error) noexcept;

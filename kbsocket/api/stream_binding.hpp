@@ -10,6 +10,7 @@
 
 #include "kbsocket/api/stream.h"
 #include "kbsocket/runtime/connection_owner.hpp"
+#include "kbsocket/runtime/connection_progress.hpp"
 #include "kbsocket/runtime/raw_stack.hpp"
 
 namespace kbsocket {
@@ -51,6 +52,12 @@ public:
                                                         std::uint64_t now_ns) noexcept;
     std::expected<void, kbs_stream_error> ShutdownWrite(kbs_stream_handle stream) noexcept;
     std::expected<void, kbs_stream_error> Cancel(kbs_stream_handle stream) noexcept;
+    std::expected<void, kbs_stream_error> Watch(kbs_stream_handle stream, bool readable, bool writable) noexcept;
+    std::expected<std::size_t, kbs_stream_error> PollEvents(std::span<kbs_stream_event> output) noexcept;
+    // 唯一允许从原 ConnectionProgress 回调同步调用的入口：只复制快照，不重入 owner/provider。
+    // 不得缓存后乱序回放；未发布/旧 scheduled identity 返回 false。暂停时拒绝并保留队列。
+    // 宿主必须先停用转发再析构本对象；Close 不替宿主注销回调。
+    std::expected<bool, kbs_stream_error> RecordProgress(const runtime::ConnectionProgressEvent& event) noexcept;
     std::expected<void, kbs_stream_error> WatchTcp(kbs_stream_handle stream, bool readable, bool writable) noexcept;
     std::expected<kbs_stream_status, kbs_stream_error> Inspect(kbs_stream_handle stream) noexcept;
     std::expected<void, kbs_stream_error> CloseStream(kbs_stream_handle stream) noexcept;

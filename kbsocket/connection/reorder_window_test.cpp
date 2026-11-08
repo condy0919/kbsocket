@@ -96,6 +96,35 @@ protected:
     std::size_t receipt_count_ = 0;
 };
 
+TEST_F(ReorderWindowTest, ReadableOnlyForContinuousHeadOrConsumedEofWithoutMutation) {
+    EXPECT_FALSE(window_.readable());
+    ASSERT_TRUE(window_.Open(Session(), Config()));
+    ASSERT_TRUE(window_.Push(Fin(1), 0));
+    // 有驻留 FIN 但缺少序号零，不能把 pending 当作 Read 就绪。
+    EXPECT_FALSE(window_.readable());
+    ASSERT_TRUE(window_.Push(Frame(0), 0));
+    const auto before = window_.stats();
+    allocation_count = 0;
+    count_allocations = true;
+    const bool readable = window_.readable();
+    count_allocations = false;
+    EXPECT_TRUE(readable);
+    EXPECT_EQ(allocation_count, 0u);
+    EXPECT_EQ(window_.stats().rcv_next, before.rcv_next);
+    EXPECT_EQ(window_.stats().buffered_frames, before.buffered_frames);
+    std::array<ReorderDelivery, 1> output;
+    ASSERT_EQ(Poll(output), 1u);
+    ASSERT_TRUE(window_.Release(output[0].receipt));
+    EXPECT_TRUE(window_.readable());
+    EXPECT_FALSE(window_.eof());
+    ASSERT_EQ(Poll(output), 1u);
+    ASSERT_TRUE(window_.Release(output[0].receipt));
+    EXPECT_TRUE(window_.eof());
+    EXPECT_TRUE(window_.readable());
+    window_.Fail();
+    EXPECT_FALSE(window_.readable());
+}
+
 TEST_F(ReorderWindowTest, DeliversTwoZeroThreeOneInOrderWithBoundedBatches) {
     ASSERT_TRUE(window_.Open(Session(), Config()));
     for (std::uint32_t sequence : {2u, 0u, 3u, 1u}) {

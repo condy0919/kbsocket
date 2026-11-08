@@ -59,6 +59,7 @@ struct OwnedConnectionStatus {
     std::size_t rx_pending = 0;
     std::size_t retained_sources = 0;
     bool lane_update_pending = false;
+    connection::ConnectionReadiness readiness = {};
 };
 struct ConnectionOwnerStats {
     std::size_t capacity = 0;
@@ -114,6 +115,7 @@ public:
     ConnectionOwnerStats stats() const noexcept;
     /// 控制路径取得真实调度 context，供业务 mailbox 加入同一暂停组；不授予跨线程访问 owner。
     const void* exclusive_context() const noexcept;
+    std::uint32_t scheduler_capacity() const noexcept;
 
 private:
     struct State;

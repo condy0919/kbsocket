@@ -33,6 +33,7 @@ struct ConnectionProgress::State {
         int watched_fd = -1;
         bool queued = false;
         ConnectionState reported = ConnectionState::kIdle;
+        connection::ConnectionReadiness reported_readiness;
     };
     ~State() {
         if (epoll >= 0) {
@@ -174,7 +175,9 @@ struct ConnectionProgress::State {
         }
         const auto pending_rx = connection.rx_pending();
         const bool rx_changed = pending_rx != slot.reported_rx;
-        if (slot.reported != connection.state() || rx_changed || slot.retired ||
+        const auto readiness = connection.readiness();
+        const bool advanced = processed != 0;
+        if (slot.reported != connection.state() || rx_changed || slot.retired || readiness != slot.reported_readiness ||
             (events && connection.state() == ConnectionState::kTcpActive)) {
             if (connection.state() == ConnectionState::kFailed && slot.reported != connection.state()) {
                 ++stats.failures;
@@ -186,14 +189,17 @@ struct ConnectionProgress::State {
                                   connection.state() == ConnectionState::kTcpActive ? events : 0,
                                   rx_changed,
                                   pending_rx,
-                                  slot.retired});
+                                  slot.retired,
+                                  readiness,
+                                  connection.failure()});
             }
             slot.reported_rx = pending_rx;
+            slot.reported_readiness = readiness;
             slot.retired = 0;
             ++processed;
         }
         // 仅已取得进展才继续本连接；等待 Credit/资源时交给 CQE、RX 或周期巡检唤醒。
-        if (processed && connection.state() == ConnectionState::kRawActive && connection.tx_stats().queued) {
+        if (advanced && connection.state() == ConnectionState::kRawActive && connection.tx_stats().queued) {
             Enqueue(slot);
         }
         return processed;
@@ -214,6 +220,13 @@ struct ConnectionProgress::State {
 };
 
 ConnectionProgress::ConnectionProgress() noexcept = default;
+std::optional<std::uint32_t> ScheduledConnection::slot_index() const noexcept {
+    const auto index = static_cast<std::uint32_t>(id);
+    if (!owner || !(id >> 32) || !index || index > ConnectionProgress::kMaxConnections) {
+        return std::nullopt;
+    }
+    return index - 1;
+}
 ConnectionProgress::~ConnectionProgress() {
     if (!Close()) {
         // 注册对象与回调仍被外部 Reactor 借用时不得释放内部状态；宿主须显式拆除依赖。
@@ -542,6 +555,9 @@ std::expected<void, ProgressError> ConnectionProgress::Close() noexcept {
 }
 const ConnectionProgressStats* ConnectionProgress::stats() const noexcept {
     return state_ ? &state_->stats : nullptr;
+}
+std::uint32_t ConnectionProgress::capacity() const noexcept {
+    return state_ ? state_->config.capacity : 0;
 }
 } // namespace runtime
 } // namespace kbsocket

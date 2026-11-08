@@ -193,6 +193,7 @@ protected:
 };
 
 TEST_F(ConnectionOwnerTest, OpenRequiresReadyProgressAndBoundedCapacity) {
+    EXPECT_EQ(owner_.scheduler_capacity(), 0u);
     ExpectError(owner_.AdoptTcp(-1), Code::kNotReady);
     EXPECT_FALSE(owner_.Open(progress_));
     ASSERT_TRUE(progress_.Open({.capacity = 4}));
@@ -200,10 +201,30 @@ TEST_F(ConnectionOwnerTest, OpenRequiresReadyProgressAndBoundedCapacity) {
     EXPECT_FALSE(owner_.Open(progress_, {.capacity = 0}));
     EXPECT_FALSE(owner_.Open(progress_, {.capacity = ConnectionProgress::kMaxConnections + 1}));
     ASSERT_TRUE(owner_.Open(progress_, {.capacity = 2}));
+    EXPECT_EQ(owner_.scheduler_capacity(), 4u);
     ExpectError(owner_.Open(progress_, {.capacity = 2}), Code::kInUse);
     EXPECT_EQ(owner_.stats().capacity, 2u);
     EXPECT_EQ(owner_.stats().occupied, 0u);
     EXPECT_TRUE(owner_.stats().accepting);
+}
+
+TEST_F(ConnectionOwnerTest, InspectIncludesKnownHalfCloseReadiness) {
+    Open();
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    const auto handle = owner_.AdoptTcp(pair.right);
+    ASSERT_TRUE(handle);
+    pair.right = -1;
+    Track(*handle);
+    const auto opened = owner_.Inspect(*handle);
+    ASSERT_TRUE(opened);
+    EXPECT_EQ(opened->readiness, connection::ConnectionReadiness{});
+    ASSERT_TRUE(owner_.ShutdownWrite(*handle));
+    const auto shutdown = owner_.Inspect(*handle);
+    ASSERT_TRUE(shutdown);
+    EXPECT_TRUE(shutdown->readiness.write_closed);
+    EXPECT_FALSE(shutdown->readiness.readable);
+    EXPECT_FALSE(shutdown->readiness.writable);
 }
 
 TEST_F(ConnectionOwnerTest, FailedTcpAdoptionPreservesFdAndReturnsSlot) {

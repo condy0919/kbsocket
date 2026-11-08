@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <new>
 #include <optional>
 #include <thread>
@@ -126,9 +127,12 @@ protected:
     std::size_t owned_count_ = 0, published_count_ = 0;
     bool runtime_open_ = false;
     std::uint32_t last_events_ = 0;
-    std::size_t notifications_ = 0;
+    std::size_t notifications_ = 0, forward_errors_ = 0;
     static void Observe(void* cookie, const runtime::ConnectionProgressEvent& event) noexcept {
         auto& self = *static_cast<StreamBindingTest*>(cookie);
+        if (self.binding_.table() && !self.binding_.RecordProgress(event)) {
+            ++self.forward_errors_;
+        }
         if (event.fd_events) {
             self.last_events_ = event.fd_events;
             ++self.notifications_;
@@ -509,6 +513,321 @@ TEST_F(StreamBindingTest, PublishedFastpathDoesNotAllocate) {
     EXPECT_EQ(allocations, 0u);
 }
 
+TEST_F(StreamBindingTest, EventArgumentsAndClosedTablePreservePendingState) {
+    Open();
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    const auto stream = Publish(Adopt(pair.right));
+    kbs_stream_event event{};
+    std::size_t count = 99;
+    kbs_stream_error error{};
+    EXPECT_EQ(kbs_stream_watch(binding_.table(), stream, 2, 0, &error), KBS_STREAM_INVALID_ARGUMENT);
+    EXPECT_EQ(kbs_stream_watch(binding_.table(), stream, 0, 2, &error), KBS_STREAM_INVALID_ARGUMENT);
+    EXPECT_EQ(kbs_stream_poll_events(binding_.table(), nullptr, 1, &count, &error), KBS_STREAM_INVALID_ARGUMENT);
+    EXPECT_EQ(count, 0u);
+    count = 99;
+    EXPECT_EQ(kbs_stream_poll_events(binding_.table(), &event, 0, &count, &error), KBS_STREAM_INVALID_ARGUMENT);
+    EXPECT_EQ(count, 0u);
+    EXPECT_EQ(kbs_stream_poll_events(binding_.table(), &event, 1, nullptr, nullptr), KBS_STREAM_INVALID_ARGUMENT);
+    ASSERT_EQ(kbs_stream_poll_events(binding_.table(), &event, 1, &count, &error), 0);
+    ASSERT_EQ(count, 1u);
+    EXPECT_EQ(event.stream.table_id, stream.table_id);
+    EXPECT_EQ(event.stream.generation, stream.generation);
+    EXPECT_EQ(event.stream.slot, stream.slot);
+    EXPECT_EQ(event.flags, KBS_STREAM_EVENT_STATE);
+    EXPECT_EQ(event.state, KBS_STREAM_TCP_ACTIVE);
+    EXPECT_EQ(error.code, 0);
+    ASSERT_TRUE(binding_.CloseStream(stream));
+    ASSERT_TRUE(binding_.Release(stream));
+    auto* table = binding_.table();
+    ASSERT_TRUE(binding_.Close());
+    count = 99;
+    EXPECT_EQ(kbs_stream_poll_events(table, &event, 1, &count, nullptr), KBS_STREAM_NOT_READY);
+    EXPECT_EQ(count, 0u);
+    ExpectError(binding_.RecordProgress({{}, connection::ConnectionState::kClosed}), KBS_STREAM_NOT_READY);
+}
+TEST_F(StreamBindingTest, ProgressEventsCoalesceLatestSnapshotAndSaturatingRetirement) {
+    Open();
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    const auto owned = Adopt(pair.right);
+    const auto stream = Publish(owned);
+    const auto scheduled = owner_.Inspect(owned)->scheduled;
+    // 高速回调合并到同一节点；进度计数累加，状态及驻留量保持最新快照。
+    runtime::ConnectionProgressEvent first{scheduled, connection::ConnectionState::kTcpActive};
+    first.rx_changed = true;
+    first.rx_pending = 5;
+    first.tx_retired = 7;
+    ASSERT_EQ(binding_.RecordProgress(first), true);
+    first.rx_pending = 2;
+    first.tx_retired = 9;
+    ASSERT_EQ(binding_.RecordProgress(first), true);
+    std::array<kbs_stream_event, 4> events{};
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    EXPECT_EQ(events[0].stream.generation, stream.generation);
+    EXPECT_EQ(events[0].rx_pending, 2u);
+    EXPECT_EQ(events[0].tx_retired, 16u);
+    EXPECT_EQ(events[0].flags, KBS_STREAM_EVENT_STATE | KBS_STREAM_EVENT_RX_CHANGED | KBS_STREAM_EVENT_TX_RETIRED);
+    EXPECT_EQ(binding_.PollEvents(events), 0u);
+    first.tx_retired = std::numeric_limits<std::uint64_t>::max();
+    ASSERT_EQ(binding_.RecordProgress(first), true);
+    first.tx_retired = 1;
+    ASSERT_EQ(binding_.RecordProgress(first), true);
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    EXPECT_EQ(events[0].tx_retired, std::numeric_limits<std::uint64_t>::max());
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_COUNTER_SATURATED, 0u);
+}
+TEST_F(StreamBindingTest, DirectCancellationAndCloseRefreshQueuedFailure) {
+    Open();
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    const auto stream = Publish(Adopt(pair.right));
+    std::array<kbs_stream_event, 1> events{};
+    ASSERT_TRUE(binding_.Cancel(stream));
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    EXPECT_EQ(events[0].state, KBS_STREAM_FAILED);
+    EXPECT_EQ(events[0].failure.code, KBS_STREAM_CANCELLED);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_ERROR, 0u);
+    ASSERT_TRUE(binding_.CloseStream(stream));
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    EXPECT_EQ(events[0].state, KBS_STREAM_STATE_CLOSED);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_CLOSED, 0u);
+}
+TEST_F(StreamBindingTest, StaleSchedulerIdentityCannotReachRepublishedSlot) {
+    Open(1);
+    TcpPair first, second;
+    ASSERT_TRUE(first.Open());
+    ASSERT_TRUE(second.Open());
+    const auto old_owned = Adopt(first.right);
+    const auto old_stream = Publish(old_owned);
+    const auto old_scheduled = owner_.Inspect(old_owned)->scheduled;
+    ASSERT_TRUE(binding_.CloseStream(old_stream));
+    ASSERT_TRUE(binding_.Release(old_stream));
+    const auto new_owned = Adopt(second.right);
+    const auto stream = Publish(new_owned);
+    const auto scheduled = owner_.Inspect(new_owned)->scheduled;
+    EXPECT_EQ(old_stream.slot, stream.slot);
+    EXPECT_EQ(old_scheduled.slot_index(), scheduled.slot_index());
+    runtime::ConnectionProgressEvent stale{old_scheduled, connection::ConnectionState::kFailed};
+    stale.tx_retired = 99;
+    EXPECT_EQ(binding_.RecordProgress(stale), false);
+    stale.connection = scheduled;
+    stale.connection.owner = nullptr;
+    EXPECT_EQ(binding_.RecordProgress(stale), false);
+    stale.connection = {scheduled.owner, 0};
+    EXPECT_EQ(binding_.RecordProgress(stale), false);
+    std::array<kbs_stream_event, 2> events{};
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    EXPECT_EQ(events[0].stream.generation, stream.generation);
+    EXPECT_EQ(events[0].state, KBS_STREAM_TCP_ACTIVE);
+    EXPECT_EQ(events[0].tx_retired, 0u);
+    // 成功 Release 取消尚未取出的提示，不能把旧关闭事件交给复用后的应用句柄。
+    ASSERT_TRUE(binding_.CloseStream(stream));
+    ASSERT_TRUE(binding_.Release(stream));
+    EXPECT_EQ(binding_.PollEvents(events), 0u);
+}
+TEST_F(StreamBindingTest, PendingMiddleRemovalPreservesFifoAndReleasedTail) {
+    Open(3);
+    std::array<TcpPair, 3> pairs;
+    std::array<kbs_stream_handle, 3> streams{};
+    for (std::size_t i = 0; i < pairs.size(); ++i) {
+        ASSERT_TRUE(pairs[i].Open());
+        streams[i] = Publish(Adopt(pairs[i].right));
+    }
+    ASSERT_TRUE(binding_.CloseStream(streams[1]));
+    ASSERT_TRUE(binding_.Release(streams[1]));
+    std::array<kbs_stream_event, 1> events{};
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    EXPECT_EQ(events[0].stream.slot, streams[0].slot);
+    ASSERT_TRUE(binding_.CloseStream(streams[2]));
+    ASSERT_TRUE(binding_.Release(streams[2]));
+    EXPECT_EQ(binding_.PollEvents(events), 0u);
+    ASSERT_TRUE(binding_.ShutdownWrite(streams[0]));
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    EXPECT_EQ(events[0].stream.slot, streams[0].slot);
+    EXPECT_EQ(events[0].write_closed, 1u);
+}
+TEST_F(StreamBindingTest, NativeOneShotDeliveryRequiresExplicitRearm) {
+    Open();
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    const auto stream = Publish(Adopt(pair.right));
+    ASSERT_TRUE(
+        runtime_.Open({}, {.reactor = {.events = true, .budget = 4, .busy_poll_ns = 0, .max_wait_ms = 1}}, &progress_));
+    runtime_open_ = true;
+    std::array<kbs_stream_event, 2> events{};
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    ASSERT_EQ(kbs_stream_watch(binding_.table(), stream, 1, 1, nullptr), 0);
+    const auto deadline = Now() + 3'000'000'000ull;
+    std::uint32_t flags = 0;
+    while (!(flags & KBS_STREAM_EVENT_WRITABLE) && Now() < deadline) {
+        ASSERT_TRUE(runtime_.RunOnce());
+        const auto count = binding_.PollEvents(events);
+        ASSERT_TRUE(count);
+        for (std::size_t i = 0; i < *count; ++i) {
+            flags |= events[i].flags;
+        }
+    }
+    ASSERT_NE(flags & KBS_STREAM_EVENT_WRITABLE, 0u);
+    const std::byte byte{0x62};
+    ASSERT_EQ(::send(pair.left, &byte, 1, MSG_NOSIGNAL), 1);
+    // OUT 已消费整体 oneshot；后到 IN 不得复用此前订阅，Poll 本身也不重新 arm。
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(runtime_.RunOnce());
+    }
+    ASSERT_EQ(binding_.PollEvents(events), 0u);
+    ASSERT_TRUE(binding_.Watch(stream, true, false));
+    flags = 0;
+    while (!(flags & KBS_STREAM_EVENT_READABLE) && Now() < deadline) {
+        ASSERT_TRUE(runtime_.RunOnce());
+        const auto count = binding_.PollEvents(events);
+        ASSERT_TRUE(count);
+        for (std::size_t i = 0; i < *count; ++i) {
+            flags |= events[i].flags;
+        }
+    }
+    EXPECT_NE(flags & KBS_STREAM_EVENT_READABLE, 0u);
+    EXPECT_EQ(forward_errors_, 0u);
+}
+TEST_F(StreamBindingTest, PeerShutdownHintsDoNotClaimEofBeforeRead) {
+    Open();
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    const auto stream = Publish(Adopt(pair.right));
+    ASSERT_TRUE(
+        runtime_.Open({}, {.reactor = {.events = true, .budget = 4, .busy_poll_ns = 0, .max_wait_ms = 1}}, &progress_));
+    runtime_open_ = true;
+    std::array<kbs_stream_event, 2> events{};
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    ASSERT_TRUE(binding_.Watch(stream, true, false));
+    const std::byte byte{0x35};
+    ASSERT_EQ(::send(pair.left, &byte, 1, MSG_NOSIGNAL), 1);
+    ASSERT_EQ(::shutdown(pair.left, SHUT_WR), 0);
+    const auto deadline = Now() + 3'000'000'000ull;
+    bool readable = false;
+    while (!readable && Now() < deadline) {
+        ASSERT_TRUE(runtime_.RunOnce());
+        const auto count = binding_.PollEvents(events);
+        ASSERT_TRUE(count);
+        for (std::size_t i = 0; i < *count; ++i) {
+            readable |= (events[i].flags & KBS_STREAM_EVENT_READABLE) != 0;
+            EXPECT_EQ(events[i].read_eof, 0u);
+        }
+    }
+    ASSERT_TRUE(readable);
+    std::array<std::byte, 1> output{};
+    const auto data = binding_.Read(stream, output, Now());
+    ASSERT_TRUE(data);
+    EXPECT_EQ(data->bytes, 1u);
+    EXPECT_EQ(data->eof, 0u);
+    const auto eof = binding_.Read(stream, output, Now());
+    ASSERT_TRUE(eof);
+    EXPECT_EQ(eof->eof, 1u);
+    ASSERT_TRUE(binding_.Watch(stream, true, false));
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    EXPECT_EQ(events[0].read_eof, 1u);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_READABLE, 0u);
+    ASSERT_TRUE(binding_.ShutdownWrite(stream));
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    EXPECT_EQ(events[0].write_closed, 1u);
+}
+TEST_F(StreamBindingTest, ReadHalfCloseDoesNotInventWritableAndConsumesWholeWatch) {
+    Open();
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    const auto owned = Adopt(pair.right);
+    const auto stream = Publish(owned);
+    const auto scheduled = owner_.Inspect(owned)->scheduled;
+    std::array<kbs_stream_event, 2> events{};
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    ASSERT_TRUE(binding_.Watch(stream, false, true));
+    // 单独 RDHUP 只终结对端发送半部，不能说明本地发送缓冲有空间；底层 oneshot 仍已被消费。
+    runtime::ConnectionProgressEvent half_closed{scheduled, connection::ConnectionState::kTcpActive};
+    half_closed.fd_events = EPOLLRDHUP;
+    ASSERT_EQ(binding_.RecordProgress(half_closed), true);
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_PEER_SHUTDOWN, 0u);
+    EXPECT_EQ(events[0].flags & (KBS_STREAM_EVENT_READABLE | KBS_STREAM_EVENT_WRITABLE), 0u);
+    EXPECT_EQ(events[0].read_eof, 0u);
+    half_closed.fd_events = EPOLLOUT;
+    ASSERT_EQ(binding_.RecordProgress(half_closed), true);
+    EXPECT_EQ(binding_.PollEvents(events), 0u);
+    ASSERT_TRUE(binding_.Watch(stream, true, true));
+    half_closed.fd_events = EPOLLERR;
+    ASSERT_EQ(binding_.RecordProgress(half_closed), true);
+    ASSERT_EQ(binding_.PollEvents(events), 1u);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_ERROR, 0u);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_READABLE, 0u);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_WRITABLE, 0u);
+    // 原生错误提示没有经过数据 API 诊断，不能凭 fd 标志猜测 ConnectionError。
+    EXPECT_EQ(events[0].failure.code, 0);
+}
+TEST_F(StreamBindingTest, EventIngressAndPollingAllocateNothing) {
+    Open();
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    const auto owned = Adopt(pair.right);
+    const auto stream = Publish(owned);
+    runtime::ConnectionProgressEvent progress{owner_.Inspect(owned)->scheduled,
+                                              connection::ConnectionState::kTcpActive};
+    progress.tx_retired = 1;
+    std::array<kbs_stream_event, 2> events{};
+    allocations = 0;
+    count_allocations = true;
+    bool recorded = true;
+    for (std::size_t i = 0; i < 100; ++i) {
+        recorded &= binding_.RecordProgress(progress).value_or(false);
+    }
+    const auto polled = binding_.PollEvents(events);
+    const auto watched = binding_.Watch(stream, true, true);
+    progress.fd_events = EPOLLOUT;
+    recorded &= binding_.RecordProgress(progress).value_or(false);
+    const auto second = binding_.PollEvents(events);
+    count_allocations = false;
+    EXPECT_TRUE(recorded);
+    EXPECT_EQ(polled, 1u);
+    EXPECT_TRUE(watched);
+    EXPECT_EQ(second, 1u);
+    EXPECT_EQ(allocations, 0u);
+}
+TEST(StreamEventQueueTest, PollCapsBatchAndKeepsRemainingHandlesInOrder) {
+    runtime::ConnectionProgress progress;
+    runtime::ConnectionOwner owner;
+    StreamBinding binding;
+    constexpr std::size_t kCount = KBS_STREAM_EVENT_BATCH_MAX + 2;
+    ASSERT_TRUE(progress.Open({.capacity = kCount}));
+    ASSERT_TRUE(owner.Open(progress, {.capacity = kCount}));
+    ASSERT_TRUE(binding.OpenTcp(owner, {901, kCount, 16}));
+    std::array<TcpPair, kCount> pairs;
+    std::array<kbs_stream_handle, kCount> streams{};
+    for (std::size_t i = 0; i < kCount; ++i) {
+        ASSERT_TRUE(pairs[i].Open());
+        const auto owned = owner.AdoptTcp(pairs[i].right);
+        ASSERT_TRUE(owned);
+        pairs[i].right = -1;
+        const auto stream = binding.Publish(*owned);
+        ASSERT_TRUE(stream);
+        streams[i] = *stream;
+    }
+    std::array<kbs_stream_event, kCount> events{};
+    ASSERT_EQ(binding.PollEvents(events), KBS_STREAM_EVENT_BATCH_MAX);
+    for (std::size_t i = 0; i < KBS_STREAM_EVENT_BATCH_MAX; ++i) {
+        EXPECT_EQ(events[i].stream.slot, streams[i].slot);
+    }
+    ASSERT_EQ(binding.PollEvents(events), 2u);
+    EXPECT_EQ(events[0].stream.slot, streams[kCount - 2].slot);
+    EXPECT_EQ(events[1].stream.slot, streams[kCount - 1].slot);
+    EXPECT_EQ(binding.PollEvents(events), 0u);
+    for (const auto stream : streams) {
+        ASSERT_TRUE(binding.CloseStream(stream));
+        ASSERT_TRUE(binding.Release(stream));
+    }
+    EXPECT_EQ(binding.PollEvents(events), 0u);
+    EXPECT_TRUE(binding.Close());
+    EXPECT_TRUE(owner.Close());
+    EXPECT_TRUE(progress.Close());
+}
+
 class RawStreamBindingTest : public ::testing::Test {
 protected:
     struct Receive {
@@ -528,6 +847,7 @@ protected:
         bool hold_tx = false;
         std::atomic<bool> block_import{false};
         std::atomic<unsigned> imports{0};
+        std::size_t forward_errors = 0;
         runtime::RawStackContextResources resources{};
         runtime::OwnedConnection owned;
         kbs_stream_handle stream{};
@@ -738,6 +1058,13 @@ protected:
             endpoints_[i].context.eid_index = i;
             endpoints_[i].context.async_fd = -1;
             endpoints[i].device = {"raw", static_cast<std::uint32_t>(i)};
+            endpoints[i].cookie = &endpoints_[i];
+            endpoints[i].on_connection = [](void* cookie, const runtime::ConnectionProgressEvent& event) noexcept {
+                auto& endpoint = *static_cast<Endpoint*>(cookie);
+                if (endpoint.binding.table() && !endpoint.binding.RecordProgress(event)) {
+                    ++endpoint.forward_errors;
+                }
+            };
             auto& domain = endpoints[i].domain;
             domain.local_domain = {11, 101 + i};
             domain.context_incarnation = i + 1;
@@ -937,6 +1264,7 @@ TEST_F(RawStreamBindingTest, SameCAbiDeliversRawPrefixesAndRetainsDmaUntilRealCo
 TEST_F(RawStreamBindingTest, EveryBoundEntryHonorsActualImportPauseAndOtherContextRemainsUsable) {
     AdoptProtocol();
     endpoints_[0].block_import.store(true);
+    const auto scheduled = endpoints_[0].resources.connections->Inspect(endpoints_[0].owned)->scheduled;
     Prepare();
     ASSERT_TRUE(Until([&] { return stack_.paused(0); }));
     auto& e = endpoints_[0];
@@ -948,6 +1276,13 @@ TEST_F(RawStreamBindingTest, EveryBoundEntryHonorsActualImportPauseAndOtherConte
     EXPECT_EQ(kbs_stream_inspect(e.binding.table(), e.stream, &status, nullptr), KBS_STREAM_BUSY);
     EXPECT_EQ(kbs_stream_shutdown_write(e.binding.table(), e.stream, nullptr), KBS_STREAM_BUSY);
     EXPECT_EQ(kbs_stream_watch_tcp(e.binding.table(), e.stream, 1, 0, nullptr), KBS_STREAM_BUSY);
+    EXPECT_EQ(kbs_stream_watch(e.binding.table(), e.stream, 1, 0, nullptr), KBS_STREAM_BUSY);
+    std::array<kbs_stream_event, 4> events{};
+    std::size_t count = 99;
+    EXPECT_EQ(kbs_stream_poll_events(e.binding.table(), events.data(), events.size(), &count, nullptr),
+              KBS_STREAM_BUSY);
+    EXPECT_EQ(count, 0u);
+    ExpectError(e.binding.RecordProgress({scheduled, connection::ConnectionState::kPreparing}), KBS_STREAM_BUSY);
     EXPECT_EQ(kbs_stream_cancel(e.binding.table(), e.stream, nullptr), KBS_STREAM_BUSY);
     EXPECT_EQ(kbs_stream_close(e.binding.table(), e.stream, nullptr), KBS_STREAM_BUSY);
     EXPECT_EQ(kbs_stream_release(e.binding.table(), e.stream, nullptr), KBS_STREAM_BUSY);
@@ -959,12 +1294,96 @@ TEST_F(RawStreamBindingTest, EveryBoundEntryHonorsActualImportPauseAndOtherConte
     ASSERT_TRUE(additional.Close());
     ASSERT_TRUE(Until([&] { return !stack_.paused(1); }));
     EXPECT_TRUE(endpoints_[1].binding.Inspect(endpoints_[1].stream));
+    EXPECT_TRUE(endpoints_[1].binding.PollEvents(events));
     EXPECT_EQ(e.binding.published(), 1u);
     e.block_import.store(false);
     e.block_import.notify_all();
     ASSERT_TRUE(
         Until([&] { return !stack_.paused(0) && e.binding.Inspect(e.stream)->state == KBS_STREAM_RAW_ACTIVE; }));
     EXPECT_EQ(e.binding.Inspect(e.stream)->failure.code, 0);
+    const auto pending = e.binding.PollEvents(events);
+    ASSERT_TRUE(pending);
+    ASSERT_EQ(*pending, 1u);
+    EXPECT_EQ(events[0].stream.generation, e.stream.generation);
+    EXPECT_EQ(events[0].state, KBS_STREAM_RAW_ACTIVE);
+    EXPECT_EQ(e.forward_errors, 0u);
+}
+TEST_F(RawStreamBindingTest, ExistingRawDataPartialReadAndFinRearmImmediately) {
+    Activate();
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    std::array<kbs_stream_event, 4> events{};
+    ASSERT_TRUE(sender.binding.PollEvents(events));
+    ASSERT_TRUE(receiver.binding.PollEvents(events));
+    ASSERT_TRUE(sender.binding.Watch(sender.stream, false, true));
+    ASSERT_EQ(sender.binding.PollEvents(events), 1u);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_WRITABLE, 0u);
+    std::array<std::byte, 3> payload{std::byte{0x11}, std::byte{0x22}, std::byte{0x33}};
+    ASSERT_EQ(sender.binding.Write(sender.stream, payload), payload.size());
+    bool received_event = false;
+    ASSERT_TRUE(Until([&] {
+        if (!received_event) {
+            const auto count = receiver.binding.PollEvents(events);
+            received_event = count && *count && (events[0].flags & KBS_STREAM_EVENT_RX_CHANGED);
+        }
+        return received_event;
+    }));
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_RX_CHANGED, 0u);
+    EXPECT_EQ(events[0].flags & KBS_STREAM_EVENT_READABLE, 0u);
+    // 数据在订阅前已到达；每次显式 Watch 都从实际连续数据快照检查，不依赖再次产生 CQE。
+    ASSERT_TRUE(receiver.binding.Watch(receiver.stream, true, false));
+    ASSERT_EQ(receiver.binding.PollEvents(events), 1u);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_READABLE, 0u);
+    EXPECT_EQ(receiver.binding.PollEvents(events), 0u);
+    std::array<std::byte, 3> output{};
+    auto read = receiver.binding.Read(receiver.stream, std::span(output).first(1), Now());
+    ASSERT_TRUE(read);
+    ASSERT_EQ(read->bytes, 1u);
+    ASSERT_TRUE(receiver.binding.Watch(receiver.stream, true, false));
+    ASSERT_EQ(receiver.binding.PollEvents(events), 1u);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_READABLE, 0u);
+    read = receiver.binding.Read(receiver.stream, std::span(output).subspan(1), Now());
+    ASSERT_TRUE(read);
+    EXPECT_EQ(read->bytes, 2u);
+    EXPECT_EQ(output, payload);
+    ASSERT_TRUE(receiver.binding.PollEvents(events));
+    ASSERT_TRUE(sender.binding.ShutdownWrite(sender.stream));
+    ASSERT_TRUE(Until([&] { return receiver.resources.connections->Inspect(receiver.owned)->readiness.readable; }));
+    ASSERT_TRUE(receiver.binding.Watch(receiver.stream, true, false));
+    ASSERT_EQ(receiver.binding.PollEvents(events), 1u);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_READABLE, 0u);
+    EXPECT_EQ(events[0].read_eof, 0u);
+    read = receiver.binding.Read(receiver.stream, output, Now());
+    ASSERT_TRUE(read);
+    EXPECT_EQ(read->bytes, 0u);
+    EXPECT_EQ(read->eof, 1u);
+    ASSERT_TRUE(receiver.binding.Watch(receiver.stream, true, false));
+    ASSERT_EQ(receiver.binding.PollEvents(events), 1u);
+    EXPECT_EQ(events[0].read_eof, 1u);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_READABLE, 0u);
+    EXPECT_EQ(sender.forward_errors, 0u);
+    EXPECT_EQ(receiver.forward_errors, 0u);
+}
+TEST_F(RawStreamBindingTest, RetainedReleaseKeepsQueuedApplicationEvent) {
+    Activate();
+    auto& sender = endpoints_[0];
+    std::array<kbs_stream_event, 4> events{};
+    ASSERT_TRUE(sender.binding.PollEvents(events));
+    sender.hold_tx = true;
+    const std::array<std::byte, 1> payload{std::byte{0x51}};
+    ASSERT_EQ(sender.binding.Write(sender.stream, payload), 1u);
+    ASSERT_TRUE(Until([&] { return shared_->slab->stats().local_dma > 0; }));
+    ExpectError(sender.binding.CloseStream(sender.stream), KBS_STREAM_RETAINED);
+    EXPECT_FALSE(sender.binding.Release(sender.stream));
+    ASSERT_EQ(sender.binding.PollEvents(events), 1u);
+    EXPECT_EQ(events[0].stream.generation, sender.stream.generation);
+    EXPECT_EQ(events[0].state, KBS_STREAM_CLOSING);
+    EXPECT_EQ(sender.binding.published(), 1u);
+    sender.hold_tx = false;
+    ASSERT_TRUE(Until([&] { return shared_->slab->stats().local_dma == 0; }));
+    ASSERT_EQ(sender.binding.PollEvents(events), 1u);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_TX_RETIRED, 0u);
+    EXPECT_GT(events[0].tx_retired, 0u);
 }
 } // namespace
 } // namespace api

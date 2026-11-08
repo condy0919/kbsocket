@@ -580,6 +580,10 @@ std::expected<void, EagerRxError> EagerRxStream::Close() noexcept {
 bool EagerRxStream::eof() const noexcept {
     return state_ && !state_->failed && state_->window->eof();
 }
+bool EagerRxStream::readable() const noexcept {
+    return state_ && !state_->failed && !state_->stopped && !state_->window->failure() &&
+           ((state_->current && state_->offset < state_->current->frame.payload.size()) || state_->window->readable());
+}
 bool EagerRxStream::failed() const noexcept {
     return state_ && state_->failed;
 }

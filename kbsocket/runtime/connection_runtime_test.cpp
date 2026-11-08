@@ -74,6 +74,10 @@ protected:
         std::uint64_t callback_tx_retired = 0, callback_closing_tx = 0, callback_failed_tx = 0;
         std::uint64_t callback_rx_changes = 0;
         std::size_t callback_rx_pending = 0;
+        std::uint64_t callback_count = 0;
+        std::uint64_t callback_readiness_changes = 0;
+        ConnectionReadiness callback_readiness;
+        std::optional<ConnectionError> callback_failure;
         bool callback_bad_id = false;
         bool lane_updates_enabled = false, reject_lane_update = false;
         std::uint64_t lane_authorizations = 0;
@@ -101,6 +105,10 @@ protected:
     }
     static void OnProgress(void* cookie, const runtime::ConnectionProgressEvent& event) noexcept {
         auto& endpoint = *static_cast<Endpoint*>(cookie);
+        ++endpoint.callback_count;
+        endpoint.callback_readiness_changes += endpoint.callback_readiness != event.readiness;
+        endpoint.callback_readiness = event.readiness;
+        endpoint.callback_failure = event.failure;
         endpoint.callback_bad_id |= event.connection != endpoint.scheduled;
         endpoint.callback_tx_retired += event.tx_retired;
         if (event.state == ConnectionState::kClosing) {
@@ -1023,6 +1031,66 @@ TEST_F(OwnedConnectionRuntimeTest, RawPreparationRejectsInjectedBindingsAndUnaut
     }));
     EXPECT_EQ(endpoints_[0].sources.size(), 2u);
     EXPECT_EQ(endpoints_[1].sources.size(), 2u);
+}
+
+TEST_F(ConnectionRuntimeTest, FinOnlyReportsReadOpportunityThenKnownEofWithoutRepeatedReadinessChanges) {
+    Activate();
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    ASSERT_TRUE(Until([&] { return sender.callback_readiness.writable && receiver.callback_readiness.writable; }));
+    EXPECT_FALSE(receiver.callback_readiness.readable);
+    ASSERT_TRUE(sender.connection.ShutdownWrite());
+    ASSERT_TRUE(sender.scheduler.Wake(sender.scheduled));
+    // FIN 没有业务字节，仍须通知应用消费它；首次提示不能提前宣称已经读到了 EOF。
+    ASSERT_TRUE(Until([&] { return receiver.callback_readiness.readable; }));
+    EXPECT_TRUE(sender.callback_readiness.write_closed);
+    EXPECT_FALSE(sender.callback_readiness.writable);
+    EXPECT_FALSE(receiver.callback_readiness.read_eof);
+    EXPECT_EQ(receiver.connection.rx_pending(), 1u);
+    std::array<std::byte, 1> output;
+    const auto read = receiver.connection.Read(output, Now());
+    ASSERT_TRUE(read);
+    EXPECT_TRUE(read->eof);
+    ASSERT_TRUE(receiver.scheduler.Wake(receiver.scheduled));
+    ASSERT_TRUE(Until([&] { return receiver.callback_readiness.read_eof; }));
+    EXPECT_TRUE(receiver.callback_readiness.readable);
+    const auto changes = receiver.callback_readiness_changes;
+    for (int i = 0; i < 10; ++i) {
+        ASSERT_TRUE(Step());
+    }
+    EXPECT_EQ(receiver.callback_readiness_changes, changes);
+}
+
+TEST_F(ConnectionRuntimeTest, SharedSlabReturnChangesReadinessWithoutOwnTxCompletion) {
+    Activate();
+    auto& endpoint = endpoints_[0];
+    ASSERT_TRUE(Until([&] { return endpoint.callback_readiness.writable; }));
+    std::array<memory::BufferLease, 16> external{};
+    std::size_t held = 0;
+    while (endpoint.slab.stats().available) {
+        const auto lease = endpoint.slab.Acquire(1);
+        ASSERT_TRUE(lease);
+        external[held++] = *lease;
+    }
+    ASSERT_TRUE(endpoint.scheduler.RequestSweep());
+    ASSERT_TRUE(Until([&] { return !endpoint.callback_readiness.writable; }));
+    const auto tx_retired = endpoint.callback_tx_retired;
+    const auto callbacks = endpoint.callback_count;
+    ASSERT_GT(held, 0u);
+    ASSERT_TRUE(endpoint.slab.ReleaseCpu(external[--held]));
+    // 资源由另一个 Slab 使用者归还，周期巡检仍需发出恢复通知，不能只依赖本连接 CQE。
+    ASSERT_TRUE(Until([&] { return endpoint.callback_readiness.writable; }));
+    EXPECT_EQ(endpoint.callback_count, callbacks + 1);
+    EXPECT_EQ(endpoint.callback_tx_retired, tx_retired);
+    const auto recovered = endpoint.callback_count;
+    for (int i = 0; i < 10; ++i) {
+        ASSERT_TRUE(endpoint.scheduler.RequestSweep());
+        ASSERT_TRUE(Step());
+    }
+    EXPECT_EQ(endpoint.callback_count, recovered);
+    while (held) {
+        ASSERT_TRUE(endpoint.slab.ReleaseCpu(external[--held]));
+    }
 }
 
 TEST_F(ConnectionRuntimeTest, HelloAutomaticallyAdmitsBothActiveLanesBeforeReady) {

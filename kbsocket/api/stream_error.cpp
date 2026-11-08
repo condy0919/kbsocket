@@ -324,6 +324,9 @@ kbs_stream_error MapStreamError(const runtime::RawStackError& error) noexcept {
     }
     return mapped;
 }
+std::uint32_t StreamState(connection::ConnectionState state) noexcept {
+    return StateCode(state);
+}
 kbs_stream_status StreamStatus(const runtime::OwnedConnectionStatus& status) noexcept {
     kbs_stream_status result{};
     result.state = StateCode(status.state);

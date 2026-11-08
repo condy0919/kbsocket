@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 
 #include "kbsocket/connection/connection.hpp"
 #include "kbsocket/runtime/progress_source.hpp"
@@ -17,6 +18,8 @@ struct ScheduledConnection {
     const ConnectionProgress* owner = nullptr;
     std::uint64_t id = 0;
     bool operator==(const ScheduledConnection&) const = default;
+    /// 只解码槽下标，不访问 owner；使用者仍须比对完整 owner/id，防止代次复用。
+    std::optional<std::uint32_t> slot_index() const noexcept;
 };
 struct ConnectionProgressConfig {
     std::uint32_t capacity = 4096;
@@ -34,6 +37,8 @@ struct ConnectionProgressEvent {
     std::size_t rx_pending = 0;
     // 自上次回调以来真实退休的 WR 数；Closing/Failed 也报告，供宿主重试保留中的 Close。
     std::uint64_t tx_retired = 0;
+    connection::ConnectionReadiness readiness = {};
+    std::optional<connection::ConnectionError> failure = {};
 };
 using ConnectionProgressCallback = void (*)(void*, const ConnectionProgressEvent&) noexcept;
 struct ConnectionProgressStats {
@@ -71,6 +76,7 @@ public:
     std::expected<void, ProgressError> RemoveReceiveDomain(connection::EagerReceiveDomain& domain) noexcept;
     std::expected<void, ProgressError> Close() noexcept;
     const ConnectionProgressStats* stats() const noexcept;
+    std::uint32_t capacity() const noexcept;
 
     // now_ns 为本轮调度时间下界；实际 Connection 访问刷新单调时钟，晚到 RX 不造成时间倒退。
     std::expected<ProgressBatch, ProgressError> Progress(ProgressKind, std::size_t, std::uint64_t) noexcept override;

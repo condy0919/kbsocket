@@ -111,6 +111,8 @@ TEST(ConnectionTcp, DirectOpenDoesNotSendHelloAndUsesTransparentShortIo) {
     ASSERT_TRUE(right.OpenTcp(sockets.right));
     sockets.right = -1;
     EXPECT_EQ(left.state(), ConnectionState::kTcpActive);
+    // TCP 的就绪来源是内核 fd；纯快照只暴露已知 EOF/半关闭，不探测或消费数据。
+    EXPECT_EQ(left.readiness(), ConnectionReadiness{});
     std::array<std::byte, 5> source{std::byte{'K'}, std::byte{'B'}, std::byte{0}, std::byte{0xff}, std::byte{7}};
     const auto expected = source;
     std::array<std::byte, 5> output{};
@@ -133,11 +135,13 @@ TEST(ConnectionTcp, DirectOpenDoesNotSendHelloAndUsesTransparentShortIo) {
     EXPECT_EQ(received, output.size());
     EXPECT_EQ(output, expected);
     ASSERT_TRUE(left.ShutdownWrite());
+    EXPECT_EQ(left.readiness(), (ConnectionReadiness{.write_closed = true}));
     ASSERT_TRUE(Wait(right.fd(), POLLIN, deadline));
     const auto eof = right.Read(output, Now());
     ASSERT_TRUE(eof);
     EXPECT_EQ(eof->bytes, 0u);
     EXPECT_TRUE(eof->eof);
+    EXPECT_EQ(right.readiness(), (ConnectionReadiness{.read_eof = true}));
     EXPECT_FALSE(right.failure());
     // FIN 只关闭一侧写方向；对端仍可回写，且本端不会因写已关闭进入失败状态。
     ExpectError(left.Write(expected), ConnectionErrorCode::kTcp);

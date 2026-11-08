@@ -221,6 +221,14 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Write(std::span<const st
     }
     return copied;
 }
+bool EagerTxStream::writable() const noexcept {
+    if (!state_ || state_->closed || state_->stats.failed || state_->stats.write_shutdown) {
+        return false;
+    }
+    const auto& s = *state_;
+    return s.free != kEnd && s.generation != std::numeric_limits<std::uint64_t>::max() && s.slab->accepting() &&
+           s.slab->stats().available && s.sequence.accepted_bytes() + s.queued_bytes < s.config.max_stream_bytes;
+}
 std::expected<void, EagerTxError> EagerTxStream::ShutdownWrite() noexcept {
     if (!state_ || state_->closed) {
         return Error(EagerTxErrorCode::kNotReady);

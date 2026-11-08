@@ -97,6 +97,8 @@ public:
     void Fail() noexcept;
     std::expected<void, EagerTxError> Close() noexcept;
     EagerTxStats stats() const noexcept;
+    /// 至少可复制一个字节的本地准入提示；不要求远端 DATA credit 或可立即提交 SQ。
+    bool writable() const noexcept;
 
 private:
     struct State;

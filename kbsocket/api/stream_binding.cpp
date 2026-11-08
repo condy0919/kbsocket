@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 #include "kbsocket/api/stream_binding.hpp"
 
+#include <sys/epoll.h>
+
 #include <algorithm>
 #include <limits>
 #include <new>
@@ -20,6 +22,10 @@ auto Error(int code) noexcept {
     return std::unexpected(StreamError(code));
 }
 constexpr auto kUnused = std::numeric_limits<std::uint32_t>::max();
+bool SameError(const kbs_stream_error& left, const kbs_stream_error& right) noexcept {
+    return left.code == right.code && left.origin == right.origin && left.native_code == right.native_code &&
+           left.detail == right.detail && left.underlying == right.underlying;
+}
 std::expected<void, kbs_stream_error> Active(const runtime::OwnedConnectionStatus& status) noexcept {
     using State = connection::ConnectionState;
     if (status.state == State::kClosed || status.state == State::kClosing) {
@@ -38,6 +44,11 @@ struct StreamBinding::State {
     struct Slot {
         runtime::OwnedConnection connection;
         std::uint64_t generation = 0;
+        runtime::ScheduledConnection scheduled;
+        kbs_stream_event event{};
+        std::uint32_t previous = kUnused, next = kUnused;
+        bool pending = false, snapshot_known = false;
+        bool watch_read = false, watch_write = false;
     };
     kbs_stream_table table;
     runtime::ConnectionOwner* owner = nullptr;
@@ -48,6 +59,9 @@ struct StreamBinding::State {
     std::unique_ptr<std::uint32_t[]> free;
     // 按原 owner 槽定位发布，避免 40k 连接时每次 Publish 扫全表。
     std::unique_ptr<std::uint32_t[]> owner_slots;
+    std::unique_ptr<std::uint32_t[]> scheduled_slots;
+    std::uint32_t scheduled_capacity = 0;
+    std::uint32_t pending_head = kUnused, pending_tail = kUnused;
     std::size_t count = 0;
     std::uint64_t next_generation = 0;
     bool accepting = true, closed = false;
@@ -90,6 +104,119 @@ struct StreamBinding::State {
         }
         return *status;
     }
+    // 单槽一个 intrusive 节点，重复提示只合并；解除发布时 O(1) 移除，避免陈旧 token 占满队列。
+    void Enqueue(Slot& slot) noexcept {
+        if (slot.pending) {
+            return;
+        }
+        const auto index = static_cast<std::uint32_t>(&slot - slots.get());
+        slot.previous = pending_tail;
+        slot.next = kUnused;
+        if (pending_tail != kUnused) {
+            slots[pending_tail].next = index;
+        } else {
+            pending_head = index;
+        }
+        pending_tail = index;
+        slot.pending = true;
+    }
+    void Remove(Slot& slot) noexcept {
+        if (!slot.pending) {
+            return;
+        }
+        if (slot.previous != kUnused) {
+            slots[slot.previous].next = slot.next;
+        } else {
+            pending_head = slot.next;
+        }
+        if (slot.next != kUnused) {
+            slots[slot.next].previous = slot.previous;
+        } else {
+            pending_tail = slot.previous;
+        }
+        slot.previous = slot.next = kUnused;
+        slot.pending = false;
+        slot.event.flags = 0;
+        slot.event.tx_retired = 0;
+    }
+    void Observe(Slot& slot, const runtime::ConnectionProgressEvent& update) noexcept {
+        auto& event = slot.event;
+        const auto state = StreamState(update.state);
+        const auto failure = update.failure ? MapStreamError(*update.failure) : kbs_stream_error{};
+        const bool changed_error = !SameError(event.failure, failure);
+        std::uint32_t flags = 0;
+        if (!slot.snapshot_known || event.state != state || changed_error ||
+            event.read_eof != update.readiness.read_eof || event.write_closed != update.readiness.write_closed) {
+            flags |= KBS_STREAM_EVENT_STATE;
+            if (state == KBS_STREAM_STATE_CLOSED) {
+                flags |= KBS_STREAM_EVENT_CLOSED;
+            }
+        }
+        if (failure.code && (!slot.snapshot_known || changed_error)) {
+            flags |= KBS_STREAM_EVENT_ERROR;
+        }
+        if (update.rx_changed || event.rx_pending != update.rx_pending) {
+            flags |= KBS_STREAM_EVENT_RX_CHANGED;
+        }
+        if (update.tx_retired) {
+            flags |= KBS_STREAM_EVENT_TX_RETIRED;
+            const auto max = std::numeric_limits<std::uint64_t>::max();
+            if (update.tx_retired > max - event.tx_retired) {
+                event.tx_retired = max;
+                flags |= KBS_STREAM_EVENT_COUNTER_SATURATED;
+            } else {
+                event.tx_retired += update.tx_retired;
+            }
+        }
+        // TCP RDHUP/HUP 提示应用继续读取尾部，不能提前报告 EOF 或凭 fd 错误猜底层错误码。
+        const bool peer_shutdown = update.fd_events & (EPOLLRDHUP | EPOLLHUP);
+        const bool fd_error = update.fd_events & EPOLLERR;
+        if (peer_shutdown) {
+            flags |= KBS_STREAM_EVENT_PEER_SHUTDOWN;
+        }
+        if (fd_error) {
+            flags |= KBS_STREAM_EVENT_ERROR;
+        }
+        const bool active = state == KBS_STREAM_RAW_ACTIVE || state == KBS_STREAM_TCP_ACTIVE;
+        const bool read_ready = active && slot.watch_read &&
+                                (update.readiness.readable || update.readiness.read_eof ||
+                                 (update.fd_events & EPOLLIN) || peer_shutdown || fd_error);
+        const bool write_ready = active && slot.watch_write && !update.readiness.write_closed &&
+                                 (update.readiness.writable || (update.fd_events & (EPOLLOUT | EPOLLHUP)) || fd_error);
+        if (read_ready) {
+            flags |= KBS_STREAM_EVENT_READABLE;
+        }
+        if (write_ready) {
+            flags |= KBS_STREAM_EVENT_WRITABLE;
+        }
+        // TCP 底层一次 fd 事件整体消耗 EPOLLONESHOT，不能留下永远不会唤醒的另一方向。
+        if (read_ready || write_ready || update.fd_events || !active) {
+            slot.watch_read = slot.watch_write = false;
+        }
+        event.state = state;
+        event.failure = failure;
+        event.rx_pending = update.rx_pending;
+        event.read_eof = update.readiness.read_eof;
+        event.write_closed = update.readiness.write_closed;
+        event.flags |= flags;
+        slot.snapshot_known = true;
+        if (event.flags) {
+            Enqueue(slot);
+        }
+    }
+    void Observe(Slot& slot, const runtime::OwnedConnectionStatus& status) noexcept {
+        Observe(slot, runtime::ConnectionProgressEvent{.connection = status.scheduled,
+                                                       .state = status.state,
+                                                       .rx_pending = status.rx_pending,
+                                                       .readiness = status.readiness,
+                                                       .failure = status.failure});
+    }
+    void Refresh(Slot& slot) noexcept {
+        // 仅应用入口调用；RecordProgress 不能重入 owner。刷新失败不覆盖已有成功字节前缀。
+        if (const auto status = owner->Inspect(slot.connection); status) {
+            Observe(slot, *status);
+        }
+    }
 };
 StreamBinding::StreamBinding() noexcept = default;
 StreamBinding::~StreamBinding() = default;
@@ -100,8 +227,9 @@ std::expected<void, kbs_stream_error> StreamBinding::Open(runtime::ConnectionOwn
         return Error(KBS_STREAM_BUSY);
     }
     const auto capacity = owner.stats().capacity;
-    if (!capacity || !config.table_id || !config.capacity || config.capacity > capacity || !config.max_io_bytes ||
-        config.max_io_bytes > 1024u * 1024u) {
+    const auto scheduled_capacity = owner.scheduler_capacity();
+    if (!capacity || !scheduled_capacity || !config.table_id || !config.capacity || config.capacity > capacity ||
+        !config.max_io_bytes || config.max_io_bytes > 1024u * 1024u) {
         return Error(KBS_STREAM_INVALID_ARGUMENT);
     }
     std::unique_ptr<State> state;
@@ -110,6 +238,7 @@ std::expected<void, kbs_stream_error> StreamBinding::Open(runtime::ConnectionOwn
         state->slots = std::make_unique<State::Slot[]>(config.capacity);
         state->free = std::make_unique<std::uint32_t[]>(config.capacity);
         state->owner_slots = std::make_unique<std::uint32_t[]>(capacity);
+        state->scheduled_slots = std::make_unique<std::uint32_t[]>(scheduled_capacity);
     } catch (const std::bad_alloc&) {
         return Error(KBS_STREAM_NO_MEMORY);
     }
@@ -118,10 +247,12 @@ std::expected<void, kbs_stream_error> StreamBinding::Open(runtime::ConnectionOwn
     state->stack = stack;
     state->context = context;
     state->config = config;
+    state->scheduled_capacity = scheduled_capacity;
     for (std::uint32_t i = 0; i < config.capacity; ++i) {
         state->free[i] = config.capacity - i - 1;
     }
     std::fill_n(state->owner_slots.get(), capacity, kUnused);
+    std::fill_n(state->scheduled_slots.get(), scheduled_capacity, kUnused);
     state_ = std::move(state);
     opened_once_ = true;
     return {};
@@ -161,14 +292,24 @@ StreamBinding::Publish(runtime::OwnedConnection connection) noexcept {
     if (s.owner_slots[connection.slot] != kUnused) {
         return Error(KBS_STREAM_BUSY);
     }
+    const auto scheduled_index = status->scheduled.slot_index();
+    if (!scheduled_index || *scheduled_index >= s.scheduled_capacity) {
+        return Error(KBS_STREAM_NOT_READY);
+    }
+    if (s.scheduled_slots[*scheduled_index] != kUnused) {
+        return Error(KBS_STREAM_BUSY);
+    }
     if (s.count == s.config.capacity || s.next_generation == std::numeric_limits<std::uint64_t>::max()) {
         return Error(KBS_STREAM_EXHAUSTED);
     }
     const auto index = s.free[s.config.capacity - ++s.count];
     auto& slot = s.slots[index];
-    slot = {connection, ++s.next_generation};
+    slot = {.connection = connection, .generation = ++s.next_generation, .scheduled = status->scheduled};
     s.owner_slots[connection.slot] = index;
-    return kbs_stream_handle{s.config.table_id, slot.generation, index, 0};
+    s.scheduled_slots[*scheduled_index] = index;
+    slot.event.stream = {s.config.table_id, slot.generation, index, 0};
+    s.Observe(slot, *status);
+    return slot.event.stream;
 }
 kbs_stream_table* StreamBinding::table() noexcept {
     return state_ && !state_->closed ? &state_->table : nullptr;
@@ -216,6 +357,7 @@ std::expected<std::size_t, kbs_stream_error> StreamBinding::Write(kbs_stream_han
     }
     const auto written =
         state_->owner->Write((*slot)->connection, input.first(std::min(input.size(), state_->config.max_io_bytes)));
+    state_->Refresh(**slot);
     if (!written) {
         return std::unexpected(MapStreamError(written.error()));
     }
@@ -242,6 +384,7 @@ StreamBinding::Read(kbs_stream_handle stream, std::span<std::byte> output, std::
     }
     const auto read = state_->owner->Read((*slot)->connection,
                                           output.first(std::min(output.size(), state_->config.max_io_bytes)), now_ns);
+    state_->Refresh(**slot);
     if (!read) {
         return std::unexpected(MapStreamError(read.error()));
     }
@@ -263,6 +406,7 @@ std::expected<void, kbs_stream_error> StreamBinding::ShutdownWrite(kbs_stream_ha
         return active;
     }
     const auto result = state_->owner->ShutdownWrite((*slot)->connection);
+    state_->Refresh(**slot);
     return result ? std::expected<void, kbs_stream_error>{} : std::unexpected(MapStreamError(result.error()));
 }
 std::expected<void, kbs_stream_error> StreamBinding::Cancel(kbs_stream_handle stream) noexcept {
@@ -282,10 +426,11 @@ std::expected<void, kbs_stream_error> StreamBinding::Cancel(kbs_stream_handle st
         return Error(KBS_STREAM_CLOSED);
     }
     const auto result = state_->owner->Cancel((*slot)->connection);
+    state_->Refresh(**slot);
     return result ? std::expected<void, kbs_stream_error>{} : std::unexpected(MapStreamError(result.error()));
 }
-std::expected<void, kbs_stream_error> StreamBinding::WatchTcp(kbs_stream_handle stream, bool readable,
-                                                              bool writable) noexcept {
+std::expected<void, kbs_stream_error> StreamBinding::Watch(kbs_stream_handle stream, bool readable,
+                                                           bool writable) noexcept {
     if (!state_) {
         return Error(KBS_STREAM_NOT_READY);
     }
@@ -300,11 +445,82 @@ std::expected<void, kbs_stream_error> StreamBinding::WatchTcp(kbs_stream_handle 
     if (const auto active = Active(*status); !active) {
         return active;
     }
-    if (status->state != connection::ConnectionState::kTcpActive) {
+    if (status->state == connection::ConnectionState::kTcpActive) {
+        const auto result = state_->owner->WatchTcp((*slot)->connection, readable, writable);
+        if (!result) {
+            return std::unexpected(MapStreamError(result.error()));
+        }
+    }
+    (*slot)->watch_read = readable;
+    (*slot)->watch_write = writable;
+    state_->Observe(**slot, *status);
+    return {};
+}
+std::expected<void, kbs_stream_error> StreamBinding::WatchTcp(kbs_stream_handle stream, bool readable,
+                                                              bool writable) noexcept {
+    const auto status = Inspect(stream);
+    if (!status) {
+        return std::unexpected(status.error());
+    }
+    if (status->state != KBS_STREAM_TCP_ACTIVE) {
+        // 保留旧入口对 raw 的拒绝；统一接口用 Watch。
+        if (status->state == KBS_STREAM_STATE_CLOSED || status->state == KBS_STREAM_CLOSING) {
+            return Error(KBS_STREAM_CLOSED);
+        }
+        if (status->failure.code) {
+            return std::unexpected(status->failure);
+        }
         return Error(KBS_STREAM_NOT_READY);
     }
-    const auto result = state_->owner->WatchTcp((*slot)->connection, readable, writable);
-    return result ? std::expected<void, kbs_stream_error>{} : std::unexpected(MapStreamError(result.error()));
+    return Watch(stream, readable, writable);
+}
+std::expected<bool, kbs_stream_error>
+StreamBinding::RecordProgress(const runtime::ConnectionProgressEvent& event) noexcept {
+    if (!state_ || state_->closed) {
+        return Error(KBS_STREAM_NOT_READY);
+    }
+    auto& s = *state_;
+    // 原回调已经在 owner 内；只读顶层暂停标志，绝不访问 ConnectionOwner 或域资源。
+    if (s.stack && s.stack->paused(s.context)) {
+        return Error(KBS_STREAM_BUSY);
+    }
+    if (s.stack && s.stack->stage() == runtime::RawStackStage::kClosed) {
+        return Error(KBS_STREAM_NOT_READY);
+    }
+    const auto index = event.connection.slot_index();
+    if (!index || *index >= s.scheduled_capacity) {
+        return false;
+    }
+    const auto published = s.scheduled_slots[*index];
+    if (published == kUnused) {
+        return false;
+    }
+    auto& slot = s.slots[published];
+    if (slot.scheduled != event.connection) {
+        return false;
+    }
+    s.Observe(slot, event);
+    return true;
+}
+std::expected<std::size_t, kbs_stream_error> StreamBinding::PollEvents(std::span<kbs_stream_event> output) noexcept {
+    if (!state_) {
+        return Error(KBS_STREAM_NOT_READY);
+    }
+    if (output.empty()) {
+        return Error(KBS_STREAM_INVALID_ARGUMENT);
+    }
+    auto& s = *state_;
+    if (const auto ready = s.Gate(); !ready) {
+        return std::unexpected(ready.error());
+    }
+    const auto limit = std::min(output.size(), static_cast<std::size_t>(KBS_STREAM_EVENT_BATCH_MAX));
+    std::size_t count = 0;
+    while (count < limit && s.pending_head != kUnused) {
+        auto& slot = s.slots[s.pending_head];
+        output[count++] = slot.event;
+        s.Remove(slot);
+    }
+    return count;
 }
 std::expected<kbs_stream_status, kbs_stream_error> StreamBinding::Inspect(kbs_stream_handle stream) noexcept {
     if (!state_) {
@@ -329,6 +545,7 @@ std::expected<void, kbs_stream_error> StreamBinding::CloseStream(kbs_stream_hand
         return std::unexpected(slot.error());
     }
     const auto result = state_->owner->CloseConnection((*slot)->connection);
+    state_->Refresh(**slot);
     return result ? std::expected<void, kbs_stream_error>{} : std::unexpected(MapStreamError(result.error()));
 }
 std::expected<void, kbs_stream_error> StreamBinding::RetireSources(kbs_stream_handle stream,
@@ -356,7 +573,9 @@ std::expected<void, kbs_stream_error> StreamBinding::Release(kbs_stream_handle s
         return std::unexpected(MapStreamError(result.error()));
     }
     auto& s = *state_;
+    s.Remove(**slot);
     s.owner_slots[(*slot)->connection.slot] = kUnused;
+    s.scheduled_slots[*(*slot)->scheduled.slot_index()] = kUnused;
     **slot = {};
     s.free[s.config.capacity - s.count--] = stream.slot;
     return {};
@@ -423,6 +642,29 @@ int32_t kbs_stream_watch_tcp(kbs_stream_table* table, kbs_stream_handle stream, 
         return Invalid(error);
     }
     return Finish(table->binding->WatchTcp(stream, readable != 0, writable != 0), error);
+}
+int32_t kbs_stream_watch(kbs_stream_table* table, kbs_stream_handle stream, uint32_t readable, uint32_t writable,
+                         kbs_stream_error* error) {
+    if (!table || readable > 1 || writable > 1) {
+        return Invalid(error);
+    }
+    return Finish(table->binding->Watch(stream, readable != 0, writable != 0), error);
+}
+int32_t kbs_stream_poll_events(kbs_stream_table* table, kbs_stream_event* events, size_t capacity, size_t* count,
+                               kbs_stream_error* error) {
+    if (count) {
+        *count = 0;
+    }
+    if (!table || !events || !capacity || !count) {
+        return Invalid(error);
+    }
+    const auto result =
+        table->binding->PollEvents({events, std::min(capacity, static_cast<size_t>(KBS_STREAM_EVENT_BATCH_MAX))});
+    if (!result) {
+        return Report(result.error(), error);
+    }
+    *count = *result;
+    return Report({}, error);
 }
 int32_t kbs_stream_inspect(kbs_stream_table* table, kbs_stream_handle stream, kbs_stream_status* out,
                            kbs_stream_error* error) {

@@ -113,6 +113,19 @@ bool ReorderWindow::accepting() const noexcept {
 bool ReorderWindow::eof() const noexcept {
     return state_ && !state_->failure && state_->fin && state_->stats.released_prefix > *state_->fin;
 }
+bool ReorderWindow::readable() const noexcept {
+    if (!state_ || state_->failure || state_->stopping) {
+        return false;
+    }
+    if (eof()) {
+        return true;
+    }
+    if (state_->stats.rcv_next >= kSequenceEnd) {
+        return false;
+    }
+    const auto& entry = state_->entries[state_->stats.rcv_next % state_->config.window];
+    return entry.status == State::Status::kBuffered && entry.frame.sequence == state_->stats.rcv_next;
+}
 std::optional<ReorderError> ReorderWindow::failure() const noexcept {
     return state_ ? state_->failure : std::nullopt;
 }

@@ -150,12 +150,19 @@ TEST(ConnectionProgress, DeviceContextIdentityCannotUseAnotherPauseGroupOrStanda
 TEST(ConnectionProgress, BoundedFairQueueAndStaleHandleRejection) {
     ConnectionProgress progress;
     std::array<Connection, 3> connections;
+    EXPECT_EQ(progress.capacity(), 0u);
+    EXPECT_FALSE(ScheduledConnection{}.slot_index());
     ASSERT_TRUE(progress.Open({.capacity = 3}));
+    EXPECT_EQ(progress.capacity(), 3u);
+    EXPECT_FALSE((ScheduledConnection{&progress, 1}).slot_index());
+    EXPECT_FALSE((ScheduledConnection{&progress, std::uint64_t{1} << 32}).slot_index());
     std::array<ScheduledConnection, 3> handles;
     for (std::size_t i = 0; i < handles.size(); ++i) {
         auto handle = progress.Attach(connections[i]);
         ASSERT_TRUE(handle);
         handles[i] = *handle;
+        ASSERT_TRUE(handle->slot_index());
+        EXPECT_LT(*handle->slot_index(), progress.capacity());
     }
     // 重复 Wake 合并，预算 1 只访问一个连接，不能让首个热点占住整轮。
     for (int i = 0; i < 20; ++i) {
@@ -174,6 +181,7 @@ TEST(ConnectionProgress, BoundedFairQueueAndStaleHandleRejection) {
     const auto newer = progress.Attach(replacement);
     ASSERT_TRUE(newer);
     EXPECT_NE(newer->id, handles[0].id);
+    EXPECT_EQ(newer->slot_index(), handles[0].slot_index());
     EXPECT_FALSE(progress.Wake(handles[0]));
     raw::TxCompletionEvent old;
     old.record.emplace();
@@ -185,6 +193,55 @@ TEST(ConnectionProgress, BoundedFairQueueAndStaleHandleRejection) {
         ASSERT_TRUE(connections[i].Close());
         ASSERT_TRUE(progress.Detach(handles[i]));
     }
+    EXPECT_TRUE(progress.Close());
+    EXPECT_EQ(progress.capacity(), 0u);
+}
+
+TEST(ConnectionProgress, HalfCloseAndFailureSnapshotsNotifyOnceWithoutFdEvents) {
+    TcpPair sockets;
+    ASSERT_TRUE(sockets.Open());
+    Connection connection;
+    ASSERT_TRUE(connection.OpenTcp(sockets.right));
+    sockets.right = -1;
+    struct Snapshot {
+        std::size_t count = 0;
+        ConnectionProgressEvent event{};
+    } snapshot;
+    ConnectionProgress progress;
+    ASSERT_TRUE(progress.Open(
+        {.capacity = 1},
+        [](void* pointer, const ConnectionProgressEvent& event) noexcept {
+            auto& snapshot = *static_cast<Snapshot*>(pointer);
+            ++snapshot.count;
+            snapshot.event = event;
+        },
+        &snapshot));
+    const auto handle = progress.Attach(connection);
+    ASSERT_TRUE(handle);
+    ASSERT_TRUE(progress.Progress(ProgressKind::kMailbox, 8, Now()));
+    EXPECT_EQ(snapshot.count, 1u);
+    EXPECT_EQ(snapshot.event.readiness, connection::ConnectionReadiness{});
+    ASSERT_TRUE(connection.ShutdownWrite());
+    ASSERT_TRUE(progress.Wake(*handle));
+    ASSERT_TRUE(progress.Progress(ProgressKind::kMailbox, 8, Now()));
+    EXPECT_EQ(snapshot.count, 2u);
+    EXPECT_TRUE(snapshot.event.readiness.write_closed);
+    EXPECT_EQ(snapshot.event.fd_events, 0u);
+    EXPECT_FALSE(snapshot.event.failure);
+    // 快照不变时即使应用再次唤醒，也不能产生持续通知。
+    ASSERT_TRUE(progress.Wake(*handle));
+    ASSERT_TRUE(progress.Progress(ProgressKind::kMailbox, 8, Now()));
+    EXPECT_EQ(snapshot.count, 2u);
+    connection.Cancel();
+    ASSERT_TRUE(progress.Wake(*handle));
+    ASSERT_TRUE(progress.Progress(ProgressKind::kMailbox, 8, Now()));
+    EXPECT_EQ(snapshot.count, 3u);
+    EXPECT_EQ(snapshot.event.state, ConnectionState::kFailed);
+    ASSERT_TRUE(snapshot.event.failure);
+    EXPECT_EQ(snapshot.event.failure->code, connection::ConnectionErrorCode::kCancelled);
+    EXPECT_EQ(snapshot.event.readiness, connection::ConnectionReadiness{});
+    EXPECT_TRUE(connection.Close());
+    EXPECT_TRUE(progress.Detach(*handle));
     EXPECT_TRUE(progress.Close());
 }
 

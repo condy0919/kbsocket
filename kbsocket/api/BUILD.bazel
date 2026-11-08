@@ -16,6 +16,7 @@ cc_library(
         ":stream",
         "//kbsocket/connection",
         "//kbsocket/runtime:connection_owner",
+        "//kbsocket/runtime:connection_progress",
         "//kbsocket/runtime:raw_stack",
     ],
 )
@@ -29,6 +30,7 @@ cc_library(
         ":stream",
         ":stream_error",
         "//kbsocket/runtime:connection_owner",
+        "//kbsocket/runtime:connection_progress",
         "//kbsocket/runtime:raw_stack",
     ],
 )

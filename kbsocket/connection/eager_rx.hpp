@@ -129,6 +129,8 @@ public:
     /// 已停止后按预算释放本流持有的真实 Lease；不触碰仍 Posted 的 RX。
     std::expected<std::size_t, EagerRxError> Drain(std::size_t budget = ReorderWindow::kMaxBatch) noexcept;
     std::expected<void, EagerRxError> Close() noexcept;
+    /// 未读的当前帧、连续后继帧/FIN 或 EOF；乱序驻留本身不代表可读。
+    bool readable() const noexcept;
     bool eof() const noexcept;
     bool failed() const noexcept;
     std::size_t pending() const noexcept;

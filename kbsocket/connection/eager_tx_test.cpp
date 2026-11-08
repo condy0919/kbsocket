@@ -263,6 +263,73 @@ protected:
     std::size_t partial_ = 0;
 };
 
+TEST_F(EagerTxTest, WritableReportsCopyCapacityWithoutRemoteCreditOrProviderWork) {
+    EXPECT_FALSE(stream_.writable());
+    ASSERT_TRUE(credits_.Close());
+    auto identity = identity_;
+    ++identity.epoch;
+    ASSERT_TRUE(credits_.Open(identity));
+    ASSERT_TRUE(credits_.Update(identity, 0, 4));
+    auto config = Config(1);
+    config.credit_identity = identity;
+    ASSERT_TRUE(stream_.Open(config, sender_, slab_, imports_, endpoint_, credits_));
+    PumpImports();
+    EXPECT_EQ(credits_.available(CreditClass::kData), 0u);
+    // 本地 copy 准入不依赖 DATA credit，也不消费 Slab 或进行 provider 调用。
+    const auto available = slab_.stats().available;
+    allocations = 0;
+    count_allocations = true;
+    const bool writable = stream_.writable();
+    count_allocations = false;
+    EXPECT_TRUE(writable);
+    EXPECT_EQ(allocations, 0u);
+    EXPECT_EQ(slab_.stats().available, available);
+    EXPECT_EQ(post_calls_, 0u);
+    const std::array bytes{std::byte{1}};
+    ASSERT_EQ(stream_.Write(bytes), 1u);
+    EXPECT_FALSE(stream_.writable());
+    const auto blocked = stream_.Progress();
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code, EagerTxErrorCode::kWouldBlock);
+    EXPECT_EQ(post_calls_, 0u);
+    stream_.Fail();
+    EXPECT_FALSE(stream_.writable());
+}
+
+TEST_F(EagerTxTest, WritableTracksSharedSlabExhaustionRecoveryAndStop) {
+    Open();
+    std::array<memory::BufferLease, 514> external{};
+    std::size_t held = 0;
+    while (slab_.stats().available) {
+        auto lease = slab_.Acquire(1);
+        ASSERT_TRUE(lease);
+        external[held++] = *lease;
+    }
+    EXPECT_FALSE(stream_.writable());
+    // 其他使用者归还 Slab 后，本连接没有 TX CQE 也可恢复本地可写提示。
+    ASSERT_TRUE(slab_.ReleaseCpu(external[--held]));
+    EXPECT_TRUE(stream_.writable());
+    slab_.StopAccepting();
+    EXPECT_FALSE(stream_.writable());
+    while (held) {
+        ASSERT_TRUE(slab_.ReleaseCpu(external[--held]));
+    }
+}
+
+TEST_F(EagerTxTest, WritableTracksByteWindowAndHalfClose) {
+    auto config = Config();
+    config.max_stream_bytes = 1;
+    ASSERT_TRUE(stream_.Open(config, sender_, slab_, imports_, endpoint_, credits_));
+    EXPECT_TRUE(stream_.writable());
+    const std::array bytes{std::byte{1}};
+    ASSERT_EQ(stream_.Write(bytes), 1u);
+    EXPECT_FALSE(stream_.writable());
+    ASSERT_TRUE(stream_.ApplyCredit(session_, identity_, 1000, 1000, 10000, 2));
+    EXPECT_TRUE(stream_.writable());
+    ASSERT_TRUE(stream_.ShutdownWrite());
+    EXPECT_FALSE(stream_.writable());
+}
+
 TEST_F(EagerTxTest, CopiesAcceptedPrefixAndKeepsDmaPinnedUntilExactTerminal) {
     Open(2);
     std::array<std::byte, 10000> source;

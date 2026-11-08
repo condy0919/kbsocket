@@ -574,5 +574,17 @@ int Connection::fd() const noexcept {
     }
     return state_ == ConnectionState::kRawActive ? lane_control_.fd() : handshake_.fd();
 }
+ConnectionReadiness Connection::readiness() const noexcept {
+    if (failure_) {
+        return {};
+    }
+    if (state_ == ConnectionState::kRawActive) {
+        return {rx_.readable(), tx_.writable(), rx_.eof(), tx_.stats().write_shutdown};
+    }
+    if (state_ == ConnectionState::kTcpActive) {
+        return {.read_eof = tcp_.read_eof(), .write_closed = tcp_.write_shutdown()};
+    }
+    return {};
+}
 } // namespace connection
 } // namespace kbsocket

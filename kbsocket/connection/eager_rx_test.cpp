@@ -254,9 +254,12 @@ protected:
 
 TEST_F(EagerRxTest, OutOfOrderAndShortReadHoldRealLeaseUntilFullyConsumed) {
     ASSERT_TRUE(Dispatch(Data(2, "ef")));
+    EXPECT_FALSE(stream_.readable());
     EXPECT_EQ(Read(8), "");
     ASSERT_TRUE(Dispatch(Data(0, "ab")));
+    EXPECT_TRUE(stream_.readable());
     EXPECT_EQ(Read(1), "a");
+    EXPECT_TRUE(stream_.readable());
     EXPECT_EQ(buffers_.held(), 2u);
     EXPECT_EQ(credits_.stats().held, 2u);
     EXPECT_EQ(window_.stats().consumed_bytes, 0u);
@@ -265,6 +268,7 @@ TEST_F(EagerRxTest, OutOfOrderAndShortReadHoldRealLeaseUntilFullyConsumed) {
     ASSERT_TRUE(Dispatch(Data(3, "gh")));
     ASSERT_TRUE(Dispatch(Data(1, "cd")));
     EXPECT_EQ(Read(7), "bcdefgh");
+    EXPECT_FALSE(stream_.readable());
     EXPECT_EQ(buffers_.held(), 0u);
     EXPECT_EQ(credits_.stats().released, 4u);
     EXPECT_EQ(window_.stats().consumed_bytes, 8u);
@@ -367,16 +371,36 @@ TEST_F(EagerRxTest, FinWaitsForOrderedDataAndFullApplicationConsumption) {
     fin.seq = 1;
     fin.session = binding_.context.session;
     ASSERT_TRUE(Dispatch(Event(fin)));
+    EXPECT_FALSE(stream_.readable());
     EXPECT_FALSE(stream_.eof());
     EXPECT_EQ(Read(4), "");
     ASSERT_TRUE(Dispatch(Data(0, "ab")));
     EXPECT_EQ(Read(1), "a");
+    EXPECT_TRUE(stream_.readable());
     EXPECT_FALSE(stream_.eof());
     EXPECT_EQ(Read(4), "b");
     EXPECT_TRUE(stream_.eof());
+    EXPECT_TRUE(stream_.readable());
     EXPECT_EQ(stream_.pending(), 0u);
     EXPECT_EQ(credits_.stats().released, 2u);
     EXPECT_EQ(credits_.stats().control.granted, 1u);
+}
+
+TEST_F(EagerRxTest, FinOnlyBecomesReadableBeforeReadConsumesEof) {
+    WireFrameInput fin;
+    fin.type = WireFrameType::kControl;
+    fin.control = WireControlType::kFin;
+    fin.token = route_.token;
+    fin.session = binding_.context.session;
+    ASSERT_TRUE(Dispatch(Event(fin)));
+    // FIN 虽然没有业务字节，仍应给应用一次 Read 机会，按序消费后再释放 RX Lease。
+    EXPECT_EQ(stream_.pending(), 1u);
+    EXPECT_TRUE(stream_.readable());
+    EXPECT_FALSE(stream_.eof());
+    EXPECT_EQ(Read(1), "");
+    EXPECT_EQ(stream_.pending(), 0u);
+    EXPECT_TRUE(stream_.eof());
+    EXPECT_TRUE(stream_.readable());
 }
 
 TEST_F(EagerRxTest, CreditControlReleasesWithoutEnteringReorderWindow) {

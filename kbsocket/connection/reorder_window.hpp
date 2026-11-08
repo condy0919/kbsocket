@@ -111,6 +111,8 @@ public:
     std::expected<void, ReorderError> CheckTimeout(std::uint64_t now_ns) noexcept;
     void StopAccepting() noexcept;
     void Fail() noexcept;
+    /// 只查看下一个连续帧（包括 FIN）或已确认 EOF，不消费 receipt，也不推进超时。
+    bool readable() const noexcept;
     bool eof() const noexcept;
     bool accepting() const noexcept;
     std::optional<ReorderError> failure() const noexcept;
