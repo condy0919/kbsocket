@@ -2,6 +2,8 @@
 #ifndef KBSOCKET_RUNTIME_CONNECTION_OWNER_HPP_
 #define KBSOCKET_RUNTIME_CONNECTION_OWNER_HPP_
 
+#include <sys/socket.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -83,6 +85,9 @@ public:
     std::expected<void, ConnectionOwnerError> Open(ConnectionProgress& progress,
                                                    const ConnectionOwnerConfig& config = {}) noexcept;
     std::expected<OwnedConnection, ConnectionOwnerError> AdoptTcp(int fd) noexcept;
+    /// 先预留有界槽/调度身份，再非阻塞直连；返回句柄不代表已连通，状态/错误由原调度回调交付。
+    std::expected<OwnedConnection, ConnectionOwnerError>
+    ConnectTcp(const sockaddr* address, socklen_t length, std::uint64_t now_ns, std::uint64_t deadline_ns) noexcept;
     std::expected<OwnedConnection, ConnectionOwnerError> AdoptProtocol(int fd, connection::ConnectionTable& routes,
                                                                        const control::ConnectionHandshakeConfig& config,
                                                                        std::uint64_t now_ns) noexcept;

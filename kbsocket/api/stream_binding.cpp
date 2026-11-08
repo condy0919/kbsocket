@@ -317,6 +317,9 @@ kbs_stream_table* StreamBinding::table() noexcept {
 std::size_t StreamBinding::published() const noexcept {
     return state_ ? state_->count : 0;
 }
+bool StreamBinding::events_pending() const noexcept {
+    return state_ && !state_->closed && state_->pending_head != kUnused;
+}
 void StreamBinding::StopAccepting() noexcept {
     if (state_) {
         state_->accepting = false;

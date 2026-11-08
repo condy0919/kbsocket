@@ -3,7 +3,7 @@
 > **对齐规范**：[kbsocket-design-v1.md](design/kbsocket-design-v1.md) · [hardware-observations.md](hardware-observations.md) · [hardware-validation-matrix.md](hardware-validation-matrix.md) · [OBSERVABILITY-DESIGN-GUIDE.md](OBSERVABILITY-DESIGN-GUIDE.md)
 > **最后更新**：2026-11-08
 
-本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语；M3 已实现借用 raw 资源的单 owner 进度器、四 context 调度、事件与有界控制执行器，验证状态分别见对应小节。M4 已交付 M4.1 固定 Slab/Lease 和 M4.2 协议、顺序、授信原语；M5.1 已交付已连接协议 fd 上的非阻塞握手、完整身份路由和 Single-Flight 导入。M5.2 已接通有界 Eager Connection copy-stream 与 NativeTCP 数据后端；M5.3.1–10 已接通借用 raw 资源的 Runtime owner、context 暂停组、连接 fd 调度、实际 CQE 来源登记校验、HELLO 主动 Lane 交换、在线 UPDATE/ACK，以及拥有连接对象的有界入口和跨线程业务 mailbox；已提供真实物理关闭后冻结 RX receipt 的整域核销，以及独立控制 fd 上的 Peer 共账授信撤回与 Runtime 调度。M5.3.9–10 已有单域 RawDomain 和最多四 context 的 RawStack，接通会话、共享 Slab/import、连接及 Runtime 的装配和分阶段关闭；认证、远端静默、来源退休仍由宿主提供。M5.4.1–2 已交付 owner 上的 Eager/NativeTCP copy-stream C ABI、有界连接事件与一次性就绪订阅；独立 C Runtime/建链与零拷贝 API 待后续，Grant 联动待 M6。M6–M7、L1/L2、O1/O2 仍为待交付计划，未实现类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
+本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语；M3 已实现借用 raw 资源的单 owner 进度器、四 context 调度、事件与有界控制执行器，验证状态分别见对应小节。M4 已交付 M4.1 固定 Slab/Lease 和 M4.2 协议、顺序、授信原语；M5.1 已交付已连接协议 fd 上的非阻塞握手、完整身份路由和 Single-Flight 导入。M5.2 已接通有界 Eager Connection copy-stream 与 NativeTCP 数据后端；M5.3.1–10 已接通借用 raw 资源的 Runtime owner、context 暂停组、连接 fd 调度、实际 CQE 来源登记校验、HELLO 主动 Lane 交换、在线 UPDATE/ACK，以及拥有连接对象的有界入口和跨线程业务 mailbox；已提供真实物理关闭后冻结 RX receipt 的整域核销，以及独立控制 fd 上的 Peer 共账授信撤回与 Runtime 调度。M5.3.9–10 已有单域 RawDomain 和最多四 context 的 RawStack，接通会话、共享 Slab/import、连接及 Runtime 的装配和分阶段关闭；认证、远端静默、来源退休仍由宿主提供。M5.4.1–3 已交付 Eager/NativeTCP copy-stream C ABI、有界连接事件与一次性就绪订阅，并提供独立 NativeTCP C Runtime/非阻塞建链；独立 raw 应用入口与零拷贝 API 待后续，Grant 联动待 M6。M6–M7、L1/L2、O1/O2 仍为待交付计划，未实现类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。
 
 ---
 
@@ -30,7 +30,7 @@
 - `kbsocket/runtime/` 后续集成：NUMA 亲和性、应用入口整合与连接定时器扩展；当前已有有界 `ProgressSource` 接口、CPU Lease 归还源、`ConnectionOwner`、业务 mailbox、单域 `RawDomain` 及四 context `RawStack` 所有者
 - `kbsocket/control/` 后续集成：拓扑/身份策略与 `HealthRegistry`；M5.1 已有握手协调器及 `EndpointImportCache`，M5.3 已接通控制 fd 调度和在线 Lane 更新
 - `kbsocket/connection/` 后续集成：完整应用入口、远端关闭协议及 `WriteRndvEngine`；M5.2 已交付有界 Connection copy-stream，M5.3 已接通 Runtime 收发调度与实际来源路由，详见 [Eager 接线](eager-connection.md)
-- `kbsocket/api/` 与 `kbsocket/socket/`：M5.4.1–2 已有 `stream.h` / `StreamBinding` 及统一连接事件；独立 runtime/建链、`buffer.h` 零拷贝、C++23 `execution` 封装、`FdTable`、`SocketAdapter`、`EpollMux` 待交付
+- `kbsocket/api/` 与 `kbsocket/socket/`：M5.4.1–3 已有 `stream.h` / `StreamBinding`、统一连接事件及 NativeTCP 独立 `stream_runtime.h`；raw 应用入口、`buffer.h` 零拷贝、C++23 `execution` 封装、`FdTable`、`SocketAdapter`、`EpollMux` 待交付
 - `kbsocket/transport/tcp/` 后续集成与 `kbsocket/transport/shm/`：NativeTCP 的 Runtime/ABI 接线、`ShmBackend`
 - `kbsocket/observability/` 与 `adapters/brpc/`：缓存行对齐 `ShardMetrics`、USDT 探针、bRPC 零拷贝适配器
 
@@ -239,7 +239,10 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 - **当前交付 M5.4.2**：`stream.h` 追加稳定连接事件、整体一次性 Watch 与最多 64 条的 Poll。StreamBinding 在控制路径预分配 scheduler 身份反向映射，每发布槽一个 intrusive pending 节点，合并提示并保留最新状态及退休计数，Release 成功才撤销队列/映射。Eager 按连续数据/FIN 判断可读，按本地 staging 判断可写；ConnectionProgress 有界巡检报告 FIN-only 与共享 Slab 恢复。NativeTCP 使用实际 fd 事件，RDHUP 不冒充 EOF。直接 I/O 刷新快照，raw 暂停拒绝 Watch/Poll 且保留队列；回调只复制已有快照，不重入 owner/provider。
 - **M5.4.2 范围**：宿主安装同步 RecordProgress 转发并管理回调生命周期，唯一 owner 在 Runtime 推进后 Poll；没有新增事件 fd、跨线程读表或自动驱动。事件是合并提示，不是状态历史、DMA 释放证明或逐 WR 完成列表。独立 C Runtime/建链、零拷贝及 M6 Grant/RNDV 继续后续。
 - **M5.4.2 验证**：2026-11-08 完整相关回归通过 71 个测试目标、1288 个用例，新增 21 个，无失败或跳过。覆盖纯 C11 布局/链接、真实 TCP 整体 oneshot/半关闭/EOF、事件合并及计数饱和、64 条批次上限、完整 scheduler 身份/旧代次/FIFO 删除复用、无分配事件入口；Mock raw 已有数据/partial read/FIN 的即时重订阅、Retained 期间事件保留、实际 context 暂停及另一域继续处理。底层用例覆盖乱序不可读、零远端 DATA credit 时本地可写、共享 Slab 耗尽/归还通知及避免重复忙转。严格 C++23/C11、格式、文档链接及 diff 检查通过；UB 真机与 40k 性能验收未执行。
-- **下一步 M5.4.3**：收口独立 Runtime/连接建立入口的配置、资源归属和生命周期，接入现有 owner/RawStack 与事件接口；零拷贝 Lease 继续后续交付。
+- **当前交付 M5.4.3**：`stream_runtime.h` 提供独立 NativeTCP C Runtime 创建/表借用/推进/关闭/销毁、非阻塞 Connect、已连接 fd 接管，以及固定容量监听/Accept/关闭。Runtime 拥有 scheduler/owner/binding/shard，自动转发连接事件。Connect 复用原 Connection 状态机，追加 TCP_CONNECTING 而不改既有状态数值；fd 一经接管通过指针写回 -1，异常回滚保留内部责任。待取应用事件阻止 Step 再次睡眠；Close 有未释放流/监听器时停准入并返回 BUSY，仍允许推进和显式清理，Destroy 要求已 Closed。详见 [独立 C Runtime](stream-runtime.md)。
+- **M5.4.3 范围**：独立模式为透明 NativeTCP，不发送 HELLO、不做 DNS 或隐式重拨。监听器显式有界 Accept，暂不汇聚监听事件。raw 保留既有 RawStack/StreamBinding 暂停与 DMA 门禁，认证、Peer 共账和来源证明继续由宿主提供，不借用 TCP 关闭条件推测 raw 安全。
+- **M5.4.3 验证**：2026-11-08 完整相关回归通过 72 个测试目标、1306 个用例，新增 18 个，无失败或跳过。13 个独立 C Runtime 用例覆盖 C11 编译/布局/全部符号、本机 IPv4 全 C 入口短读写/FIN、fd 接管失败保留、接收容量背压、监听槽非 LIFO 复用/失败回滚/旧身份、BUSY 停准入而保留现有 I/O、拒绝/取消与事件、待取事件阻止等待、普通 Step/I/O/事件零分配；另 5 个 Connection/Owner 用例验证直接拨号无 HELLO、连接期限/取消/拒绝、相同调度身份、容量回滚与自主 OUT 订阅收敛。严格 C++23/C11、自包含头文件、格式、文档链接及 diff 检查通过；UB 真机与 40k 验证未执行。
+- **下一步 M5.4.4**：接通 raw 应用 Runtime/建链编排，将已有 RawStack、StreamBinding、协议 Prepare、Peer 共账及独立生命周期证明组合为明确宿主契约；监听事件和零拷贝 Lease 继续后续交付。
 
 - **目标**：打通从非阻塞 TCP 握手、`EndpointImportCache` 去重导入、到 `Connection` 收发与显式零拷贝 C/C++ API 的端到端 Eager 数据面闭环，并提供 `NativeTcpBackend` 保底。
 - **设计章节**：[§10.1 非阻塞建链](design/kbsocket-design-v1.md#101-非阻塞建链与能力协商状态机)、[§10.3 分层 API](design/kbsocket-design-v1.md#103-接口分层c-abiposix-兼容与-c23-p2300)

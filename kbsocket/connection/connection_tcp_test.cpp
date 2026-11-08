@@ -157,6 +157,118 @@ TEST(ConnectionTcp, DirectOpenDoesNotSendHelloAndUsesTransparentShortIo) {
     EXPECT_EQ(left.state(), ConnectionState::kClosed);
 }
 
+TEST(ConnectionTcp, DirectConnectPublishesConnectingBeforeTransparentIo) {
+    tcp::NativeTcpListener listener;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_TRUE(listener.Open(reinterpret_cast<const sockaddr*>(&address), sizeof(address)));
+    socklen_t length = sizeof(address);
+    ASSERT_EQ(getsockname(listener.fd(), reinterpret_cast<sockaddr*>(&address), &length), 0);
+    Connection client, server;
+    const auto deadline = Now() + kTimeoutNs;
+    // 参数错误尚未分配 fd，不消耗成功打开的一次生命周期。
+    ExpectError(client.ConnectTcp(nullptr, 0, Now(), deadline), ConnectionErrorCode::kTcp);
+    EXPECT_EQ(client.state(), ConnectionState::kIdle);
+    ASSERT_TRUE(client.ConnectTcp(reinterpret_cast<const sockaddr*>(&address), sizeof(address), Now(), deadline));
+    ASSERT_GE(client.fd(), 0);
+    std::array<std::byte, 3> bytes{std::byte{1}, std::byte{2}, std::byte{3}}, output{};
+    if (client.state() == ConnectionState::kTcpConnecting) {
+        ExpectError(client.Write(bytes), ConnectionErrorCode::kNotReady);
+        ExpectError(client.Read(output, Now()), ConnectionErrorCode::kNotReady);
+        ExpectError(client.ShutdownWrite(), ConnectionErrorCode::kNotReady);
+        EXPECT_EQ(client.readiness(), ConnectionReadiness{});
+    }
+    ASSERT_TRUE(Wait(listener.fd(), POLLIN, deadline));
+    const auto accepted = listener.Accept();
+    ASSERT_TRUE(accepted);
+    ASSERT_TRUE(server.OpenTcp(*accepted));
+    ASSERT_TRUE(Wait(client.fd(), POLLOUT, deadline));
+    const bool connecting = client.state() == ConnectionState::kTcpConnecting;
+    ASSERT_EQ(client.Progress(Now()), connecting ? 1u : 0u);
+    EXPECT_EQ(client.state(), ConnectionState::kTcpActive);
+    EXPECT_EQ(client.Progress(Now()), 0u);
+    // 直连路径不发送协议 HELLO，首批应用字节必须原样交付。
+    ExpectError(server.Read(output, Now()), ConnectionErrorCode::kWouldBlock);
+    ASSERT_EQ(client.Write(bytes), bytes.size());
+    ASSERT_TRUE(Wait(server.fd(), POLLIN, deadline));
+    const auto read = server.Read(output, Now());
+    ASSERT_TRUE(read);
+    EXPECT_EQ(read->bytes, bytes.size());
+    EXPECT_EQ(output, bytes);
+    EXPECT_TRUE(client.Close());
+    EXPECT_TRUE(server.Close());
+}
+
+TEST(ConnectionTcp, ConnectingDeadlineAndCancelCloseOnlyTheirOwnedSocket) {
+    tcp::NativeTcpListener listener;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_TRUE(listener.Open(reinterpret_cast<const sockaddr*>(&address), sizeof(address)));
+    socklen_t length = sizeof(address);
+    ASSERT_EQ(getsockname(listener.fd(), reinterpret_cast<sockaddr*>(&address), &length), 0);
+    Connection expired;
+    ASSERT_TRUE(expired.ConnectTcp(reinterpret_cast<const sockaddr*>(&address), sizeof(address), 10, 20));
+    if (expired.state() == ConnectionState::kTcpConnecting) {
+        const int fd = expired.fd();
+        // 单调时钟回退是参数错误，不应终结连接；到达绝对 deadline 才锁存 Timeout。
+        ExpectError(expired.Progress(9), ConnectionErrorCode::kTcp);
+        EXPECT_EQ(expired.state(), ConnectionState::kTcpConnecting);
+        const auto timed_out = expired.Progress(20);
+        ASSERT_FALSE(timed_out);
+        EXPECT_EQ(timed_out.error().detail, static_cast<int>(tcp::TcpErrorCode::kTimeout));
+        EXPECT_EQ(timed_out.error().underlying_error, ETIMEDOUT);
+        EXPECT_EQ(expired.state(), ConnectionState::kFailed);
+        EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+        EXPECT_EQ(errno, EBADF);
+    }
+    ASSERT_TRUE(expired.Close());
+    Connection cancelled;
+    const auto deadline = Now() + kTimeoutNs;
+    ASSERT_TRUE(cancelled.ConnectTcp(reinterpret_cast<const sockaddr*>(&address), sizeof(address), Now(), deadline));
+    const int fd = cancelled.fd();
+    cancelled.Cancel();
+    EXPECT_EQ(cancelled.state(), ConnectionState::kFailed);
+    ASSERT_TRUE(cancelled.failure());
+    EXPECT_EQ(cancelled.failure()->code, ConnectionErrorCode::kCancelled);
+    EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+    ASSERT_TRUE(cancelled.Close());
+    EXPECT_GE(fcntl(listener.fd(), F_GETFD), 0);
+}
+
+TEST(ConnectionTcp, RefusedDirectConnectKeepsNativeErrorAndCannotBeReused) {
+    SocketPair reservation;
+    reservation.left = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
+    ASSERT_GE(reservation.left, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    // 保留端口但不 listen，避免“取空闲端口再关闭”与其他测试进程竞争。
+    ASSERT_EQ(bind(reservation.left, reinterpret_cast<const sockaddr*>(&address), sizeof(address)), 0);
+    socklen_t length = sizeof(address);
+    ASSERT_EQ(getsockname(reservation.left, reinterpret_cast<sockaddr*>(&address), &length), 0);
+    Connection client;
+    const auto deadline = Now() + kTimeoutNs;
+    const auto started =
+        client.ConnectTcp(reinterpret_cast<const sockaddr*>(&address), sizeof(address), Now(), deadline);
+    if (started) {
+        while (client.state() == ConnectionState::kTcpConnecting && Now() < deadline) {
+            ASSERT_TRUE(Wait(client.fd(), POLLOUT, deadline));
+            (void)client.Progress(Now());
+        }
+    }
+    EXPECT_EQ(client.state(), ConnectionState::kFailed);
+    ASSERT_TRUE(client.failure());
+    EXPECT_EQ(client.failure()->code, ConnectionErrorCode::kTcp);
+    EXPECT_EQ(client.failure()->underlying_error, ECONNREFUSED);
+    EXPECT_EQ(client.fd(), -1);
+    ExpectError(client.ConnectTcp(reinterpret_cast<const sockaddr*>(&address), sizeof(address), Now(), deadline),
+                ConnectionErrorCode::kInUse);
+    EXPECT_TRUE(client.Close());
+}
+
 TEST(ConnectionTcp, NegotiatedTcpRequiresBothReadyAndPreservesImmediatelyFollowingPayload) {
     SocketPair sockets;
     ASSERT_TRUE(sockets.Open());

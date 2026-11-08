@@ -78,6 +78,23 @@ std::expected<void, ConnectionError> Connection::OpenTcp(int fd) noexcept {
     state_ = ConnectionState::kTcpActive;
     return {};
 }
+std::expected<void, ConnectionError> Connection::ConnectTcp(const sockaddr* address, socklen_t length,
+                                                            std::uint64_t now_ns, std::uint64_t deadline_ns) noexcept {
+    if (opened_once_) {
+        return Error(ConnectionErrorCode::kInUse);
+    }
+    const auto started = tcp_.Connect(address, length, now_ns, deadline_ns);
+    if (!started) {
+        if (tcp_.failure()) {
+            opened_once_ = true;
+            return std::unexpected(Fail(TcpError(started.error())));
+        }
+        return std::unexpected(TcpError(started.error()));
+    }
+    opened_once_ = true;
+    state_ = tcp_.state() == tcp::TcpState::kConnected ? ConnectionState::kTcpActive : ConnectionState::kTcpConnecting;
+    return {};
+}
 std::expected<void, ConnectionError> Connection::PrepareRaw(const RawConnectionPreparation& prep) noexcept {
     if (state_ != ConnectionState::kPreparing || raw_prepared_) {
         return Error(ConnectionErrorCode::kNotReady);
@@ -269,6 +286,20 @@ std::expected<std::size_t, ConnectionError> Connection::Progress(std::uint64_t n
     }
     if (state_ == ConnectionState::kTcpActive) {
         return 0;
+    }
+    if (state_ == ConnectionState::kTcpConnecting) {
+        const auto connected = tcp_.FinishConnect(now_ns);
+        if (!connected) {
+            if (connected.error().code == tcp::TcpErrorCode::kWouldBlock) {
+                return 0;
+            }
+            if (tcp_.failure()) {
+                return std::unexpected(Fail(TcpError(connected.error())));
+            }
+            return std::unexpected(TcpError(connected.error()));
+        }
+        state_ = ConnectionState::kTcpActive;
+        return 1;
     }
     if (state_ == ConnectionState::kIdle || state_ == ConnectionState::kClosed || state_ == ConnectionState::kClosing) {
         return Error(ConnectionErrorCode::kNotReady);
@@ -569,7 +600,7 @@ std::expected<void, ConnectionError> Connection::Close() noexcept {
     return {};
 }
 int Connection::fd() const noexcept {
-    if (state_ == ConnectionState::kTcpActive) {
+    if (state_ == ConnectionState::kTcpActive || state_ == ConnectionState::kTcpConnecting) {
         return tcp_.fd();
     }
     return state_ == ConnectionState::kRawActive ? lane_control_.fd() : handshake_.fd();

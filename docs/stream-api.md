@@ -1,6 +1,6 @@
 # M5.4.1–2：copy-stream C 接口与连接事件
 
-[`stream.h`](../kbsocket/api/stream.h) 提供 Eager 和 NativeTCP 共用的有界复制读写、半关闭、取消、状态查询及关闭/释放接口。头文件可由 C11 独立编译，不暴露 URMA、C++ 类型或底层 fd。`KBS_STREAM_ABI_VERSION=1` 标识本次结构与函数契约；M5.4.2 追加统一连接事件及一次性 readiness，保持已有结构布局不变。独立 Runtime 创建、拨号/接收和零拷贝 Lease 接口仍待后续交付。
+[`stream.h`](../kbsocket/api/stream.h) 提供 Eager 和 NativeTCP 共用的有界复制读写、半关闭、取消、状态查询及关闭/释放接口。头文件可由 C11 独立编译，不暴露 URMA、C++ 类型或底层 fd。`KBS_STREAM_ABI_VERSION=1` 标识本次结构与函数契约；M5.4.2 追加统一连接事件及一次性 readiness，保持已有结构布局不变。M5.4.3 的 [stream_runtime.h](stream-runtime.md) 已提供独立 NativeTCP Runtime 创建、拨号/接收及自动事件转发；raw 应用编排和零拷贝 Lease 继续后续。
 
 ## 绑定已有运行时
 
@@ -69,4 +69,4 @@ C Poll 的 `events`、`count` 必填，capacity 必须大于 0；一次最多返
 
 ## 验证边界
 
-验证使用纯 C 编译/C++ 链接、本地 IPv4 TCP 以及 Mock RawStack。重点覆盖有界前缀、错误与 EOF、旧句柄、关闭保留、来源退休、context 暂停、事件合并/一次性订阅以及无分配 I/O 和事件交付。实际回归数量记录于 [roadmap](roadmap.md)。UB 真机与 40k 性能验收未执行；本阶段不宣称完整独立 C Runtime、跨线程同步 API 或零拷贝 ABI 已交付。
+验证使用纯 C 编译/C++ 链接、本地 IPv4 TCP 以及 Mock RawStack。重点覆盖有界前缀、错误与 EOF、旧句柄、关闭保留、来源退休、context 暂停、事件合并/一次性订阅以及无分配 I/O 和事件交付。实际回归数量记录于 [roadmap](roadmap.md)。UB 真机与 40k 性能验收未执行；NativeTCP 独立 C Runtime 已由 M5.4.3 交付，raw 独立应用入口、跨线程同步 API 和零拷贝 ABI 仍未交付。

@@ -51,4 +51,4 @@ AdvanceClose 先无副作用检查所有域的连接槽、调度注册、命令�
 
 不可信 CQ 终结进入 Retained，不提供强制清零或在线恢复。任何未成功 Closed 的析构保留整份 State，包括 RawRuntime、共享内存、回调桥接和控制线程，防止个别成员析构先删除 context。宿主仍须保留外部 provider 代码、cookie、Peer 账本与其他相关依赖；保留不是正常释放。
 
-测试使用 Mock URMA 与本地 TCP，覆盖 2 设备 × 2 EID 装配、部分创建、关闭门禁、缓存 unimport、context 暂停、关闭重试及 DMA 责任。UB 真机和 40k 性能验收未执行；M5.4.1 的 [StreamBinding](stream-api.md) 已把资源门禁接入 Eager/NativeTCP copy-stream C ABI，M5.4.2 已追加统一连接事件；独立 C Runtime、零拷贝接口与 M6 WRITE RNDV 继续后续交付。
+测试使用 Mock URMA 与本地 TCP，覆盖 2 设备 × 2 EID 装配、部分创建、关闭门禁、缓存 unimport、context 暂停、关闭重试及 DMA 责任。UB 真机和 40k 性能验收未执行；M5.4.1 的 [StreamBinding](stream-api.md) 已把资源门禁接入 Eager/NativeTCP copy-stream C ABI，M5.4.2 已追加统一连接事件；M5.4.3 已交付 [独立 NativeTCP C Runtime](stream-runtime.md)，raw 应用编排、零拷贝接口与 M6 WRITE RNDV 继续后续交付。

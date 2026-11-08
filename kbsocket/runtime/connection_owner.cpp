@@ -168,6 +168,23 @@ std::expected<OwnedConnection, ConnectionOwnerError> ConnectionOwner::AdoptTcp(i
     ++state_->stats.adopted;
     return handle;
 }
+std::expected<OwnedConnection, ConnectionOwnerError> ConnectionOwner::ConnectTcp(const sockaddr* address,
+                                                                                 socklen_t length, std::uint64_t now_ns,
+                                                                                 std::uint64_t deadline_ns) noexcept {
+    if (!state_) {
+        return Error(Code::kNotReady);
+    }
+    const auto handle = state_->Reserve(-1);
+    if (!handle) {
+        return handle;
+    }
+    const auto started = state_->Find(*handle)->connection->ConnectTcp(address, length, now_ns, deadline_ns);
+    if (!started) {
+        return std::unexpected(state_->Rollback(*handle, ConnectionError(started.error()).error()));
+    }
+    ++state_->stats.adopted;
+    return handle;
+}
 std::expected<OwnedConnection, ConnectionOwnerError>
 ConnectionOwner::AdoptProtocol(int fd, connection::ConnectionTable& routes,
                                const control::ConnectionHandshakeConfig& config, std::uint64_t now_ns) noexcept {

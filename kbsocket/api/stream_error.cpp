@@ -174,6 +174,8 @@ std::uint32_t StateCode(connection::ConnectionState state) noexcept {
         return KBS_STREAM_CLOSING;
     case State::kClosed:
         return KBS_STREAM_STATE_CLOSED;
+    case State::kTcpConnecting:
+        return KBS_STREAM_TCP_CONNECTING;
     }
     return KBS_STREAM_FAILED;
 }
@@ -181,6 +183,13 @@ std::uint32_t StateCode(connection::ConnectionState state) noexcept {
 
 kbs_stream_error StreamError(int code) noexcept {
     return {code, KBS_STREAM_ORIGIN_API, 0, 0, 0, 0};
+}
+kbs_stream_error MapStreamError(const runtime::ProgressError& error) noexcept {
+    return ProgressError(error);
+}
+kbs_stream_error MapStreamError(const tcp::TcpError& error) noexcept {
+    return NativeError(TcpCode(static_cast<int>(error.code), error.system_error), KBS_STREAM_ORIGIN_TCP, error.code,
+                       error.system_error);
 }
 kbs_stream_error MapStreamError(const connection::ConnectionError& error) noexcept {
     using Code = connection::ConnectionErrorCode;

@@ -102,6 +102,9 @@ struct ConnectionProgress::State {
             if (slot.interests) {
                 mask = slot.interests | EPOLLRDHUP | EPOLLONESHOT;
             }
+        } else if (phase == ConnectionState::kTcpConnecting) {
+            // 建链不依赖应用 Watch；完成后切回按需订阅，避免空闲连接持续 OUT 通知。
+            mask = EPOLLOUT | EPOLLRDHUP | EPOLLONESHOT;
         } else if (phase == ConnectionState::kRawActive) {
             mask = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
             if (slot.connection->control_output_pending()) {

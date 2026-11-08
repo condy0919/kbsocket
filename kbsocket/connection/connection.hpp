@@ -2,6 +2,8 @@
 #ifndef KBSOCKET_CONNECTION_CONNECTION_HPP_
 #define KBSOCKET_CONNECTION_CONNECTION_HPP_
 
+#include <sys/socket.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -27,7 +29,8 @@ enum class ConnectionState : std::uint8_t {
     kTcpActive,
     kFailed,
     kClosing,
-    kClosed
+    kClosed,
+    kTcpConnecting
 };
 enum class ConnectionErrorCode : std::uint8_t {
     kInvalidArgument,
@@ -101,6 +104,9 @@ public:
                                               std::uint64_t now_ns) noexcept;
     /// 普通 TCP 服务不探测私有协议；只接管干净、已连接的非阻塞 TCP fd。
     std::expected<void, ConnectionError> OpenTcp(int fd) noexcept;
+    /// 数值地址上的非阻塞直连，不发送私有 HELLO；成功启动后由 Progress 推进至 Active/Failed。
+    std::expected<void, ConnectionError> ConnectTcp(const sockaddr* address, socklen_t length, std::uint64_t now_ns,
+                                                    std::uint64_t deadline_ns) noexcept;
     std::expected<void, ConnectionError> PrepareRaw(const RawConnectionPreparation& preparation) noexcept;
     std::expected<void, ConnectionError> PrepareTcp() noexcept;
     /// 单次有界握手/一个 TX 批次；物理域 refill 后调用，发布累计 Credit 与应用消费窗口。

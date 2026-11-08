@@ -153,4 +153,4 @@ M5.3.5 增加并发提交/领取、完成背压、有限预算、缓冲复制、
 
 M5.3.9 已交付 RawDomain 单域所有者。Runtime 解绑后，`ConnectionIoBinding::Close(true)` 从 ConnectionProgress 的固定补投数组移除本域再清除借用；未停止回调时拒绝，不分配、不调用 provider。ConnectionProgress 可先 Close，但对象必须存活且不得重开，直到桥接解绑。单独使用桥接的宿主也须遵守这一顺序。
 
-M5.3.10 的 RawStack 已补齐最多四 context 顶层装配及 Slab/导入/ConnectionOwner 的关闭门禁。BeginClose 保留 Runtime 控制调度到 unimport 等责任收敛，再逐域关闭。M5.4.1 的 [StreamBinding](stream-api.md) 已提供 owner 上的 copy-stream C ABI，并将应用关闭与来源退休/槽释放分开；M5.4.2 已追加统一连接事件；独立 C Runtime 和零拷贝接口仍待交付。宿主仍须组织静默、来源退休与进度解绑，不能通过 ConnectionOwner 析构或授信 ACK 推断物理资源可释放。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。
+M5.3.10 的 RawStack 已补齐最多四 context 顶层装配及 Slab/导入/ConnectionOwner 的关闭门禁。BeginClose 保留 Runtime 控制调度到 unimport 等责任收敛，再逐域关闭。M5.4.1 的 [StreamBinding](stream-api.md) 已提供 owner 上的 copy-stream C ABI，并将应用关闭与来源退休/槽释放分开；M5.4.2 已追加统一连接事件；M5.4.3 的 [独立 NativeTCP C Runtime](stream-runtime.md) 已接入非阻塞 Connect 与固定容量 Listen/Accept，raw 应用编排和零拷贝接口仍待交付。宿主仍须组织静默、来源退休与进度解绑，不能通过 ConnectionOwner 析构或授信 ACK 推断物理资源可释放。跨 Peer 弹性授信调度与 M6 Grant/RNDV 不在本次交付内。

@@ -17,7 +17,9 @@ cc_library(
         "//kbsocket/connection",
         "//kbsocket/runtime:connection_owner",
         "//kbsocket/runtime:connection_progress",
+        "//kbsocket/runtime:progress_source",
         "//kbsocket/runtime:raw_stack",
+        "//kbsocket/transport/tcp:native_tcp_backend",
     ],
 )
 
@@ -62,6 +64,40 @@ cc_test(
         "//kbsocket/control:tx_lane_snapshot",
         "//kbsocket/transport/raw:urma_test_support",
         "//kbsocket/transport/tcp:native_tcp_backend",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "stream_runtime",
+    srcs = ["stream_runtime.cpp"],
+    hdrs = ["stream_runtime.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":stream",
+        ":stream_binding",
+        ":stream_error",
+        "//kbsocket/runtime:connection_owner",
+        "//kbsocket/runtime:connection_progress",
+        "//kbsocket/runtime:runtime_shard",
+        "//kbsocket/transport/tcp:native_tcp_backend",
+    ],
+)
+
+cc_library(
+    name = "stream_runtime_c_test",
+    testonly = True,
+    srcs = ["stream_runtime_c_test.c"],
+    copts = ["-std=c11"],
+    deps = [":stream_runtime"],
+)
+
+cc_test(
+    name = "stream_runtime_test",
+    srcs = ["stream_runtime_test.cpp"],
+    deps = [
+        ":stream_runtime",
+        ":stream_runtime_c_test",
         "@googletest//:gtest_main",
     ],
 )

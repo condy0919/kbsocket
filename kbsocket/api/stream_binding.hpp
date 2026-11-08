@@ -45,6 +45,8 @@ public:
     std::expected<void, kbs_stream_error> Close() noexcept;
     kbs_stream_table* table() noexcept;
     std::size_t published() const noexcept;
+    // 只读本表 owner 元数据，供宿主避免有待交付事件时进入阻塞等待；不访问 raw 域。
+    bool events_pending() const noexcept;
 
     std::expected<std::size_t, kbs_stream_error> Write(kbs_stream_handle stream,
                                                        std::span<const std::byte> input) noexcept;

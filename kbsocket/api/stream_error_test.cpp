@@ -182,6 +182,8 @@ TEST(StreamErrorTest, ClosingStatusPreservesFailureAndUnknownStateFailsClosed) {
     EXPECT_EQ(status.failure.underlying, 9);
     input.state = connection::ConnectionState::kClosed;
     EXPECT_EQ(StreamStatus(input).state, KBS_STREAM_STATE_CLOSED);
+    input.state = connection::ConnectionState::kTcpConnecting;
+    EXPECT_EQ(StreamStatus(input).state, KBS_STREAM_TCP_CONNECTING);
     input.state = static_cast<connection::ConnectionState>(255);
     EXPECT_EQ(StreamStatus(input).state, KBS_STREAM_FAILED);
 }

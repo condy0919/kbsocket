@@ -43,6 +43,7 @@ typedef struct kbs_stream_handle {
 #define KBS_STREAM_ORIGIN_PROGRESS 3u
 #define KBS_STREAM_ORIGIN_SOURCE 4u
 #define KBS_STREAM_ORIGIN_STACK 5u
+#define KBS_STREAM_ORIGIN_TCP 6u
 
 // code 是稳定分类；其余字段仅诊断，native_code 是本版本对应内部组件枚举值。
 // detail/underlying 保留原始状态（例如 provider status 9）；不得据此推测 DMA 已终结。
@@ -69,6 +70,7 @@ typedef struct kbs_stream_io {
 #define KBS_STREAM_FAILED 6u
 #define KBS_STREAM_CLOSING 7u
 #define KBS_STREAM_STATE_CLOSED 8u
+#define KBS_STREAM_TCP_CONNECTING 9u
 typedef struct kbs_stream_status {
     uint32_t state;
     uint32_t lane_update_pending;

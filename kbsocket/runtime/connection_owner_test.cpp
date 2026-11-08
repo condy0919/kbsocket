@@ -136,10 +136,12 @@ protected:
     bool progress_open_ = false, shard_open_ = false;
     std::uint64_t readiness_ = 0, state_events_ = 0;
     std::uint32_t last_fd_events_ = 0;
+    ConnectionState last_state_ = ConnectionState::kIdle;
     ScheduledConnection last_event_;
     static void Observe(void* pointer, const ConnectionProgressEvent& event) noexcept {
         auto& self = *static_cast<ConnectionOwnerTest*>(pointer);
         self.last_event_ = event.connection;
+        self.last_state_ = event.state;
         self.readiness_ += event.fd_events != 0;
         self.state_events_ += event.fd_events == 0;
         self.last_fd_events_ = event.fd_events;
@@ -206,6 +208,88 @@ TEST_F(ConnectionOwnerTest, OpenRequiresReadyProgressAndBoundedCapacity) {
     EXPECT_EQ(owner_.stats().capacity, 2u);
     EXPECT_EQ(owner_.stats().occupied, 0u);
     EXPECT_TRUE(owner_.stats().accepting);
+}
+
+TEST_F(ConnectionOwnerTest, DirectConnectUsesRegisteredIdentityAndRuntimeWithoutApplicationWatch) {
+    Open(2);
+    StartShard();
+    tcp::NativeTcpListener listener;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_TRUE(listener.Open(reinterpret_cast<const sockaddr*>(&address), sizeof(address)));
+    socklen_t length = sizeof(address);
+    ASSERT_EQ(getsockname(listener.fd(), reinterpret_cast<sockaddr*>(&address), &length), 0);
+    const auto deadline = Now() + kTimeoutNs;
+    allocations = 0;
+    count_allocations = true;
+    const auto client =
+        owner_.ConnectTcp(reinterpret_cast<const sockaddr*>(&address), sizeof(address), Now(), deadline);
+    count_allocations = false;
+    ASSERT_TRUE(client);
+    Track(*client);
+    EXPECT_EQ(allocations, 0u);
+    const auto initial = owner_.Inspect(*client);
+    ASSERT_TRUE(initial);
+    const auto identity = initial->scheduled;
+    EXPECT_TRUE(initial->state == ConnectionState::kTcpConnecting || initial->state == ConnectionState::kTcpActive);
+    ASSERT_TRUE(Wait(listener.fd(), POLLIN));
+    const auto accepted = listener.Accept();
+    ASSERT_TRUE(accepted);
+    TcpPair peer;
+    peer.right = *accepted;
+    // 不调用 WatchTcp；连接器自身由原 scheduler 推进并报告同一完整身份。
+    ASSERT_TRUE(Until([&] { return last_event_ == identity && last_state_ == ConnectionState::kTcpActive; }));
+    EXPECT_EQ(owner_.Inspect(*client)->scheduled, identity);
+    const auto notifications = readiness_;
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(shard_.RunOnce());
+    }
+    EXPECT_EQ(readiness_, notifications);
+    std::array<std::byte, 3> payload{std::byte{5}, std::byte{9}, std::byte{4}}, output{};
+    ASSERT_EQ(owner_.Write(*client, payload), payload.size());
+    ASSERT_TRUE(Wait(peer.right, POLLIN));
+    EXPECT_EQ(recv(peer.right, output.data(), output.size(), MSG_DONTWAIT), 3);
+    EXPECT_EQ(output, payload);
+}
+
+TEST_F(ConnectionOwnerTest, DirectConnectRejectsInvalidAndCapacityWithoutLeakingSlots) {
+    Open(1);
+    const auto now = Now();
+    const auto invalid = owner_.ConnectTcp(nullptr, 0, now, now + kTimeoutNs);
+    ASSERT_FALSE(invalid);
+    EXPECT_EQ(invalid.error().code, Code::kConnection);
+    EXPECT_EQ(owner_.stats().occupied, 0u);
+    EXPECT_EQ(progress_.stats()->attached, 0u);
+    tcp::NativeTcpListener listener;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_TRUE(listener.Open(reinterpret_cast<const sockaddr*>(&address), sizeof(address)));
+    socklen_t length = sizeof(address);
+    ASSERT_EQ(getsockname(listener.fd(), reinterpret_cast<sockaddr*>(&address), &length), 0);
+    const auto first =
+        owner_.ConnectTcp(reinterpret_cast<const sockaddr*>(&address), sizeof(address), now, now + kTimeoutNs);
+    ASSERT_TRUE(first);
+    Track(*first);
+    const auto original = owner_.Inspect(*first)->scheduled;
+    ExpectError(owner_.ConnectTcp(reinterpret_cast<const sockaddr*>(&address), sizeof(address), now, now + kTimeoutNs),
+                Code::kExhausted);
+    EXPECT_EQ(owner_.stats().occupied, 1u);
+    ASSERT_TRUE(owner_.Cancel(*first));
+    ASSERT_TRUE(owner_.CloseConnection(*first));
+    ASSERT_TRUE(owner_.Release(*first));
+    const auto replacement =
+        owner_.ConnectTcp(reinterpret_cast<const sockaddr*>(&address), sizeof(address), now, now + kTimeoutNs);
+    ASSERT_TRUE(replacement);
+    Track(*replacement);
+    const auto newer = owner_.Inspect(*replacement)->scheduled;
+    EXPECT_EQ(newer.slot_index(), original.slot_index());
+    EXPECT_NE(newer.id, original.id);
+    EXPECT_FALSE(progress_.Wake(original));
+    owner_.StopAccepting();
+    ExpectError(owner_.ConnectTcp(reinterpret_cast<const sockaddr*>(&address), sizeof(address), now, now + kTimeoutNs),
+                Code::kStopped);
 }
 
 TEST_F(ConnectionOwnerTest, InspectIncludesKnownHalfCloseReadiness) {
