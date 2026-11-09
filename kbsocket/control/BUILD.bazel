@@ -2,6 +2,27 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "tseg_import_cache",
+    srcs = ["tseg_import_cache.cpp"],
+    hdrs = ["tseg_import_cache.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//kbsocket/runtime:control_executor",
+        "//kbsocket/transport/raw:urma_api",
+    ],
+)
+
+cc_test(
+    name = "tseg_import_cache_test",
+    srcs = ["tseg_import_cache_test.cpp"],
+    deps = [
+        ":tseg_import_cache",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "raw_source_admission",
     hdrs = ["raw_source_admission.hpp"],
     visibility = ["//visibility:public"],

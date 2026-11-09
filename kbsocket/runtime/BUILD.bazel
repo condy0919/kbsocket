@@ -3,6 +3,30 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "tseg_import_progress",
+    srcs = ["tseg_import_progress.cpp"],
+    hdrs = ["tseg_import_progress.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":progress_source",
+        "//kbsocket/control:tseg_import_cache",
+    ],
+)
+
+cc_test(
+    name = "tseg_import_progress_test",
+    srcs = ["tseg_import_progress_test.cpp"],
+    deps = [
+        ":context_progress_group",
+        ":import_progress",
+        ":shard_reactor",
+        ":tseg_import_progress",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "raw_stack",
     srcs = ["raw_stack.cpp"],
     hdrs = ["raw_stack.hpp"],
