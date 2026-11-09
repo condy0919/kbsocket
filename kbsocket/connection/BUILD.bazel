@@ -2,6 +2,29 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "write_rndv_engine",
+    srcs = ["write_rndv_engine.cpp"],
+    hdrs = ["write_rndv_engine.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":grant_manager",
+        "//kbsocket/memory:slab_allocator",
+        "//kbsocket/transport/raw:tx_completion_processor",
+        "//kbsocket/transport/raw:tx_sender",
+    ],
+)
+
+cc_test(
+    name = "write_rndv_engine_test",
+    srcs = ["write_rndv_engine_test.cpp"],
+    deps = [
+        ":write_rndv_engine",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "grant_manager",
     srcs = ["grant_manager.cpp"],
     hdrs = ["grant_manager.hpp"],
