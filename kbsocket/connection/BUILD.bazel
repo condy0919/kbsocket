@@ -2,6 +2,27 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "rndv_protocol",
+    srcs = ["rndv_protocol.cpp"],
+    hdrs = ["rndv_protocol.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":grant_manager",
+        ":wire_frame",
+        ":write_rndv_pool",
+    ],
+)
+
+cc_test(
+    name = "rndv_protocol_test",
+    srcs = ["rndv_protocol_test.cpp"],
+    deps = [
+        ":rndv_protocol",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "write_rndv_pool",
     srcs = ["write_rndv_pool.cpp"],
     hdrs = ["write_rndv_pool.hpp"],
@@ -17,6 +38,7 @@ cc_test(
     name = "write_rndv_pool_test",
     srcs = ["write_rndv_pool_test.cpp"],
     deps = [
+        ":rndv_protocol",
         ":write_rndv_pool",
         "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",
@@ -40,6 +62,7 @@ cc_test(
     name = "write_rndv_engine_test",
     srcs = ["write_rndv_engine_test.cpp"],
     deps = [
+        ":rndv_protocol",
         ":write_rndv_engine",
         "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",
@@ -273,6 +296,7 @@ cc_test(
         ":connection_tokens",
         ":credit_account",
         ":reorder_window",
+        ":rndv_protocol",
         ":tx_sequence_window",
         ":wire_frame",
         "//kbsocket/memory:slab_allocator",

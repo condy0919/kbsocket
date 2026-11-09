@@ -129,7 +129,10 @@ std::expected<void, EagerRxError> EagerReceiveDomain::Dispatch(const raw::RxBuff
                              event.completion.completion_len == event.payload.size() && decoded.has_value();
     std::expected<RxCreditReceipt, CreditError> receipt = std::unexpected(CreditError{CreditErrorCode::kWrongIdentity});
     if (source_valid && frame_valid) {
-        const auto kind = decoded->frame.type == WireFrameType::kControl ? CreditClass::kControl : CreditClass::kData;
+        // RTS 是业务准入请求，必须消耗 data 额度，不能挤占 GRANT/DONE 的控制保留。
+        const auto& frame = decoded->frame;
+        const bool control = frame.type == WireFrameType::kControl && frame.control != WireControlType::kRndvRts;
+        const auto kind = control ? CreditClass::kControl : CreditClass::kData;
         receipt = s.credits->Consume(source.peer, kind);
     }
     if (!receipt) {
@@ -387,9 +390,9 @@ std::expected<void, EagerRxError> EagerRxStream::Open(EagerReceiveDomain& domain
     }
     const auto stats = window.stats();
     const auto capacity = stats.max_frame_seq - stats.released_prefix;
-    if (domain.frozen() || !window.accepting() || stats.buffered_frames || stats.delivered_frames || !capacity ||
-        capacity > ReorderWindow::kMaxWindow || !binding.context.peer_runtime || !binding.context.receive_domain ||
-        !binding.context.session || !binding.token.generation) {
+    if (domain.frozen() || !window.accepting() || stats.pending_frames || stats.buffered_frames ||
+        stats.delivered_frames || !capacity || capacity > ReorderWindow::kMaxWindow || !binding.context.peer_runtime ||
+        !binding.context.receive_domain || !binding.context.session || !binding.token.generation) {
         return Error(EagerRxErrorCode::kInvalidArgument);
     }
     auto state = std::unique_ptr<State>(new (std::nothrow) State);

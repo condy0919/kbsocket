@@ -34,7 +34,8 @@
 | CREDIT_UPDATE | 0 | 48 B：六个大端 uint64，依次为 session、credit_epoch、max_credit_seq、max_control_credit_seq、max_frame_seq、max_stream_bytes |
 | FIN | 4 | 8 B：大端 session:uint64；FIN 的终结 SN 位于 IMM |
 | RST | 5 | 12 B：大端 session:uint64、非零 reason:uint32 |
-| RNDV_RTS / GRANT / DONE | 1 / 2 / 3 | 当前返回 `kUnsupportedType`，由 M6 冻结并实现完整授权格式 |
+| RNDV_RTS | 1 | 64 B：当前路由 session 和原事务完整身份、总长度；IMM 携带原 SN |
+| RNDV_GRANT / DONE | 2 / 3 | 104 B：RTS 公共字段及 Arena/Grant 身份、目标地址；精确布局见 [RNDV 协议](rndv-protocol.md) |
 
 `max_frame_seq` 是累计序号独占上界，最多为 `2^32`；`max_stream_bytes` 是累计业务字节独占上界，不是一次更新新增的字节数。数据/控制物理授信上界独立，不能把控制保留额度无条件交给任意 Peer 使用。普通 DATA 不能使用 `UINT32_MAX`，该 SN 为最后一个 FIN 保留。
 
@@ -66,6 +67,8 @@
 
 `Push` 成功才接管 Lease。旧 Session、重复 SN、越窗、错误类型、重复持有同一 Lease 等错误均不接管输入，由调用方按真实所有权清理；不能因某个描述符副本被拒绝就再次归还窗口已经持有的同一个 Lease。越窗、超字节上界和 FIN 冲突会使当前流显式失败。`kValidatedRmaDone` 只提供将已验证大包放入同一顺序窗口的入口，不代表 DONE 协议、Grant 撤权或 DMA 证明已经实现。
 
+M6.3.3 增加 `ReserveRndv`：在 RTS 准入时占用共同 SN 和完整业务字节额度，返回单调代次 reservation；没有目标 Lease 的 pending 项阻止后继 Eager/FIN 交付。`CompleteRndv` 只接受相同 session/SN/长度及有效 Lease 的可信完成项，原位转为可重排数据，不重复扣字节。停止或失败后的 `AbandonRndv` 仅删除占位元数据，不终结远端 Grant，也不增加消费前缀。见 [完整契约](rndv-protocol.md)。
+
 `Poll` 每次最多交付 `min(output.size(),64)` 个连续帧。交付后 Lease 由应用/宿主持有，窗口仍以 `ReorderReceipt` 记录驻留责任。只有真实 Lease 已归还、应用不再访问后，才能 `Release(receipt)`；该调用不会代替 `ReleaseCpu` 或 `RxBufferPool::Release`。迟到/重复 receipt 不得释放新一轮槽位。
 
 窗口公布两个累计上界：
@@ -73,9 +76,9 @@
 - `max_frame_seq = min(2^32, released_prefix + window)`。只有连续归还前缀推进才扩大序号上界；即使 `rcv_next` 已前进，仍由应用持有的槽也不重新授出。
 - `max_stream_bytes = consumed_bytes + max_resident_bytes`，发生整数上界时饱和。收到的数据与尚未归还的驻留字节分别记录，不因 Poll 交付就提前恢复字节窗口。
 
-缺口从“已有后续缓冲帧但当前 SN 缺失”开始计时，要求传入单调的 `now_ns`。到期后失败不可被迟到帧消除；失败后仍可交付已经验证的连续前缀。FIN 同样进入重排窗口，只有 FIN 及此前连续数据都已归还，且流没有失败，`eof()` 才成立；Poll 看到 FIN 本身不等于应用已经读尽数据。
+缺口从“已有后续缓冲帧但当前 SN 缺失”，或存在尚未完成的 RNDV 占位开始计时，要求传入单调的 `now_ns`。到期后失败不可被迟到帧消除；失败后仍可交付已经验证的连续前缀。FIN 同样进入重排窗口，只有 FIN 及此前连续数据都已归还，且流没有失败，`eof()` 才成立；Poll 看到 FIN 本身不等于应用已经读尽数据。
 
-停止或失败后可调用 `Drain`，按最多 64 个扫描槽的预算交出待清理描述符，`discarded=true` 不得作为有序业务或正常 EOF。由于扫描有界且可能遇到空洞，一次返回 0 不等于全部清空；按 `buffered_frames` 继续推进。Drain 不抢回已交付给应用的 Lease，清理者仍须完成真实归还和 receipt 归还。`Close` 在存在缓冲或已交付责任时拒绝完成。
+停止或失败后可调用 `Drain`，按最多 64 个扫描槽的预算交出待清理描述符，`discarded=true` 不得作为有序业务或正常 EOF。由于扫描有界且可能遇到空洞，一次返回 0 不等于全部清空；按 `buffered_frames` 继续推进。Drain 不抢回已交付给应用的 Lease，也不暴露未完成的 RNDV 目标；清理者仍须完成真实归还和 receipt 归还。`Close` 在存在 pending、缓冲或已交付责任时拒绝完成。
 
 ## 物理 RQE Credits
 
@@ -100,7 +103,7 @@ F 是可授出的已 post 槽，G 是已经授出的承诺，U 是尚未初始 p
 
 `SenderCreditAccount` 对同一个授信关系维护数据/控制两组累计上界、spent 和当前 reservation。`Reserve` 先扣可用额度；可信 partial post 只将接受前缀计为 spent，并解除未接受后缀 reservation。接受范围未知时把整批保守记为 spent，停止新准入，并将本 epoch 的 `accepted_known` 永久置为 false；这个上界不能作为授信撤回的确定接受量。TX 完成、超时和逻辑连接关闭都没有增加远端 credits 的接口。重复 CREDIT 更新只取累计最大值。
 
-数据额度耗尽时控制额度仍可单独预留，但必须确实获得控制授权并取得本地 SQ 资源。RNDV RTS 属于数据入口需求，不能消耗全部控制保留；当前 codec 尚未开放 RTS。M5.3.7 的独立 TCP 控制流仅用于整份 Peer 授信撤回，尚未承担运行中 CREDIT 的通用逃生或跨 Peer 公平发放；不能仅凭两个额度分类就宣称完整协议没有死锁。
+数据额度耗尽时控制额度仍可单独预留，但必须确实获得控制授权并取得本地 SQ 资源。RNDV RTS 属于数据入口需求，必须走 data；M6.3.3 的 codec 和接收域扣账已支持此分类，GRANT/DONE 使用 control，连接通知调度器尚未接入。M5.3.7 的独立 TCP 控制流仅用于整份 Peer 授信撤回，尚未承担运行中 CREDIT 的通用逃生或跨 Peer 公平发放；不能仅凭两个额度分类就宣称完整协议没有死锁。
 
 `RetirePeer` 要求宿主同时证明发送端已停止、真实接受集合已结清、未使用授权已撤销，并等待该 Peer 所有接收 receipt 正常 refill 结账；失联、TTL 或空 CQ 不构成证明。退休后保留 tombstone 到域关闭，不复用原表项和旧 epoch。相同 Peer 重新准入要求更高 epoch，且旧关系已经退休。Sender 重开也要求同 Peer/域且 epoch 严格增加，这不代替 Receiver 的终结证明。
 

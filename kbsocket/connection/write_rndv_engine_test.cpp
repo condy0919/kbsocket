@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include "kbsocket/connection/rndv_protocol.hpp"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
 
 namespace {
@@ -414,6 +415,101 @@ TEST_F(WriteRndvEngineTest, ReorderedCompletionsGateFullDoneAndTargetVisibility)
     EXPECT_EQ(post_calls_, calls);
 }
 
+TEST_F(WriteRndvEngineTest, DoneNotificationRequiresEveryTrustedWriteCompletion) {
+    const auto grant = Target(77);
+    const auto lease = Source(77);
+    const auto binding = Binding();
+    const RndvDestination destination{binding.receiver_runtime, binding.receive_domain, binding.session, binding.token};
+    const std::array sources{WriteRndvSource{lease, 0, 77}};
+    Open(grant, sources);
+    ReleaseCpu(lease);
+    ASSERT_EQ(engine_.Progress(), 3u);
+    Complete(2);
+    Complete(0);
+    // 尾块和首块已退休，仍然不能因为目标内存已有内容而提前编码 DONE。
+    EXPECT_FALSE(engine_.DoneEvidence());
+    EXPECT_FALSE(BuildRndvDone(engine_, destination));
+    EXPECT_FALSE(grants_.Borrow(grant.handle));
+    Complete(1);
+    const auto evidence = engine_.DoneEvidence();
+    ASSERT_TRUE(evidence);
+    // 真正的引擎证据检查和通知构造属于热路径，不能隐式分配或回收内存。
+    allocations = deallocations = 0;
+    count_allocations = true;
+    const auto input = BuildRndvDone(engine_, destination);
+    count_allocations = false;
+    ASSERT_TRUE(input);
+    EXPECT_EQ(allocations, 0u);
+    EXPECT_EQ(deallocations, 0u);
+    auto wrong_destination = destination;
+    ++wrong_destination.token.generation;
+    EXPECT_FALSE(BuildRndvDone(engine_, wrong_destination));
+    std::array<std::byte, 112> payload{};
+    const auto encoded = EncodeWireFrame(*input, payload);
+    ASSERT_TRUE(encoded);
+    const auto decoded = DecodeWireFrame(encoded->imm_data, std::span(payload).first(encoded->payload_bytes));
+    ASSERT_TRUE(decoded);
+    const WireSessionBinding route{.context = {.peer_runtime = binding.sender_runtime,
+                                               .receive_domain = binding.receive_domain,
+                                               .session = binding.session},
+                                   .token = binding.token,
+                                   .credit_epoch = 91};
+    ASSERT_TRUE(ValidateRndvDone(*decoded, route, route.context, grant.identity));
+    // 编解码和身份匹配均不解除目标授权；测试握有独立的真实发送端证据才能终结 Grant。
+    EXPECT_FALSE(grants_.Borrow(grant.handle));
+    EXPECT_EQ(target_.stats().remote_grants, 1u);
+    ASSERT_TRUE(grants_.CompleteDone(*evidence));
+    ASSERT_TRUE(grants_.Borrow(grant.handle));
+    ASSERT_TRUE(grants_.Return(grant.handle));
+}
+
+TEST_F(WriteRndvEngineTest, FailedWriteCleanupEvidenceCannotBuildSuccessNotification) {
+    const auto grant = Target(48);
+    const auto lease = Source(48);
+    const std::array sources{WriteRndvSource{lease, 0, 48}};
+    Open(grant, sources, 16);
+    ReleaseCpu(lease);
+    ASSERT_EQ(engine_.Progress(), 3u);
+    Complete(0);
+    Complete(1, URMA_CR_REM_ACCESS_ABORT_ERR);
+    Complete(2);
+    EXPECT_FALSE(engine_.DoneEvidence());
+    const auto cleanup = engine_.TerminalEvidence();
+    ASSERT_TRUE(cleanup);
+    const auto binding = Binding();
+    const RndvDestination destination{binding.receiver_runtime, binding.receive_domain, binding.session, binding.token};
+    const auto notification = BuildRndvDone(engine_, destination);
+    ASSERT_FALSE(notification);
+    EXPECT_EQ(notification.error().code, RndvProtocolErrorCode::kInvalidEvidence);
+    EXPECT_EQ(target_.stats().remote_grants, 1u);
+    ASSERT_TRUE(grants_.ConfirmTerminal(*cleanup));
+}
+
+TEST_F(WriteRndvEngineTest, CancelledFullSuccessCleanupCannotBePromotedToDoneNotification) {
+    const auto grant = Target(48);
+    const auto lease = Source(48);
+    const std::array sources{WriteRndvSource{lease, 0, 48}};
+    Open(grant, sources, 16);
+    ReleaseCpu(lease);
+    ASSERT_EQ(engine_.Progress(), 3u);
+    ASSERT_TRUE(engine_.Cancel());
+    Complete(0);
+    Complete(1);
+    Complete(2);
+    const auto cleanup = engine_.TerminalEvidence();
+    ASSERT_TRUE(cleanup);
+    ASSERT_EQ(cleanup->successful_writes, cleanup->accepted_writes);
+    ASSERT_EQ(cleanup->completed_bytes, grant.identity.transfer.bytes);
+    // 成功计数与完整覆盖仍不足以授权 DONE：取消事务只能通过清理入口终结。
+    const auto binding = Binding();
+    const RndvDestination destination{binding.receiver_runtime, binding.receive_domain, binding.session, binding.token};
+    const auto notification = BuildRndvDone(engine_, destination);
+    ASSERT_FALSE(notification);
+    EXPECT_EQ(notification.error().code, RndvProtocolErrorCode::kInvalidEvidence);
+    EXPECT_FALSE(grants_.Borrow(grant.handle));
+    ASSERT_TRUE(grants_.ConfirmTerminal(*cleanup));
+}
+
 TEST_F(WriteRndvEngineTest, MultiSgeChunkSpansSourceBoundaryAndPreservesConcatenation) {
     const auto grant = Target(12);
     const auto first = Source(8, 1), second = Source(11, 67);
@@ -658,6 +754,8 @@ TEST_F(WriteRndvEngineTest, AckTimeoutStopsPostingAndRetiresOnlyProvenCompletion
 
 TEST_F(WriteRndvEngineTest, UnknownAcceptanceNeverReplaysOrClaimsRemoteTerminalEvidence) {
     const auto grant = Target(64);
+    const auto binding = Binding();
+    const RndvDestination destination{binding.receiver_runtime, binding.receive_domain, binding.session, binding.token};
     const auto source = Source(64);
     const std::array sources{WriteRndvSource{source, 0, 64}};
     Open(grant, sources, 16, 3);
@@ -671,6 +769,7 @@ TEST_F(WriteRndvEngineTest, UnknownAcceptanceNeverReplaysOrClaimsRemoteTerminalE
     EXPECT_EQ(post_calls_, 1u);
     EXPECT_FALSE(engine_.DoneEvidence());
     EXPECT_FALSE(engine_.TerminalEvidence());
+    EXPECT_FALSE(BuildRndvDone(engine_, destination));
     EXPECT_FALSE(engine_.Close());
     // Mock 明确执行了三个 WRITE，仅破坏 bad_wr 契约；依据这项外部事实恢复 Prepared 记录。
     // 生产引擎没有推测接受集合的入口，后续 CQE 只允许解除真实本地 DMA 责任。
@@ -682,6 +781,7 @@ TEST_F(WriteRndvEngineTest, UnknownAcceptanceNeverReplaysOrClaimsRemoteTerminalE
     EXPECT_EQ(source_.stats().available, 16u);
     EXPECT_FALSE(engine_.DoneEvidence());
     EXPECT_FALSE(engine_.TerminalEvidence());
+    EXPECT_FALSE(BuildRndvDone(engine_, destination));
     EXPECT_FALSE(engine_.stats().acceptance_known);
     ASSERT_TRUE(engine_.Close());
     // 接收端独立授权凭测试已知的完整终结事实清理，不能从 engine 的未知接受状态合成证明。

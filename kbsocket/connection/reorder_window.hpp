@@ -40,7 +40,8 @@ enum class ReorderErrorCode : std::uint8_t {
     kGapTimeout,
     kFailed,
     kInvalidReceipt,
-    kSequenceExhausted
+    kSequenceExhausted,
+    kInvalidReservation
 };
 struct ReorderError {
     ReorderErrorCode code;
@@ -60,6 +61,12 @@ struct ReorderReceipt {
     std::uint32_t slot = 0;
     std::uint64_t generation = 0;
     bool operator==(const ReorderReceipt&) const = default;
+};
+struct ReorderReservation {
+    const ReorderWindow* owner = nullptr;
+    std::uint32_t slot = 0;
+    std::uint64_t generation = 0;
+    bool operator==(const ReorderReservation&) const = default;
 };
 struct ReorderDelivery {
     ReorderFrame frame{};
@@ -83,6 +90,8 @@ struct ReorderStats {
     std::uint64_t released_prefix = 0;
     std::uint64_t max_frame_seq = 0;
     std::uint64_t max_stream_bytes = 0;
+    // RTS 已占用 SN/完整字节额度，但尚未取得可信 DONE 和目标 Lease 的项。
+    std::size_t pending_frames = 0;
 };
 
 /// 单 owner、固定容量的乱序与应用持有账本；Open 分配，数据路径不分配或调用 provider。
@@ -99,9 +108,20 @@ public:
     ReorderWindow(const ReorderWindow&) = delete;
     ReorderWindow& operator=(const ReorderWindow&) = delete;
     std::expected<void, ReorderError> Open(ReorderSession session, const ReorderConfig& config = {}) noexcept;
-    /// 停止新准入；仍有 Buffered 或已交付但未归还的 receipt 时拒绝关闭。
+    /// 停止新准入；仍有 Pending、Buffered 或已交付但未归还的 receipt 时拒绝关闭。
     std::expected<void, ReorderError> Close() noexcept;
     std::expected<void, ReorderError> Push(const ReorderFrame& frame, std::uint64_t now_ns) noexcept;
+    /// RTS 与 Eager 共用同一 SN/字节窗口；成功只占元数据，不借用或终结远端 Grant。
+    /// 宿主须先核验 RTS 来源/授权，负责将票据与对应 Grant 绑定；不能由重复 RTS 再占位。
+    std::expected<ReorderReservation, ReorderError> ReserveRndv(ReorderSession session, std::uint32_t sequence,
+                                                                std::uint64_t bytes, std::uint64_t now_ns) noexcept;
+    /// 仅完整可信 DONE 后调用，原位转换占位；成功才接管 Lease，不再次计入字节额度。
+    /// 输入必须为相同 session/SN/长度的 kValidatedRmaDone；本类不校验 Grant 或 DMA 证据。
+    std::expected<void, ReorderError> CompleteRndv(ReorderReservation reservation, const ReorderFrame& frame,
+                                                   std::uint64_t now_ns) noexcept;
+    /// 只在停止/失败后丢弃占位元数据；不产生 Grant 终结证据，不前进消费序号或累计已消费字节。
+    /// 宿主仍须独立保留未终结 Grant 的 backing，不能把本接口成功视为可复用目标内存。
+    std::expected<void, ReorderError> AbandonRndv(ReorderReservation reservation) noexcept;
     /// 最多交付 min(output.size(), 64) 个连续帧；失败后仍可取出已经验证的连续前缀。
     std::expected<std::size_t, ReorderError> Poll(std::span<ReorderDelivery> output, std::uint64_t now_ns) noexcept;
     /// 仅在真实 Lease 已归还且应用不再访问后解除驻留；它不调用底层 ReleaseCpu/Release。
@@ -120,12 +140,15 @@ public:
 
 private:
     struct State;
+    std::expected<void, ReorderError> CheckAdmission(const ReorderFrame& frame, std::uint64_t bytes,
+                                                     std::uint64_t now_ns, bool reserving) noexcept;
     std::expected<void, ReorderError> ObserveTime(std::uint64_t now_ns) noexcept;
     void UpdateGap(std::uint64_t now_ns) noexcept;
     bool Deliver(std::uint32_t index, ReorderDelivery& output, bool discarded) noexcept;
     std::unique_ptr<State> state_;
     // Close/Open 不重置；同一对象生命周期内 receipt 身份绝不回绕复用。
     std::uint64_t next_receipt_ = 0;
+    std::uint64_t next_reservation_ = 0;
 };
 } // namespace connection
 } // namespace kbsocket

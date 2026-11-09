@@ -47,9 +47,29 @@ struct WireError {
     WireErrorCode code;
 };
 
+/// 原始 WRITE 事务身份；session/token 是目标接收连接身份，与当前帧路由身份独立。
+/// GRANT 反向返回时不能把接收回复的 token 写入这里；Arena 描述由可信控制目录另行绑定。
+/// 这些值只是协议字段，不构成 DMA 完成或远端 Grant 终结证明。
+struct WireRndvFields {
+    std::uint64_t sender_runtime = 0;
+    std::uint64_t receiver_runtime = 0;
+    std::uint64_t receive_domain = 0;
+    std::uint64_t session = 0;
+    WireToken token;
+    std::uint64_t transfer_id = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t arena_id = 0;
+    std::uint64_t arena_generation = 0;
+    std::uint32_t grant_slot = 0;
+    std::uint64_t grant_generation = 0;
+    std::uint64_t target_address = 0;
+    bool operator==(const WireRndvFields&) const = default;
+};
+
 /// 只含值与借用视图；编码不接管数据。data_flags 仅用于两类数据帧，不含扩展身份位。
 /// DATA 使用 seq/data，捎带帧另用 max_credit_seq；CREDIT 使用 session/epoch/四个累计上界；
-/// FIN 使用 seq/session，RST 使用 session/reset_code。未使用的数值字段必须为零。
+/// FIN 使用 seq/session，RST 使用 session/reset_code；RNDV 使用 seq/session/rndv。
+/// 未使用的数值字段必须为零。
 struct WireFrameInput {
     WireFrameType type = WireFrameType::kDataEager;
     WireControlType control = WireControlType::kCreditUpdate;
@@ -64,6 +84,7 @@ struct WireFrameInput {
     std::uint64_t max_frame_seq = 0;
     std::uint64_t max_stream_bytes = 0;
     std::uint32_t reset_code = 0;
+    WireRndvFields rndv{};
 };
 struct WireEncodedFrame {
     // URMA imm_data 是数值，不额外 htonll；payload 内所有多字节字段使用大端。
@@ -96,7 +117,11 @@ struct WireSessionBinding {
 /// IMM: type[63:60], flags[59:56], gen[55:48], slot[47:32], seq[31:0]。
 /// 扩展身份为 BE slot32/gen32，IMM 的 gen/slot 必须为零，禁止两种身份解释。
 /// CREDIT body=BE session64/epoch64/max_credit64/max_control64/max_frame64/max_bytes64；
-/// FIN body=BE session64；RST body=BE session64/reason32。RNDV 类型保留到 M6。
+/// FIN body=BE session64；RST body=BE session64/reason32。
+/// RNDV 公共 body=BE route_session64/sender_runtime64/receiver_runtime64/receive_domain64/
+/// transfer_session64/transfer_token.slot32/gen32/transfer_id64/bytes64，RTS 恰好 64B；SN 来自 IMM。
+/// GRANT/DONE 再追加 arena_id64/arena_generation64/grant_slot32/zero32/grant_generation64/
+/// target_address64，恰好 104B；不直接发送原生 MR 结构或将任意网络计数视作完成证明。
 std::expected<WireEncodedFrame, WireError> EncodeWireFrame(const WireFrameInput& input,
                                                            std::span<std::byte> output) noexcept;
 /// 仅写协议头，不读取/复制 input.data；宿主可用独立注册 SGE 拼接 header 和原 Lease。
@@ -108,6 +133,8 @@ std::expected<WireEncodedFrame, WireError> EncodeWireHeader(const WireFrameInput
 /// payload 必须恰好是 CQE completion_len 的区间；返回 data 借用 payload 生命周期。
 std::expected<WireFrameView, WireError> DecodeWireFrame(std::uint64_t imm_data,
                                                         std::span<const std::byte> payload) noexcept;
+/// 仅验证当前方向的帧路由；RNDV 的原事务 binding/Arena/Grant 仍须与本地账本核对。
+/// 解码成功或路由匹配均不证明 WRITE 已完成，也不授权调用 Grant 终结接口。
 std::expected<void, WireError> ValidateWireIdentity(const WireFrameView& decoded, const WireSessionBinding& binding,
                                                     const WireReceiveContext& observed) noexcept;
 

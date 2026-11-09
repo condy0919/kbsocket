@@ -185,7 +185,7 @@ flowchart TB
 | `AttemptId` (`user_ctx`) | `uint64_t`（账本生命周期内单调递增，0 无效，取模定位槽位） | 在所属完成域/账本中 O(1) 定位单次物理提交；必须校验完整 ID、池代次与 Lane 代次，取模位置本身不是身份 |
 | `OpId` | `uint32_t op_slot` + `uint32_t op_gen` | 定位单次异步读写或 RNDV 操作状态机（Operation State） |
 | `BufferLeaseId` | `const Pool*` + `PoolEpoch` + `uint64_t lease_id`（按容量步进递增） | 唯一标识一次 DMA/共享内存切片借用；拒绝迟到 CQE 或应用重复 `Release` |
-| `GrantId` | `uint32_t grant_slot` + `uint32_t grant_gen` | 标识 `WRITE RNDV` 暴露给远端写入的目标内存区间授权周期 |
+| `GrantId` | `uint32_t grant_slot` + `uint64_t grant_gen` | 标识 `WRITE RNDV` 暴露给远端写入的目标内存区间授权周期；与 GrantManager 和 M6.3.3 线格式保持一致 |
 
 所有有限位宽的身份计数都必须有耗尽策略：在仍可能存在旧 CQE、回调、远端授权或归还请求时禁止回绕复用；达到上限时停止对应槽位准入，只有完成旧实例的全部终结与事件屏障后才建立新实例。软件对象地址或硬件 ID 相同均不能代替实例身份；SN 的耗尽策略另见第 6 节。
 
@@ -368,7 +368,7 @@ sequenceDiagram
 
 ### 6.1 64-Bit `IMM` 紧凑线协议与完整身份扩展
 
-**M4.2 已交付**：`wire_frame.*` 实现下述 IMM 布局、规范短/扩展身份和 Eager/piggyback/CREDIT/FIN/RST；payload 多字节字段使用大端，IMM 是 URMA 数值，不再次做 `htonll`。扩展时 IMM 的 slot/gen 位清零，slot/gen 可用紧凑格式时不接受冗余扩展编码。CREDIT body 固定 48 B，依次为 session、credit_epoch、max_credit_seq、max_control_credit_seq、max_frame_seq、max_stream_bytes 六个 u64；FIN body 为 session u64，RST body 为 session u64 + 非零 reason u32，均可再前置 8 B 扩展身份。`EncodeWireHeader` 仅输出头部供独立注册 SGE 组合，短 DATA 无 payload 头。RNDV 类型已预留但当前拒绝解析/编码，待 M6 冻结。具体接口及完整来源校验前提见 [连接协议原语](../connection-primitives.md)。
+**M4.2 已交付**：`wire_frame.*` 实现下述 IMM 布局、规范短/扩展身份和 Eager/piggyback/CREDIT/FIN/RST；payload 多字节字段使用大端，IMM 是 URMA 数值，不再次做 `htonll`。扩展时 IMM 的 slot/gen 位清零，slot/gen 可用紧凑格式时不接受冗余扩展编码。CREDIT body 固定 48 B，依次为 session、credit_epoch、max_credit_seq、max_control_credit_seq、max_frame_seq、max_stream_bytes 六个 u64；FIN body 为 session u64，RST body 为 session u64 + 非零 reason u32，均可再前置 8 B 扩展身份。`EncodeWireHeader` 仅输出头部供独立注册 SGE 组合，短 DATA 无 payload 头。M6.3.3 已实现 RNDV 编解码：RTS body 64 B，GRANT/DONE body 104 B，区分当前方向路由与原事务的 session/token；通知状态机尚未接入 Connection。具体接口及完整来源校验前提见 [连接协议原语](../connection-primitives.md)。
 
 `RM_CTP SEND` 的单 WR 硬件上限为 **4096 字节（含 payload 内头部）**。每帧前置协议头会使 4096 B 独立写入需要分片；这增加 WR/CQE 数量，但吞吐影响仍须测量，不能直接推导为减半。紧凑编码是优化，完整身份校验优先。
 
@@ -462,7 +462,7 @@ M2 已在 `TxSender` 提供非 inline、全 signal 的 WRITE raw 提交原语。
 
 ### 7.4 `WRITE RNDV` 完整状态机与安全终结
 
-本节为 M6 待实现协议；M2 的 WRITE 提交/完成原语只提供其底层 WR 能力，不代表完整 RNDV 已交付。
+本节描述 M6 完整协议。M6.1–M6.3.3 已交付 Grant 账本、WRITE 引擎与事务池、段缓存、线格式及共同接收占位；通知状态机与 Connection/Runtime 装配尚未完成，不代表完整 RNDV 已交付。当前线格式与成功通知构造门禁见 [RNDV 协议](../rndv-protocol.md)。
 
 ```mermaid
 sequenceDiagram

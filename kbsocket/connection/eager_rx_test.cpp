@@ -216,6 +216,16 @@ protected:
     std::expected<void, EagerRxError> Dispatch(raw::RxBufferEvent event) {
         return domain_.Dispatch(event, source_, Handler, ++now_);
     }
+    static std::expected<EagerRxDisposition, EagerRxError> EagerOnlyHandler(void* owner, EagerReceiveDomain&,
+                                                                            const WireFrameView&, EagerRxPacket packet,
+                                                                            std::uint64_t now) noexcept {
+        auto& self = *static_cast<EagerRxTest*>(owner);
+        auto accepted = self.stream_.Accept(packet, now);
+        if (!accepted) {
+            return std::unexpected(accepted.error());
+        }
+        return EagerRxDisposition::kHeld;
+    }
     std::string Read(std::size_t bytes) {
         std::array<std::byte, 128> output{};
         auto read = stream_.Read(std::span(output).first(bytes), ++now_);
@@ -281,6 +291,82 @@ TEST_F(EagerRxTest, OutOfOrderAndShortReadHoldRealLeaseUntilFullyConsumed) {
     EXPECT_EQ(credits_.stats().data.free, 4u);
     EXPECT_EQ(credits_.stats().released, 0u);
     EXPECT_FALSE(domain_.Release(last_packet_));
+}
+
+TEST_F(EagerRxTest, RndvRtsUsesDataCreditWhileGrantAndDoneUseControlCredit) {
+    WireFrameInput frame;
+    frame.type = WireFrameType::kControl;
+    frame.control = WireControlType::kRndvRts;
+    frame.token = route_.token;
+    frame.session = binding_.context.session;
+    frame.rndv = {.sender_runtime = 22,
+                  .receiver_runtime = 11,
+                  .receive_domain = 33,
+                  .session = 44,
+                  .token = route_.token,
+                  .transfer_id = 1,
+                  .bytes = 16};
+    // 此 handler 仅释放控制包；codec 开放不代表业务入口已经启用 RNDV。
+    ASSERT_TRUE(Dispatch(Event(frame)));
+    EXPECT_EQ(credits_.stats().data.granted, 5u);
+    EXPECT_EQ(credits_.stats().control.granted, 2u);
+    EXPECT_EQ(window_.stats().received_bytes, 0u);
+    frame.rndv.arena_id = 2;
+    frame.rndv.arena_generation = 3;
+    frame.rndv.grant_generation = 4;
+    frame.rndv.target_address = 4096;
+    for (auto control : {WireControlType::kRndvGrant, WireControlType::kRndvDone}) {
+        frame.control = control;
+        ASSERT_TRUE(Dispatch(Event(frame)));
+    }
+    EXPECT_EQ(credits_.stats().data.granted, 5u);
+    EXPECT_EQ(credits_.stats().control.granted, 0u);
+    EXPECT_EQ(domain_.pending_refill(), 3u);
+    EXPECT_EQ(buffers_.held(), 0u);
+    EXPECT_FALSE(domain_.frozen());
+}
+
+TEST_F(EagerRxTest, EagerStreamRejectsRndvWithoutPublishingDataOrLeakingRx) {
+    WireFrameInput frame;
+    frame.type = WireFrameType::kControl;
+    frame.control = WireControlType::kRndvRts;
+    frame.token = route_.token;
+    frame.session = binding_.context.session;
+    frame.rndv = {.sender_runtime = 22,
+                  .receiver_runtime = 11,
+                  .receive_domain = 33,
+                  .session = 44,
+                  .token = route_.token,
+                  .transfer_id = 1,
+                  .bytes = 16};
+    // 模拟当前 Connection 仍交给 EagerRxStream 的路径；不静默吞掉或交付不支持的事务。
+    auto result = domain_.Dispatch(Event(frame), source_, EagerOnlyHandler, ++now_);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, EagerRxErrorCode::kUnsupportedFrame);
+    EXPECT_EQ(window_.stats().pending_frames, 0u);
+    EXPECT_EQ(window_.stats().buffered_frames, 0u);
+    EXPECT_FALSE(stream_.readable());
+    EXPECT_EQ(stream_.pending(), 0u);
+    EXPECT_EQ(buffers_.held(), 0u);
+    EXPECT_EQ(domain_.pending_refill(), 1u);
+    EXPECT_EQ(credits_.stats().data.granted, 5u);
+    EXPECT_EQ(credits_.stats().control.granted, 2u);
+}
+
+TEST_F(EagerRxTest, EagerStreamCannotBindWindowWithPendingRndvReservation) {
+    const ReorderSession session{22, 33, 44, route_.token.slot, route_.token.generation};
+    ReorderWindow occupied;
+    EagerRxStream candidate;
+    ASSERT_TRUE(occupied.Open(session, {8, 32, 10000, 0}));
+    auto pending = occupied.ReserveRndv(session, 0, 16, ++now_);
+    ASSERT_TRUE(pending);
+    auto opened = candidate.Open(domain_, occupied, binding_);
+    ASSERT_FALSE(opened);
+    EXPECT_EQ(opened.error().code, EagerRxErrorCode::kInvalidArgument);
+    // 移除的仅为占位元数据，此测试未创建或发布远端 Grant。
+    occupied.StopAccepting();
+    ASSERT_TRUE(occupied.AbandonRndv(*pending));
+    EXPECT_TRUE(occupied.Close());
 }
 
 TEST_F(EagerRxTest, ReadLeaseBorrowsActualRxPrefixAndReturnsCreditOnlyAfterFullReleaseAndRefill) {

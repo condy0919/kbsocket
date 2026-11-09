@@ -72,6 +72,26 @@ WireFrameInput Control(WireControlType type, WireToken token = {0x1234, 0x56}) {
     return result;
 }
 
+WireFrameInput RndvControl(WireControlType type, WireToken route = {0x1234, 0x56}) {
+    auto result = Control(type, route);
+    result.seq = 0x789abcde;
+    result.rndv = {.sender_runtime = 0x1112131415161718,
+                   .receiver_runtime = 0x2122232425262728,
+                   .receive_domain = 0x3132333435363738,
+                   .session = 0x4142434445464748,
+                   .token = {0x51525354, 0x55565758},
+                   .transfer_id = 0x6162636465666768,
+                   .bytes = 0x7172737475767778};
+    if (type != WireControlType::kRndvRts) {
+        result.rndv.arena_id = 0x8182838485868788;
+        result.rndv.arena_generation = 0x9192939495969798;
+        result.rndv.grant_slot = 0xa1a2a3a4;
+        result.rndv.grant_generation = 0xb1b2b3b4b5b6b7b8;
+        result.rndv.target_address = 0x0102030405060708;
+    }
+    return result;
+}
+
 TEST(WireFrameTest, ShortDataPreservesPayloadAndUsesSpecifiedImmBitLayout) {
     std::array<std::byte, 16> output;
     output.fill(std::byte{0xcc});
@@ -369,10 +389,9 @@ TEST(WireFrameTest, HeaderOnlyControlIncludesEntireBodyAndFailureNeverWritesOutp
     EXPECT_TRUE(std::all_of(header.begin(), header.end(), [](auto byte) { return byte == std::byte{0xdd}; }));
 }
 
-TEST(WireFrameTest, UnknownTypesAndReservedRndvCommandsAreUnsupported) {
+TEST(WireFrameTest, UnknownTypesAndControlCommandsAreUnsupported) {
     std::array<std::byte, 64> output{};
-    for (const auto control : {WireControlType::kRndvRts, WireControlType::kRndvGrant, WireControlType::kRndvDone,
-                               static_cast<WireControlType>(6), static_cast<WireControlType>(7)}) {
+    for (const auto control : {static_cast<WireControlType>(6), static_cast<WireControlType>(7)}) {
         auto encoded = EncodeWireFrame(Control(control), output);
         ASSERT_FALSE(encoded);
         EXPECT_EQ(encoded.error().code, WireErrorCode::kUnsupportedType);
@@ -515,6 +534,303 @@ TEST(WireFrameTest, EncodeDecodeAndIdentityValidationDoNotAllocate) {
         if (!decoded || !ValidateWireIdentity(*decoded, binding, binding.context)) {
             valid = false;
             break;
+        }
+    }
+    count_allocations = false;
+    EXPECT_TRUE(valid);
+    EXPECT_EQ(allocation_count, 0u);
+}
+
+TEST(WireFrameTest, RndvGoldenBodiesCarryIndependentRouteAndTransferIdentities) {
+    // 原事务和反向 GRANT 的目的路由具有不同 session/token，禁止编码时偷偷折叠身份。
+    constexpr std::array<std::uint8_t, 64> common{
+        1,    2,    3,    4,    5,    6,    7,    8,    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+        0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
+        0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78};
+    constexpr std::array<std::uint8_t, 40> grant{0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x91, 0x92,
+                                                 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0xa1, 0xa2, 0xa3, 0xa4,
+                                                 0,    0,    0,    0,    0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6,
+                                                 0xb7, 0xb8, 1,    2,    3,    4,    5,    6,    7,    8};
+    std::array<std::byte, 128> output;
+    for (const auto route : {WireToken{0x1234, 0x56}, WireToken{0x12345678, 0x90abcdef}}) {
+        for (const auto type : {WireControlType::kRndvRts, WireControlType::kRndvGrant, WireControlType::kRndvDone}) {
+            output.fill(std::byte{0xcc});
+            const auto input = RndvControl(type, route);
+            const auto encoded = EncodeWireFrame(input, output);
+            ASSERT_TRUE(encoded);
+            const bool extended = route.generation > 255;
+            const std::size_t offset = extended ? 8 : 0;
+            EXPECT_EQ(encoded->payload_bytes, offset + (type == WireControlType::kRndvRts ? 64 : 104));
+            EXPECT_EQ(encoded->header_bytes, encoded->payload_bytes);
+            EXPECT_EQ(encoded->imm_data, (extended ? 0x28000000789abcdeull : 0x20561234789abcdeull) |
+                                             (static_cast<std::uint64_t>(type) << 56));
+            for (std::size_t i = 0; i < common.size(); ++i) {
+                EXPECT_EQ(output[offset + i], static_cast<std::byte>(common[i]));
+            }
+            if (type != WireControlType::kRndvRts) {
+                for (std::size_t i = 0; i < grant.size(); ++i) {
+                    EXPECT_EQ(output[offset + common.size() + i], static_cast<std::byte>(grant[i]));
+                }
+            }
+            EXPECT_EQ(output[encoded->payload_bytes], std::byte{0xcc});
+            const auto decoded = DecodeWireFrame(encoded->imm_data, std::span(output).first(encoded->payload_bytes));
+            ASSERT_TRUE(decoded);
+            EXPECT_EQ(decoded->frame.token, input.token);
+            EXPECT_EQ(decoded->frame.session, input.session);
+            EXPECT_EQ(decoded->frame.seq, input.seq);
+            EXPECT_EQ(decoded->frame.control, input.control);
+            EXPECT_EQ(decoded->frame.rndv, input.rndv);
+            EXPECT_TRUE(decoded->frame.data.empty());
+        }
+    }
+}
+
+TEST(WireFrameTest, RndvRejectsEveryTruncationAndTrailingByte) {
+    std::array<std::byte, 128> output{};
+    for (const auto route : {WireToken{1, 1}, WireToken{1, 256}}) {
+        for (const auto type : {WireControlType::kRndvRts, WireControlType::kRndvGrant, WireControlType::kRndvDone}) {
+            const auto encoded = EncodeWireFrame(RndvControl(type, route), output);
+            ASSERT_TRUE(encoded);
+            for (std::size_t bytes = 0; bytes < encoded->payload_bytes; ++bytes) {
+                const auto decoded = DecodeWireFrame(encoded->imm_data, std::span(output).first(bytes));
+                ASSERT_FALSE(decoded);
+                EXPECT_EQ(decoded.error().code, WireErrorCode::kInvalidLength);
+            }
+            EXPECT_FALSE(DecodeWireFrame(encoded->imm_data, std::span(output).first(encoded->payload_bytes + 1)));
+        }
+    }
+}
+
+TEST(WireFrameTest, RndvGrantAndDoneRejectReservedBytes) {
+    std::array<std::byte, 128> output{};
+    for (const auto route : {WireToken{1, 1}, WireToken{1, 256}}) {
+        for (const auto type : {WireControlType::kRndvGrant, WireControlType::kRndvDone}) {
+            const auto encoded = EncodeWireFrame(RndvControl(type, route), output);
+            ASSERT_TRUE(encoded);
+            const std::size_t offset = route.generation > 255 ? 8 : 0;
+            // 不接收第二种带隐含标志的解释；每个保留字节都必须严格为零。
+            for (std::size_t byte = 84; byte < 88; ++byte) {
+                output[offset + byte] = std::byte{1};
+                const auto decoded =
+                    DecodeWireFrame(encoded->imm_data, std::span(output).first(encoded->payload_bytes));
+                ASSERT_FALSE(decoded);
+                EXPECT_EQ(decoded.error().code, WireErrorCode::kInvalidControl);
+                output[offset + byte] = std::byte{0};
+            }
+        }
+    }
+}
+
+TEST(WireFrameTest, RndvRequiresBothSessionsAndCompleteTransferIdentity) {
+    std::array<std::byte, 128> output{};
+    for (const auto type : {WireControlType::kRndvRts, WireControlType::kRndvGrant, WireControlType::kRndvDone}) {
+        auto input = RndvControl(type);
+        for (auto* field : {&input.session, &input.rndv.sender_runtime, &input.rndv.receiver_runtime,
+                            &input.rndv.receive_domain, &input.rndv.session, &input.rndv.transfer_id}) {
+            const auto saved = *field;
+            *field = 0;
+            const auto rejected = EncodeWireFrame(input, output);
+            ASSERT_FALSE(rejected);
+            EXPECT_EQ(rejected.error().code, WireErrorCode::kInvalidIdentity);
+            *field = saved;
+        }
+        input.rndv.token.generation = 0;
+        EXPECT_FALSE(EncodeWireFrame(input, output));
+        input = RndvControl(type);
+        input.token.generation = 0;
+        EXPECT_FALSE(EncodeWireFrame(input, output));
+        input = RndvControl(type);
+        input.rndv.bytes = 0;
+        const auto empty = EncodeWireFrame(input, output);
+        ASSERT_FALSE(empty);
+        EXPECT_EQ(empty.error().code, WireErrorCode::kInvalidLength);
+    }
+}
+
+TEST(WireFrameTest, RndvGrantIdentityRequiresAllGenerationsAndAddress) {
+    std::array<std::byte, 128> output{};
+    for (const auto type : {WireControlType::kRndvGrant, WireControlType::kRndvDone}) {
+        auto input = RndvControl(type);
+        for (auto* field : {&input.rndv.arena_id, &input.rndv.arena_generation, &input.rndv.grant_generation,
+                            &input.rndv.target_address}) {
+            const auto saved = *field;
+            *field = 0;
+            const auto rejected = EncodeWireFrame(input, output);
+            ASSERT_FALSE(rejected);
+            EXPECT_EQ(rejected.error().code, WireErrorCode::kInvalidIdentity);
+            *field = saved;
+        }
+        // slot 和 SN 的零值合法；64-bit 代次的高位不可被裁成设计早期的 32-bit 字段。
+        input.seq = 0;
+        input.rndv.token.slot = 0;
+        input.rndv.grant_slot = 0;
+        input.rndv.arena_generation = std::numeric_limits<std::uint64_t>::max();
+        input.rndv.grant_generation = std::numeric_limits<std::uint64_t>::max();
+        const auto encoded = EncodeWireFrame(input, output);
+        ASSERT_TRUE(encoded);
+        const auto decoded = DecodeWireFrame(encoded->imm_data, std::span(output).first(encoded->payload_bytes));
+        ASSERT_TRUE(decoded);
+        EXPECT_EQ(decoded->frame.rndv, input.rndv);
+    }
+}
+
+TEST(WireFrameTest, RndvDecodeValidatesIdentitiesAndAddressOverflow) {
+    std::array<std::byte, 128> output{};
+    for (const auto type : {WireControlType::kRndvGrant, WireControlType::kRndvDone}) {
+        const auto input = RndvControl(type);
+        const auto encoded = EncodeWireFrame(input, output);
+        ASSERT_TRUE(encoded);
+        const auto original = output;
+        // 注入来自网络的零值，确认解码并非只检长度后就交出缺失身份。
+        for (const std::size_t offset : {0, 8, 16, 24, 32, 48, 56, 64, 72, 88, 96}) {
+            output = original;
+            std::fill_n(output.begin() + offset, 8, std::byte{0});
+            EXPECT_FALSE(DecodeWireFrame(encoded->imm_data, std::span(output).first(encoded->payload_bytes)));
+        }
+        output = original;
+        std::fill_n(output.begin() + 44, 4, std::byte{0});
+        EXPECT_FALSE(DecodeWireFrame(encoded->imm_data, std::span(output).first(encoded->payload_bytes)));
+        output = original;
+        std::fill_n(output.begin() + 96, 8, std::byte{0xff});
+        const auto overflow = DecodeWireFrame(encoded->imm_data, std::span(output).first(encoded->payload_bytes));
+        ASSERT_FALSE(overflow);
+        EXPECT_EQ(overflow.error().code, WireErrorCode::kInvalidLength);
+    }
+}
+
+TEST(WireFrameTest, RndvRangeAllowsExactEndAndRejectsOverflow) {
+    std::array<std::byte, 128> output{};
+    for (const auto type : {WireControlType::kRndvGrant, WireControlType::kRndvDone}) {
+        auto input = RndvControl(type);
+        input.rndv.bytes = 4096;
+        input.rndv.target_address = std::numeric_limits<std::uint64_t>::max() - input.rndv.bytes;
+        ASSERT_TRUE(EncodeWireFrame(input, output));
+        ++input.rndv.target_address;
+        const auto overflow = EncodeWireFrame(input, output);
+        ASSERT_FALSE(overflow);
+        EXPECT_EQ(overflow.error().code, WireErrorCode::kInvalidLength);
+    }
+}
+
+TEST(WireFrameTest, RndvNeverConsumesReservedFinSequence) {
+    std::array<std::byte, 128> output{};
+    for (const auto type : {WireControlType::kRndvRts, WireControlType::kRndvGrant, WireControlType::kRndvDone}) {
+        auto input = RndvControl(type);
+        input.seq = std::numeric_limits<std::uint32_t>::max() - 1;
+        const auto encoded = EncodeWireFrame(input, output);
+        ASSERT_TRUE(encoded);
+        ++input.seq;
+        const auto rejected = EncodeWireFrame(input, output);
+        ASSERT_FALSE(rejected);
+        EXPECT_EQ(rejected.error().code, WireErrorCode::kInvalidSequence);
+        const auto decoded =
+            DecodeWireFrame(encoded->imm_data | 0xffffffffull, std::span(output).first(encoded->payload_bytes));
+        ASSERT_FALSE(decoded);
+        EXPECT_EQ(decoded.error().code, WireErrorCode::kInvalidSequence);
+    }
+}
+
+TEST(WireFrameTest, RtsCannotSmuggleGrantFieldsAndOtherFramesCannotCarryRndv) {
+    std::array<std::byte, 128> output{};
+    auto rts = RndvControl(WireControlType::kRndvRts);
+    for (auto* field :
+         {&rts.rndv.arena_id, &rts.rndv.arena_generation, &rts.rndv.grant_generation, &rts.rndv.target_address}) {
+        *field = 1;
+        EXPECT_FALSE(EncodeWireFrame(rts, output));
+        *field = 0;
+    }
+    rts.rndv.grant_slot = 1;
+    EXPECT_FALSE(EncodeWireFrame(rts, output));
+    for (auto input : {Data(), Control(WireControlType::kCreditUpdate), Control(WireControlType::kFin),
+                       Control(WireControlType::kReset)}) {
+        input.rndv = RndvControl(WireControlType::kRndvRts).rndv;
+        const auto rejected = EncodeWireFrame(input, output);
+        ASSERT_FALSE(rejected);
+        EXPECT_EQ(rejected.error().code, WireErrorCode::kInvalidControl);
+    }
+}
+
+TEST(WireFrameTest, RndvCannotCarryDataCreditOrResetFields) {
+    std::array<std::byte, 128> output{};
+    for (const auto type : {WireControlType::kRndvRts, WireControlType::kRndvGrant, WireControlType::kRndvDone}) {
+        auto input = RndvControl(type);
+        for (auto* field : {&input.credit_epoch, &input.max_credit_seq, &input.max_control_credit_seq,
+                            &input.max_frame_seq, &input.max_stream_bytes}) {
+            *field = 1;
+            EXPECT_FALSE(EncodeWireFrame(input, output));
+            *field = 0;
+        }
+        input.reset_code = 1;
+        EXPECT_FALSE(EncodeWireFrame(input, output));
+        input.reset_code = 0;
+        input.data = kData;
+        EXPECT_FALSE(EncodeWireFrame(input, output));
+        input.data = {};
+        input.data_flags = kWireFlagUrgent;
+        EXPECT_FALSE(EncodeWireFrame(input, output));
+    }
+}
+
+TEST(WireFrameTest, RndvHeaderMatchesFullFrameAndFailedEncodingNeverWrites) {
+    std::array<std::byte, 128> output{}, header{};
+    for (const auto type : {WireControlType::kRndvRts, WireControlType::kRndvGrant, WireControlType::kRndvDone}) {
+        auto input = RndvControl(type, {1, 256});
+        const auto encoded = EncodeWireFrame(input, output);
+        const auto header_only = EncodeWireHeader(input, header);
+        ASSERT_TRUE(encoded);
+        ASSERT_TRUE(header_only);
+        EXPECT_EQ(header_only->imm_data, encoded->imm_data);
+        EXPECT_EQ(header_only->header_bytes, encoded->payload_bytes);
+        EXPECT_EQ(header, output);
+        output.fill(std::byte{0xdd});
+        EXPECT_FALSE(EncodeWireFrame(input, std::span(output).first(encoded->payload_bytes - 1)));
+        EXPECT_FALSE(EncodeWireHeader(input, std::span(output).first(encoded->header_bytes - 1)));
+        input.rndv.session = 0;
+        EXPECT_FALSE(EncodeWireFrame(input, output));
+        EXPECT_FALSE(EncodeWireHeader(input, output));
+        EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](auto byte) { return byte == std::byte{0xdd}; }));
+        output = {};
+        header = {};
+    }
+}
+
+TEST(WireFrameTest, RndvRoutingValidationUsesCurrentDirectionNotOriginalTransaction) {
+    const auto input = RndvControl(WireControlType::kRndvGrant);
+    const WireSessionBinding route{{kWireVersion, input.rndv.receiver_runtime, 22, input.session}, input.token, 44};
+    // GRANT 的原始事务 session/token 与反向路由不同；普通路由校验只证明当前接收来源。
+    const WireFrameView decoded{input, false};
+    ASSERT_NE(input.session, input.rndv.session);
+    ASSERT_NE(input.token, input.rndv.token);
+    EXPECT_TRUE(ValidateWireIdentity(decoded, route, route.context));
+    auto incorrect = route;
+    incorrect.token = input.rndv.token;
+    EXPECT_FALSE(ValidateWireIdentity(decoded, incorrect, route.context));
+    incorrect = route;
+    incorrect.context.session = input.rndv.session;
+    EXPECT_FALSE(ValidateWireIdentity(decoded, incorrect, incorrect.context));
+}
+
+TEST(WireFrameTest, RndvEncodingDecodingAndRouteValidationDoNotAllocate) {
+    std::array<std::byte, 128> output{};
+    bool valid = true;
+    allocation_count = 0;
+    count_allocations = true;
+    for (const auto type : {WireControlType::kRndvRts, WireControlType::kRndvGrant, WireControlType::kRndvDone}) {
+        const auto input = RndvControl(type, {65536, 256});
+        const WireSessionBinding route{{kWireVersion, 11, 22, input.session}, input.token, 44};
+        for (std::size_t i = 0; i < 100; ++i) {
+            const auto header = EncodeWireHeader(input, output);
+            const auto encoded = EncodeWireFrame(input, output);
+            if (!header || !encoded) {
+                valid = false;
+                break;
+            }
+            const auto decoded = DecodeWireFrame(encoded->imm_data, std::span(output).first(encoded->payload_bytes));
+            if (!decoded || !ValidateWireIdentity(*decoded, route, route.context)) {
+                valid = false;
+                break;
+            }
         }
     }
     count_allocations = false;

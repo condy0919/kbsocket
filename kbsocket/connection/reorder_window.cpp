@@ -37,10 +37,12 @@ bool SameLease(const ReorderLease& left, const ReorderLease& right) noexcept {
 } // namespace
 
 struct ReorderWindow::State {
-    enum class Status : std::uint8_t { kEmpty, kBuffered, kDelivered, kConsumed };
+    enum class Status : std::uint8_t { kEmpty, kPending, kBuffered, kDelivered, kConsumed };
     struct Entry {
         ReorderFrame frame;
         std::uint64_t receipt = 0;
+        std::uint64_t reservation = 0;
+        std::size_t reserved_bytes = 0;
         Status status = Status::kEmpty;
         bool discarded = false;
     };
@@ -90,7 +92,7 @@ std::expected<void, ReorderError> ReorderWindow::Close() noexcept {
         return {};
     }
     state_->stopping = true;
-    if (state_->stats.buffered_frames || state_->stats.delivered_frames) {
+    if (state_->stats.pending_frames || state_->stats.buffered_frames || state_->stats.delivered_frames) {
         return Error(ReorderErrorCode::kInUse);
     }
     state_.reset();
@@ -167,14 +169,15 @@ std::expected<void, ReorderError> ReorderWindow::CheckTimeout(std::uint64_t now_
 void ReorderWindow::UpdateGap(std::uint64_t now_ns) noexcept {
     const auto sequence = state_->stats.rcv_next;
     const auto& head = state_->entries[sequence % state_->config.window];
-    if (!state_->stats.buffered_frames ||
+    if ((!state_->stats.buffered_frames && !state_->stats.pending_frames) ||
         (head.status == State::Status::kBuffered && head.frame.sequence == sequence)) {
         state_->gap_since.reset();
     } else if (!state_->gap_since) {
         state_->gap_since = now_ns;
     }
 }
-std::expected<void, ReorderError> ReorderWindow::Push(const ReorderFrame& frame, std::uint64_t now_ns) noexcept {
+std::expected<void, ReorderError> ReorderWindow::CheckAdmission(const ReorderFrame& frame, std::uint64_t bytes,
+                                                                std::uint64_t now_ns, bool reserving) noexcept {
     if (!state_) {
         return Error(ReorderErrorCode::kNotReady);
     }
@@ -195,7 +198,7 @@ std::expected<void, ReorderError> ReorderWindow::Push(const ReorderFrame& frame,
     if (frame.kind != ReorderFrameKind::kEager && frame.kind != ReorderFrameKind::kValidatedRmaDone && !fin) {
         return Error(ReorderErrorCode::kInvalidArgument);
     }
-    if ((!fin && (frame.payload.empty() || !frame.payload.data() || !ValidLease(frame.lease))) ||
+    if ((!fin && (!bytes || (!reserving && (!frame.payload.data() || !ValidLease(frame.lease))))) ||
         (fin && (!frame.payload.empty() || (frame.lease.index() != 0 && !ValidLease(frame.lease))))) {
         return Error(ReorderErrorCode::kInvalidArgument);
     }
@@ -230,32 +233,129 @@ std::expected<void, ReorderError> ReorderWindow::Push(const ReorderFrame& frame,
     // 有界身份检查覆盖已交给应用的 Lease，避免同一物理所有权挂进两个 SN 后被双重归还。
     for (std::uint32_t i = 0; i < state_->config.window; ++i) {
         const auto& held = state_->entries[i];
-        if (held.status != State::Status::kBuffered && held.status != State::Status::kDelivered) {
+        if (held.status != State::Status::kPending && held.status != State::Status::kBuffered &&
+            held.status != State::Status::kDelivered) {
             continue;
         }
         if (fin && held.frame.sequence > frame.sequence) {
             state_->failure = ReorderError{ReorderErrorCode::kProtocol};
             return std::unexpected(*state_->failure);
         }
-        if (SameLease(held.frame.lease, frame.lease)) {
+        if (!reserving && SameLease(held.frame.lease, frame.lease)) {
             return Error(ReorderErrorCode::kLeaseAlreadyHeld);
         }
     }
     const auto available_bytes = state_->config.max_resident_bytes - state_->stats.resident_bytes;
-    if (frame.payload.size() > available_bytes ||
-        frame.payload.size() > stats().max_stream_bytes - state_->stats.received_bytes) {
+    const auto max_stream_bytes = stats().max_stream_bytes;
+    if (bytes > available_bytes || state_->stats.received_bytes > max_stream_bytes ||
+        bytes > max_stream_bytes - state_->stats.received_bytes) {
         state_->failure = ReorderError{ReorderErrorCode::kByteLimit};
         return std::unexpected(*state_->failure);
     }
+    return {};
+}
+std::expected<void, ReorderError> ReorderWindow::Push(const ReorderFrame& frame, std::uint64_t now_ns) noexcept {
+    if (const auto checked = CheckAdmission(frame, frame.payload.size(), now_ns, false); !checked) {
+        return checked;
+    }
+    auto& entry = state_->entries[frame.sequence % state_->config.window];
     entry.frame = frame;
     entry.status = State::Status::kBuffered;
     ++state_->stats.buffered_frames;
     state_->stats.resident_bytes += frame.payload.size();
     state_->stats.received_bytes += frame.payload.size();
-    if (fin) {
+    if (frame.kind == ReorderFrameKind::kFin) {
         state_->fin = frame.sequence;
     }
     UpdateGap(now_ns);
+    return {};
+}
+std::expected<ReorderReservation, ReorderError> ReorderWindow::ReserveRndv(ReorderSession session,
+                                                                           std::uint32_t sequence, std::uint64_t bytes,
+                                                                           std::uint64_t now_ns) noexcept {
+    const ReorderFrame frame{session, sequence, ReorderFrameKind::kValidatedRmaDone, {}, {}};
+    if (const auto checked = CheckAdmission(frame, bytes, now_ns, true); !checked) {
+        return std::unexpected(checked.error());
+    }
+    if (next_reservation_ == std::numeric_limits<std::uint64_t>::max()) {
+        state_->failure = ReorderError{ReorderErrorCode::kSequenceExhausted};
+        return std::unexpected(*state_->failure);
+    }
+    const auto index = sequence % state_->config.window;
+    auto& entry = state_->entries[index];
+    entry.frame = frame;
+    entry.reservation = ++next_reservation_;
+    entry.reserved_bytes = static_cast<std::size_t>(bytes);
+    entry.status = State::Status::kPending;
+    ++state_->stats.pending_frames;
+    state_->stats.resident_bytes += entry.reserved_bytes;
+    state_->stats.received_bytes += bytes;
+    UpdateGap(now_ns);
+    return ReorderReservation{this, index, entry.reservation};
+}
+std::expected<void, ReorderError> ReorderWindow::CompleteRndv(ReorderReservation reservation, const ReorderFrame& frame,
+                                                              std::uint64_t now_ns) noexcept {
+    if (!state_) {
+        return Error(ReorderErrorCode::kNotReady);
+    }
+    if (reservation.owner != this || !reservation.generation || reservation.slot >= state_->config.window) {
+        return Error(ReorderErrorCode::kInvalidReservation);
+    }
+    auto& entry = state_->entries[reservation.slot];
+    if (entry.status != State::Status::kPending || entry.reservation != reservation.generation) {
+        return Error(ReorderErrorCode::kInvalidReservation);
+    }
+    if (frame.session != state_->session) {
+        return Error(ReorderErrorCode::kWrongSession);
+    }
+    if (const auto observed = ObserveTime(now_ns); !observed) {
+        return observed;
+    }
+    if (state_->failure) {
+        return std::unexpected(*state_->failure);
+    }
+    if (state_->stopping) {
+        return Error(ReorderErrorCode::kStopped);
+    }
+    if (frame.kind != ReorderFrameKind::kValidatedRmaDone || frame.sequence != entry.frame.sequence ||
+        frame.payload.size() != entry.reserved_bytes || !frame.payload.data() || !ValidLease(frame.lease)) {
+        return Error(ReorderErrorCode::kInvalidArgument);
+    }
+    // 占位时没有目标 Lease；完成时仍须检查所有已缓冲和应用持有项，防止双重归还。
+    for (std::uint32_t i = 0; i < state_->config.window; ++i) {
+        const auto& held = state_->entries[i];
+        if ((held.status == State::Status::kBuffered || held.status == State::Status::kDelivered) &&
+            SameLease(held.frame.lease, frame.lease)) {
+            return Error(ReorderErrorCode::kLeaseAlreadyHeld);
+        }
+    }
+    entry.frame = frame;
+    entry.reservation = 0;
+    entry.reserved_bytes = 0;
+    entry.status = State::Status::kBuffered;
+    --state_->stats.pending_frames;
+    ++state_->stats.buffered_frames;
+    UpdateGap(now_ns);
+    return {};
+}
+std::expected<void, ReorderError> ReorderWindow::AbandonRndv(ReorderReservation reservation) noexcept {
+    if (!state_) {
+        return Error(ReorderErrorCode::kNotReady);
+    }
+    if (reservation.owner != this || !reservation.generation || reservation.slot >= state_->config.window) {
+        return Error(ReorderErrorCode::kInvalidReservation);
+    }
+    auto& entry = state_->entries[reservation.slot];
+    if (entry.status != State::Status::kPending || entry.reservation != reservation.generation) {
+        return Error(ReorderErrorCode::kInvalidReservation);
+    }
+    if (!state_->stopping && !state_->failure) {
+        return Error(ReorderErrorCode::kInUse);
+    }
+    --state_->stats.pending_frames;
+    state_->stats.resident_bytes -= entry.reserved_bytes;
+    entry = {};
+    UpdateGap(state_->last_now);
     return {};
 }
 bool ReorderWindow::Deliver(std::uint32_t index, ReorderDelivery& output, bool discarded) noexcept {

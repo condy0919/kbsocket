@@ -18,6 +18,27 @@ bool Extended(WireToken token) noexcept {
 bool Data(WireFrameType type) noexcept {
     return type == WireFrameType::kDataEager || type == WireFrameType::kDataWithCredit;
 }
+bool Rndv(WireControlType control) noexcept {
+    return control == WireControlType::kRndvRts || control == WireControlType::kRndvGrant ||
+           control == WireControlType::kRndvDone;
+}
+std::size_t ControlBodySize(WireControlType control) noexcept {
+    switch (control) {
+    case WireControlType::kCreditUpdate:
+        return 48;
+    case WireControlType::kRndvRts:
+        return 64;
+    case WireControlType::kRndvGrant:
+    case WireControlType::kRndvDone:
+        return 104;
+    case WireControlType::kFin:
+        return 8;
+    case WireControlType::kReset:
+        return 12;
+    default:
+        return 0;
+    }
+}
 bool ValidContext(const WireReceiveContext& context) noexcept {
     return context.peer_runtime && context.receive_domain && context.session;
 }
@@ -45,7 +66,7 @@ std::expected<std::size_t, WireError> BodySize(const WireFrameInput& input) noex
         }
         if (input.control != WireControlType::kCreditUpdate || input.session || input.credit_epoch ||
             input.max_control_credit_seq || input.max_frame_seq || input.max_stream_bytes || input.reset_code ||
-            (input.type == WireFrameType::kDataEager && input.max_credit_seq)) {
+            input.rndv != WireRndvFields{} || (input.type == WireFrameType::kDataEager && input.max_credit_seq)) {
             return Error(WireErrorCode::kInvalidControl);
         }
         // 最高 SN 仅留给 FIN，不能先被普通数据占用而无法有序结束。
@@ -66,12 +87,42 @@ std::expected<std::size_t, WireError> BodySize(const WireFrameInput& input) noex
     if (!input.data.empty()) {
         return Error(WireErrorCode::kInvalidLength);
     }
-    if (input.control == WireControlType::kRndvRts || input.control == WireControlType::kRndvGrant ||
-        input.control == WireControlType::kRndvDone) {
-        return Error(WireErrorCode::kUnsupportedType);
-    }
     if (!input.session) {
         return Error(WireErrorCode::kInvalidIdentity);
+    }
+    if (Rndv(input.control)) {
+        if (input.credit_epoch || input.max_credit_seq || input.max_control_credit_seq || input.max_frame_seq ||
+            input.max_stream_bytes || input.reset_code) {
+            return Error(WireErrorCode::kInvalidControl);
+        }
+        if (input.seq == std::numeric_limits<std::uint32_t>::max()) {
+            return Error(WireErrorCode::kInvalidSequence);
+        }
+        const auto& rndv = input.rndv;
+        if (!rndv.sender_runtime || !rndv.receiver_runtime || !rndv.receive_domain || !rndv.session ||
+            !rndv.token.generation || !rndv.transfer_id) {
+            return Error(WireErrorCode::kInvalidIdentity);
+        }
+        if (!rndv.bytes) {
+            return Error(WireErrorCode::kInvalidLength);
+        }
+        if (input.control == WireControlType::kRndvRts) {
+            if (rndv.arena_id || rndv.arena_generation || rndv.grant_slot || rndv.grant_generation ||
+                rndv.target_address) {
+                return Error(WireErrorCode::kInvalidControl);
+            }
+        } else {
+            if (!rndv.arena_id || !rndv.arena_generation || !rndv.grant_generation || !rndv.target_address) {
+                return Error(WireErrorCode::kInvalidIdentity);
+            }
+            if (rndv.bytes > std::numeric_limits<std::uint64_t>::max() - rndv.target_address) {
+                return Error(WireErrorCode::kInvalidLength);
+            }
+        }
+        return ControlBodySize(input.control);
+    }
+    if (input.rndv != WireRndvFields{}) {
+        return Error(WireErrorCode::kInvalidControl);
     }
     switch (input.control) {
     case WireControlType::kCreditUpdate:
@@ -141,6 +192,24 @@ void WriteHeader(const WireFrameInput& input, const WireEncodedFrame& layout, st
             Put(body.subspan(40, 8), input.max_stream_bytes);
         } else if (input.control == WireControlType::kReset) {
             Put(body.subspan(8, 4), input.reset_code);
+        } else if (Rndv(input.control)) {
+            const auto& rndv = input.rndv;
+            Put(body.subspan(8, 8), rndv.sender_runtime);
+            Put(body.subspan(16, 8), rndv.receiver_runtime);
+            Put(body.subspan(24, 8), rndv.receive_domain);
+            Put(body.subspan(32, 8), rndv.session);
+            Put(body.subspan(40, 4), rndv.token.slot);
+            Put(body.subspan(44, 4), rndv.token.generation);
+            Put(body.subspan(48, 8), rndv.transfer_id);
+            Put(body.subspan(56, 8), rndv.bytes);
+            if (input.control != WireControlType::kRndvRts) {
+                Put(body.subspan(64, 8), rndv.arena_id);
+                Put(body.subspan(72, 8), rndv.arena_generation);
+                Put(body.subspan(80, 4), rndv.grant_slot);
+                Put(body.subspan(84, 4), 0);
+                Put(body.subspan(88, 8), rndv.grant_generation);
+                Put(body.subspan(96, 8), rndv.target_address);
+            }
         }
     }
 }
@@ -215,14 +284,11 @@ std::expected<WireFrameView, WireError> DecodeWireFrame(std::uint64_t imm_data,
         frame.data = payload;
     } else if (frame.type == WireFrameType::kControl) {
         frame.control = static_cast<WireControlType>(flags & 7);
-        const auto body_size = frame.control == WireControlType::kCreditUpdate ? 48
-                               : frame.control == WireControlType::kFin        ? 8
-                               : frame.control == WireControlType::kReset      ? 12
-                                                                               : 0;
+        const auto body_size = ControlBodySize(frame.control);
         if (!body_size) {
             return Error(WireErrorCode::kUnsupportedType);
         }
-        if (payload.size() != static_cast<std::size_t>(body_size)) {
+        if (payload.size() != body_size) {
             return Error(WireErrorCode::kInvalidLength);
         }
         frame.session = Get(payload.first(8));
@@ -234,6 +300,26 @@ std::expected<WireFrameView, WireError> DecodeWireFrame(std::uint64_t imm_data,
             frame.max_stream_bytes = Get(payload.subspan(40, 8));
         } else if (frame.control == WireControlType::kReset) {
             frame.reset_code = static_cast<std::uint32_t>(Get(payload.subspan(8, 4)));
+        } else if (Rndv(frame.control)) {
+            auto& rndv = frame.rndv;
+            rndv.sender_runtime = Get(payload.subspan(8, 8));
+            rndv.receiver_runtime = Get(payload.subspan(16, 8));
+            rndv.receive_domain = Get(payload.subspan(24, 8));
+            rndv.session = Get(payload.subspan(32, 8));
+            rndv.token = {static_cast<std::uint32_t>(Get(payload.subspan(40, 4))),
+                          static_cast<std::uint32_t>(Get(payload.subspan(44, 4)))};
+            rndv.transfer_id = Get(payload.subspan(48, 8));
+            rndv.bytes = Get(payload.subspan(56, 8));
+            if (frame.control != WireControlType::kRndvRts) {
+                if (Get(payload.subspan(84, 4))) {
+                    return Error(WireErrorCode::kInvalidControl);
+                }
+                rndv.arena_id = Get(payload.subspan(64, 8));
+                rndv.arena_generation = Get(payload.subspan(72, 8));
+                rndv.grant_slot = static_cast<std::uint32_t>(Get(payload.subspan(80, 4)));
+                rndv.grant_generation = Get(payload.subspan(88, 8));
+                rndv.target_address = Get(payload.subspan(96, 8));
+            }
         }
     } else {
         return Error(WireErrorCode::kUnsupportedType);

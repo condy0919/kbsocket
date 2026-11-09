@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include "kbsocket/connection/rndv_protocol.hpp"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
 
 namespace {
@@ -593,6 +594,44 @@ TEST_F(WriteRndvPoolTest, CompleteAllChunksBeforeDoneAndKeepImportsUntilRelease)
     ASSERT_TRUE(DriveCaches());
     EXPECT_EQ(jetty_unimports_.load(), 1u);
     EXPECT_EQ(segment_unimports_.load(), 1u);
+}
+
+TEST_F(WriteRndvPoolTest, DoneNotificationUsesLiveTransactionAndRejectsCancelledOrReusedHandle) {
+    Open(32, 8, 1);
+    const auto first_grant = Target(64);
+    const auto source = Source(64);
+    const auto first = Reserve(first_grant);
+    const auto binding = Binding();
+    const RndvDestination destination{binding.receiver_runtime, binding.receive_domain, binding.session, binding.token};
+    EXPECT_FALSE(BuildRndvDone(transactions_, first, destination));
+    const std::array sources{WriteRndvSource{source, 0, 64}};
+    ASSERT_TRUE(transactions_.Start(first, sources));
+    ASSERT_EQ(transactions_.Progress(first), 2u);
+    Complete(1);
+    EXPECT_FALSE(BuildRndvDone(transactions_, first, destination));
+    Complete(0);
+    const auto notification = BuildRndvDone(transactions_, first, destination);
+    ASSERT_TRUE(notification);
+    EXPECT_EQ(notification->rndv.grant_generation, first_grant.identity.generation);
+    DeliverAndReturn(first, first_grant);
+    ASSERT_TRUE(transactions_.Release(first));
+    EXPECT_FALSE(BuildRndvDone(transactions_, first, destination));
+
+    // 复用同一物理槽后，旧句柄不借用新事务的完成状态；取消也不能被全成功 CQE 撤销。
+    const auto second_grant = Target(64, 1);
+    const auto second = Begin(second_grant, source);
+    EXPECT_EQ(second.slot, first.slot);
+    ASSERT_EQ(transactions_.Progress(second), 2u);
+    ASSERT_TRUE(transactions_.Cancel(second));
+    Complete(2);
+    Complete(3);
+    const auto cleanup = transactions_.TerminalEvidence(second);
+    ASSERT_TRUE(cleanup);
+    EXPECT_EQ(cleanup->completed_bytes, second_grant.identity.transfer.bytes);
+    EXPECT_FALSE(BuildRndvDone(transactions_, first, destination));
+    EXPECT_FALSE(BuildRndvDone(transactions_, second, destination));
+    EndFailedGrant(second, second_grant);
+    ASSERT_TRUE(transactions_.Release(second));
 }
 
 TEST_F(WriteRndvPoolTest, PhysicalSlotReuseRejectsOldHandleAndLateCompletion) {
