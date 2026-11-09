@@ -44,8 +44,12 @@ public:
     std::expected<std::span<std::byte>, kbs_stream_error> Writable(kbs_buffer_handle buffer) noexcept;
     std::expected<std::span<const std::byte>, kbs_stream_error> Readable(kbs_buffer_handle buffer) noexcept;
     std::expected<void, kbs_stream_error> Release(kbs_buffer_handle buffer) noexcept;
+    std::expected<kbs_buffer_status, kbs_stream_error> Inspect(kbs_buffer_handle buffer) noexcept;
     // 只供宿主后续传输接线；仍校验公开身份、CPU 可访问状态与 raw 暂停，不创造新引用；停止准入后拒绝。
     std::expected<memory::BufferLease, kbs_stream_error> Resolve(kbs_buffer_handle buffer) noexcept;
+    // C 表桥内部使用，完整校验请求范围后再取真实 Lease；不暴露 C 表布局。
+    static std::expected<memory::BufferLease, kbs_stream_error>
+    Resolve(kbs_buffer_table* table, kbs_buffer_handle buffer, std::size_t offset, std::size_t bytes) noexcept;
 
 private:
     struct State;

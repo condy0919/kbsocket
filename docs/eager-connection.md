@@ -7,6 +7,7 @@
 - `Connection::Open` 接管明确支持本协议的已连接非阻塞控制 fd；`Progress` 推进 HELLO，进入 Preparing 后宿主提供已创建的 raw 资源，或调用 `PrepareTcp`。
 - `PrepareRaw` 将完整 Connection 作为 route owner；先初始化 RX/TX，并通过 `sources` 原子安装已授权的远端主动 Lane 来源，再由握手协调器发布路由、发送 READY。HELLO 的本地 Lane 快照必须与实际 TxSender 池一致；`peer_lanes_authorized` 由宿主认证策略提供。TX 可绑定 pending import，首包与 Credit 可在本端等待 READY 时入账；应用读写和实际 post 仍等待双方 READY。
 - `Write(span)` 返回已复制到注册 Slab 的前缀，调用方可立即复用该前缀。大 write 按 4096 B RM_CTP 限制有界分片，扩展身份头计入上限。驻留/远端窗口不足时短写或 WouldBlock，不分配整次 write 的缓存。
+- M5.4.7 追加 `WriteLease(source, offset, bytes)`：从同一注册 Slab 接受有界前缀，不复制 payload；每片从入队到真实终结独立持有源责任，应用可提前归还 CPU 但不能提前复用 backing。扩展身份使用独立头部 SGE；具体 API 和复用规则见 [Eager Lease 发送](lease-send.md)。
 - `Read(span, now)` 复制连续字节并返回短读/EOF；无数据返回 WouldBlock。读到一帧中途继续持有原 RX Lease，完整消费后才归还物理责任和乱序窗口 receipt。已复制前缀之后发生错误，仍保留前缀返回，并锁存失败供下一次调用观察。
 - `ShutdownWrite` 把 FIN 排在已接受 write 之后；发送半关闭仍可发送 Credit，接收方向继续工作。FIN 通过相同 SN 重排，前面全部字节消费后才 EOF。
 - `Cancel`/不可恢复错误显式失败，不切 TCP、不重放旧 WR。`Close` 撤路由、有界清理未提交数据与未读 RX；已接受或接受未知的 DMA 依赖保留到可信终结。Retained 要继续交付完成后重试，不能销毁对象及其借用依赖。

@@ -15,6 +15,7 @@
 #include "kbsocket/control/connection_handshake.hpp"
 #include "kbsocket/control/lane_control.hpp"
 #include "kbsocket/control/raw_source_admission.hpp"
+#include "kbsocket/memory/buffer_lease.hpp"
 #include "kbsocket/transport/tcp/native_tcp_backend.hpp"
 
 namespace kbsocket {
@@ -92,7 +93,7 @@ struct RawConnectionPreparation {
 /// 单 owner 的有界 copy-stream 接口；Write 返回的前缀可立即复用，Read 只交付连续字节。
 /// 不拥有 raw 队列、RX 域、注册 Slab、缓存及共账；这些依赖必须存活到 Close 成功。
 /// 宿主独占 poll，通过 DispatchRx/OnTxCompletion 分发；实际 RX 补投只走 EagerReceiveDomain。
-/// 本层不自动回退、重放、撤销远端授信或删除共享队列；零拷贝 C ABI 留待独立交付。
+/// 本层不自动回退、重放、撤销远端授信或删除共享队列；WriteLease 仅接收同一 raw Slab 的源。
 class Connection {
 public:
     Connection() = default;
@@ -112,6 +113,8 @@ public:
     /// 单次有界握手/一个 TX 批次；物理域 refill 后调用，发布累计 Credit 与应用消费窗口。
     std::expected<std::size_t, ConnectionError> Progress(std::uint64_t now_ns) noexcept;
     std::expected<std::size_t, ConnectionError> Write(std::span<const std::byte> input) noexcept;
+    std::expected<std::size_t, ConnectionError> WriteLease(memory::BufferLease source, std::size_t offset,
+                                                           std::size_t bytes) noexcept;
     std::expected<ConnectionReadResult, ConnectionError> Read(std::span<std::byte> output,
                                                               std::uint64_t now_ns) noexcept;
     std::expected<void, ConnectionError> ShutdownWrite() noexcept;

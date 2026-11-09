@@ -65,6 +65,7 @@ struct EagerTxStats {
     bool failed = false;
     bool write_shutdown = false;
     bool fin_accepted = false;
+    std::uint64_t leased_bytes = 0;
 };
 
 /// 单 owner 的有界 Eager 发送流。Write 成功的字节已复制到注册 Slab，可立即复用用户缓冲。
@@ -82,6 +83,11 @@ public:
                                            memory::SlabAllocator& slab, control::EndpointImportCache& imports,
                                            control::ImportLease endpoint, SenderCreditAccount& credits) noexcept;
     std::expected<std::size_t, EagerTxError> Write(std::span<const std::byte> bytes) noexcept;
+    /// 借用同一注册 Slab 的有效区间，按有界帧接受前缀，不复制 payload、不转移应用 CPU 所有权。
+    /// 每个入队片段立即预留源责任；排队/已提交期间禁止修改源，可信取消或终结后才可重新取视图。
+    /// 即使只接受前缀，同一 Lease 的全部旧 CPU 视图也须停用；应用可归还 CPU，但不得提前复用 backing。
+    std::expected<std::size_t, EagerTxError> WriteLease(memory::BufferLease source, std::size_t offset,
+                                                        std::size_t bytes) noexcept;
     /// FIN 排在全部已接受 write 的数据之后；半关闭仍允许发送 CREDIT_UPDATE。
     std::expected<void, EagerTxError> ShutdownWrite() noexcept;
     /// 无分配合并累计额度；session 必须是接收方 session，token 由绑定强制填入。

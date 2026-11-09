@@ -23,6 +23,8 @@
 
 #include <gtest/gtest.h>
 
+#include "kbsocket/api/buffer_binding.hpp"
+#include "kbsocket/api/lease_send.h"
 #include "kbsocket/control/tx_lane_snapshot.hpp"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
 #include "kbsocket/transport/tcp/native_tcp_backend.hpp"
@@ -216,6 +218,41 @@ TEST_F(StreamBindingTest, PublicationRejectsDuplicatesForeignAndInvalidConnectio
     EXPECT_TRUE(owner_.Inspect(second));
     EXPECT_TRUE(binding_.Inspect(stream));
 }
+TEST_F(StreamBindingTest, NativeTcpLeaseWriteExplicitlyRejectsWithoutCopyOrSourceReservation) {
+    Open();
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    const auto stream = Publish(Adopt(pair.right));
+    BufferBinding buffers;
+    ASSERT_TRUE(buffers.OpenHost({KBS_BUFFER_ABI_VERSION, 0, 701, 1, 0, 64, 1u << 20}));
+    const auto buffer = buffers.Acquire(17);
+    ASSERT_TRUE(buffer);
+    const auto view = buffers.Writable(*buffer);
+    ASSERT_TRUE(view);
+    std::fill(view->begin(), view->end(), std::byte{0x53});
+    kbs_stream_io io{99, 1, 1};
+    kbs_stream_error error{};
+    EXPECT_EQ(kbs_stream_write_lease(binding_.table(), stream, buffers.table(), *buffer, 1, 7, &io, &error),
+              KBS_STREAM_NOT_SUPPORTED);
+    EXPECT_EQ(error.code, KBS_STREAM_NOT_SUPPORTED);
+    EXPECT_EQ(io.bytes, 0u);
+    EXPECT_EQ(io.eof, 0u);
+    EXPECT_EQ(io.reserved, 0u);
+    kbs_buffer_status status{};
+    ASSERT_EQ(kbs_buffer_inspect(buffers.table(), *buffer, &status, nullptr), 0);
+    EXPECT_EQ(status.source_reusable, 1u);
+    EXPECT_TRUE(buffers.Writable(*buffer));
+    std::array<std::byte, 17> wire{};
+    EXPECT_EQ(::recv(pair.left, wire.data(), wire.size(), 0), -1);
+    EXPECT_EQ(errno, EAGAIN);
+    EXPECT_EQ(kbs_stream_write_lease(binding_.table(), stream, nullptr, *buffer, 0, 1, &io, nullptr),
+              KBS_STREAM_INVALID_ARGUMENT);
+    EXPECT_EQ(kbs_stream_write_lease(binding_.table(), stream, buffers.table(), *buffer, 0, 1, nullptr, nullptr),
+              KBS_STREAM_INVALID_ARGUMENT);
+    ASSERT_TRUE(buffers.Release(*buffer));
+    ASSERT_TRUE(buffers.Close());
+}
+
 TEST_F(StreamBindingTest, CopyIoHasBoundedPrefixesAndImmediateSourceReuse) {
     Open(2, 3);
     TcpPair pair;
@@ -1308,6 +1345,54 @@ TEST_F(RawStreamBindingTest, EveryBoundEntryHonorsActualImportPauseAndOtherConte
     EXPECT_EQ(events[0].state, KBS_STREAM_RAW_ACTIVE);
     EXPECT_EQ(e.forward_errors, 0u);
 }
+TEST_F(RawStreamBindingTest, LeaseWriteRejectsOtherContextPauseBeforeSourceOrQueueMutation) {
+    Activate();
+    BufferBinding buffers;
+    ASSERT_TRUE(buffers.OpenSlab(*shared_->slab, {710, 1}));
+    const auto buffer = buffers.Acquire(17);
+    ASSERT_TRUE(buffer);
+    const auto before = shared_->slab->stats();
+    const auto credits = endpoints_[0].sender_credits.stats().spent;
+    const auto hello = Hello(0);
+    // 用独立授权身份创建真实 import 慢任务，保持 context 0 的现有流处于 RawActive。
+    control::EndpointImportRequest request{.key = {.local_context = &endpoints_[1].context,
+                                                   .local_context_incarnation = 2,
+                                                   .peer_runtime = hello.identity.runtime,
+                                                   .receive_domain = hello.identity.receive_domain,
+                                                   .endpoint_generation = hello.identity.endpoint_generation,
+                                                   .jetty_id = hello.jetty_id,
+                                                   .authorization_identity = 8},
+                                           .descriptor = {hello.descriptor.data(), hello.descriptor_bytes}};
+    std::memcpy(request.key.eid.data(), hello.eid.data(), hello.eid.size());
+    const auto extra = shared_->imports->Acquire(request);
+    ASSERT_TRUE(extra);
+    endpoints_[1].block_import.store(true);
+    ASSERT_TRUE(Until([&] { return stack_.paused(1); }));
+    EXPECT_FALSE(stack_.paused(0));
+    EXPECT_EQ(endpoints_[0].binding.Inspect(endpoints_[0].stream)->state, KBS_STREAM_RAW_ACTIVE);
+    kbs_stream_io io{99, 1, 1};
+    EXPECT_EQ(kbs_stream_write_lease(endpoints_[0].binding.table(), endpoints_[0].stream, buffers.table(), *buffer, 0,
+                                     3, &io, nullptr),
+              KBS_STREAM_BUSY);
+    EXPECT_EQ(io.bytes, 0u);
+    EXPECT_EQ(io.eof, 0u);
+    EXPECT_EQ(io.reserved, 0u);
+    EXPECT_EQ(endpoints_[0].binding.Inspect(endpoints_[0].stream)->tx_pending, 0u);
+    endpoints_[1].block_import.store(false);
+    endpoints_[1].block_import.notify_all();
+    ASSERT_TRUE(Until([&] { return !stack_.paused(1); }));
+    EXPECT_EQ(shared_->slab->stats().local_dma, before.local_dma);
+    EXPECT_EQ(shared_->slab->stats().cpu_leases, before.cpu_leases);
+    EXPECT_EQ(shared_->slab->stats().available, before.available);
+    EXPECT_EQ(endpoints_[0].sender_credits.stats().spent, credits);
+    kbs_buffer_status status{};
+    ASSERT_EQ(kbs_buffer_inspect(buffers.table(), *buffer, &status, nullptr), 0);
+    EXPECT_EQ(status.source_reusable, 1u);
+    ASSERT_TRUE(shared_->imports->Release(*extra));
+    ASSERT_TRUE(buffers.Release(*buffer));
+    ASSERT_TRUE(buffers.Close());
+}
+
 TEST_F(RawStreamBindingTest, ExistingRawDataPartialReadAndFinRearmImmediately) {
     Activate();
     auto& sender = endpoints_[0];

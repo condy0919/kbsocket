@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <thread>
 
@@ -52,6 +53,8 @@ protected:
         raw::AttemptId id = 0;
         std::uint64_t imm = 0;
         std::size_t bytes = 0;
+        std::size_t sge_count = 0;
+        std::array<urma_sge_t, 2> sges{};
         std::array<std::byte, kWireMaxPayload> payload{};
     };
     enum class PostMode { kAll, kPartial, kUnknown };
@@ -98,6 +101,9 @@ protected:
         };
         return f;
     }
+    virtual std::uint8_t SendSges() const noexcept {
+        return 1;
+    }
     void SetUp() override {
         active_ = this;
         urma_device_cap_t cap{};
@@ -105,11 +111,13 @@ protected:
         cap.rm_tp_cap.bs.ctp = 1;
         cap.max_jetty = 2;
         cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 2048;
-        cap.max_jfs_sge = cap.max_jfs_rsge = cap.max_jfr_sge = 1;
+        cap.max_jfs_sge = SendSges();
+        cap.max_jfs_rsge = cap.max_jfr_sge = 1;
         raw::JettyPoolConfig pool_config;
         pool_config.tx_depth = 512;
         pool_config.rx_depth = 1;
         pool_config.tx_cq_depth = 1024;
+        pool_config.send_sge = SendSges();
         jetty_.jetty_id.id = 19;
         passive_.jetty_id.id = 23;
         ASSERT_TRUE(pool_.Open(&context_, cap, pool_config));
@@ -195,6 +203,12 @@ protected:
         ASSERT_TRUE(stream_.Open(Config(capacity), sender_, slab_, imports_, endpoint_, credits_));
         PumpImports();
     }
+    void ReopenLargeSlab(std::uint32_t references = 32) {
+        ASSERT_TRUE(slab_.Close());
+        std::array<urma_context_t*, 1> contexts{&context_};
+        ASSERT_TRUE(
+            slab_.Open(contexts, {.buffer_count = 16, .buffer_size = 16384, .max_references = references}, budget_));
+    }
     urma_status_t Post(urma_jfs_wr_t* first, urma_jfs_wr_t** bad) {
         ++post_calls_;
         std::size_t i = 0;
@@ -206,9 +220,18 @@ protected:
             auto& packet = packets_[packet_count_++];
             packet.id = wr->user_ctx;
             packet.imm = wr->send.imm_data;
-            const auto& sg = wr->send.src.sge[0];
-            packet.bytes = sg.len;
-            std::memcpy(packet.payload.data(), reinterpret_cast<const void*>(sg.addr), sg.len);
+            packet.sge_count = wr->send.src.num_sge;
+            for (std::size_t j = 0; j < packet.sge_count; ++j) {
+                const auto& sg = wr->send.src.sge[j];
+                if (j >= packet.sges.size() || sg.len > packet.payload.size() - packet.bytes) {
+                    ADD_FAILURE() << "invalid source scatter list";
+                    *bad = wr;
+                    return URMA_EINVAL;
+                }
+                packet.sges[j] = sg;
+                std::memcpy(packet.payload.data() + packet.bytes, reinterpret_cast<const void*>(sg.addr), sg.len);
+                packet.bytes += sg.len;
+            }
         }
         *bad = nullptr;
         return mode_ == PostMode::kUnknown ? URMA_ENOMEM : URMA_SUCCESS;
@@ -262,6 +285,470 @@ protected:
     PostMode mode_ = PostMode::kAll;
     std::size_t partial_ = 0;
 };
+
+class EagerTxLeaseTest : public EagerTxTest {
+protected:
+    std::uint8_t SendSges() const noexcept override {
+        return 2;
+    }
+};
+
+TEST_F(EagerTxTest, LeaseAdmissionSegmentsOriginalSourceAndReturnsBoundedPrefix) {
+    ReopenLargeSlab();
+    Open(2);
+    const auto source = slab_.Acquire(12000);
+    ASSERT_TRUE(source);
+    const auto writable = slab_.Writable(*source);
+    ASSERT_TRUE(writable);
+    std::fill(writable->begin(), writable->end(), std::byte{0x5a});
+    const auto address = reinterpret_cast<std::uintptr_t>(writable->data());
+    const auto available = slab_.stats().available;
+    ASSERT_EQ(stream_.WriteLease(*source, 33, 9000), 8192u);
+    EXPECT_EQ(stream_.stats().copied_bytes, 0u);
+    EXPECT_EQ(stream_.stats().leased_bytes, 8192u);
+    EXPECT_EQ(slab_.stats().available, available);
+    EXPECT_EQ(slab_.stats().local_dma, 2u);
+    EXPECT_FALSE(slab_.Readable(*source));
+    EXPECT_FALSE(slab_.Writable(*source));
+    ASSERT_EQ(stream_.Progress(), 2u);
+    for (std::size_t i = 0; i < 2; ++i) {
+        EXPECT_EQ(packets_[i].sge_count, 1u);
+        EXPECT_EQ(packets_[i].sges[0].addr, address + 33 + i * 4096);
+        EXPECT_EQ(packets_[i].sges[0].len, 4096u);
+        const auto frame = DecodeWireFrame(packets_[i].imm, packets_[i].payload);
+        ASSERT_TRUE(frame);
+        EXPECT_EQ(frame->frame.seq, i);
+        EXPECT_TRUE(std::all_of(frame->frame.data.begin(), frame->frame.data.end(),
+                                [](auto byte) { return byte == std::byte{0x5a}; }));
+    }
+    Enqueue(0);
+    auto terminal = PollOne();
+    ASSERT_TRUE(terminal.record);
+    auto stale = terminal;
+    ++stale.record->metadata.operation_generation;
+    EXPECT_FALSE(stream_.OnCompletion(stale));
+    EXPECT_EQ(slab_.stats().local_dma, 2u);
+    ASSERT_TRUE(stream_.OnCompletion(terminal));
+    EXPECT_FALSE(stream_.OnCompletion(terminal));
+    EXPECT_EQ(slab_.stats().local_dma, 1u);
+    EXPECT_FALSE(slab_.Readable(*source));
+    Complete(1);
+    EXPECT_TRUE(slab_.Writable(*source));
+    // CQE 只归还 DMA 责任，应用 CPU 所有权仍由调用方显式归还。
+    EXPECT_EQ(slab_.stats().available, available);
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+    EXPECT_EQ(slab_.stats().available, available + 1);
+}
+
+TEST_F(EagerTxLeaseTest, ExtendedLeaseUsesIndependentHeaderAndOriginalPayloadWithoutAllocation) {
+    ReopenLargeSlab();
+    auto config = Config(3);
+    config.destination = {100000, 400};
+    ASSERT_TRUE(stream_.Open(config, sender_, slab_, imports_, endpoint_, credits_));
+    PumpImports();
+    const auto source = slab_.Acquire(10000);
+    ASSERT_TRUE(source);
+    const auto writable = slab_.Writable(*source);
+    ASSERT_TRUE(writable);
+    for (std::size_t i = 0; i < writable->size(); ++i) {
+        (*writable)[i] = static_cast<std::byte>(i % 251);
+    }
+    const auto address = reinterpret_cast<std::uintptr_t>(writable->data());
+    allocations = 0;
+    count_allocations = true;
+    const auto written = stream_.WriteLease(*source, 7, 9000);
+    const auto posted = stream_.Progress();
+    std::array<raw::TxCompletionEvent, 3> events;
+    Enqueue(0);
+    Enqueue(1);
+    Enqueue(2);
+    const auto polled = processor_.Poll(events);
+    bool completed = polled && polled->count == 3;
+    if (completed) {
+        for (const auto& event : events) {
+            completed &= stream_.OnCompletion(event).has_value();
+        }
+    }
+    count_allocations = false;
+    ASSERT_EQ(written, 9000u);
+    ASSERT_EQ(posted, 3u);
+    ASSERT_TRUE(completed);
+    EXPECT_EQ(allocations, 0u);
+    std::size_t consumed = 0;
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto& packet = packets_[i];
+        ASSERT_EQ(packet.sge_count, 2u);
+        EXPECT_EQ(packet.sges[0].len, 8u);
+        EXPECT_TRUE(packet.sges[0].addr < address || packet.sges[0].addr >= address + 10000);
+        EXPECT_EQ(packet.sges[1].addr, address + 7 + consumed);
+        const auto frame = DecodeWireFrame(packet.imm, std::span(packet.payload).first(packet.bytes));
+        ASSERT_TRUE(frame);
+        EXPECT_EQ(frame->frame.token, config.destination);
+        EXPECT_EQ(frame->frame.seq, i);
+        EXPECT_EQ(frame->frame.data.size(), std::min<std::size_t>(4088, 9000 - consumed));
+        for (std::size_t j = 0; j < frame->frame.data.size(); ++j) {
+            EXPECT_EQ(frame->frame.data[j], static_cast<std::byte>((7 + consumed + j) % 251));
+        }
+        consumed += frame->frame.data.size();
+    }
+    EXPECT_EQ(consumed, 9000u);
+    EXPECT_EQ(stream_.stats().copied_bytes, 0u);
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+}
+
+TEST_F(EagerTxTest, QueuedLeaseSurvivesCpuReleaseWhileWaitingForRemoteCredits) {
+    ASSERT_TRUE(credits_.Close());
+    auto identity = identity_;
+    ++identity.epoch;
+    ASSERT_TRUE(credits_.Open(identity));
+    ASSERT_TRUE(credits_.Update(identity, 0, 4));
+    auto config = Config();
+    config.credit_identity = identity;
+    ASSERT_TRUE(stream_.Open(config, sender_, slab_, imports_, endpoint_, credits_));
+    PumpImports();
+    const auto source = slab_.Acquire(64);
+    ASSERT_TRUE(source);
+    const auto writable = slab_.Writable(*source);
+    ASSERT_TRUE(writable);
+    std::fill(writable->begin(), writable->end(), std::byte{0x63});
+    const auto address = reinterpret_cast<std::uintptr_t>(writable->data());
+    const auto available = slab_.stats().available;
+    ASSERT_EQ(stream_.WriteLease(*source, 5, 42), 42u);
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+    EXPECT_EQ(slab_.stats().available, available);
+    EXPECT_EQ(slab_.stats().local_dma, 1u);
+    EXPECT_FALSE(stream_.Progress());
+    EXPECT_EQ(post_calls_, 0u);
+    EXPECT_EQ(stream_.stats().queued, 1u);
+    ASSERT_TRUE(stream_.ApplyCredit(session_, identity, 1, 4, 10000, 10000000));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    EXPECT_EQ(packets_[0].sges[0].addr, address + 5);
+    EXPECT_EQ(packets_[0].payload[41], std::byte{0x63});
+    Complete(0);
+    EXPECT_EQ(slab_.stats().available, available + 1);
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+    EXPECT_FALSE(slab_.Readable(*source));
+}
+
+TEST_F(EagerTxTest, PartialLeasePostKeepsSuffixPinnedWithoutReplayingAcceptedPrefix) {
+    ReopenLargeSlab();
+    Open(3);
+    const auto source = slab_.Acquire(9000);
+    ASSERT_TRUE(source);
+    const auto writable = slab_.Writable(*source);
+    ASSERT_TRUE(writable);
+    std::fill(writable->begin(), writable->end(), std::byte{0x36});
+    const auto address = reinterpret_cast<std::uintptr_t>(writable->data());
+    const auto available = slab_.stats().available;
+    ASSERT_EQ(stream_.WriteLease(*source, 0, 9000), 9000u);
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+    mode_ = PostMode::kPartial;
+    partial_ = 1;
+    ASSERT_EQ(stream_.Progress(), 1u);
+    EXPECT_EQ(stream_.stats().queued, 2u);
+    EXPECT_EQ(slab_.stats().local_dma, 3u);
+    EXPECT_EQ(credits_.stats().spent[0], 1u);
+    Complete(0);
+    EXPECT_EQ(slab_.stats().local_dma, 2u);
+    EXPECT_EQ(slab_.stats().available, available);
+    mode_ = PostMode::kAll;
+    ASSERT_EQ(stream_.Progress(), 2u);
+    ASSERT_EQ(packet_count_, 3u);
+    EXPECT_EQ(credits_.stats().spent[0], 3u);
+    for (std::size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(packets_[i].sges[0].addr, address + i * 4096);
+        const auto frame = DecodeWireFrame(packets_[i].imm, std::span(packets_[i].payload).first(packets_[i].bytes));
+        ASSERT_TRUE(frame);
+        EXPECT_EQ(frame->frame.seq, i);
+    }
+    Complete(2);
+    EXPECT_EQ(slab_.stats().available, available);
+    Complete(1);
+    EXPECT_EQ(slab_.stats().available, available + 1);
+    EXPECT_EQ(stream_.stats().retired, 3u);
+}
+
+TEST_F(EagerTxLeaseTest, ExtendedPartialPostRetainsBothSourceAndHeaderForRetry) {
+    ReopenLargeSlab();
+    auto config = Config(3);
+    config.destination = {100000, 400};
+    ASSERT_TRUE(stream_.Open(config, sender_, slab_, imports_, endpoint_, credits_));
+    PumpImports();
+    const auto source = slab_.Acquire(9000);
+    ASSERT_TRUE(source);
+    const auto view = slab_.Writable(*source);
+    ASSERT_TRUE(view);
+    const auto address = reinterpret_cast<std::uintptr_t>(view->data());
+    ASSERT_EQ(stream_.WriteLease(*source, 0, 9000), 9000u);
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+    EXPECT_EQ(slab_.stats().local_dma, 6u);
+    mode_ = PostMode::kPartial;
+    partial_ = 1;
+    ASSERT_EQ(stream_.Progress(), 1u);
+    EXPECT_EQ(slab_.stats().local_dma, 6u);
+    Complete(0);
+    EXPECT_EQ(slab_.stats().local_dma, 4u);
+    mode_ = PostMode::kAll;
+    ASSERT_EQ(stream_.Progress(), 2u);
+    EXPECT_EQ(packet_count_, 3u);
+    for (std::size_t i = 0; i < 3; ++i) {
+        ASSERT_EQ(packets_[i].sge_count, 2u);
+        EXPECT_EQ(packets_[i].sges[1].addr, address + i * 4088);
+        const auto frame = DecodeWireFrame(packets_[i].imm, std::span(packets_[i].payload).first(packets_[i].bytes));
+        ASSERT_TRUE(frame);
+        EXPECT_EQ(frame->frame.seq, i);
+        EXPECT_EQ(frame->frame.token, config.destination);
+    }
+    Complete(1);
+    Complete(2);
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+    EXPECT_EQ(slab_.stats().cpu_leases, 1u);
+}
+
+TEST_F(EagerTxTest, FailedLeaseStreamCancelsOnlyUnpostedFragmentsAndWaitsForRealTerminal) {
+    ReopenLargeSlab();
+    Open(3);
+    const auto source = slab_.Acquire(9000);
+    ASSERT_TRUE(source);
+    ASSERT_EQ(stream_.WriteLease(*source, 0, 9000), 9000u);
+    const auto available = slab_.stats().available;
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+    mode_ = PostMode::kPartial;
+    partial_ = 1;
+    ASSERT_EQ(stream_.Progress(), 1u);
+    stream_.Fail();
+    EXPECT_EQ(stream_.stats().queued, 0u);
+    EXPECT_EQ(stream_.stats().in_flight, 1u);
+    EXPECT_EQ(slab_.stats().local_dma, 1u);
+    EXPECT_EQ(slab_.stats().available, available);
+    EXPECT_FALSE(stream_.Close());
+    Complete(0);
+    EXPECT_EQ(slab_.stats().available, available + 1);
+    EXPECT_EQ(post_calls_, 1u);
+    EXPECT_TRUE(stream_.Close());
+}
+
+TEST_F(EagerTxTest, LeaseRemoteFailureCannotReleaseOtherPostedFragments) {
+    ReopenLargeSlab();
+    Open(2);
+    const auto source = slab_.Acquire(8192);
+    ASSERT_TRUE(source);
+    ASSERT_EQ(stream_.WriteLease(*source, 0, 8192), 8192u);
+    ASSERT_EQ(stream_.Progress(), 2u);
+    Enqueue(0, URMA_CR_REM_ACCESS_ABORT_ERR);
+    const auto event = PollOne();
+    ASSERT_TRUE(event.lane);
+    const auto result = stream_.OnCompletion(event);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().provider_status, 8);
+    EXPECT_EQ(pool_.lane_state(*event.lane), raw::JettyLaneState::kReady);
+    EXPECT_EQ(slab_.stats().local_dma, 1u);
+    EXPECT_FALSE(slab_.Writable(*source));
+    EXPECT_FALSE(stream_.Close());
+    Complete(1);
+    EXPECT_TRUE(slab_.Writable(*source));
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+}
+
+TEST_F(EagerTxTest, LeaseAckTimeoutDoesNotReleaseOtherDmaWhenSqEntersDrain) {
+    ReopenLargeSlab();
+    Open(2);
+    const auto source = slab_.Acquire(8192);
+    ASSERT_TRUE(source);
+    ASSERT_EQ(stream_.WriteLease(*source, 0, 8192), 8192u);
+    ASSERT_EQ(stream_.Progress(), 2u);
+    Enqueue(0, URMA_CR_ACK_TIMEOUT_ERR);
+    const auto event = PollOne();
+    ASSERT_TRUE(event.lane);
+    EXPECT_FALSE(stream_.OnCompletion(event));
+    EXPECT_NE(pool_.lane_state(*event.lane), raw::JettyLaneState::kReady);
+    EXPECT_EQ(slab_.stats().local_dma, 1u);
+    EXPECT_FALSE(slab_.Writable(*source));
+    EXPECT_FALSE(stream_.Progress());
+    EXPECT_EQ(post_calls_, 1u);
+    EXPECT_FALSE(stream_.Close());
+    // SQ 状态改变不等于每个 WR 已退休，剩余源引用仍须等待独立的真实 CQE。
+    Enqueue(1, URMA_CR_WR_FLUSH_ERR);
+    EXPECT_FALSE(stream_.OnCompletion(PollOne()));
+    EXPECT_TRUE(slab_.Writable(*source));
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+    ASSERT_TRUE(pool_.ObserveFlushDone(*event.lane));
+    std::array<raw::TxCompletionEvent, 1> output;
+    ASSERT_TRUE(processor_.Flush(*event.lane, output));
+}
+
+TEST_F(EagerTxTest, UnknownLeaseAcceptanceQuarantinesSharedSourceUntilEveryTerminal) {
+    ReopenLargeSlab();
+    Open(2);
+    const auto source = slab_.Acquire(8192);
+    ASSERT_TRUE(source);
+    ASSERT_EQ(stream_.WriteLease(*source, 0, 8192), 8192u);
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+    const auto available = slab_.stats().available;
+    mode_ = PostMode::kUnknown;
+    const auto posted = stream_.Progress();
+    ASSERT_FALSE(posted);
+    EXPECT_EQ(posted.error().code, EagerTxErrorCode::kAcceptanceUnknown);
+    EXPECT_EQ(slab_.stats().local_dma, 2u);
+    EXPECT_EQ(slab_.stats().quarantined_buffers, 1u);
+    EXPECT_FALSE(stream_.Close());
+    EXPECT_FALSE(stream_.Progress());
+    EXPECT_EQ(post_calls_, 1u);
+    // Mock 已执行全批；只有诊断确认接受集合并收到真实 CQE 后才能恢复账本并解除共享源引用。
+    const auto record = ledger_.Lookup(packets_[0].id);
+    ASSERT_TRUE(record);
+    const auto lane = record->ticket.lane;
+    ASSERT_TRUE(ledger_.Commit(packets_[0].id, 1));
+    Complete(0);
+    EXPECT_EQ(slab_.stats().quarantined_buffers, 1u);
+    EXPECT_EQ(slab_.stats().available, available);
+    ASSERT_TRUE(ledger_.Commit(packets_[1].id, 2));
+    Complete(1);
+    EXPECT_EQ(slab_.stats().quarantined_buffers, 0u);
+    EXPECT_EQ(slab_.stats().available, available + 1);
+    ASSERT_TRUE(pool_.BeginDrain(lane));
+    ASSERT_TRUE(pool_.ObserveFlushDone(lane));
+    std::array<raw::TxCompletionEvent, 1> output;
+    ASSERT_TRUE(processor_.Flush(lane, output));
+}
+
+TEST_F(EagerTxTest, LeaseRejectsInvalidRangeForeignPoolAndBusySourceBeforeAdmission) {
+    Open();
+    const auto source = slab_.Acquire(64);
+    ASSERT_TRUE(source);
+    memory::SlabAllocator foreign;
+    ASSERT_TRUE(foreign.OpenHost({.buffer_count = 1, .buffer_size = 64, .max_references = 1}, budget_));
+    const auto foreign_source = foreign.Acquire(64);
+    ASSERT_TRUE(foreign_source);
+    EXPECT_FALSE(stream_.WriteLease(*foreign_source, 0, 1));
+    EXPECT_FALSE(stream_.WriteLease({}, 0, 1));
+    auto stale = *source;
+    ++stale.generation;
+    EXPECT_FALSE(stream_.WriteLease(stale, 0, 1));
+    EXPECT_FALSE(stream_.WriteLease(*source, 0, 0));
+    EXPECT_FALSE(stream_.WriteLease(*source, 65, 1));
+    EXPECT_FALSE(stream_.WriteLease(*source, 63, 2));
+    EXPECT_FALSE(stream_.WriteLease(*source, 1, std::numeric_limits<std::size_t>::max()));
+    const auto reference = slab_.Reserve(*source, memory::BufferUse::kLocalDma);
+    ASSERT_TRUE(reference);
+    EXPECT_FALSE(stream_.WriteLease(*source, 0, 1));
+    ASSERT_TRUE(slab_.Cancel(*reference));
+    EXPECT_EQ(stream_.stats().queued, 0u);
+    EXPECT_EQ(stream_.stats().leased_bytes, 0u);
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+    EXPECT_EQ(post_calls_, 0u);
+    EXPECT_TRUE(slab_.Writable(*source));
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+    EXPECT_FALSE(stream_.WriteLease(*source, 0, 1));
+    ASSERT_TRUE(foreign.ReleaseCpu(*foreign_source));
+    ASSERT_TRUE(foreign.Close());
+}
+
+TEST_F(EagerTxTest, ExtendedLeaseRequiresTwoSgesWithoutFallingBackToPayloadCopy) {
+    auto config = Config();
+    config.destination = {100000, 400};
+    ASSERT_TRUE(stream_.Open(config, sender_, slab_, imports_, endpoint_, credits_));
+    PumpImports();
+    const auto source = slab_.Acquire(64);
+    ASSERT_TRUE(source);
+    const auto available = slab_.stats().available;
+    const auto written = stream_.WriteLease(*source, 0, 64);
+    ASSERT_FALSE(written);
+    EXPECT_EQ(written.error().code, EagerTxErrorCode::kInvalidArgument);
+    EXPECT_EQ(stream_.stats().queued, 0u);
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+    EXPECT_EQ(slab_.stats().available, available);
+    EXPECT_TRUE(slab_.Writable(*source));
+    EXPECT_EQ(post_calls_, 0u);
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+}
+
+TEST_F(EagerTxTest, LeaseReferencePressureAcceptsOnlyPinnedPrefixAndCancellationRestoresSource) {
+    ReopenLargeSlab(2);
+    Open(3);
+    const auto source = slab_.Acquire(9000);
+    ASSERT_TRUE(source);
+    ASSERT_EQ(stream_.WriteLease(*source, 0, 9000), 4096u);
+    EXPECT_EQ(stream_.stats().queued, 1u);
+    EXPECT_EQ(stream_.stats().leased_bytes, 4096u);
+    EXPECT_EQ(slab_.stats().local_dma, 1u);
+    EXPECT_FALSE(slab_.Writable(*source));
+    stream_.Fail();
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+    EXPECT_TRUE(slab_.Writable(*source));
+    EXPECT_EQ(post_calls_, 0u);
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+}
+
+TEST_F(EagerTxTest, PinnedLeaseAdmissionLeavesReferenceForEarlierCopiedFrame) {
+    ReopenLargeSlab(2);
+    Open(4);
+    const std::array copied{std::byte{0x11}};
+    ASSERT_EQ(stream_.Write(copied), 1u);
+    const auto source = slab_.Acquire(9000);
+    ASSERT_TRUE(source);
+    ASSERT_EQ(stream_.WriteLease(*source, 0, 9000), 4096u);
+    EXPECT_EQ(slab_.stats().local_dma, 1u);
+    // 已排队的借用源不能借尽引用表，阻塞排在前面的复制帧取得提交责任。
+    ASSERT_EQ(stream_.Progress(), 2u);
+    EXPECT_EQ(packet_count_, 2u);
+    const auto first = DecodeWireFrame(packets_[0].imm, std::span(packets_[0].payload).first(packets_[0].bytes));
+    const auto second = DecodeWireFrame(packets_[1].imm, std::span(packets_[1].payload).first(packets_[1].bytes));
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(first->frame.seq, 0u);
+    EXPECT_EQ(first->frame.data.size(), 1u);
+    EXPECT_EQ(second->frame.seq, 1u);
+    EXPECT_EQ(second->frame.data.size(), 4096u);
+    Complete(0);
+    Complete(1);
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+}
+
+TEST_F(EagerTxLeaseTest, ExtendedLeaseReservesHeaderResponsibilityBeforeAcceptingPrefix) {
+    ReopenLargeSlab(3);
+    auto config = Config(3);
+    config.destination = {100000, 400};
+    ASSERT_TRUE(stream_.Open(config, sender_, slab_, imports_, endpoint_, credits_));
+    PumpImports();
+    const auto source = slab_.Acquire(9000);
+    ASSERT_TRUE(source);
+    // 每片必须同时有源及头部责任；只占满源引用会使所有后续 header 准备永久等待。
+    ASSERT_EQ(stream_.WriteLease(*source, 0, 9000), 4088u);
+    EXPECT_EQ(stream_.stats().queued, 1u);
+    EXPECT_EQ(slab_.stats().local_dma, 2u);
+    ASSERT_EQ(stream_.Progress(), 1u);
+    ASSERT_EQ(packet_count_, 1u);
+    EXPECT_EQ(packets_[0].sge_count, 2u);
+    EXPECT_EQ(packets_[0].bytes, 4096u);
+    Complete(0);
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+    EXPECT_TRUE(slab_.Writable(*source));
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+}
+
+TEST_F(EagerTxTest, LeaseAdmissionHonorsStreamByteWindowBeforeReservingExcessData) {
+    auto config = Config(3);
+    config.max_stream_bytes = 17;
+    ASSERT_TRUE(stream_.Open(config, sender_, slab_, imports_, endpoint_, credits_));
+    PumpImports();
+    const auto source = slab_.Acquire(64);
+    ASSERT_TRUE(source);
+    ASSERT_EQ(stream_.WriteLease(*source, 4, 60), 17u);
+    EXPECT_EQ(stream_.stats().leased_bytes, 17u);
+    EXPECT_EQ(slab_.stats().local_dma, 1u);
+    ASSERT_EQ(stream_.Progress(), 1u);
+    EXPECT_EQ(packets_[0].bytes, 17u);
+    Complete(0);
+    EXPECT_FALSE(stream_.WriteLease(*source, 21, 43));
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+    ASSERT_TRUE(stream_.ApplyCredit(session_, identity_, 1000, 1000, 10000, 64));
+    ASSERT_EQ(stream_.WriteLease(*source, 21, 43), 43u);
+    ASSERT_EQ(stream_.Progress(), 1u);
+    Complete(1);
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+}
 
 TEST_F(EagerTxTest, WritableReportsCopyCapacityWithoutRemoteCreditOrProviderWork) {
     EXPECT_FALSE(stream_.writable());

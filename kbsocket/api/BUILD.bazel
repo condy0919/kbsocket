@@ -16,6 +16,16 @@ cc_library(
 )
 
 cc_library(
+    name = "lease_send",
+    hdrs = ["lease_send.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":buffer_lease",
+        ":stream",
+    ],
+)
+
+cc_library(
     name = "buffer_binding",
     srcs = ["buffer_binding.cpp"],
     hdrs = ["buffer_binding.hpp"],
@@ -69,6 +79,8 @@ cc_library(
     hdrs = ["stream_binding.hpp"],
     visibility = ["//visibility:public"],
     deps = [
+        ":buffer_binding",
+        ":lease_send",
         ":stream",
         ":stream_error",
         "//kbsocket/runtime:connection_owner",
@@ -91,13 +103,18 @@ cc_library(
     testonly = True,
     srcs = ["stream_c_test.c"],
     copts = ["-std=c11"],
-    deps = [":stream"],
+    deps = [
+        ":lease_send",
+        ":stream",
+    ],
 )
 
 cc_test(
     name = "stream_binding_test",
     srcs = ["stream_binding_test.cpp"],
     deps = [
+        ":buffer_binding",
+        ":lease_send",
         ":stream_binding",
         ":stream_c_test",
         "//kbsocket/connection:wire_frame",
@@ -197,6 +214,7 @@ cc_test(
     name = "raw_stream_runtime_test",
     srcs = ["raw_stream_runtime_test.cpp"],
     deps = [
+        ":lease_send",
         ":raw_stream_runtime",
         "//kbsocket/connection:wire_frame",
         "//kbsocket/transport/raw:urma_test_support",

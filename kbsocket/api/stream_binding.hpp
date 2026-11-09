@@ -8,6 +8,7 @@
 #include <memory>
 #include <span>
 
+#include "kbsocket/api/lease_send.h"
 #include "kbsocket/api/stream.h"
 #include "kbsocket/runtime/connection_owner.hpp"
 #include "kbsocket/runtime/connection_progress.hpp"
@@ -51,6 +52,9 @@ public:
 
     std::expected<std::size_t, kbs_stream_error> Write(kbs_stream_handle stream,
                                                        std::span<const std::byte> input) noexcept;
+    std::expected<std::size_t, kbs_stream_error> WriteLease(kbs_stream_handle stream, kbs_buffer_table* buffers,
+                                                            kbs_buffer_handle buffer, std::size_t offset,
+                                                            std::size_t bytes) noexcept;
     std::expected<kbs_stream_io, kbs_stream_error> Read(kbs_stream_handle stream, std::span<std::byte> output,
                                                         std::uint64_t now_ns) noexcept;
     std::expected<void, kbs_stream_error> ShutdownWrite(kbs_stream_handle stream) noexcept;

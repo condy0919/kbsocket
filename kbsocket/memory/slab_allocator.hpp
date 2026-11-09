@@ -51,6 +51,8 @@ struct SlabStats {
     std::size_t remote_grants = 0;
     std::size_t quarantined_buffers = 0;
     std::size_t quarantined_bytes = 0;
+    // 包含 Reserved 与 Committed 的责任表余量；供排队源保留提交/控制进度空间。
+    std::size_t available_references = 0;
 };
 
 /// 一个固定容量、页对齐 Slab，显式 CPU 池或最多四 context 注册；所有 Lease/责任操作由同一 owner 串行推进。

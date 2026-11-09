@@ -2,7 +2,7 @@
 
 本文记录 [roadmap](roadmap.md) 的 M5.4.6：通过有界 C 句柄分配、访问及归还应用缓冲区，并复用已有 Slab 的 CPU/DMA/Grant 责任。公共定义在 [`buffer_lease.h`](../kbsocket/api/buffer_lease.h)，C++ 控制面在 [`BufferBinding`](../kbsocket/api/buffer_binding.hpp)。
 
-本阶段交付缓冲区生命周期接口；`write_lease` / `read_lease`、传输完成通知和 M6 WRITE Grant/RNDV 尚未接入。取得缓冲区或 CPU 视图不会提交 SEND、READ、WRITE，也不代表远端拥有访问权。
+M5.4.7 已接通 [Eager Lease 零拷贝发送](lease-send.md) 和源可复用查询；`read_lease` 与 M6 WRITE Grant/RNDV 尚未接入。取得缓冲区或 CPU 视图不会提交 SEND、READ、WRITE，也不代表远端拥有访问权。
 
 ## 创建与资源来源
 
@@ -28,6 +28,7 @@ CPU-only Slab 不具备 URMA DMA/远端 Grant 能力，不能将其当成已注�
 | `kbs_buffer_acquire` | 借出非零且不超过单槽大小的区间，建立唯一 CPU 所有权 |
 | `kbs_buffer_writable` | 校验当前身份和责任后返回可写视图，长度等于本次 Acquire 长度 |
 | `kbs_buffer_readable` | 校验当前身份和责任后返回只读视图；停止新准入后仍可完成合法消费 |
+| `kbs_buffer_inspect` | 查询有效长度和整份 Lease 的 `source_reusable`；DMA/Grant/隔离返回不可复用，暂停或无效身份返回错误 |
 | `kbs_buffer_release` | 归还 CPU 所有权；成功后全部句柄和视图副本立即失效 |
 
 返回值和 `kbs_stream_error` 沿用 [stream API](stream-api.md) 的稳定错误分类；成功返回零，失败不依赖 `errno`。失败的 Acquire/视图输出清零，避免调用方误用上次成功结果。Release 失败时保留句柄供 owner 重试，不能丢弃尚未归还的责任。
@@ -40,7 +41,7 @@ CPU-only Slab 不具备 URMA DMA/远端 Grant 能力，不能将其当成已注�
 
 ## 宿主传输接线与终结证据
 
-`BufferBinding::Resolve` 供宿主后续传输接线取得真实 Lease，仍验证公开句柄、CPU 可访问状态及 raw 暂停门禁，停止新准入后拒绝调用。它不会增加引用或自动提交操作；宿主不得另行 `ReleaseCpu` 或把同一 CPU 所有权重复发布到其他表。
+`BufferBinding::Resolve` 供宿主传输接线取得真实 Lease，仍验证公开句柄、CPU 可访问状态及 raw 暂停门禁，停止新准入后拒绝调用。它不会增加引用或自动提交操作；宿主不得另行 `ReleaseCpu` 或把同一 CPU 所有权重复发布到其他表。公开发送入口 `kbs_stream_write_lease` 在返回接受前缀前取得独立源责任，排队阶段即禁止旧 CPU 视图访问。
 
 注册 Slab 的传输仍须遵循 `Reserve -> Commit -> CompleteDma/EndGrant`：可信未接受的责任可取消，已接受或接受范围未知的责任须保持到各自真实终结。C API 没有伪造 DMA 完成、远端授权结束或强制回收的入口。
 
@@ -60,4 +61,4 @@ NativeTCP Runtime Close 将应用缓冲区与已发布流、监听器一起纳�
 
 ## 验证范围
 
-无硬件测试覆盖 C ABI 布局/符号、CPU-only 池、注册 Slab 借用、容量及预算、旧身份和槽位复用、视图与 DMA/Grant 责任、停止/关闭重试、raw 暂停门禁及数据路径零分配。具体测试目标和用例数量记录在 [roadmap](roadmap.md)。这些验证不提供新的 UB 真机、零拷贝传输或 40k 性能结论。
+无硬件测试覆盖 C ABI 布局/符号、CPU-only 池、注册 Slab 借用、容量及预算、旧身份和槽位复用、视图与 DMA/Grant 责任、源可复用查询、停止/关闭重试、raw 暂停门禁及数据路径零分配。具体测试目标和用例数量记录在 [roadmap](roadmap.md)。这些验证不提供新的 UB 真机或 40k 性能结论。

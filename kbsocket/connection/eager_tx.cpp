@@ -25,6 +25,9 @@ struct EagerTxStream::State {
     struct Record {
         memory::BufferLease lease{};
         memory::BufferReference dma{};
+        memory::BufferLease source{};
+        memory::BufferReference source_dma{};
+        std::size_t source_offset = 0;
         control::ImportLease endpoint{};
         raw::AttemptMetadata metadata{};
         raw::AttemptId id = 0;
@@ -34,6 +37,7 @@ struct EagerTxStream::State {
         std::size_t bytes = 0, wire_bytes = 0;
         Kind kind = Kind::kData;
         bool active = false, cpu = false, committed = false, posted = false;
+        bool source_committed = false;
         bool consumed_last_control = false;
     };
     EagerTxConfig config;
@@ -48,7 +52,7 @@ struct EagerTxStream::State {
     SequenceTicket ticket;
     std::array<std::uint32_t, raw::TxSender::kMaxBatch> batch{};
     std::array<TxFramePlan, raw::TxSender::kMaxBatch> plans{};
-    std::array<urma_sge_t, raw::TxSender::kMaxBatch> sges{};
+    std::array<std::array<urma_sge_t, 2>, raw::TxSender::kMaxBatch> sges{};
     std::array<raw::TxSendRequest, raw::TxSender::kMaxBatch> requests{};
     std::array<raw::AttemptId, raw::TxSender::kMaxBatch> ids{};
     WireFrameInput credit;
@@ -221,6 +225,109 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Write(std::span<const st
     }
     return copied;
 }
+std::expected<std::size_t, EagerTxError> EagerTxStream::WriteLease(memory::BufferLease source, std::size_t offset,
+                                                                   std::size_t bytes) noexcept {
+    if (!state_ || state_->closed) {
+        return Error(EagerTxErrorCode::kNotReady);
+    }
+    auto& s = *state_;
+    if (s.stats.failed || s.stats.write_shutdown) {
+        return Error(EagerTxErrorCode::kStopped);
+    }
+    if (source.allocator != s.slab || !bytes || !s.sender->pool() ||
+        s.sender->pool()->max_send_sge() < (s.header ? 2u : 1u)) {
+        return Error(EagerTxErrorCode::kInvalidArgument);
+    }
+    const auto source_view = s.slab->Readable(source);
+    if (!source_view || offset > source_view->size() || bytes > source_view->size() - offset) {
+        return Error(EagerTxErrorCode::kInvalidArgument);
+    }
+    std::size_t queued = 0;
+    while (queued < bytes && s.free != kEnd) {
+        if (s.generation == std::numeric_limits<std::uint64_t>::max()) {
+            break;
+        }
+        // 给已排队复制帧/控制帧留一个临时责任，避免源 pin 占满引用表后阻塞队首。
+        if (s.slab->stats().available_references <= (s.header ? 2u : 1u)) {
+            break;
+        }
+        const auto buffered = s.sequence.accepted_bytes() + s.queued_bytes;
+        if (buffered >= s.config.max_stream_bytes) {
+            break;
+        }
+        const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(
+            std::min(bytes - queued, kWireMaxPayload - s.header), s.config.max_stream_bytes - buffered));
+        const auto index = s.free;
+        auto& r = s.records[index];
+        const auto next = r.next;
+        // 先占有记录再取得责任；罕见清理失败也有稳定槽记录所有权，不把责任藏在栈变量中。
+        s.free = next;
+        r = {.source = source,
+             .source_offset = offset + queued,
+             .generation = ++s.generation,
+             .bytes = length,
+             .wire_bytes = length + s.header,
+             .active = true};
+        auto discard = [&](EagerTxErrorCode code) noexcept -> std::expected<std::size_t, EagerTxError> {
+            if (!Drop(index)) {
+                Fail();
+                return queued ? std::expected<std::size_t, EagerTxError>(queued) : Error(EagerTxErrorCode::kRetained);
+            }
+            return queued ? std::expected<std::size_t, EagerTxError>(queued) : Error(code);
+        };
+        const auto source_dma = s.slab->Reserve(source, memory::BufferUse::kLocalDma);
+        if (!source_dma) {
+            return discard(source_dma.error().code == memory::MemoryErrorCode::kExhausted
+                               ? EagerTxErrorCode::kWouldBlock
+                               : EagerTxErrorCode::kMemory);
+        }
+        r.source_dma = *source_dma;
+        // 在发布入队前核对实际 context 的注册和范围；失败撤销未暴露责任，不接受任何新字节。
+        if (!s.slab->Sge(r.source_dma, s.config.local_context, r.source_offset, length)) {
+            return discard(EagerTxErrorCode::kInvalidArgument);
+        }
+        if (s.header) {
+            const auto header = s.slab->Acquire(s.header);
+            if (!header) {
+                return discard(header.error().code == memory::MemoryErrorCode::kExhausted
+                                   ? EagerTxErrorCode::kWouldBlock
+                                   : EagerTxErrorCode::kMemory);
+            }
+            r.lease = *header;
+            r.cpu = true;
+        }
+        std::span<std::byte> header_view;
+        if (r.lease.generation) {
+            const auto writable = s.slab->Writable(r.lease);
+            if (!writable) {
+                return discard(EagerTxErrorCode::kMemory);
+            }
+            header_view = *writable;
+        }
+        WireFrameInput input;
+        input.token = s.config.destination;
+        // 扩展头只有不可变目标身份；SN 位于 IMM，因此可在准入时编码并独立持有头部责任。
+        input.data = source_view->subspan(r.source_offset, r.bytes);
+        const auto encoded = EncodeWireHeader(input, header_view);
+        if (!encoded) {
+            return discard(EagerTxErrorCode::kInvalidArgument);
+        }
+        r.imm = encoded->imm_data;
+        if (r.lease.generation) {
+            const auto header_dma = s.slab->Reserve(r.lease, memory::BufferUse::kLocalDma);
+            if (!header_dma) {
+                return discard(header_dma.error().code == memory::MemoryErrorCode::kExhausted
+                                   ? EagerTxErrorCode::kWouldBlock
+                                   : EagerTxErrorCode::kMemory);
+            }
+            r.dma = *header_dma;
+        }
+        s.Enqueue(index);
+        queued += length;
+        s.stats.leased_bytes += length;
+    }
+    return queued ? std::expected<std::size_t, EagerTxError>(queued) : Error(EagerTxErrorCode::kWouldBlock);
+}
 bool EagerTxStream::writable() const noexcept {
     if (!state_ || state_->closed || state_->stats.failed || state_->stats.write_shutdown) {
         return false;
@@ -295,6 +402,12 @@ std::expected<void, EagerTxError> EagerTxStream::ApplyCredit(SequenceSession ses
 std::expected<void, EagerTxError> EagerTxStream::Drop(std::uint32_t index) noexcept {
     auto& s = *state_;
     auto& r = s.records[index];
+    if (r.source_dma.sequence) {
+        if (r.source_committed || !s.slab->Cancel(r.source_dma)) {
+            return Error(EagerTxErrorCode::kRetained);
+        }
+        r.source_dma = {};
+    }
     if (r.dma.sequence) {
         if (r.committed || !s.slab->Cancel(r.dma)) {
             return Error(EagerTxErrorCode::kRetained);
@@ -458,31 +571,37 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexc
     bool preparation_exhausted = false;
     for (std::size_t i = 0; i < count; ++i) {
         auto& r = s.records[s.batch[i]];
-        auto view = s.slab->Writable(r.lease);
-        if (!view) {
-            prepared = false;
-            break;
-        }
-        WireFrameInput input;
-        if (control) {
-            input = s.credit;
+        if (r.source.generation) {
+            // 源及不可变扩展头从准入开始持有独立责任；不重新取得 CPU 视图或改写头部。
+            r.imm = (r.imm & 0xffffffff00000000ull) | s.sequence.pending()[i].seq;
         } else {
-            input.token = s.config.destination;
-            input.seq = s.sequence.pending()[i].seq;
-            if (fin) {
-                input.type = WireFrameType::kControl;
-                input.control = WireControlType::kFin;
-                input.session = s.config.session.session;
-            } else {
-                input.data = view->subspan(s.header, r.bytes);
+            const auto writable = s.slab->Writable(r.lease);
+            if (!writable) {
+                prepared = false;
+                break;
             }
+            auto view = *writable;
+            WireFrameInput input;
+            if (control) {
+                input = s.credit;
+            } else {
+                input.token = s.config.destination;
+                input.seq = s.sequence.pending()[i].seq;
+                if (fin) {
+                    input.type = WireFrameType::kControl;
+                    input.control = WireControlType::kFin;
+                    input.session = s.config.session.session;
+                } else {
+                    input.data = view.subspan(s.header, r.bytes);
+                }
+            }
+            const auto encoded = EncodeWireHeader(input, view.first(control || fin ? r.wire_bytes : s.header));
+            if (!encoded) {
+                prepared = false;
+                break;
+            }
+            r.imm = encoded->imm_data;
         }
-        const auto encoded = EncodeWireHeader(input, view->first(control || fin ? r.wire_bytes : s.header));
-        if (!encoded) {
-            prepared = false;
-            break;
-        }
-        r.imm = encoded->imm_data;
         const auto pin = s.imports->Retain(s.endpoint);
         if (!pin) {
             prepared = false;
@@ -490,32 +609,48 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexc
             break;
         }
         r.endpoint = *pin;
-        const auto dma = s.slab->Reserve(r.lease, memory::BufferUse::kLocalDma);
-        if (!dma) {
-            prepared = false;
-            preparation_exhausted = dma.error().code == memory::MemoryErrorCode::kExhausted;
-            break;
+        std::size_t sge_count = 0;
+        if (r.lease.generation) {
+            if (!r.source.generation) {
+                const auto dma = s.slab->Reserve(r.lease, memory::BufferUse::kLocalDma);
+                if (!dma) {
+                    prepared = false;
+                    preparation_exhausted = dma.error().code == memory::MemoryErrorCode::kExhausted;
+                    break;
+                }
+                r.dma = *dma;
+            }
+            const auto sge =
+                s.slab->Sge(r.dma, s.config.local_context, 0, r.source.generation ? s.header : r.wire_bytes);
+            if (!sge) {
+                prepared = false;
+                break;
+            }
+            s.sges[i][sge_count++] = *sge;
         }
-        r.dma = *dma;
-        const auto sge = s.slab->Sge(*dma, s.config.local_context, 0, r.wire_bytes);
-        if (!sge) {
-            prepared = false;
-            break;
+        if (r.source.generation) {
+            // 从入队到 post 始终保留源 Reserved 责任；应用可已归还 CPU，不能重新申请 CPU 视图。
+            const auto source_sge = s.slab->Sge(r.source_dma, s.config.local_context, r.source_offset, r.bytes);
+            if (!source_sge) {
+                prepared = false;
+                break;
+            }
+            s.sges[i][sge_count++] = *source_sge;
         }
-        s.sges[i] = *sge;
         r.metadata = {.connection_id = s.config.connection_id,
                       .operation_id = s.batch[i] + 1,
                       .operation_generation = r.generation,
                       .target = *target,
                       .opcode = URMA_OPC_SEND_IMM,
-                      .buffer_lease = r.lease.generation};
-        s.requests[i] = {.metadata = r.metadata, .sges = std::span(&s.sges[i], 1), .imm_data = r.imm, .remote = {}};
+                      .buffer_lease = r.source.generation ? r.source.generation : r.lease.generation};
+        s.requests[i] = {
+            .metadata = r.metadata, .sges = std::span(s.sges[i]).first(sge_count), .imm_data = r.imm, .remote = {}};
     }
     auto cancel_prepared = [&]() noexcept {
         bool valid = true;
         for (std::size_t i = 0; i < count; ++i) {
             auto& r = s.records[s.batch[i]];
-            if (r.dma.sequence) {
+            if (r.dma.sequence && !r.source.generation) {
                 if (s.slab->Cancel(r.dma)) {
                     r.dma = {};
                 } else {
@@ -565,14 +700,27 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexc
             r.id = s.ids[i];
             r.posted = true;
             r.consumed_last_control = consumes_last_control && accepted && i < *accepted;
-            if (s.slab->Commit(r.dma)) {
-                r.committed = true;
-            } else {
-                accounting_ok = false;
+            if (r.dma.sequence) {
+                if (s.slab->Commit(r.dma)) {
+                    r.committed = true;
+                } else {
+                    accounting_ok = false;
+                }
+            }
+            if (r.source_dma.sequence) {
+                if (s.slab->Commit(r.source_dma)) {
+                    r.source_committed = true;
+                } else {
+                    accounting_ok = false;
+                }
             }
             if (uncertain || !accounting_ok) {
-                const auto quarantined = s.slab->Quarantine(r.lease);
-                accounting_ok = quarantined.has_value() && accounting_ok;
+                if (r.lease.generation) {
+                    accounting_ok = s.slab->Quarantine(r.lease).has_value() && accounting_ok;
+                }
+                if (r.source.generation) {
+                    accounting_ok = s.slab->Quarantine(r.source).has_value() && accounting_ok;
+                }
             }
             if (r.cpu) {
                 if (s.slab->ReleaseCpu(r.lease)) {
@@ -586,11 +734,14 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexc
                 s.Pop();
             }
         } else {
-            if (s.slab->Cancel(r.dma)) {
-                r.dma = {};
-            } else {
-                accounting_ok = false;
+            if (r.dma.sequence && !r.source.generation) {
+                if (s.slab->Cancel(r.dma)) {
+                    r.dma = {};
+                } else {
+                    accounting_ok = false;
+                }
             }
+            // 源与扩展头责任仍覆盖未提交后缀，不能随本次 post 的临时预留一起撤销。
             if (s.imports->Release(r.endpoint)) {
                 r.endpoint = {};
             } else {
@@ -621,8 +772,14 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexc
         for (std::size_t i = 0; i < count; ++i) {
             auto& r = s.records[s.batch[i]];
             if (r.active && r.posted) {
-                const auto quarantined = s.slab->Quarantine(r.lease);
-                static_cast<void>(quarantined);
+                if (r.lease.generation) {
+                    const auto quarantined = s.slab->Quarantine(r.lease);
+                    static_cast<void>(quarantined);
+                }
+                if (r.source.generation) {
+                    const auto quarantined = s.slab->Quarantine(r.source);
+                    static_cast<void>(quarantined);
+                }
             }
         }
         Fail();
@@ -661,7 +818,9 @@ std::expected<void, EagerTxError> EagerTxStream::OnCompletion(const raw::TxCompl
     const auto& metadata = event.record->metadata;
     if (!r.active || !r.posted || !r.id || r.id != event.record->id || metadata.operation_generation != r.generation ||
         metadata.target != r.metadata.target || metadata.opcode != URMA_OPC_SEND_IMM ||
-        metadata.buffer_lease != r.lease.generation || metadata.grant_lease || !metadata.signaled || !r.committed) {
+        metadata.buffer_lease != (r.source.generation ? r.source.generation : r.lease.generation) ||
+        metadata.grant_lease || !metadata.signaled || (r.lease.generation && !r.committed) ||
+        (r.source.generation && !r.source_committed)) {
         return Error(EagerTxErrorCode::kInvalidCompletion);
     }
     const bool terminal_failed = event.completion.status != URMA_CR_SUCCESS || event.error.has_value();
@@ -677,12 +836,22 @@ std::expected<void, EagerTxError> EagerTxStream::OnCompletion(const raw::TxCompl
             peer_frozen = s.config.advertised_credits->FreezePeer(s.config.advertised_peer).has_value();
         }
     }
-    if (!s.slab->CompleteDma(r.dma)) {
-        Fail();
-        return Error(EagerTxErrorCode::kAccounting);
+    if (r.source_dma.sequence) {
+        if (!s.slab->CompleteDma(r.source_dma)) {
+            Fail();
+            return Error(EagerTxErrorCode::kAccounting);
+        }
+        r.source_dma = {};
+        r.source_committed = false;
     }
-    r.dma = {};
-    r.committed = false;
+    if (r.dma.sequence) {
+        if (!s.slab->CompleteDma(r.dma)) {
+            Fail();
+            return Error(EagerTxErrorCode::kAccounting);
+        }
+        r.dma = {};
+        r.committed = false;
+    }
     r.posted = false;
     --s.stats.in_flight;
     ++s.stats.retired;

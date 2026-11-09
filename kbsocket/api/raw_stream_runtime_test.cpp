@@ -11,11 +11,14 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <optional>
 #include <thread>
+#include <utility>
 
 #include <gtest/gtest.h>
 
+#include "kbsocket/api/lease_send.h"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
 
 namespace kbsocket {
@@ -42,6 +45,10 @@ protected:
         std::deque<Receive> posted;
         std::array<std::deque<urma_cr_t>, 2> completed;
         bool hold_tx = false;
+        std::size_t posted_sends = 0;
+        std::uint64_t last_source_address = 0;
+        urma_target_seg_t* last_source_segment = nullptr;
+        std::uint32_t last_source_sges = 0;
         std::atomic<bool> block_import{false};
         std::atomic<unsigned> imports{0};
         std::size_t callbacks = 0, commands = 0, withdrawals = 0, exports = 0, puts = 0;
@@ -186,6 +193,10 @@ protected:
                     *bad = wr;
                     return URMA_ENOMEM;
                 }
+                ++e.posted_sends;
+                e.last_source_address = wr->send.src.sge[0].addr;
+                e.last_source_segment = wr->send.src.sge[0].tseg;
+                e.last_source_sges = wr->send.src.num_sge;
                 auto receive = peer.posted.front();
                 peer.posted.pop_front();
                 std::size_t bytes = 0;
@@ -614,6 +625,175 @@ TEST_F(RawStreamRuntimeTest, ApplicationBuffersShareRegisteredBackingWithoutDisr
     Transfer();
 }
 
+TEST_F(RawStreamRuntimeTest, LeaseWritePostsApplicationAddressAndRetainsSourceUntilActualCqe) {
+    ASSERT_TRUE(runtime_.OpenBuffers({906, 2}));
+    auto* buffers = runtime_.buffers();
+    Activate();
+    kbs_buffer_handle buffer{};
+    ASSERT_EQ(kbs_buffer_acquire(buffers, 17, &buffer, nullptr), 0);
+    kbs_buffer_view writable{};
+    ASSERT_EQ(kbs_buffer_writable(buffers, buffer, &writable, nullptr), 0);
+    for (std::size_t i = 0; i < writable.size; ++i) {
+        static_cast<std::byte*>(writable.data)[i] = static_cast<std::byte>(i + 1);
+    }
+    const auto source_address = reinterpret_cast<std::uintptr_t>(writable.data) + 2;
+    const auto before = runtime_.Inspect();
+    ASSERT_TRUE(before);
+    endpoints_[0].hold_tx = true;
+    kbs_stream_io io{};
+    ASSERT_EQ(kbs_stream_write_lease(runtime_.table(0), endpoints_[0].streams[0], buffers, buffer, 2, 8, &io, nullptr),
+              0);
+    EXPECT_EQ(io.bytes, 3u); // 公开表的 max_io_bytes=3，只接受有界前缀。
+    kbs_buffer_status status{};
+    ASSERT_EQ(kbs_buffer_inspect(buffers, buffer, &status, nullptr), 0);
+    EXPECT_EQ(status.bytes, 17u);
+    EXPECT_EQ(status.source_reusable, 0u);
+    EXPECT_EQ(kbs_buffer_writable(buffers, buffer, &writable, nullptr), KBS_STREAM_BUSY);
+    kbs_buffer_const_view readable{};
+    EXPECT_EQ(kbs_buffer_readable(buffers, buffer, &readable, nullptr), KBS_STREAM_BUSY);
+    io = {99, 1, 1};
+    EXPECT_EQ(kbs_stream_write_lease(runtime_.table(0), endpoints_[0].streams[0], buffers, buffer, 5, 3, &io, nullptr),
+              KBS_STREAM_BUSY);
+    EXPECT_EQ(io.bytes, 0u);
+    EXPECT_EQ(io.eof, 0u);
+    EXPECT_EQ(io.reserved, 0u);
+    ASSERT_TRUE(Until([&] { return Status(1)->rx_pending != 0; }));
+    EXPECT_EQ(endpoints_[0].last_source_address, source_address);
+    ASSERT_NE(endpoints_[0].last_source_segment, nullptr);
+    EXPECT_EQ(endpoints_[0].last_source_segment->urma_ctx, &endpoints_[0].context);
+    EXPECT_LE(endpoints_[0].last_source_segment->seg.ubva.va, source_address);
+    EXPECT_GE(endpoints_[0].last_source_segment->seg.ubva.va + endpoints_[0].last_source_segment->seg.len,
+              source_address + 3);
+    EXPECT_EQ(endpoints_[0].last_source_sges, 1u);
+    std::array<std::byte, 3> wire{};
+    ASSERT_EQ(
+        kbs_stream_read(runtime_.table(1), endpoints_[1].streams[0], wire.data(), wire.size(), Now(), &io, nullptr), 0);
+    EXPECT_EQ(wire, (std::array<std::byte, 3>{std::byte{3}, std::byte{4}, std::byte{5}}));
+    // 远端已经读取仍不能替代本地 TX 终态；CPU 句柄一直保留且没有 payload staging 副本。
+    ASSERT_EQ(kbs_buffer_inspect(buffers, buffer, &status, nullptr), 0);
+    EXPECT_EQ(status.source_reusable, 0u);
+    ASSERT_FALSE(endpoints_[0].completed[0].empty());
+    endpoints_[0].hold_tx = false;
+    ASSERT_TRUE(Until([&] { return Status(0)->tx_pending == 0; }));
+    ASSERT_EQ(kbs_buffer_inspect(buffers, buffer, &status, nullptr), 0);
+    EXPECT_EQ(status.source_reusable, 1u);
+    ASSERT_EQ(kbs_buffer_readable(buffers, buffer, &readable, nullptr), 0);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(readable.data) + 2, source_address);
+    EXPECT_EQ(static_cast<const std::byte*>(readable.data)[16], std::byte{17});
+    ASSERT_EQ(kbs_buffer_release(buffers, buffer, nullptr), 0);
+}
+
+TEST_F(RawStreamRuntimeTest, LeaseWriteRangeAndForeignSourceRejectBeforeQueueMutation) {
+    ASSERT_TRUE(runtime_.OpenBuffers({907, 2}));
+    auto* buffers = runtime_.buffers();
+    Activate();
+    kbs_buffer_handle buffer{};
+    ASSERT_EQ(kbs_buffer_acquire(buffers, 17, &buffer, nullptr), 0);
+    const auto before = runtime_.Inspect();
+    ASSERT_TRUE(before);
+    for (const auto [offset, length] : std::array<std::pair<std::size_t, std::size_t>, 4>{
+             {{0, 0}, {17, 1}, {16, 2}, {std::numeric_limits<std::size_t>::max(), 2}}}) {
+        kbs_stream_io io{99, 1, 1};
+        EXPECT_EQ(kbs_stream_write_lease(runtime_.table(0), endpoints_[0].streams[0], buffers, buffer, offset, length,
+                                         &io, nullptr),
+                  KBS_STREAM_INVALID_ARGUMENT);
+        EXPECT_EQ(io.bytes, 0u);
+        EXPECT_EQ(io.eof, 0u);
+        EXPECT_EQ(io.reserved, 0u);
+    }
+    BufferBinding foreign;
+    ASSERT_TRUE(foreign.OpenHost({KBS_BUFFER_ABI_VERSION, 0, 909, 1, 0, 64, 1u << 20}));
+    const auto cpu_only = foreign.Acquire(17);
+    ASSERT_TRUE(cpu_only);
+    kbs_stream_io io{};
+    EXPECT_EQ(kbs_stream_write_lease(runtime_.table(0), endpoints_[0].streams[0], foreign.table(), *cpu_only, 0, 3, &io,
+                                     nullptr),
+              KBS_STREAM_INVALID_ARGUMENT);
+    const auto after = runtime_.Inspect();
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->slab.local_dma, before->slab.local_dma);
+    EXPECT_EQ(Status(0)->tx_pending, 0u);
+    kbs_buffer_status status{};
+    ASSERT_EQ(kbs_buffer_inspect(buffers, buffer, &status, nullptr), 0);
+    EXPECT_EQ(status.source_reusable, 1u);
+    ASSERT_TRUE(foreign.Release(*cpu_only));
+    ASSERT_TRUE(foreign.Close());
+    ASSERT_EQ(kbs_buffer_release(buffers, buffer, nullptr), 0);
+}
+
+TEST_F(RawStreamRuntimeTest, CancellingQueuedLeaseReleasesSourceWithoutPosting) {
+    ASSERT_TRUE(runtime_.OpenBuffers({910, 1}));
+    auto* buffers = runtime_.buffers();
+    Activate();
+    kbs_buffer_handle buffer{};
+    ASSERT_EQ(kbs_buffer_acquire(buffers, 3, &buffer, nullptr), 0);
+    const auto sends = endpoints_[0].posted_sends;
+    kbs_stream_io io{};
+    ASSERT_EQ(kbs_stream_write_lease(runtime_.table(0), endpoints_[0].streams[0], buffers, buffer, 0, 3, &io, nullptr),
+              0);
+    ASSERT_EQ(kbs_stream_cancel(runtime_.table(0), endpoints_[0].streams[0], nullptr), 0);
+    EXPECT_EQ(endpoints_[0].posted_sends, sends);
+    kbs_buffer_status status{};
+    ASSERT_EQ(kbs_buffer_inspect(buffers, buffer, &status, nullptr), 0);
+    EXPECT_EQ(status.source_reusable, 1u);
+    EXPECT_EQ(Status(0)->state, KBS_STREAM_FAILED);
+    ASSERT_EQ(kbs_buffer_release(buffers, buffer, nullptr), 0);
+}
+
+TEST_F(RawStreamRuntimeTest, CancellingPostedLeaseKeepsSourceBusyUntilErrorCompletionRetires) {
+    ASSERT_TRUE(runtime_.OpenBuffers({911, 1}));
+    auto* buffers = runtime_.buffers();
+    Activate();
+    kbs_buffer_handle buffer{};
+    ASSERT_EQ(kbs_buffer_acquire(buffers, 3, &buffer, nullptr), 0);
+    endpoints_[0].hold_tx = true;
+    kbs_stream_io io{};
+    ASSERT_EQ(kbs_stream_write_lease(runtime_.table(0), endpoints_[0].streams[0], buffers, buffer, 0, 3, &io, nullptr),
+              0);
+    ASSERT_TRUE(Until([&] { return !endpoints_[0].completed[0].empty(); }));
+    ASSERT_EQ(kbs_stream_cancel(runtime_.table(0), endpoints_[0].streams[0], nullptr), 0);
+    kbs_buffer_status status{};
+    ASSERT_EQ(kbs_buffer_inspect(buffers, buffer, &status, nullptr), 0);
+    EXPECT_EQ(status.source_reusable, 0u);
+    EXPECT_EQ(Status(0)->state, KBS_STREAM_FAILED);
+    // 连接取消不是 DMA 终态；可信 status 8 CQE 到达后才允许重新访问源。
+    endpoints_[0].completed[0].front().status = URMA_CR_REM_ACCESS_ABORT_ERR;
+    endpoints_[0].hold_tx = false;
+    ASSERT_TRUE(Until([&] { return Status(0)->tx_pending == 0; }));
+    ASSERT_EQ(kbs_buffer_inspect(buffers, buffer, &status, nullptr), 0);
+    EXPECT_EQ(status.source_reusable, 1u);
+    EXPECT_EQ(Status(0)->state, KBS_STREAM_FAILED);
+    ASSERT_EQ(kbs_buffer_release(buffers, buffer, nullptr), 0);
+}
+
+TEST_F(RawStreamRuntimeTest, ReturningCpuHandleWhilePostedKeepsDmaAliveAndInvalidatesQueries) {
+    ASSERT_TRUE(runtime_.OpenBuffers({912, 1}));
+    auto* buffers = runtime_.buffers();
+    Activate();
+    kbs_buffer_handle buffer{};
+    ASSERT_EQ(kbs_buffer_acquire(buffers, 3, &buffer, nullptr), 0);
+    endpoints_[0].hold_tx = true;
+    kbs_stream_io io{};
+    ASSERT_EQ(kbs_stream_write_lease(runtime_.table(0), endpoints_[0].streams[0], buffers, buffer, 0, 3, &io, nullptr),
+              0);
+    ASSERT_TRUE(Until([&] { return !endpoints_[0].completed[0].empty(); }));
+    const auto before = runtime_.Inspect();
+    ASSERT_TRUE(before);
+    ASSERT_EQ(kbs_buffer_release(buffers, buffer, nullptr), 0);
+    const auto after = runtime_.Inspect();
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->slab.local_dma, before->slab.local_dma);
+    EXPECT_EQ(after->slab.available, before->slab.available);
+    EXPECT_EQ(after->slab.cpu_leases + 1, before->slab.cpu_leases);
+    kbs_buffer_status status{99, 1, 1};
+    EXPECT_EQ(kbs_buffer_inspect(buffers, buffer, &status, nullptr), KBS_STREAM_INVALID_HANDLE);
+    EXPECT_EQ(status.bytes, 0u);
+    EXPECT_EQ(status.source_reusable, 0u);
+    endpoints_[0].hold_tx = false;
+    ASSERT_TRUE(Until([&] { return Status(0)->tx_pending == 0; }));
+    EXPECT_EQ(runtime_.Inspect()->slab.local_dma, before->slab.local_dma - 1);
+}
+
 TEST_F(RawStreamRuntimeTest, ApplicationLeaseBlocksPhysicalCloseUntilReturnedAfterStop) {
     ASSERT_TRUE(runtime_.OpenBuffers({903, 2}));
     auto* buffers = runtime_.buffers();
@@ -668,6 +848,11 @@ TEST_F(RawStreamRuntimeTest, SharedBufferOperationsWaitForOtherContextControlPau
     kbs_buffer_const_view readable{};
     EXPECT_EQ(kbs_buffer_readable(buffers, handle, &readable, nullptr), KBS_STREAM_BUSY);
     EXPECT_EQ(readable.data, nullptr);
+    kbs_buffer_status status{99, 1, 1};
+    EXPECT_EQ(kbs_buffer_inspect(buffers, handle, &status, nullptr), KBS_STREAM_BUSY);
+    EXPECT_EQ(status.bytes, 0u);
+    EXPECT_EQ(status.source_reusable, 0u);
+    EXPECT_EQ(status.reserved, 0u);
     EXPECT_EQ(kbs_buffer_release(buffers, handle, nullptr), KBS_STREAM_BUSY);
     EXPECT_FALSE(runtime_.BeginClose());
 

@@ -227,6 +227,37 @@ TEST(BufferBindingTest, BusyCloseStopsWritesButKeepsReadonlyAndReturnAvailable) 
     EXPECT_EQ(out.size, 0u);
 }
 
+TEST(BufferBindingTest, InspectTracksExactLengthAndSurvivesStopButRejectsStaleAndClosedIdentity) {
+    BufferBinding binding;
+    ASSERT_TRUE(binding.OpenHost(HostConfig()));
+    const auto handle = binding.Acquire(17);
+    ASSERT_TRUE(handle);
+    auto* table = binding.table();
+    kbs_buffer_status status{99, 0, 99};
+    kbs_stream_error error{};
+    ASSERT_EQ(kbs_buffer_inspect(table, *handle, &status, &error), 0);
+    EXPECT_EQ(status.bytes, 17u);
+    EXPECT_EQ(status.source_reusable, 1u);
+    EXPECT_EQ(status.reserved, 0u);
+    EXPECT_EQ(error.code, 0);
+    EXPECT_EQ(kbs_buffer_inspect(table, *handle, nullptr, &error), KBS_STREAM_INVALID_ARGUMENT);
+    binding.StopAccepting();
+    ASSERT_EQ(kbs_buffer_inspect(table, *handle, &status, nullptr), 0);
+    EXPECT_EQ(status.source_reusable, 1u);
+    ASSERT_TRUE(binding.Release(*handle));
+    status = {99, 1, 99};
+    EXPECT_EQ(kbs_buffer_inspect(table, *handle, &status, nullptr), KBS_STREAM_INVALID_HANDLE);
+    EXPECT_EQ(status.bytes, 0u);
+    EXPECT_EQ(status.source_reusable, 0u);
+    EXPECT_EQ(status.reserved, 0u);
+    ASSERT_TRUE(binding.Close());
+    status = {99, 1, 99};
+    EXPECT_EQ(kbs_buffer_inspect(table, *handle, &status, nullptr), KBS_STREAM_NOT_READY);
+    EXPECT_EQ(status.bytes, 0u);
+    EXPECT_EQ(status.source_reusable, 0u);
+    EXPECT_EQ(status.reserved, 0u);
+}
+
 TEST(BufferBindingTest, PreallocatedFastPathDoesNotAllocate) {
     BufferBinding binding;
     ASSERT_TRUE(binding.OpenHost(HostConfig()));
@@ -238,10 +269,12 @@ TEST(BufferBindingTest, PreallocatedFastPathDoesNotAllocate) {
         kbs_buffer_handle handle{};
         kbs_buffer_view writable{};
         kbs_buffer_const_view readable{};
+        kbs_buffer_status status{};
         if (kbs_buffer_acquire(binding.table(), 32, &handle, nullptr) ||
             kbs_buffer_writable(binding.table(), handle, &writable, nullptr) ||
             kbs_buffer_readable(binding.table(), handle, &readable, nullptr) ||
-            kbs_buffer_release(binding.table(), handle, nullptr)) {
+            kbs_buffer_inspect(binding.table(), handle, &status, nullptr) || status.bytes != 32 ||
+            status.source_reusable != 1 || kbs_buffer_release(binding.table(), handle, nullptr)) {
             success = false;
             break;
         }
@@ -371,6 +404,33 @@ TEST_F(RegisteredBufferBindingTest, CpuReturnDoesNotEndDmaOrRemoteGrant) {
     EXPECT_EQ(slab_.stats().available, 3u);
 }
 
+TEST_F(RegisteredBufferBindingTest, InspectWaitsForEveryReservedAndCommittedSourceResponsibility) {
+    ASSERT_TRUE(binding_.OpenSlab(slab_, {25, 1}));
+    const auto handle = binding_.Acquire(32);
+    ASSERT_TRUE(handle);
+    const auto lease = binding_.Resolve(*handle);
+    ASSERT_TRUE(lease);
+    const auto dma = slab_.Reserve(*lease, memory::BufferUse::kLocalDma);
+    const auto grant = slab_.Reserve(*lease, memory::BufferUse::kRemoteGrant);
+    ASSERT_TRUE(dma);
+    ASSERT_TRUE(grant);
+    kbs_buffer_status status{};
+    // 尚未提交的队列责任也禁止源复用；查询成功不等于能够取视图。
+    ASSERT_EQ(kbs_buffer_inspect(binding_.table(), *handle, &status, nullptr), 0);
+    EXPECT_EQ(status.bytes, 32u);
+    EXPECT_EQ(status.source_reusable, 0u);
+    ASSERT_TRUE(slab_.Commit(*dma));
+    ASSERT_TRUE(slab_.Commit(*grant));
+    ASSERT_TRUE(slab_.CompleteDma(*dma));
+    ASSERT_EQ(kbs_buffer_inspect(binding_.table(), *handle, &status, nullptr), 0);
+    EXPECT_EQ(status.source_reusable, 0u);
+    ASSERT_TRUE(slab_.EndGrant(*grant));
+    ASSERT_EQ(kbs_buffer_inspect(binding_.table(), *handle, &status, nullptr), 0);
+    EXPECT_EQ(status.source_reusable, 1u);
+    EXPECT_TRUE(binding_.Writable(*handle));
+    ASSERT_TRUE(binding_.Release(*handle));
+}
+
 TEST_F(RegisteredBufferBindingTest, QuarantinedLeaseCannotBeViewedButCpuCanReturn) {
     ASSERT_TRUE(binding_.OpenSlab(slab_, {24, 1}));
     const auto handle = binding_.Acquire(20);
@@ -378,6 +438,10 @@ TEST_F(RegisteredBufferBindingTest, QuarantinedLeaseCannotBeViewedButCpuCanRetur
     const auto lease = binding_.Resolve(*handle);
     ASSERT_TRUE(lease);
     ASSERT_TRUE(slab_.Quarantine(*lease));
+    kbs_buffer_status status{};
+    ASSERT_EQ(kbs_buffer_inspect(binding_.table(), *handle, &status, nullptr), 0);
+    EXPECT_EQ(status.bytes, 20u);
+    EXPECT_EQ(status.source_reusable, 0u);
     ExpectError(binding_.Readable(*handle), KBS_STREAM_BUSY);
     ExpectError(binding_.Writable(*handle), KBS_STREAM_BUSY);
     ASSERT_TRUE(binding_.Release(*handle));

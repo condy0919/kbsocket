@@ -200,6 +200,7 @@ SlabStats SlabAllocator::stats() const noexcept {
     auto stats = state_->stats;
     stats.quarantined_buffers = state_->quarantine.size();
     stats.quarantined_bytes = state_->quarantine.bytes();
+    stats.available_references = state_->config.max_references - stats.local_dma - stats.remote_grants;
     return stats;
 }
 std::expected<std::uint32_t, MemoryError> SlabAllocator::Find(BufferLease lease) const noexcept {

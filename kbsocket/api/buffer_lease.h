@@ -29,6 +29,14 @@ typedef struct kbs_buffer_const_view {
     size_t size;
 } kbs_buffer_const_view;
 
+// 当前整份 Lease 的源可复用状态，独立于 stream 成败；不是远端接收/消费确认。
+// source_reusable=0 表示仍有责任或隔离，继续推进后查询；暂停/无效句柄则返回错误，不伪造快照。
+typedef struct kbs_buffer_status {
+    uint64_t bytes;
+    uint32_t source_reusable;
+    uint32_t reserved;
+} kbs_buffer_status;
+
 // NativeTCP 可选 CPU 内存池；初始化时分配并预触页，不向 URMA 注册或承诺 DMA 能力。
 // table_id 由宿主保证跨表/生命周期不复用。预算只计页取整 backing，不含元数据。
 typedef struct kbs_buffer_pool_config {
@@ -49,6 +57,8 @@ int32_t kbs_buffer_writable(kbs_buffer_table* table, kbs_buffer_handle buffer, k
                             kbs_stream_error* error);
 int32_t kbs_buffer_readable(kbs_buffer_table* table, kbs_buffer_handle buffer, kbs_buffer_const_view* out,
                             kbs_stream_error* error);
+int32_t kbs_buffer_inspect(kbs_buffer_table* table, kbs_buffer_handle buffer, kbs_buffer_status* out,
+                           kbs_stream_error* error);
 // 成功立即失效全部句柄/视图副本；仅归还 CPU 所有权，不代表 DMA/Grant 已结束或 backing 可复用。
 // 失败保留句柄供 owner 重试；跨线程归还须交给 owner，不得并发调用此入口。
 int32_t kbs_buffer_release(kbs_buffer_table* table, kbs_buffer_handle buffer, kbs_stream_error* error);

@@ -424,6 +424,26 @@ std::expected<std::size_t, ConnectionError> Connection::Write(std::span<const st
     }
     return *result;
 }
+std::expected<std::size_t, ConnectionError> Connection::WriteLease(memory::BufferLease source, std::size_t offset,
+                                                                   std::size_t bytes) noexcept {
+    if (failure_) {
+        return std::unexpected(*failure_);
+    }
+    if (state_ != ConnectionState::kRawActive) {
+        return Error(ConnectionErrorCode::kNotReady);
+    }
+    const auto result = tx_.WriteLease(source, offset, bytes);
+    if (!result) {
+        if (tx_.stats().failed) {
+            return std::unexpected(Fail(TxError(result.error())));
+        }
+        return std::unexpected(TxError(result.error()));
+    }
+    if (tx_.stats().failed) {
+        (void)Fail({ConnectionErrorCode::kTx});
+    }
+    return *result;
+}
 std::expected<ConnectionReadResult, ConnectionError> Connection::Read(std::span<std::byte> output,
                                                                       std::uint64_t now_ns) noexcept {
     if (failure_) {

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MulanPSL-2.0
+#include "kbsocket/api/lease_send.h"
 #include "kbsocket/api/stream.h"
 
 // 在 C 编译单元校验 ABI 布局并链接实际 C 符号，不依靠 C++ 的兼容解析。
@@ -30,6 +31,13 @@ int KbsStreamCHeaderTest(void) {
         kbs_stream_close(NULL, stream, NULL) != KBS_STREAM_INVALID_ARGUMENT ||
         kbs_stream_release(NULL, stream, NULL) != KBS_STREAM_INVALID_ARGUMENT) {
         return 2;
+    }
+    const kbs_buffer_handle buffer = {0};
+    io.bytes = 99;
+    io.eof = io.reserved = 1;
+    if (kbs_stream_write_lease(NULL, stream, NULL, buffer, 0, 1, &io, &error) != KBS_STREAM_INVALID_ARGUMENT ||
+        io.bytes != 0 || io.eof != 0 || io.reserved != 0 || error.code != KBS_STREAM_INVALID_ARGUMENT) {
+        return 3;
     }
     return 0;
 }

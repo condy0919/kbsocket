@@ -7,6 +7,7 @@
 #include <limits>
 #include <new>
 
+#include "kbsocket/api/buffer_binding.hpp"
 #include "kbsocket/api/stream_error.hpp"
 
 // 不把 C++ 对象布局暴露给 C；指针有效期为绑定对象存活期，Close 后仍能拒绝旧调用。
@@ -392,6 +393,48 @@ std::expected<std::size_t, kbs_stream_error> StreamBinding::Write(kbs_stream_han
     }
     return *written;
 }
+std::expected<std::size_t, kbs_stream_error> StreamBinding::WriteLease(kbs_stream_handle stream,
+                                                                       kbs_buffer_table* buffers,
+                                                                       kbs_buffer_handle buffer, std::size_t offset,
+                                                                       std::size_t bytes) noexcept {
+    if (!state_) {
+        return Error(KBS_STREAM_NOT_READY);
+    }
+    const auto slot = state_->Find(stream);
+    if (!slot) {
+        return std::unexpected(slot.error());
+    }
+    const auto status = state_->Inspect(**slot);
+    if (!status) {
+        return std::unexpected(status.error());
+    }
+    if (const auto active = Active(*status); !active) {
+        return std::unexpected(active.error());
+    }
+    if (!state_->stack || status->state != connection::ConnectionState::kRawActive) {
+        return Error(KBS_STREAM_NOT_SUPPORTED);
+    }
+    if (status->tx.write_shutdown) {
+        return Error(KBS_STREAM_CLOSED);
+    }
+    // 源池由全部 context 共享，当前流所在 context 可用不足以允许访问源元数据。
+    const auto shared = state_->stack->shared();
+    if (!shared) {
+        return std::unexpected(MapStreamError(shared.error()));
+    }
+    const auto source = BufferBinding::Resolve(buffers, buffer, offset, bytes);
+    if (!source) {
+        return std::unexpected(source.error());
+    }
+    if (source->allocator != shared->slab) {
+        return Error(KBS_STREAM_INVALID_ARGUMENT);
+    }
+    const auto written =
+        state_->owner->WriteLease((*slot)->connection, *source, offset, std::min(bytes, state_->config.max_io_bytes));
+    state_->Refresh(**slot);
+    return written ? std::expected<std::size_t, kbs_stream_error>{*written}
+                   : std::unexpected(MapStreamError(written.error()));
+}
 std::expected<kbs_stream_io, kbs_stream_error>
 StreamBinding::Read(kbs_stream_handle stream, std::span<std::byte> output, std::uint64_t now_ns) noexcept {
     if (!state_) {
@@ -627,6 +670,22 @@ int32_t Finish(const std::expected<void, kbs_stream_error>& result, kbs_stream_e
 }
 } // namespace
 extern "C" {
+int32_t kbs_stream_write_lease(kbs_stream_table* table, kbs_stream_handle stream, kbs_buffer_table* buffers,
+                               kbs_buffer_handle buffer, size_t offset, size_t length, kbs_stream_io* out,
+                               kbs_stream_error* error) {
+    if (out) {
+        *out = {};
+    }
+    if (!table || !buffers || !out || !length) {
+        return Invalid(error);
+    }
+    const auto result = table->binding->WriteLease(stream, buffers, buffer, offset, length);
+    if (!result) {
+        return Report(result.error(), error);
+    }
+    out->bytes = *result;
+    return Report({}, error);
+}
 int32_t kbs_stream_write(kbs_stream_table* table, kbs_stream_handle stream, const void* data, size_t length,
                          kbs_stream_io* out, kbs_stream_error* error) {
     if (out) {

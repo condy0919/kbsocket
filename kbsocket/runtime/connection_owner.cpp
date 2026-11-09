@@ -273,6 +273,21 @@ ConnectionOwner::Read(OwnedConnection handle, std::span<std::byte> output, std::
     return read ? std::expected<connection::ConnectionReadResult, ConnectionOwnerError>{*read}
                 : ConnectionError(read.error());
 }
+std::expected<std::size_t, ConnectionOwnerError> ConnectionOwner::WriteLease(OwnedConnection handle,
+                                                                             memory::BufferLease source,
+                                                                             std::size_t offset,
+                                                                             std::size_t bytes) noexcept {
+    if (!state_) {
+        return Error(Code::kNotReady);
+    }
+    // 先取得调度责任，再接受源 Lease；Wake 失败不能发生在接受字节之后。
+    const auto slot = state_->Wake(handle);
+    if (!slot) {
+        return std::unexpected(slot.error());
+    }
+    const auto written = (*slot)->connection->WriteLease(source, offset, bytes);
+    return written ? std::expected<std::size_t, ConnectionOwnerError>{*written} : ConnectionError(written.error());
+}
 std::expected<void, ConnectionOwnerError> ConnectionOwner::ShutdownWrite(OwnedConnection handle) noexcept {
     if (!state_) {
         return Error(Code::kNotReady);

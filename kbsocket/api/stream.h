@@ -36,6 +36,7 @@ typedef struct kbs_stream_handle {
 #define KBS_STREAM_TRANSPORT 13
 #define KBS_STREAM_RETAINED 14
 #define KBS_STREAM_TIMEOUT 15
+#define KBS_STREAM_NOT_SUPPORTED 16
 
 #define KBS_STREAM_ORIGIN_API 0u
 #define KBS_STREAM_ORIGIN_OWNER 1u

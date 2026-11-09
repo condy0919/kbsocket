@@ -15,6 +15,7 @@
 #include "kbsocket/connection/connection_table.hpp"
 #include "kbsocket/control/connection_handshake.hpp"
 #include "kbsocket/control/raw_source_admission.hpp"
+#include "kbsocket/memory/buffer_lease.hpp"
 #include "kbsocket/runtime/connection_progress.hpp"
 #include "kbsocket/runtime/handshake_rx_sources.hpp"
 #include "kbsocket/runtime/rx_source_registry.hpp"
@@ -100,6 +101,8 @@ public:
     std::expected<void, ConnectionOwnerError> PrepareTcp(OwnedConnection handle) noexcept;
     std::expected<std::size_t, ConnectionOwnerError> Write(OwnedConnection handle,
                                                            std::span<const std::byte> input) noexcept;
+    std::expected<std::size_t, ConnectionOwnerError> WriteLease(OwnedConnection handle, memory::BufferLease source,
+                                                                std::size_t offset, std::size_t bytes) noexcept;
     std::expected<connection::ConnectionReadResult, ConnectionOwnerError>
     Read(OwnedConnection handle, std::span<std::byte> output, std::uint64_t now_ns) noexcept;
     std::expected<void, ConnectionOwnerError> ShutdownWrite(OwnedConnection handle) noexcept;

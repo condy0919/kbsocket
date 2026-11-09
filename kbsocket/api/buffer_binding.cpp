@@ -66,6 +66,7 @@ struct BufferBinding::State {
     struct Slot {
         memory::BufferLease lease;
         std::uint64_t generation = 0;
+        std::size_t bytes = 0;
         std::uint32_t next = kEnd;
     };
     struct Host {
@@ -245,6 +246,7 @@ std::expected<kbs_buffer_handle, kbs_stream_error> BufferBinding::Acquire(std::s
     state.free = slot.next;
     slot.lease = *lease;
     slot.generation = ++state.next_generation;
+    slot.bytes = bytes;
     slot.next = kEnd;
     ++state.published;
     return kbs_buffer_handle{state.config.table_id, slot.generation, index, 0};
@@ -297,6 +299,42 @@ std::expected<memory::BufferLease, kbs_stream_error> BufferBinding::Resolve(kbs_
         return Error(KBS_STREAM_STOPPED);
     }
     return state_->slots[buffer.slot].lease;
+}
+std::expected<memory::BufferLease, kbs_stream_error> BufferBinding::Resolve(kbs_buffer_table* table,
+                                                                            kbs_buffer_handle buffer,
+                                                                            std::size_t offset,
+                                                                            std::size_t bytes) noexcept {
+    if (!table || !bytes) {
+        return Error(KBS_STREAM_INVALID_ARGUMENT);
+    }
+    const auto view = table->binding->Readable(buffer);
+    if (!view) {
+        return std::unexpected(view.error());
+    }
+    if (offset > view->size() || bytes > view->size() - offset) {
+        return Error(KBS_STREAM_INVALID_ARGUMENT);
+    }
+    return table->binding->Resolve(buffer);
+}
+std::expected<kbs_buffer_status, kbs_stream_error> BufferBinding::Inspect(kbs_buffer_handle buffer) noexcept {
+    if (!state_) {
+        return Error(KBS_STREAM_NOT_READY);
+    }
+    const auto access = state_->Access();
+    if (!access) {
+        return std::unexpected(access.error());
+    }
+    const auto slot = state_->Find(buffer);
+    if (!slot) {
+        return std::unexpected(slot.error());
+    }
+    const auto view = (*access)->Readable((*slot)->lease);
+    if (!view && view.error().code != memory::MemoryErrorCode::kInUse) {
+        return std::unexpected(MemoryError(view.error()));
+    }
+    // 只在通过暂停/身份门禁后，把 Slab 的责任/隔离限制映射为“尚不可复用”。
+    // 停准入不改变 DMA 事实；可写访问还须单独通过 Writable 的准入检查。
+    return kbs_buffer_status{(*slot)->bytes, view ? 1u : 0u, 0};
 }
 std::expected<void, kbs_stream_error> BufferBinding::Release(kbs_buffer_handle buffer) noexcept {
     if (!state_) {
@@ -385,5 +423,20 @@ int32_t kbs_buffer_release(kbs_buffer_table* table, kbs_buffer_handle buffer, kb
     }
     const auto result = table->binding->Release(buffer);
     return Report(result ? kbs_stream_error{} : result.error(), error);
+}
+int32_t kbs_buffer_inspect(kbs_buffer_table* table, kbs_buffer_handle buffer, kbs_buffer_status* out,
+                           kbs_stream_error* error) {
+    if (out) {
+        *out = {};
+    }
+    if (!table || !out) {
+        return Invalid(error);
+    }
+    const auto result = table->binding->Inspect(buffer);
+    if (!result) {
+        return Report(result.error(), error);
+    }
+    *out = *result;
+    return Report({}, error);
 }
 }
