@@ -67,7 +67,8 @@ struct WriteRndvStats {
     bool acceptance_known = true;
 };
 
-/// 单 owner、单事务 WRITE 引擎：一次成功 Start 后不能重绑同一对象，也不发送 DONE 控制帧。
+/// 单 owner WRITE 引擎：独立使用时一次成功 Start 后不能重绑同一对象，也不发送 DONE 控制帧。
+/// 只有具备 SN/Grant 防重放账本的 WriteRndvPool 可在全部责任终结后复用内部预分配存储。
 /// Open 在控制路径预分配；Start 及其余数据路径无分配，持有每个源 SGE 的独立 DMA 责任。
 /// 源 CPU 所有权仍归应用，可在 Start 成功后归还，但所有旧 CPU 视图必须停止使用至相关 DMA 全部结束。
 /// 宿主认证 transfer/Grant 与远端 Arena、Jetty、段的绑定，并保证 connection_id/transaction_generation 不复用。
@@ -106,8 +107,13 @@ public:
     WriteRndvStats stats() const noexcept;
 
 private:
+    friend class WriteRndvPool;
     struct Chunk;
     struct State;
+    // 仅供有 SN/Grant 防重放账本的事务池使用，保留预分配存储。
+    std::expected<void, WriteRndvError> Recycle(std::uint64_t generation) noexcept;
+    std::expected<void, WriteRndvError> CanRecycle() const noexcept;
+    std::expected<void, WriteRndvError> RetryCompleted() noexcept;
     std::expected<void, WriteRndvError> CancelQueued() noexcept;
     std::expected<void, WriteRndvError> FinishChunk(Chunk& chunk) noexcept;
     std::expected<void, WriteRndvError> CommitChunk(Chunk& chunk) noexcept;

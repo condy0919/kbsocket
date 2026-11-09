@@ -2,11 +2,13 @@
 
 [`WriteRndvEngine`](../kbsocket/connection/write_rndv_engine.hpp) 接通现有 `TxSender`、`TxCompletionProcessor` 和注册 Slab，将一份已验证 Grant 对应的源区间拆成有界 WRITE。引擎记录每个分块的接受与终结，全部成功后才提供供 DONE 使用的证据。
 
-当前是单 owner、单事务原语。它不发送 RTS/GRANT/DONE，不执行导入、分配流序号或推进接收重排，也不代替应用 Runtime。后续还需事务槽复用、段导入缓存、wire codec 和 Connection 接线。
+当前是单 owner、单事务原语。它不发送 RTS/GRANT/DONE，不执行导入、分配流序号或推进接收重排，也不代替应用 Runtime。[WriteRndvPool](write-rndv-pool.md) 已提供有界槽复用和两种导入引用的绑定；wire codec 和 Connection 接线仍待完成。
 
 ## 准入、来源与分块
 
 控制路径 `Open` 预分配固定容量记录并绑定发送器、Slab、完整 Lane 及事务身份；数据路径 `Start` 验证请求、构造计划和取得源引用。一个对象仅允许一次成功 Start，失败且完整回滚后可重试。`connection_id` 与 `transaction_generation` 由宿主分配且不得在旧完成可能存在时复用。
+
+上述一次启动限制针对公共接口；事务池可以通过私有入口在接受已知且全部本地责任结束后复用记录。该入口保持预分配存储、严格增加事务代次，不能通过公开 Close/Open 在数据路径重建，也不能解除接受未知的保留状态。
 
 `Start` 的预期 `GrantTransfer` 来自已准入的本地请求，与远端返回的 Grant 必须完整匹配。不能把任意收到的 Grant 同时当作“预期请求”。宿主还须核验实际来源、Arena incarnation、导入 Jetty 和段之间的绑定，并保证该 Grant 只有这一份发送事务可以写入；单个引擎的防重复启动不能替代跨引擎的排他所有权。
 

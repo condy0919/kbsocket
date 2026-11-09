@@ -2,6 +2,28 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "write_rndv_pool",
+    srcs = ["write_rndv_pool.cpp"],
+    hdrs = ["write_rndv_pool.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":write_rndv_engine",
+        "//kbsocket/control:endpoint_import_cache",
+        "//kbsocket/control:tseg_import_cache",
+    ],
+)
+
+cc_test(
+    name = "write_rndv_pool_test",
+    srcs = ["write_rndv_pool_test.cpp"],
+    deps = [
+        ":write_rndv_pool",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "write_rndv_engine",
     srcs = ["write_rndv_engine.cpp"],
     hdrs = ["write_rndv_engine.hpp"],

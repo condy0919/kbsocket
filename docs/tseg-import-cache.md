@@ -44,4 +44,4 @@ Close 停止准入并使条目失效，等待所有引用归还、控制任务�
 
 无硬件测试使用真实 ControlExecutor 和 Mock ImportSeg/UnimportSeg，覆盖 Single-Flight、完整身份、输入/输出校验、引用与失效竞态、失败清理及数据路径零分配。反应堆测试使用两个 worker，验证段导入、Jetty 导入和队列访问确实共享暂停屏障，而非依赖单 worker 自然串行。
 
-本阶段交付缓存及调度源。可复用 RNDV 事务槽、缓存 Lease 与 WriteRndvEngine 的自动绑定、RTS/GRANT/DONE 编解码、统一 SN 重排和应用入口仍待后续接入。未执行 UB 真机及 WRITE RNDV 端到端回归。
+本阶段交付缓存及调度源；后续 [WriteRndvPool](write-rndv-pool.md) 已接通可复用事务槽与缓存 Lease/WriteRndvEngine 责任绑定。RTS/GRANT/DONE 编解码、统一 SN 重排和应用入口仍待接入。未执行 UB 真机及 WRITE RNDV 端到端回归。

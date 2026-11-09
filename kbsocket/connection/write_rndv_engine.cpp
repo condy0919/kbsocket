@@ -522,13 +522,7 @@ std::expected<void, WriteRndvError> WriteRndvEngine::Close() noexcept {
         return {};
     }
     const auto cancelled = Cancel();
-    bool finished = true;
-    for (std::size_t i = 0; i < state_->stats.planned; ++i) {
-        auto& chunk = state_->chunks[i];
-        if (chunk.phase == Phase::kPosted && chunk.terminal_seen && !FinishChunk(chunk)) {
-            finished = false;
-        }
-    }
+    const auto finished = RetryCompleted();
     if (!cancelled || !finished) {
         return Error(WriteRndvErrorCode::kRetained);
     }
@@ -540,6 +534,63 @@ std::expected<void, WriteRndvError> WriteRndvEngine::Close() noexcept {
 }
 WriteRndvStats WriteRndvEngine::stats() const noexcept {
     return state_ ? state_->stats : WriteRndvStats{};
+}
+std::expected<void, WriteRndvError> WriteRndvEngine::RetryCompleted() noexcept {
+    if (!state_) {
+        return Error(WriteRndvErrorCode::kNotReady);
+    }
+    bool finished = true;
+    // 只重试已经保存的逐 WR 终结事实，不以取消或空 CQ 推导未见到的完成。
+    for (std::size_t i = 0; i < state_->stats.planned; ++i) {
+        auto& chunk = state_->chunks[i];
+        if (chunk.phase == Phase::kPosted && chunk.terminal_seen && !FinishChunk(chunk)) {
+            finished = false;
+        }
+    }
+    return finished ? std::expected<void, WriteRndvError>{} : Error(WriteRndvErrorCode::kRetained);
+}
+std::expected<void, WriteRndvError> WriteRndvEngine::CanRecycle() const noexcept {
+    if (!state_) {
+        return Error(WriteRndvErrorCode::kNotReady);
+    }
+    if (!state_->stats.acceptance_known) {
+        return Error(WriteRndvErrorCode::kAcceptanceUnknown);
+    }
+    if (state_->stats.queued || state_->stats.in_flight || state_->stats.retired != state_->stats.accepted) {
+        return Error(WriteRndvErrorCode::kInUse);
+    }
+    // 计数之外再确认真实引用已清空；失败 Start 的部分回滚不能被槽复用掩盖。
+    for (std::size_t i = 0; i < state_->stats.planned; ++i) {
+        const auto& chunk = state_->chunks[i];
+        for (std::size_t j = 0; j < chunk.source_count; ++j) {
+            if (chunk.sources[j].dma.sequence) {
+                return Error(WriteRndvErrorCode::kRetained);
+            }
+        }
+    }
+    return {};
+}
+std::expected<void, WriteRndvError> WriteRndvEngine::Recycle(std::uint64_t generation) noexcept {
+    if (auto ready = CanRecycle(); !ready) {
+        return ready;
+    }
+    auto& state = *state_;
+    if (generation <= state.config.transaction_generation) {
+        return Error(WriteRndvErrorCode::kInvalidArgument);
+    }
+    for (std::size_t i = 0; i < state.stats.planned; ++i) {
+        state.chunks[i] = {};
+    }
+    state.config.transaction_generation = generation;
+    state.transfer = {};
+    state.destination = {};
+    state.requests = {};
+    state.ids = {};
+    state.stats = {};
+    state.next_submit = 0;
+    state.post_limit = state.config.post_budget;
+    state.initialized = false;
+    return {};
 }
 } // namespace connection
 } // namespace kbsocket
