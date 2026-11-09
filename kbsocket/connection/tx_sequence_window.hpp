@@ -67,6 +67,9 @@ public:
         stopped_ = true;
     }
     std::span<const TxSequencedFrame> pending() const noexcept;
+    SequenceSession session() const noexcept {
+        return session_;
+    }
     std::uint64_t next_sequence() const noexcept {
         return next_seq_;
     }

@@ -175,6 +175,20 @@ std::expected<GrantManager::Entry*, GrantError> GrantManager::Find(const GrantId
     }
     return *entry;
 }
+std::expected<void, GrantError> GrantManager::ValidatePublication(GrantHandle handle,
+                                                                  const GrantIdentity& identity) noexcept {
+    auto entry = Find(handle);
+    if (!entry) {
+        return std::unexpected(entry.error());
+    }
+    if ((*entry)->identity != identity) {
+        return Error(GrantErrorCode::kIdentityMismatch);
+    }
+    if ((*entry)->phase != Phase::kReserved || (*entry)->discarding) {
+        return Error(GrantErrorCode::kInvalidState);
+    }
+    return {};
+}
 std::expected<void, GrantError> GrantManager::CommitPublication(GrantHandle handle) noexcept {
     auto entry = Find(handle);
     if (!entry) {

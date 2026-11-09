@@ -50,20 +50,30 @@ struct CreditReservation {
     CreditClass kind = CreditClass::kData;
     std::uint32_t count = 0;
 };
+/// 为未来 GRANT/DONE 保留一个控制额度；不是已进入 provider 的 post 预约。
+struct ControlCreditLease {
+    const SenderCreditAccount* account = nullptr;
+    std::uint32_t slot = 0;
+    std::uint64_t id = 0;
+    bool operator==(const ControlCreditLease&) const = default;
+};
 struct SenderCreditStats {
     std::array<std::uint64_t, 2> limits{};
     std::array<std::uint64_t, 2> spent{};
     std::array<std::uint64_t, 2> reserved{};
+    // 尚未 Activate 的控制额度；已 Activate 的额度只计入 reserved，避免重复扣账。
+    std::uint32_t promised_control = 0;
     bool stopped = false;
     // Resolve(nullopt) 后本 epoch 永久未知；不能用保守 spent 总数生成撤回完成证明。
     bool accepted_known = true;
 };
 
 /// 单 owner 的远端物理 RQE 授信账；没有通过 TX CQE 返还远端额度的接口。
-/// 一个待决 post 批次阻止后续 Reserve，明确未接受的后缀结账后才可继续。
+/// 一个待决 post 批次阻止后续 Reserve/Activate，未来控制额度不阻塞 Peer 的其他 post。
 /// 对象生命周期内绑定同一 PeerRuntime/ReceiveDomain，重新 Open 的 epoch 必须严格增加。
 class SenderCreditAccount {
 public:
+    static constexpr std::uint32_t kMaxControlLeases = 256;
     SenderCreditAccount() noexcept = default;
     SenderCreditAccount(const SenderCreditAccount&) = delete;
     SenderCreditAccount& operator=(const SenderCreditAccount&) = delete;
@@ -71,8 +81,15 @@ public:
     std::expected<void, CreditError> Update(CreditIdentity identity, std::uint64_t max_data,
                                             std::uint64_t max_control) noexcept;
     std::expected<CreditReservation, CreditError> Reserve(CreditClass kind, std::uint32_t count) noexcept;
+    /// 从 Peer 共账预留未来控制消息额度，预留时留下最后一个 CREDIT 逃生额度。
+    /// 普通 Reserve 不能消费这些承诺；只有 Activate 才占用即时 post 预约。
+    std::expected<ControlCreditLease, CreditError> ReserveControl() noexcept;
+    std::expected<CreditReservation, CreditError> ActivateControl(ControlCreditLease lease) noexcept;
+    /// 只可释放未 Activate 的额度；Stop 后仍允许释放，供撤回协议完成停止快照。
+    std::expected<void, CreditError> ReleaseControl(ControlCreditLease lease) noexcept;
     /// nullopt 表示接受范围未知：全部保留为 spent 并停止准入，绝不猜测可返还后缀。
     /// 已知前缀只收走其 credits；0 仅可用于可信的全批未接受。
+    /// 控制 lease 的 0 接受恢复原 lease；1/未知接受消费 lease，不允许重复 Activate。
     std::expected<void, CreditError> Resolve(CreditReservation reservation,
                                              std::optional<std::uint32_t> accepted_prefix) noexcept;
     void Stop() noexcept {
@@ -94,12 +111,15 @@ private:
     std::expected<void, CreditError> UnbindWithdrawal(const control::PeerCreditControl& owner) noexcept;
     std::expected<SenderCreditStats, CreditError>
     StoppedSnapshot(const control::PeerCreditControl& owner) const noexcept;
+    bool ValidControlLease(ControlCreditLease lease) const noexcept;
     CreditIdentity identity_{};
     std::array<std::uint64_t, 2> limits_{};
     std::array<std::uint64_t, 2> spent_{};
     CreditReservation pending_{};
+    std::array<std::uint64_t, kMaxControlLeases> control_leases_{};
+    std::uint32_t promised_control_ = 0, active_control_slot_ = kMaxControlLeases;
     const control::PeerCreditControl* withdrawal_owner_ = nullptr;
-    std::uint64_t next_reservation_ = 0;
+    std::uint64_t next_reservation_ = 0, next_control_lease_ = 0;
     bool ready_ = false, stopped_ = false, accepted_known_ = true;
 };
 

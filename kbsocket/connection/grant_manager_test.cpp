@@ -322,6 +322,41 @@ TEST_F(GrantManagerTest, RejectsEveryWrongBindingAndInvalidRequestWithoutOccupyi
     ASSERT_TRUE(manager_.Cancel(accepted->handle));
 }
 
+TEST_F(GrantManagerTest, PublicationValidationChecksExactIdentityWithoutPublishing) {
+    Open();
+    auto reservation = manager_.Reserve(Transfer());
+    ASSERT_TRUE(reservation);
+    const auto before = manager_.stats();
+    ASSERT_TRUE(manager_.ValidatePublication(reservation->handle, reservation->identity));
+    // 通知队列接管前必须校验完整授权身份；只读核验不能提前发布或解除责任。
+    for (unsigned field = 0; field < 4; ++field) {
+        auto changed = reservation->identity;
+        switch (field) {
+        case 0:
+            ++changed.transfer.bytes;
+            break;
+        case 1:
+            ++changed.transfer.binding.session;
+            break;
+        case 2:
+            ++changed.generation;
+            break;
+        case 3:
+            ++changed.target_address;
+            break;
+        }
+        ExpectError(manager_.ValidatePublication(reservation->handle, changed), GrantErrorCode::kIdentityMismatch);
+        ExpectStats(manager_.stats(), before);
+    }
+    // 已发布的授权不能再次交给通知队列，取消后仍须独立的远端访问终结证明。
+    ASSERT_TRUE(manager_.CommitPublication(reservation->handle));
+    ExpectError(manager_.ValidatePublication(reservation->handle, reservation->identity),
+                GrantErrorCode::kInvalidState);
+    ASSERT_TRUE(manager_.Cancel(reservation->handle));
+    ASSERT_TRUE(manager_.ConfirmTerminal(Done(reservation->identity)));
+    EXPECT_FALSE(manager_.ValidatePublication(reservation->handle, reservation->identity));
+}
+
 TEST_F(GrantManagerTest, UnpublishedRollbackReleasesBothResponsibilitiesButDoesNotReuseGeneration) {
     Open();
     auto reservation = manager_.Reserve(Transfer());

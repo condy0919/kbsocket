@@ -25,7 +25,7 @@
 
 编码/身份校验本身不证明远端 DMA 已终结。收到合法 DONE 不会自动构造 `GrantTerminalEvidence`、解除 Grant 或交付目标；接收状态机仍须确认当前已发布 Grant、可信发送端遵守逐 WR 成功与完整覆盖契约，以及取消状态。也不能从单独的网络计数、本地 CQE 或空 CQ 推导上述事实。未完成证明的 Grant 继续隔离保留。
 
-成功 WRITE 后的 DONE 仍须通过 SEND_WITH_IMM 提交，并取得真实控制授信、SQ 票据和注册源责任。本阶段没有发送通知的调度器，不能将构造帧等同于对端收到通知。接收域已按 RTS 使用 data 授信、GRANT/DONE 使用 control 授信扣除真实 RQE 消耗；物理 refill 与逻辑序号释放保持独立。
+成功 WRITE 后的 DONE 仍须通过 SEND_WITH_IMM 提交，并取得真实控制授信、SQ 票据和注册源责任。M6.3.4 的 [通知发送器](rndv-notification-tx.md) 已提供独立的有界提交与退休组件；单独构造帧仍不等同于对端收到通知。接收域已按 RTS 使用 data 授信、GRANT/DONE 使用 control 授信扣除真实 RQE 消耗；物理 refill 与逻辑序号释放保持独立。
 
 ## RTS 占位与有序交付
 
@@ -45,4 +45,4 @@
 
 无真机测试覆盖双向不同 session/token、短/扩展编码、错误来源与完整 Grant 身份、取消后的 DONE 禁发、旧事务句柄、Eager/RNDV/FIN 共同窗口、数量/字节额度和零分配。Mock 测试中的显式 DMA 事实不代表 UB 真机端到端验证。
 
-下一阶段连接通知状态机需要绑定 reservation、GrantHandle、导入引用和通知责任；完成能力协商、Arena 描述交换、控制授信预留、通知部分接受/失败，以及 Grant 只读借用与共同接收流的归还。随后接入 Connection/RawDomain/Runtime 和应用入口。
+M6.3.4 已绑定 RTS 发送 SN、未来 DONE 额度、本地通知槽、Grant 发布及导入引用。后续仍须完成接收端可信 DONE 终结、Grant 只读借用与共同接收流归还、能力协商及 Arena 描述交换，随后接入 Connection/RawDomain/Runtime 和应用入口。

@@ -2,6 +2,38 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "rndv_notification_tx",
+    srcs = ["rndv_notification_tx.cpp"],
+    hdrs = ["rndv_notification_tx.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":credit_account",
+        ":grant_manager",
+        ":rndv_protocol",
+        ":tx_sequence_window",
+        ":wire_frame",
+        ":write_rndv_pool",
+        "//kbsocket/control:endpoint_import_cache",
+        "//kbsocket/memory:slab_allocator",
+        "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:tx_completion_processor",
+        "//kbsocket/transport/raw:tx_sender",
+    ],
+)
+
+cc_test(
+    name = "rndv_notification_tx_test",
+    srcs = ["rndv_notification_tx_test.cpp"],
+    deps = [
+        ":rndv_notification_tx",
+        ":write_rndv_pool",
+        "//kbsocket/runtime:control_executor",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "rndv_protocol",
     srcs = ["rndv_protocol.cpp"],
     hdrs = ["rndv_protocol.hpp"],

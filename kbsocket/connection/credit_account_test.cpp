@@ -184,6 +184,239 @@ TEST(SenderCreditAccountTest, ClosePreservesPendingReservationAndRequiresHigherR
     EXPECT_TRUE(sender.Close());
 }
 
+TEST(SenderCreditAccountTest, FutureControlLeaseLeavesPeerDataAndCreditProgressUnblocked) {
+    SenderCreditAccount sender;
+    EXPECT_FALSE(sender.ReserveControl());
+    ASSERT_TRUE(sender.Open(kIdentity));
+    ASSERT_TRUE(sender.Update(kIdentity, 8, 3));
+    const auto first = sender.ReserveControl();
+    const auto second = sender.ReserveControl();
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    EXPECT_NE(*first, *second);
+    EXPECT_EQ(sender.stats().promised_control, 2u);
+    EXPECT_EQ(sender.stats().reserved[1], 0u);
+    EXPECT_EQ(sender.available(CreditClass::kControl), 1u);
+    // 两笔 RNDV 都在等待 WRITE；普通数据仍可发送，保留的最后一个控制额度留给 CREDIT。
+    const auto data = sender.Reserve(CreditClass::kData, 3);
+    ASSERT_TRUE(data);
+    ASSERT_TRUE(sender.Resolve(*data, 3));
+    const auto too_many = sender.Reserve(CreditClass::kControl, 2);
+    ASSERT_FALSE(too_many);
+    EXPECT_EQ(too_many.error().code, CreditErrorCode::kExhausted);
+    const auto credit = sender.Reserve(CreditClass::kControl, 1);
+    ASSERT_TRUE(credit);
+    ASSERT_TRUE(sender.Resolve(*credit, 1));
+    EXPECT_EQ(sender.available(CreditClass::kControl), 0u);
+    EXPECT_EQ(sender.stats().promised_control, 2u);
+    // 即使普通可用额度已用尽，事先保留的 DONE 额度仍能转为 post，且不能双重扣账。
+    const auto done = sender.ActivateControl(*first);
+    ASSERT_TRUE(done);
+    EXPECT_EQ(done->kind, CreditClass::kControl);
+    EXPECT_EQ(done->count, 1u);
+    EXPECT_EQ(sender.stats().promised_control, 1u);
+    EXPECT_EQ(sender.stats().reserved[1], 1u);
+    EXPECT_EQ(sender.available(CreditClass::kControl), 0u);
+    ASSERT_TRUE(sender.Resolve(*done, 1));
+    EXPECT_EQ(sender.stats().spent[1], 2u);
+    EXPECT_FALSE(sender.ActivateControl(*first));
+    EXPECT_FALSE(sender.ReleaseControl(*first));
+    ASSERT_TRUE(sender.ReleaseControl(*second));
+    EXPECT_EQ(sender.available(CreditClass::kControl), 1u);
+    EXPECT_TRUE(sender.Close());
+}
+
+TEST(SenderCreditAccountTest, ControlLeaseProtectsLastCreditAndRestoresKnownUnacceptedRetry) {
+    SenderCreditAccount sender;
+    ASSERT_TRUE(sender.Open(kIdentity));
+    ASSERT_TRUE(sender.Update(kIdentity, 0, 1));
+    const auto exhausted = sender.ReserveControl();
+    ASSERT_FALSE(exhausted);
+    EXPECT_EQ(exhausted.error().code, CreditErrorCode::kExhausted);
+    ASSERT_TRUE(sender.Update(kIdentity, 0, 2));
+    const auto lease = sender.ReserveControl();
+    ASSERT_TRUE(lease);
+    EXPECT_FALSE(sender.ReserveControl());
+    const auto first = sender.ActivateControl(*lease);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(sender.stats().promised_control, 0u);
+    EXPECT_EQ(sender.available(CreditClass::kControl), 1u);
+    EXPECT_FALSE(sender.Resolve(*first, 2));
+    EXPECT_EQ(sender.stats().reserved[1], 1u);
+    ASSERT_TRUE(sender.Resolve(*first, 0));
+    // 可信零接受把同一个承诺还给原持有者，其他连接不能抢占重试额度。
+    EXPECT_EQ(sender.stats().promised_control, 1u);
+    EXPECT_EQ(sender.stats().reserved[1], 0u);
+    EXPECT_EQ(sender.stats().spent[1], 0u);
+    EXPECT_EQ(sender.available(CreditClass::kControl), 1u);
+    const auto retry = sender.ActivateControl(*lease);
+    ASSERT_TRUE(retry);
+    EXPECT_NE(retry->id, first->id);
+    EXPECT_FALSE(sender.Resolve(*first, 1));
+    ASSERT_TRUE(sender.Resolve(*retry, 1));
+    EXPECT_EQ(sender.stats().spent[1], 1u);
+    EXPECT_EQ(sender.stats().promised_control, 0u);
+    EXPECT_FALSE(sender.ActivateControl(*lease));
+    EXPECT_TRUE(sender.Close());
+}
+
+TEST(SenderCreditAccountTest, ActiveControlLeaseSharesImmediatePostSerialization) {
+    SenderCreditAccount sender;
+    ASSERT_TRUE(sender.Open(kIdentity));
+    ASSERT_TRUE(sender.Update(kIdentity, 2, 4));
+    const auto data = sender.Reserve(CreditClass::kData, 1);
+    ASSERT_TRUE(data);
+    // 未来控制预约不占用同步 post 槽；真正 Activate 必须等前一批接受范围结账。
+    const auto first = sender.ReserveControl();
+    const auto second = sender.ReserveControl();
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    const auto blocked = sender.ActivateControl(*first);
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code, CreditErrorCode::kInUse);
+    ASSERT_TRUE(sender.Resolve(*data, 0));
+    const auto activated = sender.ActivateControl(*first);
+    ASSERT_TRUE(activated);
+    EXPECT_FALSE(sender.ActivateControl(*first));
+    EXPECT_FALSE(sender.ActivateControl(*second));
+    EXPECT_FALSE(sender.Reserve(CreditClass::kData, 1));
+    const auto active_release = sender.ReleaseControl(*first);
+    ASSERT_FALSE(active_release);
+    EXPECT_EQ(active_release.error().code, CreditErrorCode::kInUse);
+    ASSERT_TRUE(sender.ReleaseControl(*second));
+    EXPECT_EQ(sender.stats().promised_control, 0u);
+    ASSERT_TRUE(sender.Resolve(*activated, 0));
+    ASSERT_TRUE(sender.ReleaseControl(*first));
+    EXPECT_EQ(sender.available(CreditClass::kControl), 4u);
+    EXPECT_TRUE(sender.Close());
+}
+
+TEST(SenderCreditAccountTest, UnknownControlAcceptanceConsumesOnlyActiveLeaseAndStopsAccount) {
+    SenderCreditAccount sender;
+    ASSERT_TRUE(sender.Open(kIdentity));
+    ASSERT_TRUE(sender.Update(kIdentity, 8, 3));
+    const auto active = sender.ReserveControl();
+    const auto inactive = sender.ReserveControl();
+    ASSERT_TRUE(active);
+    ASSERT_TRUE(inactive);
+    const auto reservation = sender.ActivateControl(*active);
+    ASSERT_TRUE(reservation);
+    ASSERT_TRUE(sender.Resolve(*reservation, std::nullopt));
+    EXPECT_TRUE(sender.stats().stopped);
+    EXPECT_FALSE(sender.stats().accepted_known);
+    EXPECT_EQ(sender.stats().spent[1], 1u);
+    EXPECT_EQ(sender.stats().promised_control, 1u);
+    EXPECT_EQ(sender.stats().reserved[1], 0u);
+    EXPECT_FALSE(sender.ReserveControl());
+    EXPECT_FALSE(sender.Reserve(CreditClass::kData, 1));
+    EXPECT_FALSE(sender.ActivateControl(*inactive));
+    EXPECT_FALSE(sender.ReleaseControl(*active));
+    EXPECT_FALSE(sender.Close());
+    // 未 Activate 的另一事务仍可取消；它未暴露给 provider，不加入保守 spent。
+    ASSERT_TRUE(sender.ReleaseControl(*inactive));
+    EXPECT_EQ(sender.stats().spent[1], 1u);
+    EXPECT_TRUE(sender.Close());
+}
+
+TEST(SenderCreditAccountTest, StopAndClosePreserveControlLeasesUntilResolvedOrReleased) {
+    SenderCreditAccount sender;
+    ASSERT_TRUE(sender.Open(kIdentity));
+    ASSERT_TRUE(sender.Update(kIdentity, 1, 3));
+    const auto active = sender.ReserveControl();
+    const auto inactive = sender.ReserveControl();
+    ASSERT_TRUE(active);
+    ASSERT_TRUE(inactive);
+    const auto reservation = sender.ActivateControl(*active);
+    ASSERT_TRUE(reservation);
+    EXPECT_FALSE(sender.Close());
+    EXPECT_TRUE(sender.stats().stopped);
+    EXPECT_FALSE(sender.ReserveControl());
+    EXPECT_FALSE(sender.ActivateControl(*inactive));
+    ASSERT_TRUE(sender.ReleaseControl(*inactive));
+    EXPECT_FALSE(sender.Close());
+    // Stop 之后仍需交出正在 post 的真实接受结果；零接受仅恢复 lease，不隐式释放。
+    ASSERT_TRUE(sender.Resolve(*reservation, 0));
+    EXPECT_EQ(sender.stats().promised_control, 1u);
+    EXPECT_FALSE(sender.Close());
+    ASSERT_TRUE(sender.ReleaseControl(*active));
+    EXPECT_EQ(sender.stats().spent[1], 0u);
+    EXPECT_TRUE(sender.Close());
+}
+
+TEST(SenderCreditAccountTest, ControlLeaseRejectsForeignStaleAndReopenedEpochHandles) {
+    SenderCreditAccount sender, foreign;
+    ASSERT_TRUE(sender.Open(kIdentity));
+    ASSERT_TRUE(foreign.Open(kIdentity));
+    ASSERT_TRUE(sender.Update(kIdentity, 0, 2));
+    ASSERT_TRUE(foreign.Update(kIdentity, 0, 2));
+    const auto old = sender.ReserveControl();
+    ASSERT_TRUE(old);
+    EXPECT_FALSE(foreign.ActivateControl(*old));
+    EXPECT_FALSE(foreign.ReleaseControl(*old));
+    auto forged = *old;
+    forged.slot = SenderCreditAccount::kMaxControlLeases;
+    EXPECT_FALSE(sender.ActivateControl(forged));
+    EXPECT_FALSE(sender.ReleaseControl(forged));
+    ASSERT_TRUE(sender.ReleaseControl(*old));
+    const auto replacement = sender.ReserveControl();
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(replacement->slot, old->slot);
+    EXPECT_NE(replacement->id, old->id);
+    EXPECT_FALSE(sender.ActivateControl(*old));
+    EXPECT_FALSE(sender.ReleaseControl(*old));
+    ASSERT_TRUE(sender.ReleaseControl(*replacement));
+    ASSERT_TRUE(sender.Close());
+    // Open 不复位 lease 代次，即使新 epoch 重用相同物理槽也不能接纳旧句柄。
+    const CreditIdentity next{1, 10, 2};
+    ASSERT_TRUE(sender.Open(next));
+    ASSERT_TRUE(sender.Update(next, 0, 2));
+    const auto current = sender.ReserveControl();
+    ASSERT_TRUE(current);
+    EXPECT_GT(current->id, replacement->id);
+    EXPECT_FALSE(sender.ActivateControl(*replacement));
+    EXPECT_FALSE(sender.ReleaseControl(*replacement));
+    EXPECT_EQ(sender.stats().promised_control, 1u);
+    ASSERT_TRUE(sender.ReleaseControl(*current));
+    EXPECT_TRUE(sender.Close());
+    EXPECT_TRUE(foreign.Close());
+}
+
+TEST(SenderCreditAccountTest, ControlLeaseTableIsBoundedAndRecyclesWithoutFastpathAllocation) {
+    SenderCreditAccount sender;
+    ASSERT_TRUE(sender.Open(kIdentity));
+    ASSERT_TRUE(sender.Update(kIdentity, 0, 1000));
+    std::array<ControlCreditLease, SenderCreditAccount::kMaxControlLeases> leases;
+    bool succeeded = true;
+    credit_allocations = 0;
+    count_credit_allocations = true;
+    for (auto& lease : leases) {
+        const auto reserved = sender.ReserveControl();
+        if (!reserved) {
+            succeeded = false;
+            break;
+        }
+        lease = *reserved;
+    }
+    const auto full = sender.ReserveControl();
+    succeeded &= !full && full.error().code == CreditErrorCode::kExhausted;
+    for (const auto lease : leases) {
+        const auto reservation = sender.ActivateControl(lease);
+        if (!reservation || !sender.Resolve(*reservation, 1)) {
+            succeeded = false;
+            break;
+        }
+    }
+    // 满表后全部结账，物理槽可复用；Activate/Resolve/Release 的热路径均不分配。
+    const auto reused = sender.ReserveControl();
+    succeeded &= reused && sender.ReleaseControl(*reused).has_value();
+    count_credit_allocations = false;
+    EXPECT_TRUE(succeeded);
+    EXPECT_EQ(credit_allocations, 0u);
+    EXPECT_EQ(sender.stats().spent[1], SenderCreditAccount::kMaxControlLeases);
+    EXPECT_EQ(sender.stats().promised_control, 0u);
+    EXPECT_TRUE(sender.Close());
+}
+
 TEST(SenderCreditAccountTest, DataExhaustionDoesNotBorrowControlAndLargeLimitsDoNotWrap) {
     SenderCreditAccount sender;
     ASSERT_TRUE(sender.Open(kIdentity));

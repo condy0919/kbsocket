@@ -307,7 +307,11 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 - **当前交付 M6.3.3**：RTS/GRANT/DONE 固定大端线格式分别为 64/104/104 B，当前方向路由 session/token 与原事务身份独立。`RndvProtocol` 适配完整路由、预期事务和 Grant，DONE 只能经真实 Engine/Pool 成功证据入口构造；解码/校验不直接终结 Grant。`ReorderWindow` 新增 ReserveRndv/CompleteRndv/AbandonRndv，将 RTS 的 SN 与完整业务字节纳入共同窗口，未完成项阻止后续 Eager/FIN，停止清理不产生 DMA 证明。接收域将 RTS 计入 data 授信，GRANT/DONE 计入 control。详见 [RNDV 协议与占位](rndv-protocol.md)。
 - **M6.3.3 范围**：交付无分配协议与占位原语及 Mock 组合回归，保留现有 Eager 入口对 RNDV 业务处理的显式拒绝。尚未实现能力协商、Arena 目录交换、通知提交/退休、Grant 借用与共同接收流装配；不能把可编码/可校验等同于自动发送 DONE 或 RNDV 端到端交付。
 - **M6.3.3 验证**：2026-11-09 完整相关回归通过 81 个测试目标、1574 个用例，新增 56 个，无失败或跳过。覆盖规范字节格式与完整双向身份、Grant 槽边界、取消后全成功仍禁止 DONE、未知接受和旧句柄拒绝、共同 SN/字节窗口、pending 超时和 FIN 冲突、物理授信分类，以及真实 Slab 责任下的 Eager/RNDV/FIN 组合保序和零分配。严格 C++23、自包含头文件、格式、文档链接及 diff 检查通过；UB 真机和 WRITE RNDV 端到端回归未执行。
-- **下一步 M6.3.4**：实现有界通知状态机，将 RTS 占位、Grant 发布、WRITE 事务、GRANT/DONE 控制授信及逐 WR 通知责任绑定，覆盖部分接受、取消、迟到通知与 Grant 隔离，再接入 Connection/Runtime 和应用有序接收。
+- **当前交付 M6.3.4**：`RndvNotificationTx` 在固定 Lane 上提交有界、全 signal 的 SEND/IMM 通知。RTS 原子保留共同 SN、通知槽与未来 DONE 槽/额度；GRANT 在 provider 可能接受前提交发布责任；DONE 只取真实 WRITE 事务池的完整成功证据。逐 WR 跟踪源 DMA、导入 pin、物理授信及完成代次，零接受可重试，已接受不重放，未知接受永久保留。详见 [RNDV 通知发送](rndv-notification-tx.md)。
+- **M6.3.4 共享授信**：新增独立未来控制票据，不长期占用 Peer 共账的即时 post 预约；普通发送不能消费已承诺额度，始终为 CREDIT 留出最后一个额度。Peer 撤回停止快照及 Close 等待票据结清，取消、零接受恢复和未知接受均按同一账本处理。
+- **M6.3.4 范围**：交付通知提交/退休组件及 Mock 组合验证。通知完成只终结本地通知源责任，已发布 Grant 仍独立保留；尚未交付接收端 Grant 借用/归还、能力及 Arena 协商、Connection/Runtime 自动 RNDV 和端到端应用入口。
+- **M6.3.4 验证**：2026-11-09 完整相关回归及审查后的通知定向回归合计通过 82 个测试目标、1617 个用例，新增 43 个，无失败或跳过。31 个通知测试覆盖实际 WRITE pool → DONE SEND/IMM、GRANT 发布前门禁、零/未知接受、双向配对取消、RTS 槽释放复用、共享窗口停止与 FIN、成功通知关闭、status 8/9、迟到完成及热路径零分配/释放；另 12 个用例验证未来控制票据、Peer 撤回及 Grant 发布身份。严格 C++23、自包含头文件、格式、文档链接及 diff 检查通过；UB 真机和 WRITE RNDV 端到端回归未执行。
+- **下一步 M6.3.5**：实现可信 DONE 到接收端 Grant 终结和应用只读借用的适配，与 RTS 重排占位及共同流归还绑定；不能从当前 DONE 线格式伪造 WRITE accepted/terminal 计数，也不能将 Grant span 伪装成独立 BufferLease。随后接入能力协商、Arena 目录与 Connection/Runtime。
 
 - **目标**：基于已确认的 WRITE 可见性，交付 WRITE + SEND/IMM 两阶段通知。RNDV 阈值初始候选为 16 KiB，按负载对照测量调整；超过 4096 B 仍可有界分片 eager，不强制每次跨页写都走 RNDV。
 - **设计章节**：[§7.4 WRITE RNDV 状态机与终结](design/kbsocket-design-v1.md#74-write-rndv-完整状态机与安全终结)

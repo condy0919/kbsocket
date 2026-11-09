@@ -297,6 +297,79 @@ TEST_F(PeerCreditControlTest, UnknownPostAcceptanceNeverProducesStopSnapshot) {
     ExpectUnretired();
 }
 
+TEST_F(PeerCreditControlTest, FutureControlLeaseMustBeReleasedBeforePublishingStopSnapshot) {
+    const auto lease = left_.sender.ReserveControl();
+    ASSERT_TRUE(lease);
+    OpenBoth();
+    Pump();
+    // 未来 DONE 尚未 post，也未取消：不能假称 Peer 已经没有继续消费授信的持有者。
+    EXPECT_EQ(left_.sender.stats().promised_control, 1u);
+    EXPECT_FALSE(left_.controller.stats().local_snapshot);
+    EXPECT_FALSE(right_.controller.stats().peer_stop_received);
+    EXPECT_FALSE(left_.sender.Close());
+    EXPECT_FALSE(left_.sender.ActivateControl(*lease));
+    ASSERT_TRUE(left_.sender.ReleaseControl(*lease));
+    Pump();
+    EXPECT_EQ(left_.controller.stats().local_spent[1], 0u);
+    EXPECT_TRUE(left_.controller.stats().complete);
+    EXPECT_TRUE(right_.controller.stats().complete);
+}
+
+TEST_F(PeerCreditControlTest, ZeroAcceptedControlPostStillWaitsForReturnedLeaseCancellation) {
+    const auto lease = left_.sender.ReserveControl();
+    ASSERT_TRUE(lease);
+    const auto reservation = left_.sender.ActivateControl(*lease);
+    ASSERT_TRUE(reservation);
+    OpenBoth();
+    Pump();
+    EXPECT_FALSE(left_.controller.stats().local_snapshot);
+    ASSERT_TRUE(left_.sender.Resolve(*reservation, 0));
+    Pump();
+    // post 零接受返回的是原控制承诺；必须取消它，停止快照才能固定最终 spent。
+    EXPECT_FALSE(left_.controller.stats().local_snapshot);
+    EXPECT_EQ(left_.sender.stats().promised_control, 1u);
+    ASSERT_TRUE(left_.sender.ReleaseControl(*lease));
+    Pump();
+    EXPECT_EQ(left_.controller.stats().local_spent[1], 0u);
+    EXPECT_TRUE(left_.controller.stats().complete);
+    EXPECT_TRUE(right_.controller.stats().complete);
+}
+
+TEST_F(PeerCreditControlTest, AcceptedControlLeaseIsIncludedInWithdrawalReceiveProof) {
+    const auto lease = left_.sender.ReserveControl();
+    ASSERT_TRUE(lease);
+    const auto reservation = left_.sender.ActivateControl(*lease);
+    ASSERT_TRUE(reservation);
+    OpenBoth();
+    ASSERT_TRUE(left_.sender.Resolve(*reservation, 1));
+    Pump();
+    EXPECT_TRUE(left_.controller.stats().local_snapshot);
+    EXPECT_EQ(left_.controller.stats().local_spent[1], 1u);
+    EXPECT_FALSE(right_.controller.stats().receive_retired);
+    // 发送端接受事实不能代替对端实际 RX/补投结账，收到对应控制帧后撤回才能完成。
+    Receive(right_, CreditClass::kControl, 1);
+    Pump();
+    EXPECT_TRUE(left_.controller.stats().complete);
+    EXPECT_TRUE(right_.controller.stats().complete);
+}
+
+TEST_F(PeerCreditControlTest, UnknownControlLeaseAcceptanceCannotBecomeStoppedSnapshot) {
+    const auto lease = left_.sender.ReserveControl();
+    ASSERT_TRUE(lease);
+    const auto reservation = left_.sender.ActivateControl(*lease);
+    ASSERT_TRUE(reservation);
+    OpenBoth();
+    ASSERT_TRUE(left_.sender.Resolve(*reservation, std::nullopt));
+    const auto result = Step();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, Code::kCredit);
+    EXPECT_EQ(result.error().detail, static_cast<int>(CreditErrorCode::kRetained));
+    EXPECT_FALSE(left_.controller.stats().local_snapshot);
+    EXPECT_FALSE(left_.controller.stats().local_stop_sent);
+    EXPECT_EQ(left_.sender.stats().spent[1], 1u);
+    ExpectUnretired();
+}
+
 TEST_F(PeerCreditControlTest, UnattributedRxCannotBeReassignedToSatisfyWithdrawal) {
     // unknown receipt 的正常账本不能强制清理；在隔离子进程断言保留，父进程不制造假 refill。
     EXPECT_EXIT(

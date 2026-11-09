@@ -126,6 +126,9 @@ public:
                                          urma_context_t* context, const GrantConfig& config) noexcept;
     /// 窗口内允许 RTS 乱序；同 SN 即使 transfer_id/长度不同也拒绝，退休 tombstone 在推进前保留。
     std::expected<GrantReservation, GrantError> Reserve(const GrantTransfer& transfer) noexcept;
+    /// 只读核验待发布授权的完整身份与 Reserved 状态；不改变责任，也不授予第二个发布者。
+    /// 绑定通知发送器后宿主必须保证发布权唯一，不能绕过发送器再次发送此 Grant。
+    std::expected<void, GrantError> ValidatePublication(GrantHandle handle, const GrantIdentity& identity) noexcept;
     /// 必须先于任何可能暴露 GRANT 的操作调用；之后接受未知与取消均不得撤销远端责任。
     std::expected<void, GrantError> CommitPublication(GrantHandle handle) noexcept;
     /// Reserved 可撤销；Published 仅隔离；Ready 可丢弃；Borrowed 必须先 Return。

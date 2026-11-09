@@ -37,6 +37,9 @@ std::expected<void, CreditError> SenderCreditAccount::Open(CreditIdentity identi
     limits_ = {};
     spent_ = {};
     pending_ = {};
+    control_leases_ = {};
+    promised_control_ = 0;
+    active_control_slot_ = kMaxControlLeases;
     stopped_ = false;
     accepted_known_ = true;
     ready_ = true;
@@ -60,11 +63,15 @@ std::uint64_t SenderCreditAccount::available(CreditClass kind) const noexcept {
     }
     const auto index = static_cast<std::size_t>(kind);
     const auto reserved = pending_.id && pending_.kind == kind ? pending_.count : 0;
-    return limits_[index] - spent_[index] - reserved;
+    const auto promised = kind == CreditClass::kControl ? promised_control_ : 0;
+    return limits_[index] - spent_[index] - reserved - promised;
 }
 SenderCreditStats SenderCreditAccount::stats() const noexcept {
-    SenderCreditStats result{
-        .limits = limits_, .spent = spent_, .stopped = stopped_, .accepted_known = accepted_known_};
+    SenderCreditStats result{.limits = limits_,
+                             .spent = spent_,
+                             .promised_control = promised_control_,
+                             .stopped = stopped_,
+                             .accepted_known = accepted_known_};
     if (pending_.id) {
         result.reserved[static_cast<std::size_t>(pending_.kind)] = pending_.count;
     }
@@ -93,6 +100,67 @@ std::expected<CreditReservation, CreditError> SenderCreditAccount::Reserve(Credi
     pending_ = {this, ++next_reservation_, kind, count};
     return pending_;
 }
+bool SenderCreditAccount::ValidControlLease(ControlCreditLease lease) const noexcept {
+    return lease.account == this && lease.id && lease.slot < kMaxControlLeases &&
+           control_leases_[lease.slot] == lease.id;
+}
+std::expected<ControlCreditLease, CreditError> SenderCreditAccount::ReserveControl() noexcept {
+    if (!ready_) {
+        return Error(CreditErrorCode::kNotReady);
+    }
+    if (stopped_) {
+        return Error(CreditErrorCode::kStopped);
+    }
+    if (next_control_lease_ == std::numeric_limits<std::uint64_t>::max()) {
+        return Error(CreditErrorCode::kSequenceExhausted);
+    }
+    if (available(CreditClass::kControl) <= 1) {
+        return Error(CreditErrorCode::kExhausted);
+    }
+    for (std::uint32_t slot = 0; slot < kMaxControlLeases; ++slot) {
+        if (!control_leases_[slot]) {
+            control_leases_[slot] = ++next_control_lease_;
+            ++promised_control_;
+            return ControlCreditLease{this, slot, control_leases_[slot]};
+        }
+    }
+    return Error(CreditErrorCode::kExhausted);
+}
+std::expected<CreditReservation, CreditError> SenderCreditAccount::ActivateControl(ControlCreditLease lease) noexcept {
+    if (!ready_) {
+        return Error(CreditErrorCode::kNotReady);
+    }
+    if (stopped_) {
+        return Error(CreditErrorCode::kStopped);
+    }
+    if (!ValidControlLease(lease)) {
+        return Error(CreditErrorCode::kInvalidReservation);
+    }
+    if (pending_.id) {
+        return Error(CreditErrorCode::kInUse);
+    }
+    if (next_reservation_ == std::numeric_limits<std::uint64_t>::max()) {
+        return Error(CreditErrorCode::kSequenceExhausted);
+    }
+    --promised_control_;
+    active_control_slot_ = lease.slot;
+    pending_ = {this, ++next_reservation_, CreditClass::kControl, 1};
+    return pending_;
+}
+std::expected<void, CreditError> SenderCreditAccount::ReleaseControl(ControlCreditLease lease) noexcept {
+    if (!ready_) {
+        return Error(CreditErrorCode::kNotReady);
+    }
+    if (!ValidControlLease(lease)) {
+        return Error(CreditErrorCode::kInvalidReservation);
+    }
+    if (active_control_slot_ == lease.slot) {
+        return Error(CreditErrorCode::kInUse);
+    }
+    control_leases_[lease.slot] = 0;
+    --promised_control_;
+    return {};
+}
 std::expected<void, CreditError> SenderCreditAccount::Resolve(CreditReservation reservation,
                                                               std::optional<std::uint32_t> accepted_prefix) noexcept {
     if (!ready_) {
@@ -110,6 +178,15 @@ std::expected<void, CreditError> SenderCreditAccount::Resolve(CreditReservation 
         stopped_ = true;
         accepted_known_ = false;
     }
+    if (active_control_slot_ != kMaxControlLeases) {
+        if (accepted_prefix && *accepted_prefix == 0) {
+            // 明确未投递仍由原调用方持有同一个 lease，其他连接不能抢走其重试额度。
+            ++promised_control_;
+        } else {
+            control_leases_[active_control_slot_] = 0;
+        }
+        active_control_slot_ = kMaxControlLeases;
+    }
     pending_ = {};
     return {};
 }
@@ -118,7 +195,7 @@ std::expected<void, CreditError> SenderCreditAccount::Close() noexcept {
         return {};
     }
     stopped_ = true;
-    if (pending_.id || withdrawal_owner_) {
+    if (pending_.id || promised_control_ || withdrawal_owner_) {
         return Error(CreditErrorCode::kInUse);
     }
     ready_ = false;
@@ -153,7 +230,7 @@ SenderCreditAccount::StoppedSnapshot(const control::PeerCreditControl& owner) co
     if (!stopped_) {
         return Error(CreditErrorCode::kProofRequired);
     }
-    if (pending_.id) {
+    if (pending_.id || promised_control_) {
         return Error(CreditErrorCode::kInUse);
     }
     if (!accepted_known_) {
