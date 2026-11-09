@@ -53,7 +53,7 @@ struct SlabStats {
     std::size_t quarantined_bytes = 0;
 };
 
-/// 一个固定容量、页对齐 Slab，最多四 context 注册；所有 Lease/责任操作由同一 owner 串行推进。
+/// 一个固定容量、页对齐 Slab，显式 CPU 池或最多四 context 注册；所有 Lease/责任操作由同一 owner 串行推进。
 /// 数据路径不分配、不注册、不持锁。Open/Close 是可能阻塞的控制路径，不与任何访问并发。
 /// CPU、DMA、Grant 是独立责任；全部结束才回收，复制 token 不增引用。
 /// Reserve、Quarantine 或 CPU 所有权转移后必须停止使用之前取得的 CPU span；
@@ -70,6 +70,9 @@ public:
     SlabAllocator& operator=(const SlabAllocator&) = delete;
     std::expected<void, MemoryError> Open(std::span<urma_context_t* const> contexts, const SlabConfig& config,
                                           MemoryBudget& budget) noexcept;
+    /// 显式 CPU 池：沿用固定 backing/预算/Lease 规则，但不注册 MR，也不允许任何 DMA/Grant 责任。
+    /// config 的容量、权限位仍按 SlabConfig 校验；权限位不会赋予 Host 内存远端访问能力。
+    std::expected<void, MemoryError> OpenHost(const SlabConfig& config, MemoryBudget& budget) noexcept;
     /// 先停止新准入；所有 CPU/DMA/Grant 清零后才逆序注销。失败保留剩余阶段与预算，可重试。
     std::expected<void, MemoryError> Close() noexcept;
     void StopAccepting() noexcept;
@@ -99,6 +102,8 @@ public:
 
 private:
     struct State;
+    std::expected<void, MemoryError> OpenImpl(std::span<urma_context_t* const> contexts, const SlabConfig& config,
+                                              MemoryBudget& budget, bool host) noexcept;
     std::expected<std::uint32_t, MemoryError> Find(BufferLease lease) const noexcept;
     std::expected<std::uint32_t, MemoryError> Find(BufferReference reference) const noexcept;
     std::expected<void, MemoryError> Finish(BufferReference reference, BufferUse use, bool committed) noexcept;

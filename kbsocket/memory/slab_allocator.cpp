@@ -17,7 +17,7 @@ namespace memory {
 namespace {
 constexpr auto kEnd = std::numeric_limits<std::uint32_t>::max();
 auto Error(MemoryErrorCode code, int status = 0, std::size_t context = 0) noexcept {
-    return std::unexpected(MemoryError{code, status, context});
+    return std::unexpected(MemoryError{code, status, context, {}});
 }
 } // namespace
 bool MemoryBudget::Reserve(std::size_t bytes) noexcept {
@@ -70,12 +70,20 @@ SlabAllocator::~SlabAllocator() {
 }
 std::expected<void, MemoryError> SlabAllocator::Open(std::span<urma_context_t* const> contexts,
                                                      const SlabConfig& config, MemoryBudget& budget) noexcept {
+    return OpenImpl(contexts, config, budget, false);
+}
+std::expected<void, MemoryError> SlabAllocator::OpenHost(const SlabConfig& config, MemoryBudget& budget) noexcept {
+    return OpenImpl({}, config, budget, true);
+}
+std::expected<void, MemoryError> SlabAllocator::OpenImpl(std::span<urma_context_t* const> contexts,
+                                                         const SlabConfig& config, MemoryBudget& budget,
+                                                         bool host) noexcept {
     if (state_) {
         return Error(MemoryErrorCode::kInUse);
     }
     constexpr auto permissions = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
     const long page_size = ::sysconf(_SC_PAGESIZE);
-    if (contexts.empty() || contexts.size() > kMaxContexts || !config.buffer_count ||
+    if ((!host && contexts.empty()) || contexts.size() > kMaxContexts || !config.buffer_count ||
         config.buffer_count > kMaxBuffers || !config.buffer_size || !config.max_references ||
         config.max_references > kMaxReferences || !config.access || (config.access & ~permissions) || page_size <= 0 ||
         config.buffer_size > std::numeric_limits<std::size_t>::max() / config.buffer_count) {
@@ -134,7 +142,7 @@ std::expected<void, MemoryError> SlabAllocator::Open(std::span<urma_context_t* c
         errno = 0;
         state_->segments[i] = raw::UrmaApi::RegisterSeg(contexts[i], &cfg);
         if (!state_->segments[i]) {
-            MemoryError error{MemoryErrorCode::kRegisterFailed, errno ? errno : EIO, i};
+            MemoryError error{MemoryErrorCode::kRegisterFailed, errno ? errno : EIO, i, {}};
             if (auto closed = Close(); !closed) {
                 error.cleanup_error = closed.error().provider_error;
             }
@@ -311,7 +319,7 @@ std::expected<BufferReference, MemoryError> SlabAllocator::Reserve(BufferLease l
     if (state_->stopping) {
         return Error(MemoryErrorCode::kStopped);
     }
-    if ((use != BufferUse::kLocalDma && use != BufferUse::kRemoteGrant) ||
+    if (!state_->context_count || (use != BufferUse::kLocalDma && use != BufferUse::kRemoteGrant) ||
         (use == BufferUse::kRemoteGrant && !(state_->config.access & URMA_ACCESS_WRITE))) {
         return Error(MemoryErrorCode::kInvalidArgument);
     }

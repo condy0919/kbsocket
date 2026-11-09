@@ -15,6 +15,7 @@
 #include <optional>
 #include <span>
 
+#include "kbsocket/api/buffer_binding.hpp"
 #include "kbsocket/api/listener_events.hpp"
 #include "kbsocket/api/stream_binding.hpp"
 #include "kbsocket/api/stream_error.hpp"
@@ -60,6 +61,7 @@ struct kbs_runtime {
     kbsocket::runtime::ConnectionProgress progress;
     kbsocket::runtime::ConnectionOwner owner;
     kbsocket::api::StreamBinding binding;
+    kbsocket::api::BufferBinding buffers;
     kbsocket::api::ListenerEvents listener_events;
     kbsocket::runtime::ContextProgressGroup hooks;
     kbsocket::runtime::RuntimeShard shard;
@@ -201,12 +203,16 @@ struct kbs_runtime {
         accepting = false;
         listener_events.Stop();
         binding.StopAccepting();
+        buffers.StopAccepting();
         owner.StopAccepting();
         if (const auto cleanup = CleanUnpublished(); !cleanup) {
             return cleanup;
         }
-        if (listener_count || binding.published() || owner.stats().occupied) {
+        if (listener_count || binding.published() || buffers.published() || owner.stats().occupied) {
             return Error(KBS_STREAM_BUSY);
+        }
+        if (const auto result = buffers.Close(); !result) {
+            return result;
         }
         if (const auto result = shard.Close(); !result) {
             return std::unexpected(MapStreamError(result.error()));
@@ -232,6 +238,29 @@ struct kbs_runtime {
 };
 
 extern "C" {
+int32_t kbs_runtime_open_buffers(kbs_runtime* runtime, const kbs_buffer_pool_config* config, kbs_stream_error* error) {
+    if (!runtime || !config) {
+        return Invalid(error);
+    }
+    if (const auto allowed = runtime->Admit(false); !allowed) {
+        return Report(allowed.error(), error);
+    }
+    const auto opened = runtime->buffers.OpenHost(*config);
+    return Report(opened ? kbs_stream_error{} : opened.error(), error);
+}
+int32_t kbs_runtime_buffers(kbs_runtime* runtime, kbs_buffer_table** out, kbs_stream_error* error) {
+    if (out) {
+        *out = nullptr;
+    }
+    if (!runtime || !out) {
+        return Invalid(error);
+    }
+    if (runtime->closed || !runtime->buffers.table()) {
+        return Report(StreamError(KBS_STREAM_NOT_READY), error);
+    }
+    *out = runtime->buffers.table();
+    return Report({}, error);
+}
 int32_t kbs_runtime_config_init(kbs_runtime_config* config, kbs_stream_error* error) {
     if (!config) {
         return Invalid(error);

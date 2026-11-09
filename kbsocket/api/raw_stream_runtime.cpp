@@ -137,6 +137,7 @@ struct RawStreamRuntime::State {
         }
     };
     runtime::RawStack stack;
+    BufferBinding buffers;
     std::array<Endpoint, runtime::RawStack::kMaxContexts> endpoints;
     std::size_t count = 0;
     bool ready = false, stopping = false;
@@ -239,6 +240,18 @@ std::expected<void, kbs_stream_error> RawStreamRuntime::Open(std::span<const Raw
 }
 kbs_stream_table* RawStreamRuntime::table(std::size_t context) noexcept {
     return state_ && state_->ready && context < state_->count ? state_->endpoints[context].binding.table() : nullptr;
+}
+std::expected<void, kbs_stream_error> RawStreamRuntime::OpenBuffers(const BufferBindingConfig& config) noexcept {
+    if (!state_ || !state_->ready || stage() == runtime::RawStackStage::kClosed) {
+        return Error(KBS_STREAM_NOT_READY);
+    }
+    if (state_->stopping) {
+        return Error(KBS_STREAM_STOPPED);
+    }
+    return state_->buffers.OpenRaw(state_->stack, config);
+}
+kbs_buffer_table* RawStreamRuntime::buffers() noexcept {
+    return state_ && state_->ready ? state_->buffers.table() : nullptr;
 }
 runtime::RawStackStage RawStreamRuntime::stage() const noexcept {
     if (!state_) {
@@ -484,6 +497,7 @@ std::expected<void, kbs_stream_error> RawStreamRuntime::BeginClose() noexcept {
         return std::unexpected(MapStreamError(result.error()));
     }
     state_->stopping = true;
+    state_->buffers.StopAccepting();
     for (std::size_t i = 0; i < state_->count; ++i) {
         state_->endpoints[i].binding.StopAccepting();
     }
@@ -498,6 +512,9 @@ RawStreamRuntime::Close(const runtime::RawStackCloseProof& proof) noexcept {
         return std::unexpected(begun.error());
     }
     auto& s = *state_;
+    if (s.buffers.published()) {
+        return Error(KBS_STREAM_BUSY);
+    }
     for (std::size_t i = 0; i < s.count; ++i) {
         auto& e = s.endpoints[i];
         if (e.unpublished) {
@@ -517,6 +534,9 @@ RawStreamRuntime::Close(const runtime::RawStackCloseProof& proof) noexcept {
         if (const auto closed = s.endpoints[i].binding.Close(); !closed) {
             return std::unexpected(closed.error());
         }
+    }
+    if (const auto closed = s.buffers.Close(); !closed) {
+        return std::unexpected(closed.error());
     }
     const auto result = s.stack.AdvanceClose(proof);
     if (!result) {

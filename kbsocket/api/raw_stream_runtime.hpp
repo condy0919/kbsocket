@@ -8,6 +8,7 @@
 #include <memory>
 #include <span>
 
+#include "kbsocket/api/buffer_binding.hpp"
 #include "kbsocket/api/stream_binding.hpp"
 #include "kbsocket/connection/connection.hpp"
 #include "kbsocket/connection/credit_account.hpp"
@@ -60,6 +61,9 @@ public:
     std::expected<void, kbs_stream_error> Open(std::span<const RawStreamEndpointConfig> endpoints,
                                                const runtime::RawStackConfig& config = {}) noexcept;
     kbs_stream_table* table(std::size_t context) noexcept;
+    // 可选应用 Lease 表借用整栈共享注册 Slab，不另建池；每次 C 操作遵守全部 context 暂停门禁。
+    std::expected<void, kbs_stream_error> OpenBuffers(const BufferBindingConfig& config) noexcept;
+    kbs_buffer_table* buffers() noexcept;
     runtime::RawStackStage stage() const noexcept;
     bool paused(std::size_t context) const noexcept;
     std::expected<runtime::RawStackSnapshot, kbs_stream_error> Inspect() const noexcept;

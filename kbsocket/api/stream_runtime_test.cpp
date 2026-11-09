@@ -960,6 +960,128 @@ TEST(StreamRuntimeTest, BusyListenerDoesNotStarveEstablishedStreamAtSmallBudget)
     EXPECT_EQ(output, payload);
 }
 
+kbs_buffer_pool_config BufferConfig(std::uint32_t capacity = 2) {
+    static std::uint64_t next_id = 9000;
+    return {KBS_BUFFER_ABI_VERSION, 0, next_id++, capacity, 0, 64, static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE))};
+}
+
+TEST(StreamRuntimeTest, OptionalBufferPoolRejectsBadConfigurationAndCanRetryWithoutRecreatingRuntime) {
+    Runtime runtime;
+    ASSERT_TRUE(runtime.Open());
+    kbs_buffer_table* buffers = nullptr;
+    EXPECT_EQ(kbs_runtime_buffers(runtime.value, &buffers, nullptr), KBS_STREAM_NOT_READY);
+    EXPECT_EQ(buffers, nullptr);
+    auto config = BufferConfig();
+    auto invalid = config;
+    invalid.reserved = 1;
+    EXPECT_EQ(kbs_runtime_open_buffers(runtime.value, &invalid, nullptr), KBS_STREAM_INVALID_ARGUMENT);
+    invalid = config;
+    invalid.memory_budget_bytes = 1;
+    EXPECT_EQ(kbs_runtime_open_buffers(runtime.value, &invalid, nullptr), KBS_STREAM_EXHAUSTED);
+    EXPECT_EQ(kbs_runtime_buffers(runtime.value, &buffers, nullptr), KBS_STREAM_NOT_READY);
+
+    // 配置或 backing 预算拒绝均未发布池，纠正后可重试；已发布池不得被重新配置替换。
+    ASSERT_EQ(kbs_runtime_open_buffers(runtime.value, &config, nullptr), 0);
+    ASSERT_EQ(kbs_runtime_buffers(runtime.value, &buffers, nullptr), 0);
+    ASSERT_NE(buffers, nullptr);
+    EXPECT_EQ(kbs_runtime_open_buffers(runtime.value, &config, nullptr), KBS_STREAM_BUSY);
+    std::array<kbs_buffer_handle, 2> handles{};
+    for (auto& handle : handles) {
+        ASSERT_EQ(kbs_buffer_acquire(buffers, 17, &handle, nullptr), 0);
+    }
+    kbs_buffer_handle rejected{99, 99, 99, 99};
+    EXPECT_EQ(kbs_buffer_acquire(buffers, 17, &rejected, nullptr), KBS_STREAM_EXHAUSTED);
+    EXPECT_EQ(rejected.generation, 0u);
+    for (auto handle : handles) {
+        EXPECT_EQ(kbs_buffer_release(buffers, handle, nullptr), 0);
+    }
+}
+
+TEST(StreamRuntimeTest, BufferLeaseKeepsRuntimeAliveAndCanBeReadAndReturnedAfterCloseBegins) {
+    Runtime runtime;
+    ASSERT_TRUE(runtime.Open());
+    const auto config = BufferConfig(1);
+    ASSERT_EQ(kbs_runtime_open_buffers(runtime.value, &config, nullptr), 0);
+    kbs_buffer_table* buffers = nullptr;
+    ASSERT_EQ(kbs_runtime_buffers(runtime.value, &buffers, nullptr), 0);
+    kbs_buffer_handle handle{};
+    ASSERT_EQ(kbs_buffer_acquire(buffers, 7, &handle, nullptr), 0);
+    kbs_buffer_view writable{};
+    ASSERT_EQ(kbs_buffer_writable(buffers, handle, &writable, nullptr), 0);
+    ASSERT_EQ(writable.size, 7u);
+    static_cast<std::byte*>(writable.data)[0] = std::byte{0x74};
+
+    // 关闭不能释放应用仍持有的 backing；停止新借用/可写访问后，保留只读消费和归还路径。
+    EXPECT_EQ(kbs_runtime_close(runtime.value, nullptr), KBS_STREAM_BUSY);
+    EXPECT_EQ(kbs_runtime_destroy(&runtime.value, nullptr), KBS_STREAM_BUSY);
+    EXPECT_EQ(kbs_runtime_open_buffers(runtime.value, &config, nullptr), KBS_STREAM_STOPPED);
+    kbs_buffer_handle rejected{};
+    EXPECT_EQ(kbs_buffer_acquire(buffers, 1, &rejected, nullptr), KBS_STREAM_STOPPED);
+    EXPECT_EQ(kbs_buffer_writable(buffers, handle, &writable, nullptr), KBS_STREAM_STOPPED);
+    EXPECT_EQ(writable.data, nullptr);
+    kbs_buffer_const_view readable{};
+    ASSERT_EQ(kbs_buffer_readable(buffers, handle, &readable, nullptr), 0);
+    EXPECT_EQ(static_cast<const std::byte*>(readable.data)[0], std::byte{0x74});
+    ASSERT_EQ(kbs_buffer_release(buffers, handle, nullptr), 0);
+    EXPECT_EQ(kbs_buffer_release(buffers, handle, nullptr), KBS_STREAM_INVALID_HANDLE);
+    ASSERT_EQ(kbs_runtime_close(runtime.value, nullptr), 0);
+    EXPECT_EQ(kbs_buffer_readable(buffers, handle, &readable, nullptr), KBS_STREAM_NOT_READY);
+    EXPECT_EQ(kbs_runtime_buffers(runtime.value, &buffers, nullptr), KBS_STREAM_NOT_READY);
+    EXPECT_EQ(buffers, nullptr);
+}
+
+TEST(StreamRuntimeTest, HostLeaseViewsWorkWithCopyStreamAndRepeatedLeaseOperationsDoNotAllocate) {
+    Runtime runtime;
+    ASSERT_TRUE(runtime.Open());
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    kbs_stream_handle stream{};
+    ASSERT_TRUE(runtime.Adopt(pair.right.value, stream));
+    const auto config = BufferConfig();
+    ASSERT_EQ(kbs_runtime_open_buffers(runtime.value, &config, nullptr), 0);
+    kbs_buffer_table* buffers = nullptr;
+    ASSERT_EQ(kbs_runtime_buffers(runtime.value, &buffers, nullptr), 0);
+    kbs_buffer_handle handle{};
+    ASSERT_EQ(kbs_buffer_acquire(buffers, 3, &handle, nullptr), 0);
+    kbs_buffer_view writable{};
+    ASSERT_EQ(kbs_buffer_writable(buffers, handle, &writable, nullptr), 0);
+    auto* bytes = static_cast<std::byte*>(writable.data);
+    std::fill_n(bytes, 3, std::byte{0x21});
+    kbs_stream_io io{};
+    ASSERT_EQ(kbs_stream_write(runtime.table, stream, bytes, 3, &io, nullptr), 0);
+    ASSERT_EQ(io.bytes, 3u);
+    ASSERT_TRUE(Wait(pair.left.value, POLLIN));
+    std::array<std::byte, 3> remote{};
+    ASSERT_EQ(::recv(pair.left.value, remote.data(), remote.size(), 0), 3);
+    EXPECT_TRUE(std::all_of(remote.begin(), remote.end(), [](auto value) { return value == std::byte{0x21}; }));
+    ASSERT_EQ(::send(pair.left.value, remote.data(), remote.size(), MSG_NOSIGNAL), 3);
+    const auto deadline = Now() + 3'000'000'000ull;
+    std::size_t received = 0;
+    while (received < 3 && Now() < deadline) {
+        const int status = kbs_stream_read(runtime.table, stream, bytes + received, 3 - received, Now(), &io, nullptr);
+        ASSERT_TRUE(status == 0 || status == KBS_STREAM_WOULD_BLOCK);
+        received += io.bytes;
+    }
+    EXPECT_EQ(received, 3u);
+    EXPECT_TRUE(std::equal(remote.begin(), remote.end(), bytes));
+    ASSERT_EQ(kbs_buffer_release(buffers, handle, nullptr), 0);
+
+    // 只统计初始化后的应用 Lease 热路径；copy-stream 测试不宣称已经实现零拷贝发送。
+    allocations = 0;
+    count_allocations = true;
+    bool success = true;
+    for (unsigned i = 0; i < 32; ++i) {
+        kbs_buffer_const_view readable{};
+        success &= kbs_buffer_acquire(buffers, 17, &handle, nullptr) == 0;
+        success &= kbs_buffer_writable(buffers, handle, &writable, nullptr) == 0;
+        success &= kbs_buffer_readable(buffers, handle, &readable, nullptr) == 0;
+        success &= kbs_buffer_release(buffers, handle, nullptr) == 0;
+    }
+    count_allocations = false;
+    EXPECT_TRUE(success);
+    EXPECT_EQ(allocations, 0u);
+}
+
 TEST(StreamRuntimeTest, InvalidCallsDoNotConsumeDescriptorsOrRuntime) {
     Runtime runtime;
     ASSERT_TRUE(runtime.Open());

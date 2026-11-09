@@ -6,7 +6,7 @@
 
 | 组件 | 当前责任与限制 |
 | --- | --- |
-| [`SlabAllocator`](../kbsocket/memory/slab_allocator.hpp) | 页对齐 backing 切成等长槽位，在 1–4 个不同 context 中分别注册；一个 owner 串行推进全部 Lease 操作 |
+| [`SlabAllocator`](../kbsocket/memory/slab_allocator.hpp) | 页对齐 backing 切成等长槽位，显式 CPU-only 池，或在 1–4 个不同 context 中分别注册；一个 owner 串行推进全部 Lease 操作 |
 | `MemoryBudget` | 多个 Slab 共享 backing 字节硬预算；同一 backing 注册到多个 context 只计一次 |
 | [`BufferLease`](../kbsocket/memory/buffer_lease.hpp) | 一次槽位借用及其唯一 CPU 所有权；复制描述符不增加引用 |
 | `BufferReference` | 每份本地 DMA 或远端 Grant 责任的独立票据；同一个 Lease 可以持有多份 |
@@ -19,6 +19,8 @@
 backing 的预算量为 `buffer_count * buffer_size` 向系统页大小取整后的字节数；它从分配前预留，直到所有 MR 成功注销并释放 backing 才归还。因此活动、空闲、借出和隔离槽位都已经包含在预算内。该预算不重复计算多 context 注册，也不包含 provider 内部开销、Slab/票据/隔离元数据、归还队列元数据和应用其他内存。元数据由各自固定容量限制，宿主仍须将这些成本纳入总体内存规划。
 
 `Open` 在控制路径分配、预触页并注册，不自动选择 Hugepage、THP 或共享内存。注册权限由 `SlabConfig::access` 选择，当前允许 READ、WRITE、ATOMIC 的非空组合，不接受 `LOCAL_ONLY`；创建远端 Grant 责任要求具备 WRITE 权限。这些权限检查不代表已经实现 Grant 发布协议。
+
+`SlabAllocator::OpenHost` 由 M5.4.6 追加，显式创建 CPU-only 池：沿用 backing 预算、预触页、身份与关闭规则，不调用 MR 注册/注销，拒绝预留任何 DMA/Grant 责任。原 `Open` 仍要求至少一个 context；空 context 不会隐式退化成 CPU 池。应用入口见 [Buffer Lease API](buffer-api.md)。
 
 ## 所有权与责任
 

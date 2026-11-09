@@ -601,6 +601,178 @@ TEST_F(SlabAllocatorTest, LeaseReferenceAndQuarantineFastPathDoesNotAllocate) {
     EXPECT_EQ(unregister_calls_, 0u);
     EXPECT_EQ(slab_.stats().available, 1u);
 }
+
+TEST_F(SlabAllocatorTest, HostPoolPreservesBoundedCpuLeaseAndViewSemanticsWithoutRegistration) {
+    ASSERT_TRUE(slab_.OpenHost(Config(2), budget_));
+    EXPECT_EQ(register_calls_, 0u);
+    EXPECT_EQ(budget_.reserved_bytes(), page_);
+    const std::array<std::byte, 3> bytes{std::byte{1}, std::byte{2}, std::byte{3}};
+    auto first = slab_.Copy(bytes);
+    auto second = slab_.Acquire(17);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    auto copied = slab_.Readable(*first);
+    auto writable = slab_.Writable(*second);
+    ASSERT_TRUE(copied);
+    ASSERT_TRUE(writable);
+    EXPECT_EQ(copied->size(), bytes.size());
+    EXPECT_TRUE(std::equal(copied->begin(), copied->end(), bytes.begin()));
+    EXPECT_EQ(writable->size(), 17u);
+    EXPECT_NE(copied->data(), writable->data());
+    (*writable)[0] = std::byte{42};
+
+    // 不因 CPU-only 模式绕过容量；归还后旧描述符仍必须失效。
+    auto full = slab_.Acquire(1);
+    ASSERT_FALSE(full);
+    EXPECT_EQ(full.error().code, MemoryErrorCode::kExhausted);
+    ASSERT_TRUE(slab_.ReleaseCpu(*first));
+    EXPECT_FALSE(slab_.Readable(*first));
+    auto reused = slab_.Acquire(5);
+    ASSERT_TRUE(reused);
+    EXPECT_EQ(reused->slot, first->slot);
+    EXPECT_NE(reused->generation, first->generation);
+    EXPECT_FALSE(slab_.ReleaseCpu(*first));
+    ASSERT_TRUE(slab_.ReleaseCpu(*second));
+    ASSERT_TRUE(slab_.ReleaseCpu(*reused));
+    ASSERT_TRUE(slab_.Close());
+    EXPECT_EQ(unregister_calls_, 0u);
+    EXPECT_EQ(budget_.reserved_bytes(), 0u);
+}
+
+TEST_F(SlabAllocatorTest, HostPoolCannotReserveDmaOrGrantEvenWithAccessBits) {
+    ASSERT_TRUE(slab_.OpenHost(Config(), budget_));
+    auto lease = slab_.Acquire(17);
+    ASSERT_TRUE(lease);
+    for (const auto use : {BufferUse::kLocalDma, BufferUse::kRemoteGrant}) {
+        auto reference = slab_.Reserve(*lease, use);
+        ASSERT_FALSE(reference);
+        EXPECT_EQ(reference.error().code, MemoryErrorCode::kInvalidArgument);
+    }
+    // 伪造票据不能把 Host 地址变为已注册 SGE；拒绝没有占用任何责任，也不影响 CPU 访问。
+    BufferReference forged{&slab_, 0, 1};
+    EXPECT_FALSE(slab_.Sge(forged, contexts_[0], 0, 17));
+    EXPECT_FALSE(slab_.Commit(forged));
+    EXPECT_FALSE(slab_.CompleteDma(forged));
+    EXPECT_FALSE(slab_.EndGrant(forged));
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+    EXPECT_EQ(slab_.stats().remote_grants, 0u);
+    EXPECT_TRUE(slab_.Writable(*lease));
+    ASSERT_TRUE(slab_.ReleaseCpu(*lease));
+    EXPECT_EQ(register_calls_, 0u);
+}
+
+TEST_F(SlabAllocatorTest, HostPoolCloseRetainsHeldMemoryAndBudgetUntilCpuReturn) {
+    auto config = Config();
+    config.buffer_size = page_ + 1;
+    ASSERT_TRUE(slab_.OpenHost(config, budget_));
+    EXPECT_EQ(budget_.reserved_bytes(), page_ * 2);
+    auto lease = slab_.Acquire(17);
+    ASSERT_TRUE(lease);
+    auto writable = slab_.Writable(*lease);
+    ASSERT_TRUE(writable);
+    (*writable)[0] = std::byte{99};
+    auto busy = slab_.Close();
+    ASSERT_FALSE(busy);
+    EXPECT_EQ(busy.error().code, MemoryErrorCode::kInUse);
+    EXPECT_EQ(budget_.reserved_bytes(), page_ * 2);
+    EXPECT_FALSE(slab_.accepting());
+    EXPECT_FALSE(slab_.Acquire(1));
+    EXPECT_FALSE(slab_.Writable(*lease));
+    // Stop 后只读与归还仍可继续；Close 不能撤销尚未归还的应用 CPU 所有权。
+    auto readable = slab_.Readable(*lease);
+    ASSERT_TRUE(readable);
+    EXPECT_EQ((*readable)[0], std::byte{99});
+    ASSERT_TRUE(slab_.ReleaseCpu(*lease));
+    ASSERT_TRUE(slab_.Close());
+    EXPECT_EQ(budget_.reserved_bytes(), 0u);
+    EXPECT_EQ(register_calls_, 0u);
+    EXPECT_EQ(unregister_calls_, 0u);
+}
+
+TEST_F(SlabAllocatorTest, HostAndRegisteredReopenNeverReviveOldLeaseOrReference) {
+    ASSERT_TRUE(slab_.Open(Contexts(1), Config(), budget_));
+    auto registered = slab_.Acquire(17);
+    ASSERT_TRUE(registered);
+    auto reference = slab_.Reserve(*registered, BufferUse::kLocalDma);
+    ASSERT_TRUE(reference);
+    ASSERT_TRUE(slab_.Cancel(*reference));
+    ASSERT_TRUE(slab_.ReleaseCpu(*registered));
+    ASSERT_TRUE(slab_.Close());
+
+    // 同一 allocator 对象切换模式也不能重置身份计数，更不能继承旧 MR 能力。
+    ASSERT_TRUE(slab_.OpenHost(Config(), budget_));
+    auto host = slab_.Acquire(17);
+    ASSERT_TRUE(host);
+    EXPECT_NE(host->generation, registered->generation);
+    EXPECT_FALSE(slab_.Readable(*registered));
+    EXPECT_FALSE(slab_.Sge(*reference, contexts_[0], 0, 17));
+    ASSERT_TRUE(slab_.ReleaseCpu(*host));
+    ASSERT_TRUE(slab_.Close());
+    ASSERT_TRUE(slab_.Open(Contexts(1), Config(), budget_));
+    auto next = slab_.Acquire(17);
+    ASSERT_TRUE(next);
+    EXPECT_NE(next->generation, host->generation);
+    EXPECT_FALSE(slab_.ReleaseCpu(*host));
+    auto next_reference = slab_.Reserve(*next, BufferUse::kLocalDma);
+    ASSERT_TRUE(next_reference);
+    EXPECT_NE(next_reference->sequence, reference->sequence);
+    EXPECT_FALSE(slab_.Commit(*reference));
+    ASSERT_TRUE(slab_.Cancel(*next_reference));
+    ASSERT_TRUE(slab_.ReleaseCpu(*next));
+    EXPECT_EQ(register_calls_, 2u);
+}
+
+TEST_F(SlabAllocatorTest, HostPoolValidatesConfigurationAndRoundedBudgetBeforePublishing) {
+    EXPECT_FALSE(slab_.Open({}, Config(), budget_));
+    EXPECT_FALSE(slab_.OpenHost(Config(0), budget_));
+    EXPECT_FALSE(slab_.OpenHost(Config(1, 0), budget_));
+    auto invalid = Config();
+    invalid.buffer_size = 0;
+    EXPECT_FALSE(slab_.OpenHost(invalid, budget_));
+    invalid = Config();
+    invalid.access = 0;
+    EXPECT_FALSE(slab_.OpenHost(invalid, budget_));
+    invalid.access = 0x80000000u;
+    EXPECT_FALSE(slab_.OpenHost(invalid, budget_));
+    invalid = Config(2);
+    invalid.buffer_size = std::numeric_limits<std::size_t>::max();
+    EXPECT_FALSE(slab_.OpenHost(invalid, budget_));
+    MemoryBudget too_small(page_ - 1);
+    auto exhausted = slab_.OpenHost(Config(), too_small);
+    ASSERT_FALSE(exhausted);
+    EXPECT_EQ(exhausted.error().code, MemoryErrorCode::kExhausted);
+    EXPECT_EQ(too_small.reserved_bytes(), 0u);
+    EXPECT_EQ(budget_.reserved_bytes(), 0u);
+    EXPECT_FALSE(slab_.accepting());
+    ASSERT_TRUE(slab_.OpenHost(Config(), budget_));
+    EXPECT_FALSE(slab_.OpenHost(Config(), budget_));
+    EXPECT_FALSE(slab_.Acquire(0));
+    EXPECT_FALSE(slab_.Acquire(65));
+    EXPECT_EQ(register_calls_, 0u);
+}
+
+TEST_F(SlabAllocatorTest, HostLeaseFastPathDoesNotAllocate) {
+    ASSERT_TRUE(slab_.OpenHost(Config(), budget_));
+    std::array<std::byte, 17> input{};
+    bool succeeded = true;
+    allocation_count = 0;
+    count_allocations = true;
+    for (unsigned i = 0; i < 64; ++i) {
+        auto lease = slab_.Copy(input);
+        if (!lease) {
+            succeeded = false;
+            break;
+        }
+        succeeded &= slab_.Writable(*lease).has_value();
+        succeeded &= slab_.Readable(*lease).has_value();
+        succeeded &= slab_.ReleaseCpu(*lease).has_value();
+    }
+    count_allocations = false;
+    EXPECT_TRUE(succeeded);
+    EXPECT_EQ(allocation_count, 0u);
+    EXPECT_EQ(register_calls_, 0u);
+    EXPECT_EQ(slab_.stats().available, 1u);
+}
 } // namespace
 } // namespace memory
 } // namespace kbsocket

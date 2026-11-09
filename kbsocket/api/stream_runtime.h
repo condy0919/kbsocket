@@ -4,6 +4,7 @@
 
 #include <sys/socket.h>
 
+#include "kbsocket/api/buffer_lease.h"
 #include "kbsocket/api/stream.h"
 
 #ifdef __cplusplus
@@ -56,6 +57,11 @@ int32_t kbs_runtime_config_init(kbs_runtime_config* config, kbs_stream_error* er
 int32_t kbs_runtime_create(const kbs_runtime_config* config, kbs_runtime** out, kbs_stream_error* error);
 // 表借用至 Destroy；Runtime Close 后旧表指针仍可安全返回 NOT_READY，Destroy 后不得访问。
 int32_t kbs_runtime_streams(kbs_runtime* runtime, kbs_stream_table** out, kbs_stream_error* error);
+// 可选 CPU 内存池，只在控制路径初始化一次；不改变既有 Runtime 配置布局。
+// 失败未发布时可修正配置重试。归还所有 Lease 前 Runtime Close 返回 BUSY。
+int32_t kbs_runtime_open_buffers(kbs_runtime* runtime, const kbs_buffer_pool_config* config, kbs_stream_error* error);
+// 未打开/Runtime 已关闭返回 NOT_READY；已借用表在 Destroy 前仍可安全拒绝旧调用。
+int32_t kbs_runtime_buffers(kbs_runtime* runtime, kbs_buffer_table** out, kbs_stream_error* error);
 // wait=0 为非阻塞 Tick；wait=1 最多等待配置的 max_wait_ms。已有应用事件时绝不再次睡眠。
 // 推进 stream 和已订阅监听器；pending_events 覆盖两类待取事件，不自动 Accept。
 int32_t kbs_runtime_step(kbs_runtime* runtime, uint32_t wait, kbs_runtime_progress* out, kbs_stream_error* error);
@@ -86,7 +92,7 @@ int32_t kbs_runtime_listener_address(kbs_runtime* runtime, kbs_listener_handle l
 // 有效监听句柄一经关闭即失效，即使 Linux close 报错也不重试同一 fd。
 // 先撤销监听通知；若撤销失败，保留句柄/socket 并返回错误，供显式重试。
 int32_t kbs_runtime_close_listener(kbs_runtime* runtime, kbs_listener_handle listener, kbs_stream_error* error);
-// 停止新准入；仍有已发布 stream 或 listener 返回 BUSY，保留 Step/关闭/Release 能力。
+// 停止新准入；仍有已发布 stream、listener 或 CPU Buffer Lease 返回 BUSY，保留 Step/关闭/Release 能力。
 // 同时停止监听订阅并清除未取监听提示，已有流事件继续可取。
 // 不强制关闭应用连接。全部责任已显式释放后可重试，成功后不允许继续 Step。
 int32_t kbs_runtime_close(kbs_runtime* runtime, kbs_stream_error* error);

@@ -1,4 +1,4 @@
-# M5.4.3 / M5.4.5：独立 NativeTCP C Runtime 与监听事件
+# M5.4.3 / M5.4.5 / M5.4.6：独立 NativeTCP C Runtime 与监听事件
 
 [`stream_runtime.h`](../kbsocket/api/stream_runtime.h) 将 M5.4.1–2 的复制流与事件接口组成可独立使用的 NativeTCP Runtime。C 应用可创建实例、非阻塞拨号、监听和接收，随后使用同一套 [`stream.h`](../kbsocket/api/stream.h) 读写、事件、关闭和释放接口。M5.4.5 增加有界监听事件与一次性订阅，监听和既有连接共用 Runtime 推进及等待。此模式使用透明 TCP 字节流，不发送 HELLO，不做协议探测、DNS、自动重拨或跨后端切换。
 
@@ -66,3 +66,9 @@ Watch 的 enabled 只允许 0 或 1。成功的 Watch(1) 建立新一轮订阅�
 ## 验证边界
 
 验证使用真实 IPv4 本机 TCP 与 C11/C++ 链接，无 UB 真机。既有范围包括配置、非阻塞建链、状态与错误、透明字节流、FIN/EOF、fd 接管与拒绝、固定容量及 BUSY 关闭；监听事件新增一次性订阅、已排队连接重订阅、取消和槽复用、接收容量背压、监听唤醒、预算及无分配推进。实际通过数量见 [roadmap](roadmap.md)。独立 raw C 生命周期、SHM、零拷贝、40k 规模和性能验证仍未交付或执行。
+
+## 可选应用 Buffer Lease 池
+
+M5.4.6 追加 `kbs_runtime_open_buffers` 与 `kbs_runtime_buffers`，按独立配置在控制路径创建固定容量 CPU-only 池，既有 `kbs_runtime_config` 布局不变。未打开时不分配该池；配置失败可纠正重试，成功后不再次 Open。用 [Buffer Lease API](buffer-api.md) 分配/借用/归还，池本身不提交传输。
+
+Runtime Close 同时停止新缓冲区分配与可写借用；仍持有 CPU Lease 时返回 BUSY，保持只读/归还入口。所有应用 Lease 归还后才关闭 backing。Close 后已有表指针在 Destroy 前返回 NOT_READY，Destroy 后不得使用。

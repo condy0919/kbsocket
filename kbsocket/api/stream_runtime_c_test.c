@@ -10,6 +10,7 @@ int KbsStreamRuntimeCHeaderTest(void) {
     kbs_runtime_config config = {0};
     kbs_runtime* runtime = NULL;
     kbs_stream_table* table = NULL;
+    kbs_buffer_table* buffers = NULL;
     kbs_stream_handle stream = {99, 99, 99, 99};
     kbs_listener_handle listener = {0};
     kbs_runtime_progress progress = {99, 99, 99};
@@ -24,7 +25,9 @@ int KbsStreamRuntimeCHeaderTest(void) {
     if (kbs_runtime_config_init(NULL, &error) != KBS_STREAM_INVALID_ARGUMENT ||
         kbs_runtime_create(NULL, &runtime, &error) != KBS_STREAM_INVALID_ARGUMENT || runtime != NULL ||
         kbs_runtime_create(&config, NULL, NULL) != KBS_STREAM_INVALID_ARGUMENT ||
-        kbs_runtime_streams(NULL, &table, NULL) != KBS_STREAM_INVALID_ARGUMENT || table != NULL) {
+        kbs_runtime_streams(NULL, &table, NULL) != KBS_STREAM_INVALID_ARGUMENT || table != NULL ||
+        kbs_runtime_open_buffers(NULL, NULL, NULL) != KBS_STREAM_INVALID_ARGUMENT ||
+        kbs_runtime_buffers(NULL, &buffers, NULL) != KBS_STREAM_INVALID_ARGUMENT || buffers != NULL) {
         return 2;
     }
     if (kbs_runtime_step(NULL, 0, &progress, NULL) != KBS_STREAM_INVALID_ARGUMENT || progress.processed != 0 ||
