@@ -9,6 +9,7 @@
 - `Write(span)` 返回已复制到注册 Slab 的前缀，调用方可立即复用该前缀。大 write 按 4096 B RM_CTP 限制有界分片，扩展身份头计入上限。驻留/远端窗口不足时短写或 WouldBlock，不分配整次 write 的缓存。
 - M5.4.7 追加 `WriteLease(source, offset, bytes)`：从同一注册 Slab 接受有界前缀，不复制 payload；每片从入队到真实终结独立持有源责任，应用可提前归还 CPU 但不能提前复用 backing。扩展身份使用独立头部 SGE；具体 API 和复用规则见 [Eager Lease 发送](lease-send.md)。
 - `Read(span, now)` 复制连续字节并返回短读/EOF；无数据返回 WouldBlock。读到一帧中途继续持有原 RX Lease，完整消费后才归还物理责任和乱序窗口 receipt。已复制前缀之后发生错误，仍保留前缀返回，并锁存失败供下一次调用观察。
+- M5.4.8 的 `ReadLease(max_bytes, now)` 借出当前有序帧的只读前缀，`ReleaseReadLease` 消费并归还。每流最多一个视图，持有时 copy-read/再次借用返回 BUSY；取消及关闭不抢回应用数据，Failed/Closing 仍可显式归还。详见 [接收 Lease](lease-receive.md)。
 - `ShutdownWrite` 把 FIN 排在已接受 write 之后；发送半关闭仍可发送 Credit，接收方向继续工作。FIN 通过相同 SN 重排，前面全部字节消费后才 EOF。
 - `Cancel`/不可恢复错误显式失败，不切 TCP、不重放旧 WR。`Close` 撤路由、有界清理未提交数据与未读 RX；已接受或接受未知的 DMA 依赖保留到可信终结。Retained 要继续交付完成后重试，不能销毁对象及其借用依赖。
 

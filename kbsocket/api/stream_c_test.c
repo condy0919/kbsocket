@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MulanPSL-2.0
+#include "kbsocket/api/lease_receive.h"
 #include "kbsocket/api/lease_send.h"
 #include "kbsocket/api/stream.h"
 
@@ -9,6 +10,8 @@ _Static_assert(sizeof(kbs_stream_error) == 24, "error layout");
 _Static_assert(sizeof(kbs_stream_io) == 16, "io layout");
 _Static_assert(sizeof(kbs_stream_status) == 56, "status layout");
 _Static_assert(sizeof(kbs_stream_event) == 80, "event layout");
+_Static_assert(sizeof(kbs_receive_lease) == 32, "receive lease layout");
+_Static_assert(sizeof(kbs_receive_view) == 56, "receive view layout");
 
 int KbsStreamCHeaderTest(void) {
     const kbs_stream_handle stream = {0};
@@ -38,6 +41,13 @@ int KbsStreamCHeaderTest(void) {
     if (kbs_stream_write_lease(NULL, stream, NULL, buffer, 0, 1, &io, &error) != KBS_STREAM_INVALID_ARGUMENT ||
         io.bytes != 0 || io.eof != 0 || io.reserved != 0 || error.code != KBS_STREAM_INVALID_ARGUMENT) {
         return 3;
+    }
+    kbs_receive_view view = {{stream, 99}, &stream, 99, 1, 1};
+    if (kbs_stream_read_lease(NULL, stream, 1, 0, &view, &error) != KBS_STREAM_INVALID_ARGUMENT || view.data != NULL ||
+        view.size != 0 || view.lease.generation != 0 || view.eof != 0 || view.reserved != 0 ||
+        error.code != KBS_STREAM_INVALID_ARGUMENT ||
+        kbs_stream_release_read_lease(NULL, view.lease, NULL) != KBS_STREAM_INVALID_ARGUMENT) {
+        return 4;
     }
     return 0;
 }

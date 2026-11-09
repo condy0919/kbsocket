@@ -117,6 +117,10 @@ public:
                                                            std::size_t bytes) noexcept;
     std::expected<ConnectionReadResult, ConnectionError> Read(std::span<std::byte> output,
                                                               std::uint64_t now_ns) noexcept;
+    std::expected<EagerReadLeaseResult, ConnectionError> ReadLease(std::size_t max_bytes,
+                                                                   std::uint64_t now_ns) noexcept;
+    /// 归还不受业务失败/关闭门禁限制；精确 token 仍须匹配尚未归还的 RX。
+    std::expected<void, ConnectionError> ReleaseReadLease(std::uint64_t generation) noexcept;
     std::expected<void, ConnectionError> ShutdownWrite() noexcept;
     std::expected<void, ConnectionError> OnTxCompletion(const raw::TxCompletionEvent& event) noexcept;
     /// 宿主收到 raw 控制 fd readiness 后调用；EOF/错误显式失败，不能转成 DMA 终结证明。

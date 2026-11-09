@@ -87,6 +87,8 @@ int RxCode(int detail) noexcept {
     switch (detail) {
     case static_cast<int>(Code::kInvalidArgument):
         return KBS_STREAM_INVALID_ARGUMENT;
+    case static_cast<int>(Code::kInvalidLease):
+        return KBS_STREAM_INVALID_HANDLE;
     case static_cast<int>(Code::kNotReady):
         return KBS_STREAM_NOT_READY;
     case static_cast<int>(Code::kInUse):

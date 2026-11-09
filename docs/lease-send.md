@@ -38,7 +38,7 @@ int32_t result = kbs_stream_write_lease(streams, stream, buffers, buffer,
 
 连接成功/失败与源可复用是独立信息。`TX_RETIRED` 是连接聚合事件，不能用它推算某个 Lease 已可复用；也不能凭取消、超时或 Close 失败释放已提交责任。接受未知后的隔离可能在 DMA 终结后仍使 `source_reusable=0`；应用可归还 CPU 句柄，底层在全部责任结清后自行回收。成功归还后原句柄失效，不再查询或访问。
 
-源可复用不代表远端收到或消费，也不终结未来的 WRITE Grant。M5.4.7 尚未提供接收 Lease 借用、跨线程 Lease 发送 mailbox 或 M6 RNDV。
+源可复用不代表远端收到或消费，也不终结未来的 WRITE Grant。[M5.4.8 接收 Lease](lease-receive.md) 使用独立 RX 池 token，不能直接作为本接口源。跨线程 Lease 发送 mailbox 和 M6 RNDV 尚未实现。
 
 ## 验证
 

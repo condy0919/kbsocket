@@ -13,6 +13,7 @@
 
 #include "kbsocket/connection/connection.hpp"
 #include "kbsocket/connection/connection_table.hpp"
+#include "kbsocket/connection/eager_rx.hpp"
 #include "kbsocket/control/connection_handshake.hpp"
 #include "kbsocket/control/raw_source_admission.hpp"
 #include "kbsocket/memory/buffer_lease.hpp"
@@ -105,6 +106,10 @@ public:
                                                                 std::size_t offset, std::size_t bytes) noexcept;
     std::expected<connection::ConnectionReadResult, ConnectionOwnerError>
     Read(OwnedConnection handle, std::span<std::byte> output, std::uint64_t now_ns) noexcept;
+    std::expected<connection::EagerReadLeaseResult, ConnectionOwnerError>
+    ReadLease(OwnedConnection handle, std::size_t max_bytes, std::uint64_t now_ns) noexcept;
+    std::expected<void, ConnectionOwnerError> ReleaseReadLease(OwnedConnection handle,
+                                                               std::uint64_t generation) noexcept;
     std::expected<void, ConnectionOwnerError> ShutdownWrite(OwnedConnection handle) noexcept;
     std::expected<void, ConnectionOwnerError> WatchTcp(OwnedConnection handle, bool read, bool write) noexcept;
     std::expected<void, ConnectionOwnerError> Cancel(OwnedConnection handle) noexcept;

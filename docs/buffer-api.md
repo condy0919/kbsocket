@@ -2,7 +2,7 @@
 
 本文记录 [roadmap](roadmap.md) 的 M5.4.6：通过有界 C 句柄分配、访问及归还应用缓冲区，并复用已有 Slab 的 CPU/DMA/Grant 责任。公共定义在 [`buffer_lease.h`](../kbsocket/api/buffer_lease.h)，C++ 控制面在 [`BufferBinding`](../kbsocket/api/buffer_binding.hpp)。
 
-M5.4.7 已接通 [Eager Lease 零拷贝发送](lease-send.md) 和源可复用查询；`read_lease` 与 M6 WRITE Grant/RNDV 尚未接入。取得缓冲区或 CPU 视图不会提交 SEND、READ、WRITE，也不代表远端拥有访问权。
+M5.4.7 已接通 [Eager Lease 零拷贝发送](lease-send.md) 和源可复用查询；M5.4.8 的 [接收 Lease](lease-receive.md) 使用独立 RX 借用 token，不由本表分配或归还。M6 WRITE Grant/RNDV 尚未接入。取得缓冲区或 CPU 视图不会提交 SEND、READ、WRITE，也不代表远端拥有访问权。
 
 ## 创建与资源来源
 

@@ -24,6 +24,7 @@
 #include <gtest/gtest.h>
 
 #include "kbsocket/api/buffer_binding.hpp"
+#include "kbsocket/api/lease_receive.h"
 #include "kbsocket/api/lease_send.h"
 #include "kbsocket/control/tx_lane_snapshot.hpp"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
@@ -251,6 +252,34 @@ TEST_F(StreamBindingTest, NativeTcpLeaseWriteExplicitlyRejectsWithoutCopyOrSourc
               KBS_STREAM_INVALID_ARGUMENT);
     ASSERT_TRUE(buffers.Release(*buffer));
     ASSERT_TRUE(buffers.Close());
+}
+
+TEST_F(StreamBindingTest, NativeTcpReceiveLeaseExplicitlyRejectsWithoutConsumingReadableBytes) {
+    Open();
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    const auto stream = Publish(Adopt(pair.right));
+    const std::array<std::byte, 3> payload{std::byte{0x11}, std::byte{0x22}, std::byte{0x33}};
+    ASSERT_EQ(::send(pair.left, payload.data(), payload.size(), MSG_NOSIGNAL), 3);
+    kbs_receive_view view{};
+    view.data = &view;
+    view.size = 99;
+    view.eof = view.reserved = 1;
+    view.lease.generation = 99;
+    kbs_stream_error error{};
+    EXPECT_EQ(kbs_stream_read_lease(binding_.table(), stream, 3, Now(), &view, &error), KBS_STREAM_NOT_SUPPORTED);
+    EXPECT_EQ(error.code, KBS_STREAM_NOT_SUPPORTED);
+    EXPECT_EQ(view.data, nullptr);
+    EXPECT_EQ(view.size, 0u);
+    EXPECT_EQ(view.lease.generation, 0u);
+    EXPECT_EQ(view.eof, 0u);
+    EXPECT_EQ(view.reserved, 0u);
+    std::array<std::byte, 3> output{};
+    kbs_stream_io io{};
+    ASSERT_EQ(kbs_stream_read(binding_.table(), stream, output.data(), output.size(), Now(), &io, nullptr), 0);
+    EXPECT_EQ(io.bytes, payload.size());
+    EXPECT_EQ(output, payload);
+    EXPECT_EQ(binding_.Inspect(stream)->state, KBS_STREAM_TCP_ACTIVE);
 }
 
 TEST_F(StreamBindingTest, CopyIoHasBoundedPrefixesAndImmediateSourceReuse) {
@@ -1391,6 +1420,84 @@ TEST_F(RawStreamBindingTest, LeaseWriteRejectsOtherContextPauseBeforeSourceOrQue
     ASSERT_TRUE(shared_->imports->Release(*extra));
     ASSERT_TRUE(buffers.Release(*buffer));
     ASSERT_TRUE(buffers.Close());
+}
+
+TEST_F(RawStreamBindingTest, ReceiveLeaseBorrowAndReturnAllocateNothingAndRespectReadWatch) {
+    Activate();
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    const std::array<std::byte, 3> payload{std::byte{1}, std::byte{2}, std::byte{3}};
+    ASSERT_EQ(sender.binding.Write(sender.stream, payload), 3u);
+    ASSERT_TRUE(Until([&] { return receiver.binding.Inspect(receiver.stream)->rx_pending != 0; }));
+    std::array<kbs_stream_event, 4> events{};
+    ASSERT_TRUE(receiver.binding.PollEvents(events));
+    kbs_receive_view view{};
+    const auto now = Now();
+    allocations = 0;
+    count_allocations = true;
+    const auto borrowed = kbs_stream_read_lease(receiver.binding.table(), receiver.stream, 1, now, &view, nullptr);
+    count_allocations = false;
+    ASSERT_EQ(borrowed, 0);
+    EXPECT_EQ(allocations, 0u);
+    ASSERT_EQ(view.size, 1u);
+    // 持有中的当前前缀不能再读，不应消耗一次性可读订阅；归还后尾部立即触发该订阅。
+    ASSERT_TRUE(receiver.binding.Watch(receiver.stream, true, false));
+    const auto held_events = receiver.binding.PollEvents(events);
+    ASSERT_TRUE(held_events);
+    for (std::size_t i = 0; i < *held_events; ++i) {
+        EXPECT_EQ(events[i].flags & KBS_STREAM_EVENT_READABLE, 0u);
+    }
+    count_allocations = true;
+    const auto released = kbs_stream_release_read_lease(receiver.binding.table(), view.lease, nullptr);
+    count_allocations = false;
+    ASSERT_EQ(released, 0);
+    EXPECT_EQ(allocations, 0u);
+    ASSERT_EQ(receiver.binding.PollEvents(events), 1u);
+    EXPECT_NE(events[0].flags & KBS_STREAM_EVENT_READABLE, 0u);
+    std::array<std::byte, 2> tail{};
+    const auto read = receiver.binding.Read(receiver.stream, tail, Now());
+    ASSERT_TRUE(read);
+    EXPECT_EQ(read->bytes, 2u);
+    EXPECT_EQ(tail, (std::array<std::byte, 2>{std::byte{2}, std::byte{3}}));
+}
+
+TEST_F(RawStreamBindingTest, ReceiveLeaseReturnDuringControlPausePreservesTokenForRetry) {
+    Activate();
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    const std::array<std::byte, 3> payload{std::byte{1}, std::byte{2}, std::byte{3}};
+    ASSERT_EQ(sender.binding.Write(sender.stream, payload), 3u);
+    ASSERT_TRUE(Until([&] { return receiver.binding.Inspect(receiver.stream)->rx_pending != 0; }));
+    kbs_receive_view view{};
+    ASSERT_EQ(kbs_stream_read_lease(receiver.binding.table(), receiver.stream, 3, Now(), &view, nullptr), 0);
+    const auto held = receiver.resources.domain.rx->held();
+    const auto hello = Hello(0);
+    control::EndpointImportRequest request{.key = {.local_context = &receiver.context,
+                                                   .local_context_incarnation = 2,
+                                                   .peer_runtime = hello.identity.runtime,
+                                                   .receive_domain = hello.identity.receive_domain,
+                                                   .endpoint_generation = hello.identity.endpoint_generation,
+                                                   .jetty_id = hello.jetty_id,
+                                                   .authorization_identity = 9},
+                                           .descriptor = {hello.descriptor.data(), hello.descriptor_bytes}};
+    std::memcpy(request.key.eid.data(), hello.eid.data(), hello.eid.size());
+    const auto extra = shared_->imports->Acquire(request);
+    ASSERT_TRUE(extra);
+    receiver.block_import.store(true);
+    ASSERT_TRUE(Until([&] { return stack_.paused(1); }));
+    // 门禁在触碰 RX/receipt 之前拒绝，解除暂停后仍可用原 token 归还。
+    EXPECT_EQ(kbs_stream_release_read_lease(receiver.binding.table(), view.lease, nullptr), KBS_STREAM_BUSY);
+    kbs_receive_view output{};
+    EXPECT_EQ(kbs_stream_read_lease(receiver.binding.table(), receiver.stream, 3, Now(), &output, nullptr),
+              KBS_STREAM_BUSY);
+    receiver.block_import.store(false);
+    receiver.block_import.notify_all();
+    ASSERT_TRUE(Until([&] { return !stack_.paused(1); }));
+    EXPECT_EQ(receiver.resources.domain.rx->held(), held);
+    EXPECT_EQ(static_cast<const std::byte*>(view.data)[2], std::byte{3});
+    ASSERT_EQ(kbs_stream_release_read_lease(receiver.binding.table(), view.lease, nullptr), 0);
+    EXPECT_EQ(receiver.resources.domain.rx->held() + 1, held);
+    ASSERT_TRUE(shared_->imports->Release(*extra));
 }
 
 TEST_F(RawStreamBindingTest, ExistingRawDataPartialReadAndFinRearmImmediately) {

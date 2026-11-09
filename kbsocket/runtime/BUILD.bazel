@@ -147,6 +147,7 @@ cc_library(
         ":rx_source_registry",
         "//kbsocket/connection",
         "//kbsocket/connection:connection_table",
+        "//kbsocket/connection:eager_rx",
         "//kbsocket/control:connection_handshake",
         "//kbsocket/control:raw_source_admission",
         "//kbsocket/memory:buffer_lease",

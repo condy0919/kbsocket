@@ -18,7 +18,9 @@
 
 #include <gtest/gtest.h>
 
+#include "kbsocket/api/lease_receive.h"
 #include "kbsocket/api/lease_send.h"
+#include "kbsocket/connection/wire_frame.hpp"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
 
 namespace kbsocket {
@@ -46,6 +48,7 @@ protected:
         std::array<std::deque<urma_cr_t>, 2> completed;
         bool hold_tx = false;
         std::size_t posted_sends = 0;
+        const void* last_received_data = nullptr;
         std::uint64_t last_source_address = 0;
         urma_target_seg_t* last_source_segment = nullptr;
         std::uint32_t last_source_sges = 0;
@@ -205,6 +208,11 @@ protected:
                     std::memcpy(reinterpret_cast<std::byte*>(receive.sge.addr) + bytes,
                                 reinterpret_cast<const void*>(sge.addr), sge.len);
                     bytes += sge.len;
+                }
+                const auto decoded = connection::DecodeWireFrame(
+                    wr->send.imm_data, {reinterpret_cast<const std::byte*>(receive.sge.addr), bytes});
+                if (decoded && !decoded->frame.data.empty()) {
+                    peer.last_received_data = decoded->frame.data.data();
                 }
                 urma_cr_t tx{};
                 tx.status = URMA_CR_SUCCESS;
@@ -402,6 +410,18 @@ protected:
         ASSERT_TRUE(Until([&] {
             const auto sender = Status(0, pair);
             return sender && sender->tx_pending == 0;
+        }));
+    }
+    void SendForLease(std::size_t pair = 0) {
+        const std::array<std::byte, 3> payload{std::byte{0x11}, std::byte{0x22}, std::byte{0x33}};
+        kbs_stream_io io{};
+        ASSERT_EQ(kbs_stream_write(runtime_.table(0), endpoints_[0].streams[pair], payload.data(), payload.size(), &io,
+                                   nullptr),
+                  0);
+        ASSERT_EQ(io.bytes, payload.size());
+        ASSERT_TRUE(Until([&] {
+            const auto status = Status(1, pair);
+            return status && status->rx_pending;
         }));
     }
     void ClosePair(std::size_t pair) {
@@ -623,6 +643,168 @@ TEST_F(RawStreamRuntimeTest, ApplicationBuffersShareRegisteredBackingWithoutDisr
     ASSERT_EQ(kbs_buffer_release(buffers, handle, nullptr), 0);
     EXPECT_EQ(kbs_buffer_readable(buffers, handle, &readable, nullptr), KBS_STREAM_INVALID_HANDLE);
     Transfer();
+}
+
+TEST_F(RawStreamRuntimeTest, ReceiveLeaseBorrowsRegisteredPrefixAndKeepsPhysicalCreditUntilCompleteConsumption) {
+    Activate();
+    SendForLease();
+    auto& receiver = endpoints_[1];
+    auto* table = runtime_.table(1);
+    const auto stream = receiver.streams[0];
+    const auto held = receiver.resources.domain.rx->held();
+    const auto released = receiver.resources.domain.credits->stats().released;
+    kbs_receive_view view{};
+    ASSERT_EQ(kbs_stream_read_lease(table, stream, 1, Now(), &view, nullptr), 0);
+    ASSERT_EQ(view.size, 1u);
+    EXPECT_EQ(view.data, receiver.last_received_data);
+    EXPECT_EQ(*static_cast<const std::byte*>(view.data), std::byte{0x11});
+    EXPECT_NE(view.lease.generation, 0u);
+    EXPECT_EQ(view.lease.stream.table_id, stream.table_id);
+    EXPECT_EQ(view.eof, 0u);
+    EXPECT_EQ(view.reserved, 0u);
+    kbs_receive_view busy{};
+    EXPECT_EQ(kbs_stream_read_lease(table, stream, 3, Now(), &busy, nullptr), KBS_STREAM_BUSY);
+    EXPECT_EQ(busy.data, nullptr);
+    EXPECT_EQ(busy.size, 0u);
+    std::array<std::byte, 3> copied{};
+    kbs_stream_io io{};
+    EXPECT_EQ(kbs_stream_read(table, stream, copied.data(), copied.size(), Now(), &io, nullptr), KBS_STREAM_BUSY);
+    EXPECT_EQ(Status(1)->state, KBS_STREAM_RAW_ACTIVE);
+    EXPECT_EQ(Status(1)->failure.code, 0);
+    // 应用持有期间推进 Runtime 也不能释放该帧；归还前缀仍须等剩余字节消费完。
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(runtime_.Step());
+    }
+    EXPECT_EQ(receiver.resources.domain.rx->held(), held);
+    EXPECT_EQ(receiver.resources.domain.credits->stats().released, released);
+    ASSERT_EQ(kbs_stream_release_read_lease(table, view.lease, nullptr), 0);
+    EXPECT_EQ(receiver.resources.domain.rx->held(), held);
+    EXPECT_EQ(receiver.resources.domain.credits->stats().released, released);
+    ASSERT_EQ(kbs_stream_read(table, stream, copied.data(), copied.size(), Now(), &io, nullptr), 0);
+    EXPECT_EQ(io.bytes, 2u);
+    EXPECT_EQ(copied[0], std::byte{0x22});
+    EXPECT_EQ(copied[1], std::byte{0x33});
+    EXPECT_EQ(receiver.resources.domain.rx->held() + 1, held);
+    EXPECT_EQ(receiver.resources.domain.credits->stats().released, released + 1);
+    EXPECT_EQ(kbs_stream_release_read_lease(table, view.lease, nullptr), KBS_STREAM_INVALID_HANDLE);
+}
+
+TEST_F(RawStreamRuntimeTest, ReceiveLeaseContinuesPartialCopyAndSeparatesWouldBlockFromOrderedEof) {
+    Activate();
+    auto* table = runtime_.table(1);
+    const auto stream = endpoints_[1].streams[0];
+    kbs_receive_view view{};
+    EXPECT_EQ(kbs_stream_read_lease(table, stream, 3, Now(), &view, nullptr), KBS_STREAM_WOULD_BLOCK);
+    EXPECT_EQ(view.data, nullptr);
+    EXPECT_EQ(view.lease.generation, 0u);
+    EXPECT_EQ(view.eof, 0u);
+    SendForLease();
+    std::byte prefix{};
+    kbs_stream_io io{};
+    ASSERT_EQ(kbs_stream_read(table, stream, &prefix, 1, Now(), &io, nullptr), 0);
+    EXPECT_EQ(prefix, std::byte{0x11});
+    ASSERT_EQ(kbs_stream_read_lease(table, stream, 99, Now(), &view, nullptr), 0);
+    EXPECT_EQ(view.size, 2u);
+    EXPECT_EQ(view.data, static_cast<const std::byte*>(endpoints_[1].last_received_data) + 1);
+    EXPECT_EQ(static_cast<const std::byte*>(view.data)[0], std::byte{0x22});
+    EXPECT_EQ(static_cast<const std::byte*>(view.data)[1], std::byte{0x33});
+    ASSERT_EQ(kbs_stream_shutdown_write(runtime_.table(0), endpoints_[0].streams[0], nullptr), 0);
+    ASSERT_TRUE(Until([&] { return Status(1)->rx_pending == 2; }));
+    kbs_receive_view blocked{};
+    EXPECT_EQ(kbs_stream_read_lease(table, stream, 3, Now(), &blocked, nullptr), KBS_STREAM_BUSY);
+    EXPECT_EQ(blocked.eof, 0u);
+    ASSERT_EQ(kbs_stream_release_read_lease(table, view.lease, nullptr), 0);
+    ASSERT_EQ(kbs_stream_read_lease(table, stream, 3, Now(), &view, nullptr), 0);
+    EXPECT_EQ(view.size, 0u);
+    EXPECT_EQ(view.data, nullptr);
+    EXPECT_EQ(view.lease.generation, 0u);
+    EXPECT_EQ(view.eof, 1u);
+    ASSERT_EQ(kbs_stream_read_lease(table, stream, 3, Now(), &view, nullptr), 0);
+    EXPECT_EQ(view.eof, 1u);
+}
+
+TEST_F(RawStreamRuntimeTest, ReceiveLeaseSurvivesCancellationAndClosingUntilExplicitReturn) {
+    Activate();
+    SendForLease();
+    auto* table = runtime_.table(1);
+    const auto stream = endpoints_[1].streams[0];
+    kbs_receive_view view{};
+    ASSERT_EQ(kbs_stream_read_lease(table, stream, 3, Now(), &view, nullptr), 0);
+    const auto held = endpoints_[1].resources.domain.rx->held();
+    ASSERT_EQ(kbs_stream_cancel(table, stream, nullptr), 0);
+    EXPECT_EQ(Status(1)->state, KBS_STREAM_FAILED);
+    EXPECT_EQ(kbs_stream_close(table, stream, nullptr), KBS_STREAM_RETAINED);
+    EXPECT_EQ(kbs_stream_release(table, stream, nullptr), KBS_STREAM_BUSY);
+    EXPECT_EQ(Status(1)->state, KBS_STREAM_CLOSING);
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(runtime_.Step());
+    }
+    EXPECT_EQ(endpoints_[1].resources.domain.rx->held(), held);
+    EXPECT_EQ(static_cast<const std::byte*>(view.data)[2], std::byte{0x33});
+    // Close 没有夺回已借出的指针；归还不受业务 Active/失败门禁拦截。
+    ASSERT_EQ(kbs_stream_release_read_lease(table, view.lease, nullptr), 0);
+    ASSERT_EQ(kbs_stream_close(table, stream, nullptr), 0);
+    EXPECT_EQ(Status(1)->state, KBS_STREAM_STATE_CLOSED);
+    EXPECT_EQ(kbs_stream_release_read_lease(table, view.lease, nullptr), KBS_STREAM_INVALID_HANDLE);
+}
+
+TEST_F(RawStreamRuntimeTest, ReceiveLeaseRejectsOldGenerationAndCrossStreamTransplantsWithoutConsumingEither) {
+    Activate();
+    AdoptPair();
+    PreparePair(1);
+    ActivePair(1);
+    SendForLease(0);
+    kbs_receive_view first{};
+    ASSERT_EQ(kbs_stream_read_lease(runtime_.table(1), endpoints_[1].streams[0], 1, Now(), &first, nullptr), 0);
+    SendForLease(1);
+    kbs_receive_view second{};
+    ASSERT_EQ(kbs_stream_read_lease(runtime_.table(1), endpoints_[1].streams[1], 1, Now(), &second, nullptr), 0);
+    EXPECT_NE(first.lease.generation, second.lease.generation);
+    auto wrong = first.lease;
+    wrong.stream = second.lease.stream;
+    EXPECT_EQ(kbs_stream_release_read_lease(runtime_.table(1), wrong, nullptr), KBS_STREAM_INVALID_HANDLE);
+    EXPECT_EQ(kbs_stream_release_read_lease(runtime_.table(0), first.lease, nullptr), KBS_STREAM_INVALID_HANDLE);
+    wrong = first.lease;
+    wrong.stream.reserved = 1;
+    EXPECT_EQ(kbs_stream_release_read_lease(runtime_.table(1), wrong, nullptr), KBS_STREAM_INVALID_HANDLE);
+    wrong = first.lease;
+    wrong.generation += (1ull << 32);
+    EXPECT_EQ(kbs_stream_release_read_lease(runtime_.table(1), wrong, nullptr), KBS_STREAM_INVALID_HANDLE);
+    ASSERT_EQ(kbs_stream_release_read_lease(runtime_.table(1), first.lease, nullptr), 0);
+    kbs_receive_view next{};
+    ASSERT_EQ(kbs_stream_read_lease(runtime_.table(1), endpoints_[1].streams[0], 2, Now(), &next, nullptr), 0);
+    EXPECT_NE(next.lease.generation, first.lease.generation);
+    EXPECT_EQ(kbs_stream_release_read_lease(runtime_.table(1), first.lease, nullptr), KBS_STREAM_INVALID_HANDLE);
+    EXPECT_EQ(static_cast<const std::byte*>(next.data)[0], std::byte{0x22});
+    ASSERT_EQ(kbs_stream_release_read_lease(runtime_.table(1), next.lease, nullptr), 0);
+    ASSERT_EQ(kbs_stream_release_read_lease(runtime_.table(1), second.lease, nullptr), 0);
+}
+
+TEST_F(RawStreamRuntimeTest, ReceiveLeaseInvalidArgumentsResetOutputWithoutConsumingData) {
+    Activate();
+    SendForLease();
+    const auto stream = endpoints_[1].streams[0];
+    auto* table = runtime_.table(1);
+    kbs_receive_view view{};
+    view.data = &view;
+    view.size = 99;
+    view.eof = view.reserved = 1;
+    view.lease.generation = 99;
+    EXPECT_EQ(kbs_stream_read_lease(table, stream, 0, Now(), &view, nullptr), KBS_STREAM_INVALID_ARGUMENT);
+    EXPECT_EQ(view.data, nullptr);
+    EXPECT_EQ(view.size, 0u);
+    EXPECT_EQ(view.eof, 0u);
+    EXPECT_EQ(view.reserved, 0u);
+    EXPECT_EQ(view.lease.generation, 0u);
+    EXPECT_EQ(kbs_stream_read_lease(table, stream, 1, Now(), nullptr, nullptr), KBS_STREAM_INVALID_ARGUMENT);
+    EXPECT_EQ(kbs_stream_read_lease(nullptr, stream, 1, Now(), &view, nullptr), KBS_STREAM_INVALID_ARGUMENT);
+    auto invalid_stream = stream;
+    ++invalid_stream.generation;
+    EXPECT_EQ(kbs_stream_read_lease(table, invalid_stream, 1, Now(), &view, nullptr), KBS_STREAM_INVALID_HANDLE);
+    ASSERT_EQ(kbs_stream_read_lease(table, stream, 99, Now(), &view, nullptr), 0);
+    EXPECT_EQ(view.size, 3u);
+    EXPECT_EQ(*static_cast<const std::byte*>(view.data), std::byte{0x11});
+    ASSERT_EQ(kbs_stream_release_read_lease(table, view.lease, nullptr), 0);
 }
 
 TEST_F(RawStreamRuntimeTest, LeaseWritePostsApplicationAddressAndRetainsSourceUntilActualCqe) {

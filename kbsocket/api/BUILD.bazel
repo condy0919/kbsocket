@@ -26,6 +26,13 @@ cc_library(
 )
 
 cc_library(
+    name = "lease_receive",
+    hdrs = ["lease_receive.h"],
+    visibility = ["//visibility:public"],
+    deps = [":stream"],
+)
+
+cc_library(
     name = "buffer_binding",
     srcs = ["buffer_binding.cpp"],
     hdrs = ["buffer_binding.hpp"],
@@ -80,6 +87,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":buffer_binding",
+        ":lease_receive",
         ":lease_send",
         ":stream",
         ":stream_error",
@@ -104,6 +112,7 @@ cc_library(
     srcs = ["stream_c_test.c"],
     copts = ["-std=c11"],
     deps = [
+        ":lease_receive",
         ":lease_send",
         ":stream",
     ],
@@ -114,6 +123,7 @@ cc_test(
     srcs = ["stream_binding_test.cpp"],
     deps = [
         ":buffer_binding",
+        ":lease_receive",
         ":lease_send",
         ":stream_binding",
         ":stream_c_test",
@@ -214,6 +224,7 @@ cc_test(
     name = "raw_stream_runtime_test",
     srcs = ["raw_stream_runtime_test.cpp"],
     deps = [
+        ":lease_receive",
         ":lease_send",
         ":raw_stream_runtime",
         "//kbsocket/connection:wire_frame",

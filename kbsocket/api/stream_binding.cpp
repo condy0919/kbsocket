@@ -45,6 +45,7 @@ struct StreamBinding::State {
     struct Slot {
         runtime::OwnedConnection connection;
         std::uint64_t generation = 0;
+        std::uint64_t receive_generation = 0, core_receive_generation = 0;
         runtime::ScheduledConnection scheduled;
         kbs_stream_event event{};
         std::uint32_t previous = kUnused, next = kUnused;
@@ -65,6 +66,8 @@ struct StreamBinding::State {
     std::uint32_t pending_head = kUnused, pending_tail = kUnused;
     std::size_t count = 0;
     std::uint64_t next_generation = 0;
+    // 整张表共享公开代次，防止不同流的首个内部 token 相同时被移植归还。
+    std::uint64_t next_receive_generation = 0;
     bool accepting = true, closed = false;
 
     std::expected<void, kbs_stream_error> Gate() noexcept {
@@ -462,6 +465,71 @@ StreamBinding::Read(kbs_stream_handle stream, std::span<std::byte> output, std::
     }
     return kbs_stream_io{read->bytes, read->eof ? 1u : 0u, 0};
 }
+std::expected<kbs_receive_view, kbs_stream_error>
+StreamBinding::ReadLease(kbs_stream_handle stream, std::size_t max_bytes, std::uint64_t now_ns) noexcept {
+    if (!state_) {
+        return Error(KBS_STREAM_NOT_READY);
+    }
+    if (!max_bytes) {
+        return Error(KBS_STREAM_INVALID_ARGUMENT);
+    }
+    const auto slot = state_->Find(stream);
+    if (!slot) {
+        return std::unexpected(slot.error());
+    }
+    const auto status = state_->Inspect(**slot);
+    if (!status) {
+        return std::unexpected(status.error());
+    }
+    if (const auto active = Active(*status); !active) {
+        return std::unexpected(active.error());
+    }
+    if (!state_->stack || status->state != connection::ConnectionState::kRawActive) {
+        return Error(KBS_STREAM_NOT_SUPPORTED);
+    }
+    if ((*slot)->receive_generation) {
+        return Error(KBS_STREAM_BUSY);
+    }
+    if (state_->next_receive_generation == std::numeric_limits<std::uint64_t>::max()) {
+        return Error(KBS_STREAM_EXHAUSTED);
+    }
+    const auto read =
+        state_->owner->ReadLease((*slot)->connection, std::min(max_bytes, state_->config.max_io_bytes), now_ns);
+    state_->Refresh(**slot);
+    if (!read) {
+        return std::unexpected(MapStreamError(read.error()));
+    }
+    kbs_receive_view view{};
+    view.eof = read->eof ? 1u : 0u;
+    if (read->generation) {
+        (*slot)->receive_generation = ++state_->next_receive_generation;
+        (*slot)->core_receive_generation = read->generation;
+        view.lease = {stream, (*slot)->receive_generation};
+        view.data = read->data.data();
+        view.size = read->data.size();
+    }
+    return view;
+}
+std::expected<void, kbs_stream_error> StreamBinding::ReleaseReadLease(kbs_receive_lease lease) noexcept {
+    if (!state_) {
+        return Error(KBS_STREAM_NOT_READY);
+    }
+    const auto slot = state_->Find(lease.stream);
+    if (!slot) {
+        return std::unexpected(slot.error());
+    }
+    if (!lease.generation || lease.generation != (*slot)->receive_generation) {
+        return Error(KBS_STREAM_INVALID_HANDLE);
+    }
+    // 不检查 Active：逻辑取消或 Close 保留时，应用仍拥有必须显式归还的视图。
+    const auto released = state_->owner->ReleaseReadLease((*slot)->connection, (*slot)->core_receive_generation);
+    if (released) {
+        (*slot)->receive_generation = 0;
+        (*slot)->core_receive_generation = 0;
+    }
+    state_->Refresh(**slot);
+    return released ? std::expected<void, kbs_stream_error>{} : std::unexpected(MapStreamError(released.error()));
+}
 std::expected<void, kbs_stream_error> StreamBinding::ShutdownWrite(kbs_stream_handle stream) noexcept {
     if (!state_) {
         return Error(KBS_STREAM_NOT_READY);
@@ -670,6 +738,27 @@ int32_t Finish(const std::expected<void, kbs_stream_error>& result, kbs_stream_e
 }
 } // namespace
 extern "C" {
+int32_t kbs_stream_read_lease(kbs_stream_table* table, kbs_stream_handle stream, size_t max_bytes, uint64_t now_ns,
+                              kbs_receive_view* out, kbs_stream_error* error) {
+    if (out) {
+        *out = {};
+    }
+    if (!table || !out || !max_bytes) {
+        return Invalid(error);
+    }
+    const auto read = table->binding->ReadLease(stream, max_bytes, now_ns);
+    if (!read) {
+        return Report(read.error(), error);
+    }
+    *out = *read;
+    return Report({}, error);
+}
+int32_t kbs_stream_release_read_lease(kbs_stream_table* table, kbs_receive_lease lease, kbs_stream_error* error) {
+    if (!table) {
+        return Invalid(error);
+    }
+    return Finish(table->binding->ReleaseReadLease(lease), error);
+}
 int32_t kbs_stream_write_lease(kbs_stream_table* table, kbs_stream_handle stream, kbs_buffer_table* buffers,
                                kbs_buffer_handle buffer, size_t offset, size_t length, kbs_stream_io* out,
                                kbs_stream_error* error) {

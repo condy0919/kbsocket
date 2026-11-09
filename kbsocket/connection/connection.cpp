@@ -464,6 +464,9 @@ std::expected<ConnectionReadResult, ConnectionError> Connection::Read(std::span<
     }
     auto result = rx_.Read(output, now_ns);
     if (!result) {
+        if (result.error().code == EagerRxErrorCode::kInUse) {
+            return std::unexpected(RxError(result.error()));
+        }
         return std::unexpected(Fail(RxError(result.error())));
     }
     if (rx_.failed()) {
@@ -473,6 +476,41 @@ std::expected<ConnectionReadResult, ConnectionError> Connection::Read(std::span<
         return Error(ConnectionErrorCode::kWouldBlock);
     }
     return ConnectionReadResult{result->bytes, result->eof};
+}
+std::expected<EagerReadLeaseResult, ConnectionError> Connection::ReadLease(std::size_t max_bytes,
+                                                                           std::uint64_t now_ns) noexcept {
+    if (failure_) {
+        return std::unexpected(*failure_);
+    }
+    if (state_ != ConnectionState::kRawActive) {
+        return Error(ConnectionErrorCode::kNotReady);
+    }
+    const auto result = rx_.ReadLease(max_bytes, now_ns);
+    if (!result) {
+        const auto error = RxError(result.error());
+        if (rx_.failed()) {
+            (void)Fail(error);
+        }
+        return std::unexpected(error);
+    }
+    if (result->would_block) {
+        return Error(ConnectionErrorCode::kWouldBlock);
+    }
+    return *result;
+}
+std::expected<void, ConnectionError> Connection::ReleaseReadLease(std::uint64_t generation) noexcept {
+    if (!rx_open_) {
+        return Error(ConnectionErrorCode::kNotReady);
+    }
+    const auto released = rx_.ReleaseLease(generation);
+    if (!released) {
+        const auto error = RxError(released.error());
+        if (rx_.failed() && !failure_) {
+            (void)Fail(error);
+        }
+        return std::unexpected(error);
+    }
+    return {};
 }
 std::expected<void, ConnectionError> Connection::ShutdownWrite() noexcept {
     if (failure_) {

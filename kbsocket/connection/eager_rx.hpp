@@ -35,7 +35,8 @@ enum class EagerRxErrorCode : std::uint8_t {
     kReorderFailed,
     kStopped,
     kRetained,
-    kProofRequired
+    kProofRequired,
+    kInvalidLease
 };
 struct EagerRxError {
     EagerRxErrorCode code;
@@ -110,6 +111,12 @@ struct EagerReadResult {
     bool eof = false;
     bool would_block = false;
 };
+struct EagerReadLeaseResult {
+    std::uint64_t generation = 0;
+    std::span<const std::byte> data{};
+    bool eof = false;
+    bool would_block = false;
+};
 
 /// 借用握手已经初始化的重排窗口。Read 复制数据，短读继续持有真实 Lease 与两份 receipt。
 /// 只有完整消费一帧才归还全部驻留责任；FIN 也按序消费后才可见 EOF。
@@ -125,8 +132,14 @@ public:
     std::expected<void, EagerRxError> Accept(EagerRxPacket packet, std::uint64_t now_ns) noexcept;
     /// 已复制前缀后遇错仍返回该前缀并置 failed()；宿主保留本次读取结果，同时终止后续业务推进。
     std::expected<EagerReadResult, EagerRxError> Read(std::span<std::byte> output, std::uint64_t now_ns) noexcept;
+    /// 每流最多借出当前有序帧的一个只读前缀；借用期间 Read/ReadLease 拒绝，不推进消费或授信。
+    /// EOF 返回空视图和零 generation，普通空队列返回 would_block，不借出 FIN 的物理 Lease。
+    std::expected<EagerReadLeaseResult, EagerRxError> ReadLease(std::size_t max_bytes, std::uint64_t now_ns) noexcept;
+    /// 精确代次归还后才推进消费；停止/失败/关闭中仍允许归还，错误 token 不修改所有权。
+    /// 第一次合法尝试即结束视图有效期；底层归还失败时保留 token，仅供清理重试，禁止继续访问旧视图。
+    std::expected<void, EagerRxError> ReleaseLease(std::uint64_t generation) noexcept;
     void Fail() noexcept;
-    /// 已停止后按预算释放本流持有的真实 Lease；不触碰仍 Posted 的 RX。
+    /// 已停止后按预算释放本流持有的真实 Lease；不触碰仍 Posted 或已借给应用的 RX。
     std::expected<std::size_t, EagerRxError> Drain(std::size_t budget = ReorderWindow::kMaxBatch) noexcept;
     std::expected<void, EagerRxError> Close() noexcept;
     /// 未读的当前帧、连续后继帧/FIN 或 EOF；乱序驻留本身不代表可读。
@@ -139,6 +152,8 @@ private:
     struct State;
     std::expected<void, EagerRxError> ReleaseDelivery(const ReorderDelivery& delivery) noexcept;
     std::unique_ptr<State> state_;
+    // 同一对象 Close/Open 不重置，旧借用 token 不命中新生命周期。
+    std::uint64_t next_lease_ = 0;
 };
 
 } // namespace connection

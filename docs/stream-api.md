@@ -1,6 +1,6 @@
 # M5.4.1–2：copy-stream C 接口与连接事件
 
-[`stream.h`](../kbsocket/api/stream.h) 提供 Eager 和 NativeTCP 共用的有界复制读写、半关闭、取消、状态查询及关闭/释放接口。头文件可由 C11 独立编译，不暴露 URMA、C++ 类型或底层 fd。`KBS_STREAM_ABI_VERSION=1` 标识本次结构与函数契约；M5.4.2 追加统一连接事件及一次性 readiness，保持已有结构布局不变。M5.4.3 的 [stream_runtime.h](stream-runtime.md) 已提供独立 NativeTCP Runtime 创建、拨号/接收及自动事件转发；M5.4.4 的 [RawStreamRuntime](raw-stream-runtime.md) 提供 raw C++ 应用编排，自动完成本地资源接线和事件转发；M5.4.6 的 [Buffer Lease API](buffer-api.md) 已提供缓冲区生命周期；M5.4.7 的 [lease_send.h](lease-send.md) 追加 raw Eager 源 Lease 零拷贝发送与独立源可复用查询。
+[`stream.h`](../kbsocket/api/stream.h) 提供 Eager 和 NativeTCP 共用的有界复制读写、半关闭、取消、状态查询及关闭/释放接口。头文件可由 C11 独立编译，不暴露 URMA、C++ 类型或底层 fd。`KBS_STREAM_ABI_VERSION=1` 标识本次结构与函数契约；M5.4.2 追加统一连接事件及一次性 readiness，保持已有结构布局不变。M5.4.3 的 [stream_runtime.h](stream-runtime.md) 已提供独立 NativeTCP Runtime 创建、拨号/接收及自动事件转发；M5.4.4 的 [RawStreamRuntime](raw-stream-runtime.md) 提供 raw C++ 应用编排，自动完成本地资源接线和事件转发；M5.4.6 的 [Buffer Lease API](buffer-api.md) 已提供缓冲区生命周期；M5.4.7 的 [lease_send.h](lease-send.md) 追加 raw Eager 源 Lease 零拷贝发送与独立源可复用查询；M5.4.8 的 [lease_receive.h](lease-receive.md) 提供有序 RX 只读视图借用及归还。
 
 ## 绑定已有运行时
 

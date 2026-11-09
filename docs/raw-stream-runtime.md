@@ -64,7 +64,7 @@ Open 从实际被动接收 jetty 调用 `GetRjetty`，复制有界描述符并�
 
 ## 交付边界
 
-本阶段提供 C++ raw 生命周期与协议准备入口，复用既有 C copy-stream 表。协议 connect/listen/accept 与认证仍由宿主完成；尚未提供独立 raw C Runtime ABI、监听事件或接收 Lease 借用接口。无 UB 真机时，Mock URMA 与本地协议 fd 的验证只能覆盖装配和软件状态机，不能证明真实硬件行为、吞吐或 40k 规模指标。
+本阶段提供 C++ raw 生命周期与协议准备入口，复用既有 C copy-stream 表。协议 connect/listen/accept 与认证仍由宿主完成；尚未提供独立 raw C Runtime ABI 或 raw 监听事件。无 UB 真机时，Mock URMA 与本地协议 fd 的验证只能覆盖装配和软件状态机，不能证明真实硬件行为、吞吐或 40k 规模指标。
 
 ## 应用 Buffer Lease 表
 
@@ -73,3 +73,5 @@ M5.4.6 追加可选 `OpenBuffers(BufferBindingConfig)` 和 `buffers()`，将应�
 BeginClose 停止新分配/可写视图，允许合法只读/归还；Close 在全部公开 CPU Lease 归还后关闭表，再按原有证明推进物理资源关闭。应用归还不等于 DMA/Grant 终结，底层 Slab 仍独立核对全部责任。详见 [应用 Buffer Lease API](buffer-api.md)。
 
 M5.4.7 的 `kbs_stream_write_lease` 从同一共享 Slab 直接引用应用源，入队即冻结 CPU 视图；扩展身份需要至少两个发送 SGE。使用 `kbs_buffer_inspect` 查询整份源的可复用状态，取消/连接失败与源责任终结分别处理。详见 [Eager Lease 发送](lease-send.md)。
+
+M5.4.8 的 `kbs_stream_read_lease` / `kbs_stream_release_read_lease` 通过同一 stream 表借用和归还有序 RX 视图，每流最多一个；无需打开应用 BufferBinding。应用持有时 Close 保留，Failed/Closing 仍允许归还。该视图遵守所属 context 暂停门禁，生命周期与授信规则见 [接收 Lease](lease-receive.md)。

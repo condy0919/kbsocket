@@ -367,10 +367,18 @@ struct EagerRxStream::State {
     std::unique_ptr<Entry[]> entries;
     std::optional<ReorderDelivery> current;
     std::size_t capacity = 0, pending = 0, offset = 0;
+    std::size_t lease_bytes = 0;
+    std::uint64_t lease_generation = 0;
+    bool release_started = false;
     bool failed = false, stopped = false;
 };
 EagerRxStream::EagerRxStream() noexcept = default;
-EagerRxStream::~EagerRxStream() = default;
+EagerRxStream::~EagerRxStream() {
+    if (!Close()) {
+        // 应用视图及真实 Lease/receipt 尚未归还，保留清理元数据；宿主也必须保留底层依赖。
+        (void)state_.release();
+    }
+}
 
 std::expected<void, EagerRxError> EagerRxStream::Open(EagerReceiveDomain& domain, ReorderWindow& window,
                                                       WireSessionBinding binding) noexcept {
@@ -477,6 +485,9 @@ std::expected<EagerReadResult, EagerRxError> EagerRxStream::Read(std::span<std::
     if (s.failed || s.stopped) {
         return Error(EagerRxErrorCode::kStopped);
     }
+    if (s.lease_generation) {
+        return Error(EagerRxErrorCode::kInUse);
+    }
     EagerReadResult result;
     if (output.empty()) {
         return EagerReadResult{0, eof(), false};
@@ -522,6 +533,85 @@ std::expected<EagerReadResult, EagerRxError> EagerRxStream::Read(std::span<std::
     return result;
 }
 
+std::expected<EagerReadLeaseResult, EagerRxError> EagerRxStream::ReadLease(std::size_t max_bytes,
+                                                                           std::uint64_t now_ns) noexcept {
+    if (!state_) {
+        return Error(EagerRxErrorCode::kNotReady);
+    }
+    auto& s = *state_;
+    if (s.failed || s.stopped) {
+        return Error(EagerRxErrorCode::kStopped);
+    }
+    if (!max_bytes) {
+        return Error(EagerRxErrorCode::kInvalidArgument);
+    }
+    if (s.lease_generation) {
+        return Error(EagerRxErrorCode::kInUse);
+    }
+    if (next_lease_ == std::numeric_limits<std::uint64_t>::max()) {
+        // 永不回绕公开代次；在移动窗口交付位置前停止新的借用。
+        return Error(EagerRxErrorCode::kStopped);
+    }
+    if (!s.current) {
+        ReorderDelivery delivery;
+        const auto polled = s.window->Poll(std::span(&delivery, 1), now_ns);
+        if (!polled) {
+            Fail();
+            return Error(EagerRxErrorCode::kReorderFailed);
+        }
+        if (!*polled) {
+            return EagerReadLeaseResult{.eof = eof(), .would_block = !eof()};
+        }
+        s.current = delivery;
+        s.offset = 0;
+    }
+    const auto& delivery = *s.current;
+    if (delivery.frame.kind == ReorderFrameKind::kFin) {
+        const auto released = ReleaseDelivery(delivery);
+        if (!released) {
+            return std::unexpected(released.error());
+        }
+        s.current.reset();
+        return EagerReadLeaseResult{.eof = eof()};
+    }
+    const auto bytes = std::min(max_bytes, delivery.frame.payload.size() - s.offset);
+    s.lease_generation = ++next_lease_;
+    s.lease_bytes = bytes;
+    s.release_started = false;
+    return EagerReadLeaseResult{.generation = s.lease_generation,
+                                .data = delivery.frame.payload.subspan(s.offset, bytes)};
+}
+
+std::expected<void, EagerRxError> EagerRxStream::ReleaseLease(std::uint64_t generation) noexcept {
+    if (!state_) {
+        return Error(EagerRxErrorCode::kNotReady);
+    }
+    auto& s = *state_;
+    if (!generation || generation != s.lease_generation) {
+        return Error(EagerRxErrorCode::kInvalidLease);
+    }
+    if (!s.current) {
+        Fail();
+        return Error(EagerRxErrorCode::kRetained);
+    }
+    if (!s.release_started) {
+        // 此后旧视图不可再访问；先锁存交回意图，底层部分清理失败后只重试责任，不重复消费字节。
+        s.release_started = true;
+        s.offset += s.lease_bytes;
+    }
+    if (s.offset == s.current->frame.payload.size()) {
+        const auto released = ReleaseDelivery(*s.current);
+        if (!released) {
+            return released;
+        }
+        s.current.reset();
+    }
+    s.lease_generation = 0;
+    s.lease_bytes = 0;
+    s.release_started = false;
+    return {};
+}
+
 void EagerRxStream::Fail() noexcept {
     if (state_) {
         state_->failed = true;
@@ -535,6 +625,10 @@ std::expected<std::size_t, EagerRxError> EagerRxStream::Drain(std::size_t budget
     auto& s = *state_;
     if (!budget || budget > ReorderWindow::kMaxBatch || (!s.stopped && !s.failed)) {
         return Error(EagerRxErrorCode::kInvalidArgument);
+    }
+    if (s.lease_generation) {
+        // 不抢回应用视图，也不绕过待重试的精确 token；压力仍由固定窗口与物理 RX 容量约束。
+        return std::size_t{0};
     }
     std::size_t released_count = 0;
     if (s.current) {
@@ -571,17 +665,17 @@ std::expected<void, EagerRxError> EagerRxStream::Close() noexcept {
     }
     state_->stopped = true;
     state_->window->StopAccepting();
-    if (state_->pending) {
+    if (state_->pending || state_->lease_generation) {
         return Error(EagerRxErrorCode::kInUse);
     }
     state_.reset();
     return {};
 }
 bool EagerRxStream::eof() const noexcept {
-    return state_ && !state_->failed && state_->window->eof();
+    return state_ && !state_->failed && !state_->lease_generation && state_->window->eof();
 }
 bool EagerRxStream::readable() const noexcept {
-    return state_ && !state_->failed && !state_->stopped && !state_->window->failure() &&
+    return state_ && !state_->failed && !state_->stopped && !state_->lease_generation && !state_->window->failure() &&
            ((state_->current && state_->offset < state_->current->frame.payload.size()) || state_->window->readable());
 }
 bool EagerRxStream::failed() const noexcept {

@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdlib>
 #include <deque>
+#include <limits>
 #include <new>
 #include <optional>
 #include <string>
@@ -280,6 +281,260 @@ TEST_F(EagerRxTest, OutOfOrderAndShortReadHoldRealLeaseUntilFullyConsumed) {
     EXPECT_EQ(credits_.stats().data.free, 4u);
     EXPECT_EQ(credits_.stats().released, 0u);
     EXPECT_FALSE(domain_.Release(last_packet_));
+}
+
+TEST_F(EagerRxTest, ReadLeaseBorrowsActualRxPrefixAndReturnsCreditOnlyAfterFullReleaseAndRefill) {
+    auto event = Data(0, "abcdef");
+    const auto* address = event.payload.data();
+    ASSERT_TRUE(Dispatch(event));
+    const auto posted = credits_.stats().physical_posted;
+    const auto post_calls = post_calls_;
+    const auto first = stream_.ReadLease(2, ++now_);
+    ASSERT_TRUE(first);
+    EXPECT_NE(first->generation, 0u);
+    EXPECT_EQ(first->data.data(), address);
+    EXPECT_EQ(first->data.size(), 2u);
+    EXPECT_EQ(first->data[0], std::byte{'a'});
+    EXPECT_FALSE(first->eof);
+    EXPECT_FALSE(first->would_block);
+    EXPECT_EQ(buffers_.held(), 1u);
+    EXPECT_EQ(credits_.stats().held, 1u);
+    EXPECT_EQ(window_.stats().resident_bytes, 6u);
+    EXPECT_EQ(window_.stats().consumed_bytes, 0u);
+    // 应用仍持有指针时，补投不得借 spare 槽绕过未归还的 receipt。
+    const auto early_refill = domain_.Refill();
+    ASSERT_TRUE(early_refill);
+    EXPECT_EQ(*early_refill, 0u);
+    EXPECT_EQ(post_calls_, post_calls);
+    EXPECT_EQ(credits_.stats().physical_posted, posted);
+    ASSERT_TRUE(stream_.ReleaseLease(first->generation));
+    EXPECT_EQ(buffers_.held(), 1u);
+    EXPECT_EQ(credits_.stats().held, 1u);
+    EXPECT_EQ(domain_.pending_refill(), 0u);
+    EXPECT_EQ(window_.stats().consumed_bytes, 0u);
+    const auto rest = stream_.ReadLease(100, ++now_);
+    ASSERT_TRUE(rest);
+    EXPECT_GT(rest->generation, first->generation);
+    EXPECT_EQ(rest->data.data(), address + 2);
+    EXPECT_EQ(rest->data.size(), 4u);
+    EXPECT_EQ(rest->data[0], std::byte{'c'});
+    ASSERT_TRUE(stream_.ReleaseLease(rest->generation));
+    EXPECT_EQ(stream_.pending(), 0u);
+    EXPECT_EQ(buffers_.held(), 0u);
+    EXPECT_EQ(window_.stats().consumed_bytes, 6u);
+    EXPECT_EQ(domain_.pending_refill(), 1u);
+    EXPECT_EQ(credits_.stats().released, 1u);
+    EXPECT_EQ(credits_.stats().data.free, 0u);
+    const auto refilled = domain_.Refill();
+    ASSERT_TRUE(refilled);
+    EXPECT_EQ(*refilled, 1u);
+    EXPECT_EQ(credits_.stats().data.free, 1u);
+    EXPECT_EQ(credits_.stats().physical_posted, 8u);
+}
+
+TEST_F(EagerRxTest, CopyAndBorrowShareOneOffsetWithoutRepeatingOrSkippingBytes) {
+    auto event = Data(0, "abcdef");
+    const auto* address = event.payload.data();
+    ASSERT_TRUE(Dispatch(event));
+    ASSERT_TRUE(Dispatch(Data(1, "gh")));
+    EXPECT_EQ(Read(2), "ab");
+    const auto borrowed = stream_.ReadLease(2, ++now_);
+    ASSERT_TRUE(borrowed);
+    EXPECT_EQ(borrowed->data.data(), address + 2);
+    EXPECT_EQ(borrowed->data[0], std::byte{'c'});
+    EXPECT_EQ(borrowed->data[1], std::byte{'d'});
+    ASSERT_TRUE(stream_.ReleaseLease(borrowed->generation));
+    EXPECT_EQ(Read(4), "efgh");
+    EXPECT_EQ(window_.stats().consumed_bytes, 8u);
+    EXPECT_EQ(domain_.pending_refill(), 2u);
+}
+
+TEST_F(EagerRxTest, BorrowedViewBlocksSecondReadAndInvalidTokensWithoutFailingStream) {
+    ASSERT_TRUE(Dispatch(Data(0, "abcd")));
+    ASSERT_TRUE(Dispatch(Data(1, "ef")));
+    const auto borrowed = stream_.ReadLease(2, ++now_);
+    ASSERT_TRUE(borrowed);
+    EXPECT_FALSE(stream_.readable());
+    EXPECT_FALSE(stream_.eof());
+    const auto second = stream_.ReadLease(2, ++now_);
+    ASSERT_FALSE(second);
+    EXPECT_EQ(second.error().code, EagerRxErrorCode::kInUse);
+    std::array<std::byte, 8> output{};
+    const auto copied = stream_.Read(output, ++now_);
+    ASSERT_FALSE(copied);
+    EXPECT_EQ(copied.error().code, EagerRxErrorCode::kInUse);
+    for (const auto invalid : {std::uint64_t{0}, borrowed->generation + 1, std::numeric_limits<std::uint64_t>::max()}) {
+        const auto released = stream_.ReleaseLease(invalid);
+        ASSERT_FALSE(released);
+        EXPECT_EQ(released.error().code, EagerRxErrorCode::kInvalidLease);
+    }
+    EXPECT_FALSE(stream_.failed());
+    EXPECT_EQ(buffers_.held(), 2u);
+    EXPECT_EQ(borrowed->data[0], std::byte{'a'});
+    ASSERT_TRUE(stream_.ReleaseLease(borrowed->generation));
+    const auto twice = stream_.ReleaseLease(borrowed->generation);
+    ASSERT_FALSE(twice);
+    EXPECT_EQ(twice.error().code, EagerRxErrorCode::kInvalidLease);
+    EXPECT_FALSE(stream_.failed());
+    EXPECT_TRUE(stream_.readable());
+    EXPECT_EQ(Read(8), "cdef");
+}
+
+TEST_F(EagerRxTest, ReadLeaseWaitsForMissingSequenceAndBorrowsOnlyOneFrame) {
+    ASSERT_TRUE(Dispatch(Data(1, "cd")));
+    const auto waiting = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(waiting);
+    EXPECT_TRUE(waiting->would_block);
+    EXPECT_FALSE(waiting->eof);
+    EXPECT_EQ(waiting->generation, 0u);
+    EXPECT_TRUE(waiting->data.empty());
+    ASSERT_TRUE(Dispatch(Data(0, "ab")));
+    const auto first = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->data.size(), 2u);
+    EXPECT_EQ(first->data[0], std::byte{'a'});
+    EXPECT_FALSE(stream_.readable());
+    ASSERT_TRUE(stream_.ReleaseLease(first->generation));
+    EXPECT_TRUE(stream_.readable());
+    const auto next = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(next);
+    EXPECT_EQ(next->data.size(), 2u);
+    EXPECT_EQ(next->data[0], std::byte{'c'});
+    ASSERT_TRUE(stream_.ReleaseLease(next->generation));
+}
+
+TEST_F(EagerRxTest, HeldDataLeaseKeepsOrderedFinHiddenUntilReleasedAndRead) {
+    WireFrameInput fin;
+    fin.type = WireFrameType::kControl;
+    fin.control = WireControlType::kFin;
+    fin.token = route_.token;
+    fin.seq = 1;
+    fin.session = binding_.context.session;
+    ASSERT_TRUE(Dispatch(Event(fin)));
+    ASSERT_TRUE(Dispatch(Data(0, "ab")));
+    const auto data = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(data);
+    EXPECT_EQ(data->data.size(), 2u);
+    EXPECT_FALSE(data->eof);
+    EXPECT_FALSE(stream_.readable());
+    EXPECT_FALSE(stream_.eof());
+    EXPECT_EQ(buffers_.held(), 2u);
+    ASSERT_TRUE(stream_.ReleaseLease(data->generation));
+    EXPECT_FALSE(stream_.eof());
+    EXPECT_TRUE(stream_.readable());
+    const auto end = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(end);
+    EXPECT_EQ(end->generation, 0u);
+    EXPECT_TRUE(end->data.empty());
+    EXPECT_TRUE(end->eof);
+    EXPECT_FALSE(end->would_block);
+    EXPECT_TRUE(stream_.eof());
+    EXPECT_EQ(stream_.pending(), 0u);
+    EXPECT_EQ(domain_.pending_refill(), 2u);
+    const auto repeated = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(repeated);
+    EXPECT_TRUE(repeated->eof);
+    EXPECT_EQ(repeated->generation, 0u);
+    EXPECT_FALSE(stream_.ReleaseLease(0));
+}
+
+TEST_F(EagerRxTest, FailureAndDrainCannotReclaimAnApplicationHeldPrefix) {
+    ASSERT_TRUE(Dispatch(Data(0, "abcd")));
+    ASSERT_TRUE(Dispatch(Data(6, "z")));
+    const auto borrowed = stream_.ReadLease(2, ++now_);
+    ASSERT_TRUE(borrowed);
+    stream_.Fail();
+    // 失败只停止后续交付；原指针与 sparse 后继均留待应用归还后再按预算清退。
+    const auto drained = stream_.Drain();
+    ASSERT_TRUE(drained);
+    EXPECT_EQ(*drained, 0u);
+    EXPECT_FALSE(stream_.Close());
+    EXPECT_EQ(buffers_.held(), 2u);
+    EXPECT_EQ(domain_.pending_refill(), 0u);
+    EXPECT_EQ(borrowed->data[0], std::byte{'a'});
+    EXPECT_EQ(borrowed->data[1], std::byte{'b'});
+    EXPECT_FALSE(stream_.ReadLease(1, ++now_));
+    ASSERT_TRUE(stream_.ReleaseLease(borrowed->generation));
+    EXPECT_EQ(buffers_.held(), 2u); // 仅归还前缀；余下字节尚由本流清理。
+    const auto cleanup = stream_.Drain();
+    ASSERT_TRUE(cleanup);
+    EXPECT_EQ(*cleanup, 2u);
+    EXPECT_EQ(buffers_.held(), 0u);
+    EXPECT_TRUE(stream_.Close());
+}
+
+TEST_F(EagerRxTest, CloseRetainsWholeBorrowedFrameUntilExactLeaseReturns) {
+    ASSERT_TRUE(Dispatch(Data(0, "abc")));
+    const auto borrowed = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(borrowed);
+    const auto closed = stream_.Close();
+    ASSERT_FALSE(closed);
+    EXPECT_EQ(closed.error().code, EagerRxErrorCode::kInUse);
+    EXPECT_FALSE(stream_.readable());
+    const auto drained = stream_.Drain();
+    ASSERT_TRUE(drained);
+    EXPECT_EQ(*drained, 0u);
+    EXPECT_EQ(borrowed->data[2], std::byte{'c'});
+    ASSERT_TRUE(stream_.ReleaseLease(borrowed->generation));
+    EXPECT_EQ(stream_.pending(), 0u);
+    EXPECT_EQ(credits_.stats().released, 1u);
+    EXPECT_TRUE(stream_.Close());
+}
+
+TEST_F(EagerRxTest, ReceiveLeaseGenerationNeverRestartsAcrossStreamReopen) {
+    ASSERT_TRUE(Dispatch(Data(0, "old")));
+    const auto old = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(old);
+    ASSERT_TRUE(stream_.ReleaseLease(old->generation));
+    ASSERT_TRUE(stream_.Close());
+    ASSERT_TRUE(window_.Close());
+    ASSERT_TRUE(domain_.Refill());
+    ASSERT_TRUE(window_.Open({22, 33, 44, route_.token.slot, route_.token.generation}, {8, 32, 10000, 0}));
+    ASSERT_TRUE(stream_.Open(domain_, window_, binding_));
+    ASSERT_TRUE(Dispatch(Data(0, "new")));
+    const auto current = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(current);
+    EXPECT_GT(current->generation, old->generation);
+    const auto stale = stream_.ReleaseLease(old->generation);
+    ASSERT_FALSE(stale);
+    EXPECT_EQ(stale.error().code, EagerRxErrorCode::kInvalidLease);
+    EXPECT_EQ(buffers_.held(), 1u);
+    EXPECT_EQ(current->data[0], std::byte{'n'});
+    ASSERT_TRUE(stream_.ReleaseLease(current->generation));
+}
+
+TEST_F(EagerRxTest, ZeroLengthLeaseReadRejectsWithoutDeliveringOrPoisoningCurrentFrame) {
+    ASSERT_TRUE(Dispatch(Data(0, "a")));
+    const auto result = stream_.ReadLease(0, ++now_);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, EagerRxErrorCode::kInvalidArgument);
+    EXPECT_FALSE(stream_.failed());
+    EXPECT_EQ(window_.stats().buffered_frames, 1u);
+    EXPECT_EQ(window_.stats().delivered_frames, 0u);
+    EXPECT_EQ(Read(1), "a");
+}
+
+TEST_F(EagerRxTest, BorrowPartialReleaseWholeReleaseAndRefillDoNotAllocate) {
+    auto event = Data(0, "abcd");
+    allocations = 0;
+    count_allocations = true;
+    const auto dispatched = Dispatch(event);
+    const auto first = stream_.ReadLease(2, ++now_);
+    const auto first_released = stream_.ReleaseLease(first ? first->generation : 0);
+    const auto second = stream_.ReadLease(8, ++now_);
+    const auto second_released = stream_.ReleaseLease(second ? second->generation : 0);
+    const auto refilled = domain_.Refill();
+    count_allocations = false;
+    EXPECT_EQ(allocations, 0u);
+    ASSERT_TRUE(dispatched);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(first_released);
+    ASSERT_TRUE(second);
+    ASSERT_TRUE(second_released);
+    ASSERT_TRUE(refilled);
+    EXPECT_EQ(first->data.size(), 2u);
+    EXPECT_EQ(second->data.size(), 2u);
+    EXPECT_EQ(*refilled, 1u);
 }
 
 TEST_F(EagerRxTest, StaleTokenStillDebitsOriginalPhysicalGrantBeforeRouteRejection) {

@@ -288,6 +288,32 @@ std::expected<std::size_t, ConnectionOwnerError> ConnectionOwner::WriteLease(Own
     const auto written = (*slot)->connection->WriteLease(source, offset, bytes);
     return written ? std::expected<std::size_t, ConnectionOwnerError>{*written} : ConnectionError(written.error());
 }
+std::expected<connection::EagerReadLeaseResult, ConnectionOwnerError>
+ConnectionOwner::ReadLease(OwnedConnection handle, std::size_t max_bytes, std::uint64_t now_ns) noexcept {
+    if (!state_) {
+        return Error(Code::kNotReady);
+    }
+    const auto slot = state_->Wake(handle);
+    if (!slot) {
+        return std::unexpected(slot.error());
+    }
+    const auto read = (*slot)->connection->ReadLease(max_bytes, now_ns);
+    return read ? std::expected<connection::EagerReadLeaseResult, ConnectionOwnerError>{*read}
+                : ConnectionError(read.error());
+}
+std::expected<void, ConnectionOwnerError> ConnectionOwner::ReleaseReadLease(OwnedConnection handle,
+                                                                            std::uint64_t generation) noexcept {
+    if (!state_) {
+        return Error(Code::kNotReady);
+    }
+    // 先保证后续授信/关闭能继续调度；Wake 失败时尚未消费应用的归还责任。
+    const auto slot = state_->Wake(handle);
+    if (!slot) {
+        return std::unexpected(slot.error());
+    }
+    const auto released = (*slot)->connection->ReleaseReadLease(generation);
+    return released ? std::expected<void, ConnectionOwnerError>{} : ConnectionError(released.error());
+}
 std::expected<void, ConnectionOwnerError> ConnectionOwner::ShutdownWrite(OwnedConnection handle) noexcept {
     if (!state_) {
         return Error(Code::kNotReady);
