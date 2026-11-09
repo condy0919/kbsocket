@@ -2,6 +2,27 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "grant_manager",
+    srcs = ["grant_manager.cpp"],
+    hdrs = ["grant_manager.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":wire_frame",
+        "//kbsocket/memory:slab_allocator",
+    ],
+)
+
+cc_test(
+    name = "grant_manager_test",
+    srcs = ["grant_manager_test.cpp"],
+    deps = [
+        ":grant_manager",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "eager_tx",
     srcs = ["eager_tx.cpp"],
     hdrs = ["eager_tx.hpp"],
