@@ -37,3 +37,66 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "fd_command_queue",
+    srcs = ["fd_command_queue.cpp"],
+    hdrs = ["fd_command_queue.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":fd_table",
+        "//kbsocket/api:stream",
+    ],
+)
+
+cc_library(
+    name = "socket_dispatcher",
+    srcs = ["socket_dispatcher.cpp"],
+    hdrs = ["socket_dispatcher.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":fd_command_queue",
+        ":fd_table",
+        "//kbsocket/api:stream",
+        "//kbsocket/api:stream_binding",
+        "//kbsocket/runtime:progress_source",
+    ],
+)
+
+cc_test(
+    name = "fd_command_queue_test",
+    srcs = ["fd_command_queue_test.cpp"],
+    deps = [
+        ":fd_command_queue",
+        ":fd_table",
+        "//kbsocket/api:stream",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "socket_dispatcher_test",
+    srcs = ["socket_dispatcher_test.cpp"],
+    deps = [
+        ":fd_command_queue",
+        ":fd_table",
+        ":socket_dispatcher",
+        "//kbsocket/api:stream",
+        "//kbsocket/runtime:progress_source",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "socket_dispatcher_tcp_test",
+    srcs = ["socket_dispatcher_tcp_test.cpp"],
+    deps = [
+        ":fd_command_queue",
+        ":fd_table",
+        ":socket_dispatcher",
+        "//kbsocket/api:stream",
+        "//kbsocket/api:stream_runtime",
+        "//kbsocket/runtime:progress_source",
+        "@googletest//:gtest_main",
+    ],
+)

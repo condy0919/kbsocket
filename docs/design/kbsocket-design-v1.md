@@ -195,7 +195,7 @@ flowchart TB
 
 1. `FdTable` 为按 fd 索引的两级目录，每个槽位原子发布不可变的 `FdBinding` 指针。M7.1 首版按配置上限一次预分配全部 256 槽目录页、绑定池及读者槽，以硬预算约束存储；宿主按自身 FD 上限配置，最大支持 `1<<20` 个 fd，按块惰性映射尚未实现。
 2. 任意应用线程查询 `fd` 时，使用线程本地 **Hazard Pointer** 保护加载出的指针并重检槽位一致性；在成功校验完整 `FdBindingId` 并将请求推入目标 Shard 的 `Mailbox`（或取得受控操作句柄）后，立即退出 Hazard 保护，**绝不跨阻塞等待长期持有 Hazard 指针**。
-3. `close(fd)` 的 owner 解绑槽位后，旧绑定进入本地有界退休队列；原节点在 Hazard、长期引用及 owner 关闭确认均结束后才能复用。回收先扫 Hazard 再检查引用，不能漏掉查询向长期引用交接的并发窗口。实际 Connection/Runtime 仍按双轨条件关闭，最终 SocketAdapter/ShardReactor 的自动接入待后续。
+3. `close(fd)` 的 owner 解绑槽位后，旧绑定进入本地有界退休队列；原节点在 Hazard、长期引用及 owner 关闭确认均结束后才能复用。回收先扫 Hazard 再检查引用，不能漏掉查询向长期引用交接的并发窗口。实际 Connection/Runtime 仍按双轨条件关闭；M7.2 的 SocketDispatcher 已提供 owner 收发、逻辑关闭与真实 Close/Release 退休，完整 POSIX SocketAdapter/EpollMux 及 raw Runtime 自动装配待后续。
 
 M7.1 的 [FdTable](../fd-table.md) 只保存 owner 与完整 stream 数值身份；`FdLease` 保护绑定元数据，不自动保活实际 ConnectionOwner 或授权跨线程调用 C stream。适配层必须另行保留 Mailbox、回调和目标依赖。解绑后可立即发布同一 fd 的新代，已取得的旧引用只能在旧连接完成或失败，不能改投新连接；32 位代次耗尽时拒绝复用。
 
@@ -627,6 +627,8 @@ stateDiagram-v2
 2. **显式 C ABI（`kbsocket/api/kbsocket.h`, `buffer.h`）**：提供句柄式非阻塞连接、普通读写及零拷贝 `kb_alloc_lease` / `kb_write_lease` / `kb_read_lease` / `kb_release_lease`。
 3. **POSIX Socket & Epoll 兼容层（`kbsocket/socket/`）**：支持 `socket`/`connect`/`accept`/`read`/`write`/`readv`/`writev`/`close`/`shutdown`/`getsockopt(SO_ERROR)` 及 `epoll`（`EPOLLIN`/`EPOLLOUT`/`EPOLLET`/`EPOLLONESHOT`）。内部合成事件与原生内核 `epoll` 共享公平配额，防止加速连接事件饿死原生 TCP `accept`。
 4. **C++23 项目中的 P2300 风格异步层**：通过适配实现 sender/receiver，不把 P2300 的标准库实现当作 C++23 已有能力。基于 Operation State 封装 `AsyncConnect`/`AsyncRead`/`AsyncWrite`，正常、错误、超时与取消竞争下恰好完成一次；错误通知和 `source_reusable` 分开，DMA 未终结前不归还借用内存。
+
+**当前实现 M7.2**：[SocketDispatcher](../socket-dispatcher.md) 通过有界命令队列将完整 FD/stream 身份交给单 owner，支持复制读写、半关闭、状态与逻辑关闭，完成领取前保留元数据引用。Attach 控制路径独立预留内核 fd，传输 socket 仍归 Runtime；真实 Close/Release 与 CPU 回收分别推进。公开 fd 目前只保留身份，Submit/TakeCompletion 是异步请求接口，不能冒充 POSIX I/O 返回值或 epoll readiness；backend/Runtime 必须活到 dispatcher 显式 Close 成功。
 
 普通读写支持部分完成、`EAGAIN`、双向独立关闭与 `SO_ERROR`。可读 readiness 来自连续可读字节或可报告的 FIN/错误；可写 readiness 由连接状态及本地能否接纳新的写入决定。远端 credit 暂缺限制物理提交，但不应遮蔽仍有 staging 容量可接收的普通复制写。非 owner 线程调用普通 `write` 时，必须在返回前复制已接受字节，或等 owner 完成该复制后返回；不能只把用户指针入 Mailbox 就宣告成功。
 

@@ -1,6 +1,6 @@
 # M7.1：有界 FD 身份表与 CPU 退休
 
-[`FdTable`](../kbsocket/socket/fd_table.hpp) 为后续 Socket/Epoll 兼容层提供整数 fd 到完整 stream 身份的映射。当前只管理绑定元数据：不创建、关闭或代理内核 fd，不执行 stream I/O，不自动延长 ConnectionOwner、Runtime、MR 或 Grant 的生命期。宿主仍管理真实目标及其关闭，下一阶段接入 SocketAdapter/owner dispatch。
+[`FdTable`](../kbsocket/socket/fd_table.hpp) 为后续 Socket/Epoll 兼容层提供整数 fd 到完整 stream 身份的映射。当前只管理绑定元数据：不创建、关闭或代理内核 fd，不执行 stream I/O，不自动延长 ConnectionOwner、Runtime、MR 或 Grant 的生命期。独立使用时宿主仍管理真实目标及其关闭；M7.2 的 [SocketDispatcher](socket-dispatcher.md) 已提供 owner 调度与关闭接线。
 
 ## 容量与身份
 
@@ -48,4 +48,4 @@ FdLease **只保留绑定元数据**。跨线程业务必须把完整目标交�
 - [并发测试](../kbsocket/socket/fd_table_concurrency_test.cpp)：四读线程与 owner 执行 4000 代绑定/解绑/回收，检查不可变身份、完整旧代拒绝及全部节点恰好一次回收；另覆盖读者已退出但操作引用仍存续、并发 Reader 满额及归还。ThreadSanitizer 单独运行同一组三个用例通过。
 - [NativeTCP 组合测试](../kbsocket/socket/fd_table_stream_test.cpp)：真实 IPv4 loopback 和 C Runtime。应用线程只查询并交接 Lease，owner 将旧请求发给旧 stream、新请求发给新 stream，分别核验收到的字节；真实 Close/Release 后确认退休，复用 stream 槽时旧 stream 句柄和旧 FD 身份均被拒绝。
 
-这里的 NativeTCP 用例模拟 owner dispatch，不是已经接通的 SocketAdapter。内核 FD 分配策略、跨线程 Socket I/O 门面、EpollMux、bRPC 接入和 40k 规模验收仍待后续；未把本轮结果当作 UB 或吞吐性能证据。回归计数见 [roadmap](roadmap.md)。
+这里的 M7.1 NativeTCP 用例只模拟 owner dispatch；M7.2 已通过 [SocketDispatcher](socket-dispatcher.md) 接通独立内核 FD 预留、跨线程命令及真实 stream 关闭。POSIX Socket 门面、EpollMux、bRPC 接入和 40k 规模验收仍待后续；未把这些结果当作 UB 或吞吐性能证据。回归计数见 [roadmap](roadmap.md)。
