@@ -32,7 +32,7 @@ struct ConnectionCommandTicket {
 struct ConnectionCommandReply {
     std::size_t bytes = 0;
     bool eof = false;
-    std::optional<OwnedConnectionStatus> status;
+    std::optional<OwnedConnectionStatus> status = std::nullopt;
 };
 using ConnectionCommandResult = std::expected<ConnectionCommandReply, ConnectionOwnerError>;
 struct ConnectionCommandCompletion {
@@ -72,13 +72,17 @@ struct CommandQueueError {
 class ConnectionCommandQueue {
 public:
     static constexpr std::size_t kMaxCapacity = 65536;
+    // 保持既有默认大小；大消息必须显式配置并提供整环 payload 预算。
     static constexpr std::size_t kMaxIoBytes = 4096;
+    static constexpr std::size_t kMaxPayloadBytes = 1024u * 1024u;
     ConnectionCommandQueue() noexcept;
     ~ConnectionCommandQueue();
     ConnectionCommandQueue(const ConnectionCommandQueue&) = delete;
     ConnectionCommandQueue& operator=(const ConnectionCommandQueue&) = delete;
-    /// 容量向上取至少 2 的二次幂；每个槽内固定保存最多 4096 B I/O 数据。
-    std::expected<void, CommandQueueError> Open(std::size_t capacity) noexcept;
+    /// 容量向上取至少 2 的二次幂；payload 每槽向上对齐 64 B 后乘实际槽数预分配。
+    /// 预算只覆盖 payload backing，固定槽元数据另由 capacity 约束；收发及领取不分配。
+    std::expected<void, CommandQueueError> Open(std::size_t capacity, std::size_t max_io_bytes = kMaxIoBytes,
+                                                std::size_t payload_budget_bytes = kMaxCapacity * kMaxIoBytes) noexcept;
     std::expected<ConnectionCommandTicket, CommandQueueError> TrySubmit(const ConnectionCommand& command,
                                                                         std::span<const std::byte> input = {}) noexcept;
     /// 未完成返回 kPending，不重新执行命令；Read 的 output 太小时保留原结果。
@@ -94,6 +98,7 @@ public:
     std::expected<void, CommandQueueError> Close(bool clients_stopped = false) noexcept;
     int command_fd() const noexcept;
     std::size_t capacity() const noexcept;
+    std::size_t max_io_bytes() const noexcept;
     /// 并发提交/领取期间仅为快照，客户端静止后精确；不能单独证明可以释放队列。
     std::size_t outstanding() const noexcept;
     bool accepting() const noexcept;

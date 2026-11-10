@@ -72,6 +72,7 @@ protected:
         std::uint64_t polls = 0;
         std::array<std::uint64_t, 4> posts_by_jetty{};
         std::uint64_t callback_tx_retired = 0, callback_closing_tx = 0, callback_failed_tx = 0;
+        std::uint64_t initial_accepted = 0, initial_retired = 0, initial_callback_retired = 0;
         std::uint64_t callback_rx_changes = 0;
         std::size_t callback_rx_pending = 0;
         std::uint64_t callback_count = 0;
@@ -350,7 +351,8 @@ protected:
                                              .connection_id = e.scheduled.id,
                                              .tx_capacity = 8,
                                              .sources = &e.handshake_sources,
-                                             .peer_lanes_authorized = true};
+                                             .peer_lanes_authorized = true,
+                                             .rndv = {}};
         preparation.authorize_lane_update = e.lane_updates_enabled ? &AuthorizeLaneUpdate : nullptr;
         preparation.lane_authorization_cookie = &e;
         preparation.lane_update_timeout_ns = e.lane_update_timeout_ns;
@@ -407,19 +409,39 @@ protected:
             ASSERT_TRUE(endpoint.scheduler.Wake(endpoint.scheduled));
         }
     }
+    void DrainInitialCredits() {
+        // READY 不是本端 CREDIT 的成功 CQE；通过真正的 Runtime Tick/传递/poll 排空初始公告。
+        // 连续两次空闲才建立业务计数基线，不清队列、不清 DMA 或篡改回调累计数。
+        unsigned idle = 0;
+        ASSERT_TRUE(Until([&] {
+            const bool quiet = packets_.empty() && std::all_of(endpoints_.begin(), endpoints_.end(), [](const auto& e) {
+                                   return e.slab.stats().local_dma == 0 && e.completions[0].empty() &&
+                                          e.completions[1].empty() && e.receive.pending_refill() == 0;
+                               });
+            idle = quiet ? idle + 1 : 0;
+            return idle >= 2;
+        }));
+        for (auto& endpoint : endpoints_) {
+            endpoint.initial_accepted = endpoint.connection.tx_stats().accepted;
+            endpoint.initial_retired = endpoint.connection.tx_stats().retired;
+            endpoint.initial_callback_retired = endpoint.callback_tx_retired;
+        }
+    }
     void Activate() {
         Prepare();
         ASSERT_TRUE(Until([&] {
             return endpoints_[0].connection.state() == ConnectionState::kRawActive &&
                    endpoints_[1].connection.state() == ConnectionState::kRawActive;
         }));
+        DrainInitialCredits();
     }
     void EnableLaneUpdates() {
         for (auto& endpoint : endpoints_) {
             endpoint.lane_updates_enabled = true;
         }
     }
-    void ReplaceEmptyLane(std::size_t side, std::uint32_t index = 0) {
+    // 初始 CREDIT 已真实使用 Lane 0，接下来的业务 WR 使用轮转到的 Lane 1；替换它以覆盖新来源。
+    void ReplaceEmptyLane(std::size_t side, std::uint32_t index = 1) {
         auto& endpoint = endpoints_[side];
         ASSERT_EQ(endpoint.slab.stats().local_dma, 0u);
         ASSERT_TRUE(endpoint.completions[0].empty());
@@ -571,6 +593,7 @@ protected:
             return left && right && left->state == ConnectionState::kRawActive &&
                    right->state == ConnectionState::kRawActive;
         }));
+        DrainInitialCredits();
     }
 
     void RetireOwned(std::size_t side) {
@@ -968,7 +991,7 @@ TEST_F(OwnedConnectionRuntimeTest, ClosingOwnedConnectionsRetainsDmaAndLateRecei
     EXPECT_FALSE(owners_[1].RetireSources(owned_[1], {1, true, true, false}));
     EXPECT_EQ(endpoints_[1].sources.size(), 2u);
     ASSERT_TRUE(Until([&] { return endpoints_[0].slab.stats().local_dma == 0; }));
-    EXPECT_EQ(endpoints_[0].callback_tx_retired, 1u);
+    EXPECT_EQ(endpoints_[0].callback_tx_retired, endpoints_[0].initial_callback_retired + 1);
     EXPECT_EQ(endpoints_[0].callback_closing_tx, 1u);
     ASSERT_TRUE(owners_[0].CloseConnection(owned_[0]));
 
@@ -1168,7 +1191,7 @@ TEST_F(ConstrainedSourceRuntimeTest, InsufficientRegistryCapacityRejectsWholeHel
     EXPECT_EQ(endpoint.connection.handshake().local_ready(), nullptr);
     EXPECT_EQ(endpoint.sources.size(), 0u);
     EXPECT_EQ(endpoint.handshake_sources.size(), 0u);
-    EXPECT_EQ(endpoint.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(endpoint.connection.tx_stats().accepted, endpoint.initial_accepted);
     EXPECT_TRUE(packets_.empty());
 }
 
@@ -1181,7 +1204,7 @@ TEST_F(ConnectionRuntimeTest, ReplacingActiveLaneRejectsQueuedWriteUnderOldHello
     const auto old_lane = endpoint.pool.lane(0);
     ASSERT_TRUE(old_lane);
     const auto old_jetty_id = endpoint.pool.lane_jetty(0)->jetty_id.id;
-    // 尚无 WR 提交；控制路径真实完成 ERROR/边界/空 flush/替换，模拟 provider 已终结该空 SQ。
+    // 业务 WR 尚未提交且初始 CREDIT 已终结；真实完成 ERROR/边界/空 flush/替换以重建空 SQ。
     ASSERT_TRUE(endpoint.pool.BeginDrain(*old_lane));
     ASSERT_TRUE(endpoint.pool.ObserveFlushDone(*old_lane));
     std::array<urma_cr_t, 1> completions{};
@@ -1198,7 +1221,7 @@ TEST_F(ConnectionRuntimeTest, ReplacingActiveLaneRejectsQueuedWriteUnderOldHello
     ASSERT_FALSE(progressed);
     EXPECT_EQ(progressed.error().code, ConnectionErrorCode::kLaneChanged);
     EXPECT_EQ(endpoint.connection.state(), ConnectionState::kFailed);
-    EXPECT_EQ(endpoint.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(endpoint.connection.tx_stats().accepted, endpoint.initial_accepted);
     EXPECT_EQ(endpoint.slab.stats().local_dma, 0u);
     EXPECT_TRUE(packets_.empty());
     EXPECT_EQ(endpoint.sources.size(), 2u);
@@ -1221,7 +1244,7 @@ TEST_F(ConnectionRuntimeTest, RebuiltLaneWaitsForPeerAckBeforeSubmittingQueuedDa
     }
     EXPECT_TRUE(sender.connection.lane_update_pending());
     EXPECT_EQ(sender.connection.local_lane_update_id(), 0u);
-    EXPECT_EQ(sender.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(sender.connection.tx_stats().accepted, sender.initial_accepted);
     EXPECT_EQ(sender.slab.stats().local_dma, 0u);
     EXPECT_EQ(receiver.sources.size(), 2u);
     EXPECT_TRUE(packets_.empty());
@@ -1233,7 +1256,7 @@ TEST_F(ConnectionRuntimeTest, RebuiltLaneWaitsForPeerAckBeforeSubmittingQueuedDa
     EXPECT_EQ(receiver.connection.peer_lane_update_id(), 1u);
     EXPECT_EQ(receiver.sources.size(), 3u);
     EXPECT_EQ(sender.connection.local_lane_update_id(), 0u);
-    EXPECT_EQ(sender.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(sender.connection.tx_stats().accepted, sender.initial_accepted);
     ASSERT_TRUE(sender.scheduler.Wake(sender.scheduled));
     ASSERT_TRUE(receiver.scheduler.Wake(receiver.scheduled));
     ASSERT_TRUE(Until([&] {
@@ -1264,7 +1287,7 @@ TEST_F(ConnectionRuntimeTest, SimultaneousLaneUpdatesCompleteInBothDirections) {
         ASSERT_EQ(endpoint.connection.Write(payloads[side]), 1u);
         ASSERT_TRUE(endpoint.connection.Progress(Now()));
         EXPECT_TRUE(endpoint.connection.lane_update_pending());
-        EXPECT_EQ(endpoint.connection.tx_stats().accepted, 0u);
+        EXPECT_EQ(endpoint.connection.tx_stats().accepted, endpoint.initial_accepted);
         ASSERT_TRUE(endpoint.scheduler.Wake(endpoint.scheduled));
     }
     // 双向都处于等待 ACK 状态时也须处理对端 UPDATE，不能让单发送缓冲造成互相等待。
@@ -1300,7 +1323,7 @@ TEST_F(ConnectionRuntimeTest, LaneAckDoesNotRetireOldSourceWithDelayedReceive) {
     ASSERT_EQ(packets_.size(), 1u);
     auto delayed = std::move(packets_.front());
     packets_.pop_front();
-    ASSERT_EQ(delayed.source.id, sender.pool.lane_jetty(0)->jetty_id.id);
+    ASSERT_EQ(delayed.source.id, sender.pool.lane_jetty(1)->jetty_id.id);
     // 本地 TX 先终结，但远端 RX 尚未交付；这只能证明本地替换安全，不能撤销旧来源。
     ASSERT_TRUE(Until([&] { return sender.slab.stats().local_dma == 0; }));
     ReplaceEmptyLane(0);
@@ -1340,7 +1363,7 @@ TEST_F(ConnectionRuntimeTest, RejectedLanePolicyNeverAcknowledgesOrPostsFromNewS
     EXPECT_EQ(receiver.connection.peer_lane_update_id(), 0u);
     EXPECT_EQ(sender.connection.local_lane_update_id(), 0u);
     EXPECT_EQ(receiver.sources.size(), 2u);
-    EXPECT_EQ(sender.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(sender.connection.tx_stats().accepted, sender.initial_accepted);
     EXPECT_EQ(sender.slab.stats().local_dma, 0u);
     EXPECT_TRUE(packets_.empty());
 }
@@ -1373,7 +1396,7 @@ TEST_F(FullSourceRuntimeTest, FailedOnlineSourceInstallCannotAcknowledgeReplacem
     EXPECT_EQ(receiver.sources.size(), 2u);
     EXPECT_EQ(receiver.connection.peer_lane_update_id(), 0u);
     EXPECT_EQ(sender.connection.local_lane_update_id(), 0u);
-    EXPECT_EQ(sender.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(sender.connection.tx_stats().accepted, sender.initial_accepted);
     EXPECT_TRUE(packets_.empty());
 }
 
@@ -1394,7 +1417,7 @@ TEST_F(ConnectionRuntimeTest, ControlCloseWhileWaitingForLaneAckKeepsSourcesAndS
     ASSERT_TRUE(sender.connection.failure());
     EXPECT_EQ(sender.connection.failure()->code, ConnectionErrorCode::kControlClosed);
     EXPECT_EQ(sender.connection.local_lane_update_id(), 0u);
-    EXPECT_EQ(sender.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(sender.connection.tx_stats().accepted, sender.initial_accepted);
     EXPECT_EQ(sender.slab.stats().local_dma, 0u);
     EXPECT_EQ(sender.sources.size(), 2u);
     EXPECT_EQ(receiver.sources.size(), 2u);
@@ -1419,7 +1442,7 @@ TEST_F(ConnectionRuntimeTest, UnacknowledgedLaneUpdateHasBoundedDeadline) {
     EXPECT_EQ(timed_out.error().code, ConnectionErrorCode::kLaneUpdateTimeout);
     EXPECT_EQ(sender.connection.state(), ConnectionState::kFailed);
     EXPECT_EQ(sender.connection.local_lane_update_id(), 0u);
-    EXPECT_EQ(sender.connection.tx_stats().accepted, 0u);
+    EXPECT_EQ(sender.connection.tx_stats().accepted, sender.initial_accepted);
     EXPECT_EQ(sender.slab.stats().local_dma, 0u);
     EXPECT_EQ(endpoints_[1].sources.size(), 2u);
     EXPECT_TRUE(packets_.empty());
@@ -1526,7 +1549,8 @@ TEST_F(ConnectionRuntimeTest, CancelKeepsAcceptedDmaRoutableUntilRuntimeConsumes
     raw::TxCompletionEvent valid{.kind = raw::TxCompletionKind::kCompleted,
                                  .completion = completion,
                                  .lane = record->ticket.lane,
-                                 .record = *record};
+                                 .record = *record,
+                                 .error = {}};
     sender.connection.Cancel();
     // 已取消的流仍须拒绝错误代次，不能把 existing failure 当作忽略非法完成的理由。
     auto malformed = valid;
@@ -1535,23 +1559,23 @@ TEST_F(ConnectionRuntimeTest, CancelKeepsAcceptedDmaRoutableUntilRuntimeConsumes
     ASSERT_FALSE(rejected);
     EXPECT_EQ(rejected.error().code, runtime::ProgressErrorCode::kRetained);
     EXPECT_EQ(sender.slab.stats().local_dma, 1u);
-    EXPECT_EQ(sender.callback_tx_retired, 0u);
+    EXPECT_EQ(sender.callback_tx_retired, sender.initial_callback_retired);
     auto closed = sender.connection.Close();
     ASSERT_FALSE(closed);
     EXPECT_EQ(closed.error().code, ConnectionErrorCode::kRetained);
     EXPECT_FALSE(sender.scheduler.Detach(sender.scheduled));
     Deliver();
     ASSERT_TRUE(Until([&] { return sender.slab.stats().local_dma == 0; }));
-    EXPECT_EQ(sender.connection.tx_stats().retired, 1u);
-    EXPECT_EQ(sender.callback_tx_retired, 1u);
+    EXPECT_EQ(sender.connection.tx_stats().retired, sender.initial_retired + 1);
+    EXPECT_EQ(sender.callback_tx_retired, sender.initial_callback_retired + 1);
     EXPECT_EQ(sender.callback_closing_tx, 1u);
     EXPECT_FALSE(sender.io.first_error());
     auto duplicate = sender.scheduler.OnTxCompletion(valid);
     ASSERT_FALSE(duplicate);
     EXPECT_EQ(duplicate.error().code, runtime::ProgressErrorCode::kRetained);
-    EXPECT_EQ(sender.connection.tx_stats().retired, 1u);
+    EXPECT_EQ(sender.connection.tx_stats().retired, sender.initial_retired + 1);
     ASSERT_TRUE(Step());
-    EXPECT_EQ(sender.callback_tx_retired, 1u);
+    EXPECT_EQ(sender.callback_tx_retired, sender.initial_callback_retired + 1);
     EXPECT_EQ(sender.callback_closing_tx, 1u);
     EXPECT_FALSE(sender.callback_bad_id);
     ASSERT_TRUE(sender.connection.Close());
@@ -1580,7 +1604,7 @@ TEST_F(ConnectionRuntimeTest, StoppedRawReceiveFreezesCreditsAndFailsConnectionW
     ASSERT_TRUE(endpoint.connection.failure());
     EXPECT_EQ(endpoint.connection.failure()->code, ConnectionErrorCode::kCredit);
     EXPECT_EQ(endpoint.slab.stats().local_dma, 1u);
-    EXPECT_EQ(endpoint.callback_tx_retired, 0u);
+    EXPECT_EQ(endpoint.callback_tx_retired, endpoint.initial_callback_retired);
     ASSERT_TRUE(endpoint.io.first_error());
     ASSERT_TRUE(endpoint.io.first_error()->progress);
     EXPECT_EQ(endpoint.io.first_error()->progress->detail, EIO);
@@ -1588,7 +1612,7 @@ TEST_F(ConnectionRuntimeTest, StoppedRawReceiveFreezesCreditsAndFailsConnectionW
     // Failed 状态不变时也必须向宿主报告新终结，宿主才有机会重试保留中的关闭。
     endpoint.completions[0].push_back(delayed);
     ASSERT_TRUE(Until([&] { return endpoint.slab.stats().local_dma == 0; }));
-    EXPECT_EQ(endpoint.callback_tx_retired, 1u);
+    EXPECT_EQ(endpoint.callback_tx_retired, endpoint.initial_callback_retired + 1);
     EXPECT_EQ(endpoint.callback_failed_tx, 1u);
     EXPECT_FALSE(endpoint.callback_bad_id);
 }

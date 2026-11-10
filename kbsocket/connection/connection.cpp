@@ -210,13 +210,12 @@ std::expected<void, ConnectionError> Connection::PrepareRaw(const RawConnectionP
                                            .context_incarnation = prep.handshake.local_context_incarnation,
                                            .local_domain = handshake_.route().owner->domain(),
                                            .credit_peer = prep.handshake.credit_peer,
-                                           .peer_lanes_authorized = prep.peer_lanes_authorized});
+                                           .peer_lanes_authorized = prep.peer_lanes_authorized,
+                                           .sender_credits = prep.sender_credits});
     if (!admitted) {
         return std::unexpected(Fail({ConnectionErrorCode::kSourceAdmission, static_cast<int>(admitted.error())}));
     }
     const auto window = handshake_.receive_window().stats();
-    last_data_ = credit->max_data;
-    last_control_ = credit->max_control;
     control_target_ = prep.control_credit_target;
     last_frames_ = window.max_frame_seq;
     last_bytes_ = window.max_stream_bytes;
@@ -305,8 +304,14 @@ std::expected<void, ConnectionError> Connection::RefreshCredit() noexcept {
         return Error(ConnectionErrorCode::kCredit);
     }
     const auto window = handshake_.receive_window().stats();
-    if (last_data_ == peer->max_data && last_control_ == peer->max_control && last_frames_ == window.max_frame_seq &&
-        last_bytes_ == window.max_stream_bytes) {
+    const auto confirmed = credits.ConfirmedCredits(raw_.handshake.credit_peer);
+    const auto publication_failed = credits.PublicationFailed(raw_.handshake.credit_peer);
+    if (!confirmed || !publication_failed) {
+        return Error(ConnectionErrorCode::kCredit);
+    }
+    const bool window_changed = last_frames_ != window.max_frame_seq || last_bytes_ != window.max_stream_bytes;
+    if (!*publication_failed && peer->max_data <= confirmed->max_data && peer->max_control <= confirmed->max_control &&
+        !window_changed) {
         return {};
     }
     WireFrameInput frame;
@@ -318,12 +323,10 @@ std::expected<void, ConnectionError> Connection::RefreshCredit() noexcept {
     frame.max_control_credit_seq = peer->max_control;
     frame.max_frame_seq = window.max_frame_seq;
     frame.max_stream_bytes = window.max_stream_bytes;
-    auto queued = tx_.QueueCredit(frame);
+    auto queued = tx_.QueueCredit(frame, window_changed);
     if (!queued) {
         return std::unexpected(TxError(queued.error()));
     }
-    last_data_ = peer->max_data;
-    last_control_ = peer->max_control;
     last_frames_ = window.max_frame_seq;
     last_bytes_ = window.max_stream_bytes;
     return {};

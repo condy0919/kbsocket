@@ -5,7 +5,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <bit>
 #include <cerrno>
@@ -24,6 +23,12 @@ constexpr std::uint64_t kPublished = 1;
 constexpr std::uint64_t kExecuting = 2;
 constexpr std::uint64_t kComplete = 3;
 constexpr std::uint64_t kTaking = 4;
+constexpr std::size_t kPayloadAlignment = 64;
+struct PayloadDeleter {
+    void operator()(std::byte* pointer) const noexcept {
+        ::operator delete[](pointer, std::align_val_t{kPayloadAlignment});
+    }
+};
 
 auto Error(CommandQueueErrorCode code, int status = 0) noexcept {
     return std::unexpected(CommandQueueError{.code = code, .system_error = status});
@@ -39,7 +44,8 @@ void Signal(int fd) noexcept {
     } while (result < 0 && errno == EINTR);
     // EAGAIN 意味着已经可读；发布后不能再报告提交失败，避免调用方重复提交。
 }
-bool ValidCommand(const ConnectionCommand& command, std::span<const std::byte> input) noexcept {
+bool ValidCommand(const ConnectionCommand& command, std::span<const std::byte> input,
+                  std::size_t max_io_bytes) noexcept {
     if (!command.connection.owner || !command.connection.generation) {
         return false;
     }
@@ -48,10 +54,9 @@ bool ValidCommand(const ConnectionCommand& command, std::span<const std::byte> i
     }
     switch (command.kind) {
     case ConnectionCommandKind::kWrite:
-        return command.bytes > 0 && command.bytes <= ConnectionCommandQueue::kMaxIoBytes &&
-               input.size() == command.bytes;
+        return command.bytes > 0 && command.bytes <= max_io_bytes && input.size() == command.bytes;
     case ConnectionCommandKind::kRead:
-        return command.bytes > 0 && command.bytes <= ConnectionCommandQueue::kMaxIoBytes && input.empty();
+        return command.bytes > 0 && command.bytes <= max_io_bytes && input.empty();
     case ConnectionCommandKind::kShutdownWrite:
     case ConnectionCommandKind::kCancel:
     case ConnectionCommandKind::kInspect:
@@ -86,7 +91,8 @@ struct ConnectionCommandQueue::State {
         std::atomic<std::uint64_t> tag{0};
         ConnectionCommand command;
         ConnectionCommandResult result;
-        std::array<std::byte, kMaxIoBytes> payload;
+        // Open 后不再改变地址；原有 tag 的发布/领取同步同时保护这一段 payload。
+        std::byte* payload = nullptr;
     };
     struct alignas(64) Producer {
         std::atomic<std::uint64_t> next{0};
@@ -99,7 +105,8 @@ struct ConnectionCommandQueue::State {
         std::atomic<std::uint64_t> outstanding{0};
     } accounting;
     std::unique_ptr<Slot[]> slots;
-    std::size_t capacity = 0;
+    std::unique_ptr<std::byte[], PayloadDeleter> payload;
+    std::size_t capacity = 0, max_io_bytes = 0;
     int fd = -1;
 
     ~State() {
@@ -117,26 +124,41 @@ ConnectionCommandQueue::~ConnectionCommandQueue() {
     }
 }
 
-std::expected<void, CommandQueueError> ConnectionCommandQueue::Open(std::size_t requested_capacity) noexcept {
+std::expected<void, CommandQueueError> ConnectionCommandQueue::Open(std::size_t requested_capacity,
+                                                                    std::size_t max_io_bytes,
+                                                                    std::size_t payload_budget_bytes) noexcept {
     if (state_) {
         return Error(CommandQueueErrorCode::kInUse);
     }
     if (opened_once_) {
         return Error(CommandQueueErrorCode::kStopped);
     }
-    if (!requested_capacity || requested_capacity > kMaxCapacity) {
+    if (!requested_capacity || requested_capacity > kMaxCapacity || !max_io_bytes || max_io_bytes > kMaxPayloadBytes ||
+        !payload_budget_bytes) {
         return Error(CommandQueueErrorCode::kInvalidArgument);
     }
     const auto capacity = std::bit_ceil(std::max(std::size_t{2}, requested_capacity));
+    // max_io_bytes 已限制在 1 MiB 以内；整环对齐与每槽对齐避免不同生产者写入同一缓存行。
+    const auto stride = (max_io_bytes + kPayloadAlignment - 1) / kPayloadAlignment * kPayloadAlignment;
+    // 向上取整后再检查预算，除法同时拒绝乘法溢出，失败不占用单次 Open 身份。
+    if (stride > payload_budget_bytes / capacity) {
+        return Error(CommandQueueErrorCode::kInvalidArgument);
+    }
     std::unique_ptr<State> state;
     try {
         state = std::make_unique<State>();
         state->slots = std::make_unique<State::Slot[]>(capacity);
+        state->payload.reset(
+            static_cast<std::byte*>(::operator new[](capacity * stride, std::align_val_t{kPayloadAlignment})));
+        // 控制路径预触页，后续搬运不触发分配或首次清零。
+        std::memset(state->payload.get(), 0, capacity * stride);
     } catch (const std::bad_alloc&) {
         return Error(CommandQueueErrorCode::kNoMemory);
     }
     state->capacity = capacity;
+    state->max_io_bytes = max_io_bytes;
     for (std::size_t i = 0; i < capacity; ++i) {
+        state->slots[i].payload = state->payload.get() + i * stride;
         state->slots[i].tag.store(Tag(i, kFree), std::memory_order_relaxed);
     }
     state->fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -153,7 +175,7 @@ ConnectionCommandQueue::TrySubmit(const ConnectionCommand& command, std::span<co
     if (!state_) {
         return Error(CommandQueueErrorCode::kNotReady);
     }
-    if (!ValidCommand(command, input)) {
+    if (!ValidCommand(command, input, state_->max_io_bytes)) {
         return Error(CommandQueueErrorCode::kInvalidArgument);
     }
     auto& state = *state_;
@@ -181,7 +203,7 @@ ConnectionCommandQueue::TrySubmit(const ConnectionCommand& command, std::span<co
         state.accounting.outstanding.fetch_add(1, std::memory_order_relaxed);
         slot.command = command;
         if (!input.empty()) {
-            std::memcpy(slot.payload.data(), input.data(), input.size());
+            std::memcpy(slot.payload, input.data(), input.size());
         }
         slot.tag.store(Tag(position, kPublished), std::memory_order_release);
         Signal(state.fd);
@@ -212,7 +234,7 @@ ConnectionCommandQueue::PollCommands(std::span<ConnectionCommandRequest> request
         }
         requests[count++] = ConnectionCommandRequest{.ticket = {.queue = this, .sequence = position + 1},
                                                      .command = slot.command,
-                                                     .payload = {slot.payload.data(), slot.command.bytes}};
+                                                     .payload = {slot.payload, slot.command.bytes}};
         slot.tag.store(Tag(position, kExecuting), std::memory_order_release);
         ++state.owner.next;
     }
@@ -277,7 +299,7 @@ ConnectionCommandQueue::TakeCompletion(ConnectionCommandTicket ticket, std::span
     }
     ConnectionCommandCompletion completion{.ticket = ticket, .command = slot.command, .result = slot.result};
     if (bytes) {
-        std::memcpy(output.data(), slot.payload.data(), bytes);
+        std::memcpy(output.data(), slot.payload, bytes);
     }
     state.accounting.outstanding.fetch_sub(1, std::memory_order_relaxed);
     slot.tag.store(Tag(position + state.capacity, kFree), std::memory_order_release);
@@ -309,6 +331,9 @@ int ConnectionCommandQueue::command_fd() const noexcept {
 }
 std::size_t ConnectionCommandQueue::capacity() const noexcept {
     return state_ ? state_->capacity : 0;
+}
+std::size_t ConnectionCommandQueue::max_io_bytes() const noexcept {
+    return state_ ? state_->max_io_bytes : 0;
 }
 std::size_t ConnectionCommandQueue::outstanding() const noexcept {
     return state_ ? state_->accounting.outstanding.load(std::memory_order_acquire) : 0;

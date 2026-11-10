@@ -61,6 +61,7 @@ struct RxSourceRetireProof {
 /// CQE 的 local_id/type、remote EID/ID 与帧 token 共同选取完整来源；token 本身不证明 Peer 身份。
 /// 同一物理发送 Lane 可承载不同逻辑 session，但不能在旧绑定仍存在时更换 PeerRuntime/Credit 账。
 /// 逻辑连接撤路由不应 Remove；迟到旧帧仍须找到旧来源并结账，清除须证明远端静默及 RX 事件排空。
+/// source.sender_credits 的借用覆盖上述全部保留来源，不能随逻辑 Connection 关闭而销毁。
 /// Resolve 失败时宿主仍须把真实 RX Lease 交给 EagerReceiveDomain 的未知来源路径，不能只丢帧。
 class RxSourceRegistry {
 public:

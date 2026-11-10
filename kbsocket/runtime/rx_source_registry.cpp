@@ -157,13 +157,26 @@ std::expected<void, RxSourceError> RxSourceRegistry::RegisterBatch(std::span<con
             peer->identity.receive_domain != source.peer_context.receive_domain) {
             return Error(RxSourceError::kInvalidArgument);
         }
+        if (source.sender_credits) {
+            if (!source.sender_credits->ready() || source.sender_credits->stats().stopped ||
+                source.sender_credits->identity() != source.sender_identity ||
+                source.sender_identity.peer_runtime != source.peer_context.peer_runtime ||
+                !source.sender_identity.receive_domain || !source.sender_identity.epoch ||
+                source.token != route.token) {
+                return Error(RxSourceError::kInvalidArgument);
+            }
+        } else if (source.sender_identity != connection::CreditIdentity{} || source.token != connection::WireToken{}) {
+            return Error(RxSourceError::kInvalidArgument);
+        }
         if (s.Find(route)) {
             return Error(RxSourceError::kDuplicate);
         }
         const auto conflicts = [&route](const RxSourceRoute& existing) {
             return existing.is_jetty == route.is_jetty && SameRemote(existing.remote_id, route.remote_id) &&
                    (existing.source.peer_context.peer_runtime != route.source.peer_context.peer_runtime ||
-                    !SamePeer(existing.source.peer, route.source.peer));
+                    !SamePeer(existing.source.peer, route.source.peer) ||
+                    existing.source.sender_credits != route.source.sender_credits ||
+                    existing.source.sender_identity != route.source.sender_identity);
         };
         // 注册在控制路径执行；共用 Lane 的会话不能重解释旧物理来源。
         for (std::uint32_t i = 0; i < s.config.capacity; ++i) {

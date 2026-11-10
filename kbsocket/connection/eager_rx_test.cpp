@@ -773,6 +773,186 @@ TEST_F(EagerRxTest, CreditControlReleasesWithoutEnteringReorderWindow) {
     EXPECT_EQ(credits_.stats().control.granted, 1u);
 }
 
+TEST_F(EagerRxTest, SourceBoundCreditRejectsWrongSessionTokenAndEpochBeforeUpdatingSharedAccount) {
+    SenderCreditAccount sender;
+    const CreditIdentity identity{22, 66, binding_.credit_epoch};
+    ASSERT_TRUE(sender.Open(identity));
+    ASSERT_TRUE(sender.Update(identity, 1, 2));
+    source_.sender_credits = &sender;
+    source_.sender_identity = identity;
+    source_.token = route_.token;
+    const WireFrameInput credit{.type = WireFrameType::kControl,
+                                .token = route_.token,
+                                .data = {},
+                                .max_credit_seq = 100,
+                                .max_control_credit_seq = 100,
+                                .session = binding_.context.session,
+                                .credit_epoch = binding_.credit_epoch};
+    // 来源物理归属虽可信，内容仍须逐帧验证；三种身份错配都不更新对向共账或业务窗口。
+    for (int mismatch = 0; mismatch < 3; ++mismatch) {
+        auto invalid = credit;
+        if (mismatch == 0) {
+            ++invalid.session;
+        } else if (mismatch == 1) {
+            ++invalid.token.generation;
+        } else {
+            ++invalid.credit_epoch;
+        }
+        const auto dispatched = Dispatch(Event(invalid));
+        ASSERT_FALSE(dispatched);
+        EXPECT_EQ(dispatched.error().code, EagerRxErrorCode::kCreditFailed);
+        EXPECT_EQ(sender.stats().limits, (std::array<std::uint64_t, 2>{1, 2}));
+        EXPECT_EQ(handler_calls_, 0u);
+        EXPECT_FALSE(domain_.frozen());
+        ASSERT_EQ(domain_.Refill(), 1u);
+        ASSERT_TRUE(credits_.Grant(source_.peer, CreditClass::kControl, 1));
+    }
+    EXPECT_TRUE(sender.Close());
+    source_.sender_credits = nullptr;
+}
+
+TEST_F(EagerRxTest, DelayedCreditCannotUpdateReopenedAccountEpoch) {
+    SenderCreditAccount sender;
+    CreditIdentity identity{22, 66, binding_.credit_epoch};
+    ASSERT_TRUE(sender.Open(identity));
+    source_.sender_credits = &sender;
+    source_.sender_identity = identity;
+    source_.token = route_.token;
+    WireFrameInput credit{.type = WireFrameType::kControl,
+                          .token = route_.token,
+                          .data = {},
+                          .max_credit_seq = 100,
+                          .max_control_credit_seq = 100,
+                          .session = binding_.context.session,
+                          .credit_epoch = binding_.credit_epoch};
+    const auto delayed = Event(credit);
+    ASSERT_TRUE(sender.Close());
+    ++identity.epoch;
+    ASSERT_TRUE(sender.Open(identity));
+    ASSERT_TRUE(sender.Update(identity, 3, 4));
+    const auto dispatched = Dispatch(delayed);
+    ASSERT_FALSE(dispatched);
+    EXPECT_EQ(dispatched.error().code, EagerRxErrorCode::kCreditFailed);
+    EXPECT_EQ(sender.stats().limits, (std::array<std::uint64_t, 2>{3, 4}));
+    EXPECT_EQ(handler_calls_, 0u);
+    EXPECT_EQ(domain_.pending_refill(), 1u);
+    EXPECT_TRUE(sender.Close());
+    source_.sender_credits = nullptr;
+}
+
+TEST_F(EagerRxTest, CreditAfterRouteRetirementUpdatesPeerButLeavesReplacementWindowUntouched) {
+    SenderCreditAccount sender;
+    const CreditIdentity identity{22, 66, binding_.credit_epoch};
+    ASSERT_TRUE(sender.Open(identity));
+    source_.sender_credits = &sender;
+    source_.sender_identity = identity;
+    source_.token = route_.token;
+    WireFrameInput credit{.type = WireFrameType::kControl,
+                          .token = route_.token,
+                          .data = {},
+                          .max_credit_seq = 12,
+                          .max_control_credit_seq = 8,
+                          .session = binding_.context.session,
+                          .credit_epoch = binding_.credit_epoch,
+                          .max_frame_seq = 1234,
+                          .max_stream_bytes = 5678};
+    const auto delayed = Event(credit);
+    ASSERT_TRUE(routes_.Retire(route_));
+    const auto replacement = routes_.Reserve();
+    ASSERT_TRUE(replacement);
+    auto binding = binding_;
+    binding.token = replacement->token;
+    ++binding.context.session;
+    ReorderWindow sibling;
+    ASSERT_TRUE(sibling.Open({22, 33, binding.context.session, binding.token.slot, binding.token.generation},
+                             {4, 16, 10000, 0}));
+    ASSERT_TRUE(routes_.Publish(*replacement, binding, &sibling));
+    const auto dispatched = Dispatch(delayed);
+    ASSERT_FALSE(dispatched);
+    EXPECT_EQ(dispatched.error().code, EagerRxErrorCode::kRouteRejected);
+    EXPECT_EQ(sender.stats().limits, (std::array<std::uint64_t, 2>{12, 8}));
+    EXPECT_EQ(handler_calls_, 0u);
+    EXPECT_EQ(sibling.stats().max_frame_seq, 4u);
+    EXPECT_EQ(sibling.stats().max_stream_bytes, 16u);
+    EXPECT_EQ(sibling.stats().pending_frames, 0u);
+    EXPECT_TRUE(sibling.Close());
+    EXPECT_TRUE(routes_.Retire(*replacement));
+    EXPECT_TRUE(sender.Close());
+    source_.sender_credits = nullptr;
+}
+
+TEST_F(EagerRxTest, DelayedCreditRecordsLimitsWithoutReopeningStoppedAccount) {
+    SenderCreditAccount sender;
+    const CreditIdentity identity{22, 66, binding_.credit_epoch};
+    ASSERT_TRUE(sender.Open(identity));
+    source_.sender_credits = &sender;
+    source_.sender_identity = identity;
+    source_.token = route_.token;
+    WireFrameInput credit{.type = WireFrameType::kControl,
+                          .token = route_.token,
+                          .data = {},
+                          .max_credit_seq = 12,
+                          .max_control_credit_seq = 8,
+                          .session = binding_.context.session,
+                          .credit_epoch = binding_.credit_epoch};
+    const auto delayed = Event(credit);
+    sender.Stop();
+    ASSERT_TRUE(Dispatch(delayed));
+    EXPECT_EQ(sender.stats().limits, (std::array<std::uint64_t, 2>{12, 8}));
+    EXPECT_TRUE(sender.stats().stopped);
+    EXPECT_EQ(sender.available(CreditClass::kData), 0u);
+    EXPECT_EQ(sender.available(CreditClass::kControl), 0u);
+    EXPECT_TRUE(sender.Close());
+    source_.sender_credits = nullptr;
+}
+
+TEST_F(EagerRxTest, InvalidCompletionNeverUpdatesSourceBoundCredit) {
+    SenderCreditAccount sender;
+    const CreditIdentity identity{22, 66, binding_.credit_epoch};
+    ASSERT_TRUE(sender.Open(identity));
+    source_.sender_credits = &sender;
+    source_.sender_identity = identity;
+    source_.token = route_.token;
+    WireFrameInput credit{.type = WireFrameType::kControl,
+                          .token = route_.token,
+                          .data = {},
+                          .max_credit_seq = 12,
+                          .max_control_credit_seq = 8,
+                          .session = binding_.context.session,
+                          .credit_epoch = binding_.credit_epoch};
+    auto invalid = Event(credit);
+    ++invalid.completion.completion_len;
+    EXPECT_FALSE(Dispatch(invalid));
+    EXPECT_EQ(sender.stats().limits, (std::array<std::uint64_t, 2>{0, 0}));
+    EXPECT_EQ(handler_calls_, 0u);
+    EXPECT_TRUE(domain_.frozen());
+    EXPECT_TRUE(sender.Close());
+    source_.sender_credits = nullptr;
+}
+
+TEST_F(EagerRxTest, PiggybackCreditUsesRetainedSourceEpochAfterRouteRetirement) {
+    SenderCreditAccount sender;
+    const CreditIdentity identity{22, 66, binding_.credit_epoch};
+    ASSERT_TRUE(sender.Open(identity));
+    ASSERT_TRUE(sender.Update(identity, 1, 2));
+    source_.sender_credits = &sender;
+    source_.sender_identity = identity;
+    source_.token = route_.token;
+    const std::array data{std::byte{0x12}};
+    WireFrameInput frame{
+        .type = WireFrameType::kDataWithCredit, .token = route_.token, .data = data, .max_credit_seq = 17};
+    const auto delayed = Event(frame);
+    ASSERT_TRUE(routes_.Retire(route_));
+    const auto dispatched = Dispatch(delayed);
+    ASSERT_FALSE(dispatched);
+    EXPECT_EQ(dispatched.error().code, EagerRxErrorCode::kRouteRejected);
+    EXPECT_EQ(sender.stats().limits, (std::array<std::uint64_t, 2>{17, 2}));
+    EXPECT_EQ(handler_calls_, 0u);
+    EXPECT_EQ(stream_.pending(), 0u);
+    EXPECT_TRUE(sender.Close());
+    source_.sender_credits = nullptr;
+}
+
 TEST_F(EagerRxTest, FailureDrainsSparseAndPartiallyReadFramesExactlyOnce) {
     ASSERT_TRUE(Dispatch(Data(0, "abcd")));
     EXPECT_EQ(Read(1), "a");

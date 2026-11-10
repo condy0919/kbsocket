@@ -10,6 +10,7 @@
 | [注册内存与 Lease](memory-leases.md) | 多 context Slab、独立 CPU/DMA/Grant 责任、有界跨线程归还及隔离回收 |
 | [连接协议原语](connection-primitives.md) | IMM 短/扩展帧、身份代次、发送序号、乱序交付与应用驻留、数据/控制 Credit 守恒 |
 | [copy-stream C 接口](stream-api.md) | owner 上的 Eager/NativeTCP 有界读写、稳定错误、暂停门禁与关闭/释放生命周期 |
+| [Raw 应用 Runtime](raw-stream-runtime.md) | C stream/mailbox 建链编排、显式 RNDV Arena、跨连接准入与共享资源关闭 |
 | [连接建链与导入缓存](connection-handshake.md) | 非阻塞 HELLO/READY、完整身份路由、Single-Flight 导入、首包与 fd 交接门禁 |
 | [WRITE 分块引擎](write-rndv-engine.md) | 有界多 SGE 分块、独立源 DMA 引用、可信逐 WR 完成与 DONE 证据 |
 | [WRITE 事务池](write-rndv-pool.md) | 可复用事务槽、导入缓存 pin、排队源 StartPinned 与 SN/Grant 防重放 |

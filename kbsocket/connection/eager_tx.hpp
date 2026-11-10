@@ -91,7 +91,8 @@ public:
     /// FIN 排在全部已接受 write 的数据之后；半关闭仍允许发送 CREDIT_UPDATE。
     std::expected<void, EagerTxError> ShutdownWrite() noexcept;
     /// 无分配合并累计额度；session 必须是接收方 session，token 由绑定强制填入。
-    std::expected<void, EagerTxError> QueueCredit(const WireFrameInput& credit) noexcept;
+    /// window_changed 保留本连接独立窗口更新；false 时可丢弃其他连接已经确认交付的共账更新。
+    std::expected<void, EagerTxError> QueueCredit(const WireFrameInput& credit, bool window_changed = true) noexcept;
     /// 每次最多一个 256 WR post。返回实际可信接受数；资源暂缺返回 kWouldBlock。
     std::expected<std::size_t, EagerTxError> Progress() noexcept;
     /// 仅接收 TxCompletionProcessor 的逐 WR 终结；拒绝事件不解除任何 DMA/import 引用。

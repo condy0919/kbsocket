@@ -35,6 +35,8 @@ struct RawSourceAdmissionRequest {
     connection::CreditPeerHandle credit_peer;
     // 宿主可信控制路径对整份发送 Lane 快照的授权结果；HELLO 自报身份本身不是认证。
     bool peer_lanes_authorized = false;
+    // 必须与 HELLO 的远端 receive-domain/epoch 一致，并存活至所有来源安全退休。
+    connection::SenderCreditAccount* sender_credits = nullptr;
 };
 
 /// READY 发布前原子安装远端主动 Lane 来源；连接关闭不等于远端静默，不能自动撤销来源。

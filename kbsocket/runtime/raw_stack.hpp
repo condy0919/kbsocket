@@ -33,6 +33,8 @@ struct RawEndpointConfig {
     ConnectionMailboxCallback on_command = nullptr;
     PeerCreditProgressCallback on_withdrawal = nullptr;
     void* cookie = nullptr;
+    // 零沿用全栈上限；显式容量同时约束 owner 与调度槽，不能通过借用 Owner 绕过门面预算。
+    std::uint32_t connection_capacity = 0;
 };
 struct RawStackConfig {
     std::size_t memory_budget_bytes = 64u * 1024u * 1024u;
@@ -45,6 +47,12 @@ struct RawStackConfig {
     // 默认保持 Eager-only；启用后段导入与 endpoint 导入共用每 context 的独占暂停屏障。
     bool enable_rndv = false;
     control::TsegImportCacheConfig segments;
+    // 显式目标池与源 Slab 共用 backing 预算；默认不分配、不注册目标 MR。
+    std::optional<memory::SlabConfig> rndv_target_slab = std::nullopt;
+    // 每 context 的 mailbox 独立预分配；此预算只约束 payload，不计入注册 Slab backing 预算。
+    std::size_t command_io_bytes = ConnectionCommandQueue::kMaxIoBytes;
+    std::size_t command_payload_budget_bytes =
+        ConnectionCommandQueue::kMaxCapacity * ConnectionCommandQueue::kMaxIoBytes;
 };
 enum class RawStackStage : std::uint8_t {
     kEmpty,
@@ -95,6 +103,7 @@ struct RawStackSharedResources {
     memory::SlabAllocator* slab;
     control::EndpointImportCache* imports;
     control::TsegImportCache* segments = nullptr;
+    memory::SlabAllocator* rndv_target = nullptr;
 };
 struct RawStackContextSnapshot {
     RawDomainSnapshot domain;
@@ -106,6 +115,7 @@ struct RawStackSnapshot {
     bool progress_attached = false;
     std::array<RawStackContextSnapshot, RuntimeShard::kMaxContexts> contexts{};
     memory::SlabStats slab;
+    memory::SlabStats rndv_target;
     std::size_t budget_bytes = 0, import_entries = 0, import_leases = 0, import_tasks = 0;
     bool rndv_enabled = false;
     std::size_t segment_entries = 0, segment_leases = 0, segment_tasks = 0;

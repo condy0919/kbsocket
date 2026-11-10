@@ -203,7 +203,7 @@ private:
     const raw::JettyPool* tx_pool_ = nullptr;
     SequenceSession tx_session_;
     CreditIdentity tx_identity_;
-    std::uint64_t last_data_ = 0, last_control_ = 0, last_frames_ = 0, last_bytes_ = 0;
+    std::uint64_t last_frames_ = 0, last_bytes_ = 0;
     std::uint64_t control_target_ = 0;
     bool opened_once_ = false, raw_prepared_ = false, tx_open_ = false, rx_open_ = false;
     ConnectionState state_ = ConnectionState::kIdle;

@@ -14,10 +14,12 @@ RawRuntime 从设备目录提供按端点索引的能力快照：同设备不同
 | :--- | :--- |
 | `RawEndpointConfig.device/domain` | 设备/EID、完整域身份及队列、授信、路由、来源容量 |
 | 每端点 callback/cookie | 连接进度、命令完成和授信撤回通知；回调不得重入，cookie 存活至成功关闭或保留责任结束 |
-| `connections_per_context` | 每 context 的连接槽和调度容量 |
+| `connections_per_context` | 每 context 的连接槽和调度容量上限；端点 `connection_capacity` 可显式调低，零沿用全局值 |
 | `withdrawals_per_context/commands_per_context` | 每 context 的撤回槽与 mailbox 容量，包含未领取的完成 |
-| `slab/memory_budget_bytes` | 一份 backing 在全部 context 注册；预算只扣一次，且只覆盖该 Slab backing，不含域 RX、队列、mailbox 或 provider 元数据 |
+| `command_io_bytes/command_payload_budget_bytes` | mailbox 单次 copy 容量及每 context 的 payload backing 预算；默认 4096 B，可显式增加至 1 MiB，按取整后环容量预分配 |
+| `slab/memory_budget_bytes` | 源池和可选目标池共用 backing 预算，各份 backing 在全部 context 注册但只扣一次；不含域 RX、队列、mailbox 或 provider 元数据 |
 | `enable_rndv/segments` | 可选段缓存；与 endpoint 导入共用每 context 暂停屏障，默认关闭，不自动公告 Arena |
+| `rndv_target_slab` | 可选的独立目标池，只允许在 RNDV 启用时配置；默认不分配或注册，真实 Grant/Lease 责任未结清时不能注销 |
 | `imports/runtime` | 共用导入缓存、Reactor 公平预算/事件模式和控制执行器配置 |
 
 创建失败保留 `open_error` 和稳定地址的 State，必须 BeginClose/AdvanceClose；下级组件自身回滚失败的证据也保留。成功前没有连接或外部引用，不需要为了回滚临时启动 Runtime。已经投递的 RX 仍需实际 M1 关闭，不能因 Open 失败就释放 context。一个对象只承载一次生命周期，关闭后重建使用新对象与新身份。
@@ -44,7 +46,7 @@ BeginClose 停止域 TX/授信、新连接、新命令和 Slab Acquire，并令�
 
 AdvanceClose 先无副作用检查所有域的连接槽、调度注册、命令、撤回槽、路由、来源、TX 账本和完整 flush 边界，以及共享 Slab/endpoint/segment 的引用与控制任务责任。任一项未清零返回 InUse，保留整个 Runtime 继续收敛。全部满足后才关闭 Runtime 并收割剩余控制任务，再进入不可逆的物理关闭阶段。
 
-物理关闭按 context 配置逆序进行：解除 companion → RawDomain 的 M1 关闭及 receipt 清退 → 共享 import 元数据 → Slab 逐 context 注销 → context 逆序删除 → URMA Uninit。域内 Held 可跨越 JFR 删除，归还前不释放 backing；任何域未完整关闭，都不会释放共享 Slab 或 context。收到迟到 RX 的调用只结账，下一次重新确认事件屏障后才删除。
+物理关闭按 context 配置逆序进行：解除 companion → RawDomain 的 M1 关闭及 receipt 清退 → 共享 import 元数据 → 目标 Slab、源 Slab 逐 context 注销 → context 逆序删除 → URMA Uninit。进入物理关闭前分别检查两个池的 CPU、DMA、Grant 引用；目标注销失败保留源池和 context，重试不重复已经成功的注销。域内 Held 可跨越 JFR 删除，归还前不释放 backing；任何域未完整关闭，都不会释放共享 Slab 或 context。收到迟到 RX 的调用只结账，下一次重新确认事件屏障后才删除。
 
 进入 ClosingDomains 后不再允许 Tick，借用视图只供最后的责任终结，例如 Held 归还。DeleteJetty/JFR/MR/context 失败保留阶段与 `close_error`，重试不会重复已成功步骤。Uninit 报错时报告原始错误；底层已终止的会话不会再次 Uninit，后续关闭完成仍保留历史错误供诊断。
 
@@ -54,4 +56,4 @@ AdvanceClose 先无副作用检查所有域的连接槽、调度注册、命令�
 
 测试使用 Mock URMA 与本地 TCP，覆盖 2 设备 × 2 EID 装配、部分创建、关闭门禁、缓存 unimport、context 暂停、关闭重试及 DMA 责任。UB 真机和 40k 性能验收未执行；M5.4.1 的 [StreamBinding](stream-api.md) 已把资源门禁接入 Eager/NativeTCP copy-stream C ABI，M5.4.2 已追加统一连接事件；M5.4.3 已交付 [独立 NativeTCP C Runtime](stream-runtime.md)，raw 应用编排、零拷贝接口与 M6 WRITE RNDV 继续后续交付。
 
-M6.3.9 的 [Connection RNDV 装配](rndv-connection.md) 已接通显式预算、段缓存控制进度和真实完成分发；目标 Arena、对端授权和资源限额仍由宿主准备。默认及 RawStreamRuntime 便捷入口继续使用 Eager。
+M6.3.10 的 [RawStreamRuntime](raw-stream-runtime.md) 已接入显式 RNDV 配置、真实目标 Arena 导出及跨连接容量预检；默认入口保持 Eager。`shared().rndv_target` 只在配置目标池时提供，`Inspect().rndv_target` 单独报告池责任，`budget_bytes` 包含两池 backing；宿主不能绕过暂停门禁访问该借用视图。

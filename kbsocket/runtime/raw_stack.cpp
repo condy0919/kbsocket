@@ -45,13 +45,14 @@ struct RawStack::State {
     raw::RawRuntime session;
     memory::MemoryBudget budget;
     memory::SlabAllocator slab;
+    memory::SlabAllocator rndv_target;
     control::EndpointImportCache imports;
     control::TsegImportCache segments;
     std::array<Context, kMaxContexts> contexts;
     RuntimeShard runtime;
     std::size_t count = 0;
     RawStackStage stage = RawStackStage::kOpenFailed;
-    bool published = false, attached = false, rndv_enabled = false;
+    bool published = false, attached = false, rndv_enabled = false, target_enabled = false;
     std::optional<RawStackError> open_error, close_error;
 
     explicit State(std::size_t bytes) noexcept : budget(bytes) {}
@@ -91,13 +92,13 @@ std::expected<void, RawStackError> RawStack::Open(std::span<const RawEndpointCon
     if (endpoints.empty() || endpoints.size() > kMaxContexts || !config.memory_budget_bytes ||
         !config.connections_per_context || config.connections_per_context > ConnectionProgress::kMaxConnections ||
         !config.withdrawals_per_context || config.withdrawals_per_context > PeerCreditProgress::kMaxPeers ||
-        !config.commands_per_context) {
+        !config.commands_per_context || (config.rndv_target_slab && !config.enable_rndv)) {
         return Error(Code::kInvalidArgument);
     }
     for (std::size_t i = 0; i < endpoints.size(); ++i) {
         const auto& e = endpoints[i];
-        if (!e.domain.context_incarnation || !e.domain.local_domain.runtime_instance ||
-            !e.domain.local_domain.receive_domain ||
+        if (e.connection_capacity > config.connections_per_context || !e.domain.context_incarnation ||
+            !e.domain.local_domain.runtime_instance || !e.domain.local_domain.receive_domain ||
             e.domain.local_domain.runtime_instance != endpoints[0].domain.local_domain.runtime_instance ||
             (config.runtime.reactor.events && !e.domain.queues.events)) {
             return Error(Code::kInvalidArgument, i);
@@ -118,6 +119,7 @@ std::expected<void, RawStackError> RawStack::Open(std::span<const RawEndpointCon
     auto& s = *state_;
     s.count = endpoints.size();
     s.rndv_enabled = config.enable_rndv;
+    s.target_enabled = config.rndv_target_slab.has_value();
     // 生命周期控制路径允许分配；失败也留下单次 State，统一通过显式关闭处理。
     try {
         std::vector<raw::DeviceConfig> devices;
@@ -142,6 +144,14 @@ std::expected<void, RawStackError> RawStack::Open(std::span<const RawEndpointCon
         return s.FailOpen(
             {.code = Code::kMemory, .context_index = opened.error().context_index, .memory = opened.error()});
     }
+    if (config.rndv_target_slab) {
+        if (const auto opened =
+                s.rndv_target.Open(std::span(handles).first(s.count), *config.rndv_target_slab, s.budget);
+            !opened) {
+            return s.FailOpen(
+                {.code = Code::kMemory, .context_index = opened.error().context_index, .memory = opened.error()});
+        }
+    }
     if (const auto opened = s.imports.Open(config.imports); !opened) {
         return s.FailOpen({.code = Code::kImport, .import = opened.error()});
     }
@@ -154,6 +164,8 @@ std::expected<void, RawStackError> RawStack::Open(std::span<const RawEndpointCon
     for (std::size_t i = 0; i < s.count; ++i) {
         auto& c = s.contexts[i];
         const auto& endpoint = endpoints[i];
+        const auto connection_capacity =
+            endpoint.connection_capacity ? endpoint.connection_capacity : config.connections_per_context;
         const auto* cap = s.session.capabilities(i);
         if (!handles[i] || !cap) {
             return s.FailOpen({.code = Code::kSession, .context_index = i});
@@ -162,15 +174,17 @@ std::expected<void, RawStackError> RawStack::Open(std::span<const RawEndpointCon
             return s.FailOpen(DomainErrorAt(opened.error(), i));
         }
         if (const auto opened =
-                c.progress.Open({config.connections_per_context, handles[i]}, endpoint.on_connection, endpoint.cookie);
+                c.progress.Open({connection_capacity, handles[i]}, endpoint.on_connection, endpoint.cookie);
             !opened) {
             return s.FailOpen(ProgressErrorAt(opened.error(), i));
         }
-        if (const auto opened = c.connections.Open(c.progress, {config.connections_per_context}); !opened) {
+        if (const auto opened = c.connections.Open(c.progress, {connection_capacity}); !opened) {
             return s.FailOpen({.code = Code::kConnection, .context_index = i, .connection = opened.error()});
         }
-        if (const auto opened =
-                c.commands.Open(c.connections, {config.commands_per_context}, endpoint.on_command, endpoint.cookie);
+        if (const auto opened = c.commands.Open(
+                c.connections,
+                {config.commands_per_context, config.command_io_bytes, config.command_payload_budget_bytes},
+                endpoint.on_command, endpoint.cookie);
             !opened) {
             return s.FailOpen({.code = Code::kMailbox, .context_index = i, .mailbox = opened.error()});
         }
@@ -239,7 +253,8 @@ std::expected<RawStackSharedResources, RawStackError> RawStack::shared() noexcep
     if (state_->AnyPaused()) {
         return Error(Code::kInUse);
     }
-    return RawStackSharedResources{&state_->slab, &state_->imports, state_->rndv_enabled ? &state_->segments : nullptr};
+    return RawStackSharedResources{&state_->slab, &state_->imports, state_->rndv_enabled ? &state_->segments : nullptr,
+                                   state_->target_enabled ? &state_->rndv_target : nullptr};
 }
 std::expected<RawStackSnapshot, RawStackError> RawStack::Inspect() const noexcept {
     if (!state_) {
@@ -254,6 +269,7 @@ std::expected<RawStackSnapshot, RawStackError> RawStack::Inspect() const noexcep
     snapshot.context_count = s.count;
     snapshot.progress_attached = s.attached;
     snapshot.slab = s.slab.stats();
+    snapshot.rndv_target = s.rndv_target.stats();
     snapshot.budget_bytes = s.budget.reserved_bytes();
     snapshot.import_entries = s.imports.entries();
     snapshot.import_leases = s.imports.leases();
@@ -314,6 +330,7 @@ std::expected<void, RawStackError> RawStack::BeginClose() noexcept {
         return {};
     }
     s.slab.StopAccepting();
+    s.rndv_target.StopAccepting();
     s.imports.StopAccepting();
     s.segments.StopAccepting();
     std::optional<RawStackError> failure;
@@ -380,8 +397,10 @@ std::expected<RawStackSnapshot, RawStackError> RawStack::AdvanceClose(const RawS
             }
         }
         const auto memory = s.slab.stats();
-        if (memory.available != memory.buffers || s.imports.entries() || s.imports.leases() || s.imports.in_flight() ||
-            s.segments.entries() || s.segments.leases() || s.segments.in_flight()) {
+        const auto target = s.rndv_target.stats();
+        if (memory.available != memory.buffers || target.available != target.buffers || s.imports.entries() ||
+            s.imports.leases() || s.imports.in_flight() || s.segments.entries() || s.segments.leases() ||
+            s.segments.in_flight()) {
             return Error(Code::kInUse);
         }
         if (const auto closed = s.runtime.Close(); !closed) {
@@ -440,6 +459,10 @@ std::expected<RawStackSnapshot, RawStackError> RawStack::AdvanceClose(const RawS
         s.stage = RawStackStage::kClosingMemory;
     }
     if (s.stage == RawStackStage::kClosingMemory) {
+        if (const auto closed = s.rndv_target.Close(); !closed) {
+            return s.FailClose(
+                {.code = Code::kMemory, .context_index = closed.error().context_index, .memory = closed.error()});
+        }
         if (const auto closed = s.slab.Close(); !closed) {
             return s.FailClose(
                 {.code = Code::kMemory, .context_index = closed.error().context_index, .memory = closed.error()});

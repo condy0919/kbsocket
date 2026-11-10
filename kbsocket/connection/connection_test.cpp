@@ -296,7 +296,8 @@ protected:
                 .connection_id = i + 1,
                 .tx_capacity = 8,
                 .sources = &e.admission,
-                .peer_lanes_authorized = true};
+                .peer_lanes_authorized = true,
+                .rndv = {}};
     }
     void DriveCache() {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -333,6 +334,20 @@ protected:
             }
             if (endpoints_[0].connection.state() == ConnectionState::kRawActive &&
                 endpoints_[1].connection.state() == ConnectionState::kRawActive) {
+                // READY 不等于本端 CREDIT 的成功 CQE。真实交付首次共账通告并处理 TX/RX，
+                // 直到空闲稳定后再测试业务；不能清包队列或手工回收 DMA 来隐藏初始化责任。
+                for (int idle = 0; idle < 16; ++idle) {
+                    const auto accepted =
+                        endpoints_[0].connection.tx_stats().accepted + endpoints_[1].connection.tx_stats().accepted;
+                    Step();
+                    if (packets_.empty() && endpoints_[0].slab.stats().local_dma == 0 &&
+                        endpoints_[1].slab.stats().local_dma == 0 &&
+                        endpoints_[0].connection.tx_stats().accepted + endpoints_[1].connection.tx_stats().accepted ==
+                            accepted) {
+                        return;
+                    }
+                }
+                FAIL() << "initial CREDIT did not converge";
                 return;
             }
         }
@@ -621,6 +636,7 @@ TEST_F(ConnectionTest, CloseRetainsAcceptedDmaUntilCompletionAndDoesNotReplay) {
 TEST_F(ConnectionTest, StatusEightFailsConnectionAndKeepsPhysicalSqReady) {
     Activate();
     auto& a = endpoints_[0];
+    const auto retired_before = a.connection.tx_stats().retired;
     std::array<std::byte, 16> input{};
     ASSERT_TRUE(a.connection.Write(input));
     ASSERT_TRUE(a.connection.Progress(++now_));
@@ -635,7 +651,7 @@ TEST_F(ConnectionTest, StatusEightFailsConnectionAndKeepsPhysicalSqReady) {
     ASSERT_TRUE(lane);
     EXPECT_EQ(a.pool.lane_state(*lane), raw::JettyLaneState::kReady);
     EXPECT_EQ(a.slab.stats().local_dma, 0u);
-    EXPECT_EQ(a.connection.tx_stats().retired, 1u);
+    EXPECT_EQ(a.connection.tx_stats().retired, retired_before + 1);
 }
 
 TEST_F(ConnectionTest, LastControlCreditIsReservedForQuotaReturnAndIdleDoesNotPingPong) {
@@ -643,8 +659,11 @@ TEST_F(ConnectionTest, LastControlCreditIsReservedForQuotaReturnAndIdleDoesNotPi
     std::deque<Packet> delayed_controls;
     const std::array<std::byte, 1> payload{std::byte{0x37}};
     // 对端尚有数据授信时持续产生窗口更新，刻意延迟控制包交付，让双方只剩最后一个控制额度。
-    // 三轮不能提前合并成一个 CREDIT_UPDATE，否则覆盖不到双向配额同时接近耗尽的场景。
-    for (int round = 0; round < 3; ++round) {
+    // 初始化 CREDIT 已花掉一个额度；按真实剩余额度安排独立窗口更新，不能提前合并。
+    const auto updates = endpoints_[0].send_credits.available(CreditClass::kControl) - 1;
+    ASSERT_GT(updates, 0u);
+    ASSERT_LT(updates, 4u);
+    for (std::uint64_t round = 0; round < updates; ++round) {
         for (auto& endpoint : endpoints_) {
             ASSERT_EQ(endpoint.connection.Write(payload), 1u);
             ASSERT_TRUE(endpoint.connection.Progress(++now_));
@@ -673,29 +692,31 @@ TEST_F(ConnectionTest, LastControlCreditIsReservedForQuotaReturnAndIdleDoesNotPi
     }
     for (auto& endpoint : endpoints_) {
         EXPECT_EQ(endpoint.send_credits.available(CreditClass::kControl), 1u);
-        EXPECT_EQ(endpoint.send_credits.available(CreditClass::kData), 1u);
+        EXPECT_EQ(endpoint.send_credits.available(CreditClass::kData), 4u - updates);
     }
 
-    // 第四轮仍可交付最后一个 DATA，但它引起的纯窗口更新必须等待，不能耗尽最后的控制额度。
-    for (auto& endpoint : endpoints_) {
-        ASSERT_EQ(endpoint.connection.Write(payload), 1u);
-        ASSERT_TRUE(endpoint.connection.Progress(++now_));
+    // 剩余 DATA 仍可交付，但它引起的纯窗口更新必须等待，不能耗尽最后的控制额度。
+    for (std::uint64_t round = updates; round < 4; ++round) {
+        for (auto& endpoint : endpoints_) {
+            ASSERT_EQ(endpoint.connection.Write(payload), 1u);
+            ASSERT_TRUE(endpoint.connection.Progress(++now_));
+        }
+        ASSERT_EQ(packets_.size(), 2u);
+        Deliver();
+        Poll();
+        for (auto& endpoint : endpoints_) {
+            std::array<std::byte, 1> output{};
+            const auto read = endpoint.connection.Read(output, ++now_);
+            ASSERT_TRUE(read);
+            ASSERT_EQ(read->bytes, 1u);
+            ASSERT_TRUE(endpoint.receive.Refill());
+            ASSERT_TRUE(endpoint.connection.Progress(++now_));
+            EXPECT_EQ(endpoint.send_credits.available(CreditClass::kControl), 1u);
+        }
+        EXPECT_TRUE(packets_.empty());
     }
-    ASSERT_EQ(packets_.size(), 2u);
-    Deliver();
-    Poll();
-    for (auto& endpoint : endpoints_) {
-        std::array<std::byte, 1> output{};
-        const auto read = endpoint.connection.Read(output, ++now_);
-        ASSERT_TRUE(read);
-        ASSERT_EQ(read->bytes, 1u);
-        ASSERT_TRUE(endpoint.receive.Refill());
-        ASSERT_TRUE(endpoint.connection.Progress(++now_));
-        EXPECT_EQ(endpoint.send_credits.available(CreditClass::kControl), 1u);
-    }
-    EXPECT_TRUE(packets_.empty());
 
-    // 现在交付双方各三条旧控制包：真实 refill 后可归还控制配额，允许使用保留的最后一个额度。
+    // 现在交付双方延迟的旧控制包：真实 refill 后可归还控制配额，允许使用保留的最后一个额度。
     packets_.swap(delayed_controls);
     Deliver();
     Poll();
@@ -761,7 +782,11 @@ TEST_F(ConnectionTest, PublishedRouteAcceptsEarlyDataWhileLocalReadyIsStillPendi
     const std::array<std::byte, 3> input{std::byte{3}, std::byte{7}, std::byte{0xff}};
     ASSERT_EQ(sender.connection.Write(input), input.size());
     ASSERT_TRUE(sender.connection.Progress(++now_));
-    ASSERT_EQ(packets_.size(), 1u);
+    // 此刻首次 CREDIT 和业务 DATA 都真实在途；业务帧仍必须在对端 READY 完成前被接住。
+    ASSERT_EQ(packets_.size(), 2u);
+    const auto initial_credit = DecodeWireFrame(packets_[0].imm, packets_[0].bytes);
+    ASSERT_TRUE(initial_credit);
+    EXPECT_EQ(initial_credit->frame.control, WireControlType::kCreditUpdate);
     // 已发布路由必须接住先到的首包并保留 RX Lease，但尚未 Active 的应用 Read 仍被门禁阻止。
     Deliver();
     Poll();

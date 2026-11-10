@@ -330,7 +330,11 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 - **M6.3.9 顺序与进度**：Eager 未实际 post 前不允许 RNDV 越过已接受字节；共同预约校验发送器票据。FIN 与显式失败分别记录，已有 RNDV 可在本端半关闭后完成，收到 EOF 不关闭反向 GRANT/发送。通知槽保留反向 GRANT 余量；Peer 共账限制未 Activate 的未来控制承诺，避免 DONE 预留与对端低水线形成双向死锁。WRITE 窗口按远端 CREDIT 已消费前缀推进，包含 Eager，不能用本地 CQE 推断。
 - **M6.3.9 Runtime 与关闭**：ConnectionOwner 传递显式配置，ConnectionProgress 按基础 owner 加独立 WRITE/通知标记直接分发并验证原代次/context。RawStack 可选共享 TsegImportCache，段/端点导入共用每 context 暂停屏障；关闭检查段引用、控制任务与 unimport。失败或 Closing 保留路由，只接受迟到 DONE 进行清理，未终结目标 Grant 不复用；混合流、入口和通知真实责任结束后才解除路由。
 - **M6.3.9 验证**：2026-11-10 完整相关回归通过 88 个测试目标、1844 个用例，新增 33 个，无失败或跳过。其中 18 个双端 Connection 用例覆盖 copy/Lease、跨窗口混合流、FIN/反向发送、早到 RTS、独立 WRITE/DONE 责任、取消后迟到 DONE、准备拒绝、最小通知预算、空闲超时与真实调度器完成分发；其余覆盖底层票据/半关闭、Pending 准备、段导入暂停与关闭及错误映射。严格 C++23、自包含头文件、格式、文档链接与 diff 检查通过。UB 真机与规模验收未执行。
-- **下一步 M6.3.10**：将显式 Arena/预算与准入策略接入 RawStreamRuntime 便捷入口，覆盖应用 mailbox 到 Runtime 的完整双向 RNDV；补跨连接资源总预算及控制额度并发策略。当前仅单 Arena/固定 Lane；默认便捷入口仍 Eager，多 Arena 选择、UB WN1–WN4 和规模验收独立推进。
+- **M6.3.10 应用入口**：RawStreamRuntime 接入显式 endpoint RNDV 配置、真实共享目标 Arena 导出、独立对端授权和固定 READY Lane。Open 按 endpoint 的连接硬上限累计 TX、接收、chunk、通知、入口槽及 Grant 字节预算，并对照实际 backing/WRITE/SGE 能力预检；Preparing、Failed、Closing 与仅 Eager 协商的流均占槽直到 Release，默认仍不创建 RNDV。详见 [Raw 应用 Runtime](raw-stream-runtime.md)。
+- **M6.3.10 共享资源与 mailbox**：RawStack 可选目标 Slab 与源 Slab 共用注册 backing 预算，分别报告责任并在所有 Grant/Lease 归还后注销，再删除 context。宿主通过 Resolve 获取 mailbox 完整连接身份；mailbox 载荷默认 4 KiB，可显式配置至 1 MiB，Open 按实际环容量及 64 B 对齐步长预分配，数据路径不分配。应用回归使用默认 16 KiB RNDV 阈值，覆盖 C copy/Lease 与 mailbox 的双向传输。
+- **M6.3.10 Peer 活性修复**：集成回归发现兄弟连接重复 CREDIT 可耗尽控制额度。改为每 Peer 一个在途公告票据，区分 READY 发布、provider 接受、成功及失败 CQE；实际成功后合并物理上界，各连接窗口仍独立更新。失败后由健康兄弟连接公告累计额度，最后控制额度无法安全推进时显式失败，接受未知仍保留。可信 RX 在路由查找前更新物理共账，连接关闭不会丢失已到达的 CREDIT，错误会话/epoch 不更新；不重放业务 WR，也不因普通 status 8 排空共享 SQ。
+- **M6.3.10 验证**：2026-11-10 完整相关回归通过 88 个测试目标、1895 个用例，新增 51 个，无失败或跳过。覆盖 C copy/Lease、可配置大消息 mailbox、双向混合流、跨连接预算和控制额度、真实共享 Arena、目标注销失败保留、关闭及暂停门禁；共享 Peer 持续发送与空闲去重用例连续重跑 20 次通过。CREDIT 票据另覆盖零/未知接受、失败后再公告、READY 与最后控制额度、关闭后迟到 CREDIT 及旧身份拒绝。严格 C++23、自包含头文件、格式、文档链接及 diff 检查通过；UB 真机和规模验收未执行。
+- **下一步 M6.3.11**：补应用 Runtime 层的 WRITE/通知故障、取消与迟到完成组合回归，以及 64 KiB / 1 MiB / 16 MiB 有界分块和小包/控制流量公平性验证，记录实际资源峰值，为 M7 兼容层提供稳定入口。当前单 Arena/固定 Lane，跨线程 Lease、多 Arena 选择、UB WN1–WN4 与 40k 规模验收仍独立推进，不把 Mock 结果当作硬件或性能结论。
 
 - **目标**：基于已确认的 WRITE 可见性，交付 WRITE + SEND/IMM 两阶段通知。RNDV 阈值初始候选为 16 KiB，按负载对照测量调整；超过 4096 B 仍可有界分片 eager，不强制每次跨页写都走 RNDV。
 - **设计章节**：[§7.4 WRITE RNDV 状态机与终结](design/kbsocket-design-v1.md#74-write-rndv-完整状态机与安全终结)

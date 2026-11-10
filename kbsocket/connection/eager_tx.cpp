@@ -30,6 +30,7 @@ struct EagerTxStream::State {
         std::size_t source_offset = 0;
         control::ImportLease endpoint{};
         raw::AttemptMetadata metadata{};
+        CreditPublication publication{};
         raw::AttemptId id = 0;
         std::uint64_t generation = 0;
         std::uint64_t imm = 0;
@@ -39,6 +40,7 @@ struct EagerTxStream::State {
         bool active = false, cpu = false, committed = false, posted = false;
         bool source_committed = false;
         bool consumed_last_control = false;
+        bool publication_uncertain = false;
     };
     EagerTxConfig config;
     raw::TxSender* sender = nullptr;
@@ -61,7 +63,7 @@ struct EagerTxStream::State {
     std::uint32_t post_limit = raw::TxSender::kMaxBatch;
     std::uint32_t free = 0, head = kEnd, tail = kEnd;
     std::size_t header = 0;
-    bool credit_pending = false, fin_queued = false, closed = false;
+    bool credit_pending = false, credit_window_changed = false, fin_queued = false, closed = false;
 
     std::expected<std::uint64_t, EagerTxError> PublishedControl() const noexcept {
         if (!config.advertised_credits) {
@@ -72,6 +74,21 @@ struct EagerTxStream::State {
             return Error(EagerTxErrorCode::kCredit);
         }
         return std::max(advertised_control, *published);
+    }
+    std::expected<void, EagerTxError> DiscardConfirmedCredit() noexcept {
+        if (!credit_pending || credit_window_changed || !config.advertised_credits) {
+            return {};
+        }
+        const auto confirmed = config.advertised_credits->ConfirmedCredits(config.advertised_peer);
+        const auto failed = config.advertised_credits->PublicationFailed(config.advertised_peer);
+        if (!confirmed || !failed) {
+            return Error(EagerTxErrorCode::kCredit);
+        }
+        if (!*failed && credit.max_credit_seq <= confirmed->max_data &&
+            credit.max_control_credit_seq <= confirmed->max_control) {
+            credit_pending = false;
+        }
+        return {};
     }
     std::uint64_t BufferedBytes() const noexcept {
         auto bytes = sequence.accepted_bytes();
@@ -367,7 +384,8 @@ std::expected<void, EagerTxError> EagerTxStream::ShutdownWrite() noexcept {
     state_->stats.write_shutdown = true;
     return {};
 }
-std::expected<void, EagerTxError> EagerTxStream::QueueCredit(const WireFrameInput& credit) noexcept {
+std::expected<void, EagerTxError> EagerTxStream::QueueCredit(const WireFrameInput& credit,
+                                                             bool window_changed) noexcept {
     if (!state_ || state_->closed) {
         return Error(EagerTxErrorCode::kNotReady);
     }
@@ -392,6 +410,7 @@ std::expected<void, EagerTxError> EagerTxStream::QueueCredit(const WireFrameInpu
         frame.max_stream_bytes = std::max(frame.max_stream_bytes, s.credit.max_stream_bytes);
     }
     s.credit = frame;
+    s.credit_window_changed = window_changed || (s.credit_pending && s.credit_window_changed);
     s.credit_pending = true;
     return {};
 }
@@ -423,6 +442,13 @@ std::expected<void, EagerTxError> EagerTxStream::ApplyCredit(SequenceSession ses
 std::expected<void, EagerTxError> EagerTxStream::Drop(std::uint32_t index) noexcept {
     auto& s = *state_;
     auto& r = s.records[index];
+    if (r.publication.id) {
+        if (r.posted || r.publication_uncertain ||
+            !s.config.advertised_credits->ResolvePublication(r.publication, CreditPublicationResult::kNotAccepted)) {
+            return Error(EagerTxErrorCode::kRetained);
+        }
+        r.publication = {};
+    }
     if (r.source_dma.sequence) {
         if (r.source_committed || !s.slab->Cancel(r.source_dma)) {
             return Error(EagerTxErrorCode::kRetained);
@@ -471,6 +497,9 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Progress() noexcept {
         Fail();
         return Error(EagerTxErrorCode::kCredit);
     }
+    if (const auto discarded = s.DiscardConfirmedCredit(); !discarded) {
+        return std::unexpected(discarded.error());
+    }
     // 控制独占一个额外记录，数据窗口耗尽或 FIN 已接受时仍可返还接收额度。
     const auto control_available = s.credits->available(CreditClass::kControl);
     const auto published = s.PublishedControl();
@@ -478,6 +507,21 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Progress() noexcept {
         return std::unexpected(published.error());
     }
     const bool advances_control = s.credit.max_control_credit_seq > *published;
+    if (s.credit_pending && control_available == 1 && !advances_control && s.config.advertised_credits) {
+        const auto pending = s.config.advertised_credits->PublicationPending(s.config.advertised_peer);
+        const auto failed = s.config.advertised_credits->PublicationFailed(s.config.advertised_peer);
+        if (!pending || !failed) {
+            return Error(EagerTxErrorCode::kCredit);
+        }
+        if (!*pending && *failed) {
+            // 先前通告可信接受却终结失败，剩余一个额度不能安全重公告同一控制上界。
+            // 显式失败整个 Peer 共账；不回退 accepted 上界，也不把已花额度返还。
+            s.credits->Stop();
+            const auto frozen = s.config.advertised_credits->FreezePeer(s.config.advertised_peer);
+            Fail();
+            return Error(frozen ? EagerTxErrorCode::kCredit : EagerTxErrorCode::kAccounting);
+        }
+    }
     if (s.credit_pending && !s.records[s.config.capacity].active &&
         (control_available > 1 || (control_available == 1 && advances_control))) {
         return Post(true);
@@ -590,6 +634,21 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexc
             }
         }
         return Error(EagerTxErrorCode::kWouldBlock);
+    }
+    if (control && s.config.advertised_credits) {
+        const auto publication = s.config.advertised_credits->ReservePublication(
+            s.config.advertised_peer, {s.credit.max_credit_seq, s.credit.max_control_credit_seq});
+        if (!publication) {
+            const bool resolved = s.credits->Resolve(*reservation, 0).has_value();
+            const bool dropped = Drop(s.batch[0]).has_value();
+            if (!resolved || !dropped) {
+                Fail();
+                return Error(EagerTxErrorCode::kAccounting);
+            }
+            return Error(publication.error().code == CreditErrorCode::kInUse ? EagerTxErrorCode::kWouldBlock
+                                                                             : EagerTxErrorCode::kCredit);
+        }
+        s.records[s.batch[0]].publication = *publication;
     }
     bool prepared = true;
     bool preparation_exhausted = false;
@@ -723,6 +782,7 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexc
         if (i < retained) {
             r.id = s.ids[i];
             r.posted = true;
+            r.publication_uncertain = uncertain;
             r.consumed_last_control = consumes_last_control && accepted && i < *accepted;
             if (r.dma.sequence) {
                 if (s.slab->Commit(r.dma)) {
@@ -786,6 +846,7 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexc
     if (control) {
         if (retained) {
             s.credit_pending = false;
+            s.credit_window_changed = false;
         } else if (!Drop(s.batch[0])) {
             accounting_ok = false;
         }
@@ -796,6 +857,7 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexc
         for (std::size_t i = 0; i < count; ++i) {
             auto& r = s.records[s.batch[i]];
             if (r.active && r.posted) {
+                r.publication_uncertain = true;
                 if (r.lease.generation) {
                     const auto quarantined = s.slab->Quarantine(r.lease);
                     static_cast<void>(quarantined);
@@ -848,6 +910,15 @@ std::expected<void, EagerTxError> EagerTxStream::OnCompletion(const raw::TxCompl
         return Error(EagerTxErrorCode::kInvalidCompletion);
     }
     const bool terminal_failed = event.completion.status != URMA_CR_SUCCESS || event.error.has_value();
+    if (r.publication.id && !r.publication_uncertain) {
+        if (!s.config.advertised_credits->ResolvePublication(r.publication, terminal_failed
+                                                                                ? CreditPublicationResult::kFailed
+                                                                                : CreditPublicationResult::kSuccess)) {
+            Fail();
+            return Error(EagerTxErrorCode::kAccounting);
+        }
+        r.publication = {};
+    }
     bool peer_frozen = true;
     if (terminal_failed && r.consumed_last_control) {
         // 最后控制额度的返还报文失败后，不再能保证共账继续前进；禁止其他同 peer 流静默等待。

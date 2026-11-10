@@ -17,6 +17,9 @@ namespace runtime {
 
 struct ConnectionMailboxConfig {
     std::size_t capacity = 256;
+    std::size_t max_io_bytes = ConnectionCommandQueue::kMaxIoBytes;
+    // 单个 mailbox 的 payload backing 上限，按 64 B 槽步长对齐，不含固定槽元数据。
+    std::size_t payload_budget_bytes = ConnectionCommandQueue::kMaxCapacity * ConnectionCommandQueue::kMaxIoBytes;
 };
 struct ConnectionMailboxNotice {
     ConnectionCommandTicket ticket;
@@ -47,6 +50,9 @@ public:
     }
     std::size_t capacity() const noexcept {
         return queue_.capacity();
+    }
+    std::size_t max_io_bytes() const noexcept {
+        return queue_.max_io_bytes();
     }
     bool accepting() const noexcept {
         return queue_.accepting();

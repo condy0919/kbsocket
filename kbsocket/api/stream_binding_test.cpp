@@ -527,8 +527,9 @@ TEST_F(StreamBindingTest, NativeReadinessSubscriptionRunsOnExistingRuntime) {
     TcpPair pair;
     ASSERT_TRUE(pair.Open());
     const auto stream = Publish(Adopt(pair.right));
-    ASSERT_TRUE(
-        runtime_.Open({}, {.reactor = {.events = true, .budget = 4, .busy_poll_ns = 0, .max_wait_ms = 1}}, &progress_));
+    ASSERT_TRUE(runtime_.Open(
+        {}, {.reactor = {.events = true, .budget = 4, .busy_poll_ns = 0, .max_wait_ms = 1}, .control = {}},
+        &progress_));
     runtime_open_ = true;
     ASSERT_EQ(kbs_stream_watch_tcp(binding_.table(), stream, 1, 0, nullptr), 0);
     const std::byte byte{0x66};
@@ -718,8 +719,9 @@ TEST_F(StreamBindingTest, NativeOneShotDeliveryRequiresExplicitRearm) {
     TcpPair pair;
     ASSERT_TRUE(pair.Open());
     const auto stream = Publish(Adopt(pair.right));
-    ASSERT_TRUE(
-        runtime_.Open({}, {.reactor = {.events = true, .budget = 4, .busy_poll_ns = 0, .max_wait_ms = 1}}, &progress_));
+    ASSERT_TRUE(runtime_.Open(
+        {}, {.reactor = {.events = true, .budget = 4, .busy_poll_ns = 0, .max_wait_ms = 1}, .control = {}},
+        &progress_));
     runtime_open_ = true;
     std::array<kbs_stream_event, 2> events{};
     ASSERT_EQ(binding_.PollEvents(events), 1u);
@@ -760,8 +762,9 @@ TEST_F(StreamBindingTest, PeerShutdownHintsDoNotClaimEofBeforeRead) {
     TcpPair pair;
     ASSERT_TRUE(pair.Open());
     const auto stream = Publish(Adopt(pair.right));
-    ASSERT_TRUE(
-        runtime_.Open({}, {.reactor = {.events = true, .budget = 4, .busy_poll_ns = 0, .max_wait_ms = 1}}, &progress_));
+    ASSERT_TRUE(runtime_.Open(
+        {}, {.reactor = {.events = true, .budget = 4, .busy_poll_ns = 0, .max_wait_ms = 1}, .control = {}},
+        &progress_));
     runtime_open_ = true;
     std::array<kbs_stream_event, 2> events{};
     ASSERT_EQ(binding_.PollEvents(events), 1u);
@@ -1214,7 +1217,8 @@ protected:
                 .slab = shared_->slab,
                 .sender_credits = &e.sender_credits,
                 .tx_capacity = 8,
-                .peer_lanes_authorized = true};
+                .peer_lanes_authorized = true,
+                .rndv = {}};
             ASSERT_TRUE(e.resources.connections->PrepareRaw(e.owned, prep, *domain.sources));
         }
     }
@@ -1225,6 +1229,23 @@ protected:
             return !stack_.paused(0) && !stack_.paused(1) &&
                    endpoints_[0].binding.Inspect(endpoints_[0].stream)->state == KBS_STREAM_RAW_ACTIVE &&
                    endpoints_[1].binding.Inspect(endpoints_[1].stream)->state == KBS_STREAM_RAW_ACTIVE;
+        }));
+        // RAW_ACTIVE 尚可带有 READY 派生的 CREDIT；先真实收割 TX/RX、补投和授信通告，
+        // 后续暂停或零副本测试的精确资源快照才不包含与被测操作无关的在途控制帧。
+        ASSERT_TRUE(Until([&] {
+            for (auto& e : endpoints_) {
+                const auto status = e.binding.Inspect(e.stream);
+                const auto& domain = e.resources.domain;
+                const auto peer = domain.credits->PeerStats(e.peer);
+                const auto confirmed = domain.credits->ConfirmedCredits(e.peer);
+                const auto pending = domain.credits->PublicationPending(e.peer);
+                if (!status || status->tx_pending != 0 || !e.completed[0].empty() || !e.completed[1].empty() ||
+                    domain.receive->pending_refill() != 0 || !peer || !confirmed || !pending || *pending ||
+                    confirmed->max_data < peer->max_data || confirmed->max_control < peer->max_control) {
+                    return false;
+                }
+            }
+            return shared_->slab->stats().local_dma == 0;
         }));
     }
     void TearDown() override {

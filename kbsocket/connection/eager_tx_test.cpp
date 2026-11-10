@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 #include "kbsocket/connection/eager_tx.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -8,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <optional>
 #include <thread>
 
 #include <gtest/gtest.h>
@@ -197,7 +200,8 @@ protected:
                 .credit_identity = identity_,
                 .capacity = capacity,
                 .max_frame_seq = 10000,
-                .max_stream_bytes = 10000000};
+                .max_stream_bytes = 10000000,
+                .advertised_peer = {}};
     }
     void Open(std::uint32_t capacity = 4) {
         ASSERT_TRUE(stream_.Open(Config(capacity), sender_, slab_, imports_, endpoint_, credits_));
@@ -292,6 +296,317 @@ protected:
         return 2;
     }
 };
+
+class EagerTxPublicationTest : public EagerTxTest {
+protected:
+    void SetUp() override {
+        EagerTxTest::SetUp();
+        ASSERT_TRUE(receive_.Open(
+            {.receive_domain = 20, .capacity = 32, .control_slots = 16, .peer_capacity = 1, .base_credits = 1}));
+        ASSERT_TRUE(receive_.RecordInitialPosted(CreditClass::kData, 16));
+        ASSERT_TRUE(receive_.RecordInitialPosted(CreditClass::kControl, 16));
+        const auto peer = receive_.Admit(identity_);
+        ASSERT_TRUE(peer);
+        peer_ = *peer;
+        ASSERT_TRUE(receive_.Grant(peer_, CreditClass::kData, 8));
+        ASSERT_TRUE(receive_.Grant(peer_, CreditClass::kControl, 8));
+        // 模拟较早一次 CREDIT 的真实成功；两条业务连接稍后会观察相同的物理补额。
+        const auto initial = receive_.ReservePublication(peer_, {1, 2});
+        ASSERT_TRUE(initial);
+        ASSERT_TRUE(receive_.ResolvePublication(*initial, CreditPublicationResult::kSuccess));
+        ASSERT_TRUE(receive_.RecordPublishedControl(peer_, 2));
+        auto config = Config();
+        config.advertised_credits = &receive_;
+        config.advertised_peer = peer_;
+        ASSERT_TRUE(stream_.Open(config, sender_, slab_, imports_, endpoint_, credits_));
+        config.connection_id = 2;
+        config.destination.slot = 4;
+        ASSERT_TRUE(sibling_.Open(config, sender_, slab_, imports_, endpoint_, credits_));
+        PumpImports();
+        credit_ = {.type = WireFrameType::kControl,
+                   .token = {},
+                   .data = {},
+                   .max_credit_seq = 8,
+                   .max_control_credit_seq = 8,
+                   .session = session_.session,
+                   .credit_epoch = 1,
+                   .max_frame_seq = 16,
+                   .max_stream_bytes = 1024};
+    }
+    void TearDown() override {
+        EXPECT_TRUE(sibling_.Close());
+        EXPECT_TRUE(stream_.Close());
+        EXPECT_TRUE(receive_.RetirePeer(
+            peer_, {.sender_stopped = true, .accepted_set_settled = true, .unused_grants_revoked = true}));
+        EXPECT_TRUE(receive_.Close());
+        EagerTxTest::TearDown();
+    }
+    ReceiveCreditDomain receive_;
+    EagerTxStream sibling_;
+    CreditPeerHandle peer_;
+    WireFrameInput credit_;
+};
+
+TEST_F(EagerTxPublicationTest, SharedPhysicalUpdateWaitsForActualCqeAndDropsCoveredPendingWithoutAllocation) {
+    ASSERT_TRUE(stream_.QueueCredit(credit_, false));
+    ASSERT_TRUE(sibling_.QueueCredit(credit_, false));
+    allocations = 0;
+    count_allocations = true;
+    const auto posted = stream_.Progress();
+    const auto blocked = sibling_.Progress();
+    Enqueue(0);
+    const auto terminal = stream_.OnCompletion(PollOne());
+    const auto covered = sibling_.Progress();
+    count_allocations = false;
+    ASSERT_EQ(posted, 1u);
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code, EagerTxErrorCode::kWouldBlock);
+    ASSERT_TRUE(terminal);
+    ASSERT_EQ(covered, 0u);
+    EXPECT_EQ(packet_count_, 1u);
+    EXPECT_EQ(receive_.stats().publications, 0u);
+    EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_data, 8u);
+    EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_control, 8u);
+    EXPECT_EQ(allocations, 0u);
+    // 没有新业务/窗口变化时，共账更新不再由逻辑连接轮流重复发布。
+    for (unsigned i = 0; i < 8; ++i) {
+        ASSERT_TRUE(stream_.QueueCredit(credit_, false));
+        ASSERT_TRUE(sibling_.QueueCredit(credit_, false));
+        ASSERT_EQ(stream_.Progress(), 0u);
+        ASSERT_EQ(sibling_.Progress(), 0u);
+    }
+    EXPECT_EQ(packet_count_, 1u);
+}
+
+TEST_F(EagerTxPublicationTest, ConnectionWindowChangeSurvivesSharedPhysicalCoalescingAndPendingMerge) {
+    ASSERT_TRUE(stream_.QueueCredit(credit_, false));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    auto window = credit_;
+    window.max_frame_seq = 17;
+    window.max_stream_bytes = 2048;
+    ASSERT_TRUE(sibling_.QueueCredit(window));
+    EXPECT_FALSE(sibling_.Progress());
+    // 后来合并的纯共账更新不能清掉此连接独立窗口的必发标记。
+    ASSERT_TRUE(sibling_.QueueCredit(credit_, false));
+    Complete(0);
+    ASSERT_EQ(sibling_.Progress(), 1u);
+    const auto decoded = DecodeWireFrame(packets_[1].imm, std::span(packets_[1].payload).first(packets_[1].bytes));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->frame.token.slot, 4u);
+    EXPECT_EQ(decoded->frame.max_frame_seq, 17u);
+    EXPECT_EQ(decoded->frame.max_stream_bytes, 2048u);
+    Complete(1, &sibling_);
+    EXPECT_EQ(packet_count_, 2u);
+}
+
+TEST_F(EagerTxPublicationTest, InFlightPublicationKeepsItsOriginalLimitsWhenNewCreditIsMerged) {
+    auto first = credit_;
+    first.max_credit_seq = 3;
+    first.max_control_credit_seq = 4;
+    ASSERT_TRUE(stream_.QueueCredit(first, false));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    ASSERT_TRUE(stream_.QueueCredit(credit_, false));
+    Complete(0);
+    // 原 CQE 只能确认当时发送的快照，不能确认尚未发送的合并上界。
+    EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_data, 3u);
+    EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_control, 4u);
+    ASSERT_EQ(stream_.Progress(), 1u);
+    Complete(1);
+    EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_data, 8u);
+    EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_control, 8u);
+    auto data_only = credit_;
+    ASSERT_TRUE(receive_.Grant(peer_, CreditClass::kData, 1));
+    data_only.max_credit_seq = 9;
+    ASSERT_TRUE(sibling_.QueueCredit(data_only, false));
+    ASSERT_EQ(sibling_.Progress(), 1u);
+    Complete(2, &sibling_);
+    EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_data, 9u);
+    EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_control, 8u);
+}
+
+TEST_F(EagerTxPublicationTest, ZeroAcceptanceReleasesPublicationAndAllowsSiblingToPublish) {
+    ASSERT_TRUE(stream_.QueueCredit(credit_, false));
+    mode_ = PostMode::kPartial;
+    partial_ = 0;
+    const auto rejected = stream_.Progress();
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code, EagerTxErrorCode::kWouldBlock);
+    EXPECT_EQ(receive_.stats().publications, 0u);
+    EXPECT_EQ(receive_.PublishedControl(peer_), 2u);
+    EXPECT_EQ(receive_.PublicationFailed(peer_), false);
+    EXPECT_EQ(credits_.stats().spent[1], 0u);
+    mode_ = PostMode::kAll;
+    ASSERT_TRUE(sibling_.QueueCredit(credit_, false));
+    ASSERT_EQ(sibling_.Progress(), 1u);
+    Complete(0, &sibling_);
+    // 原连接的零接受 pending 可以被真实成功的 sibling 覆盖，不会重放任何已接受 WR。
+    ASSERT_EQ(stream_.Progress(), 0u);
+    EXPECT_EQ(packet_count_, 1u);
+}
+
+TEST_F(EagerTxPublicationTest, FailedPublicationLetsHealthySiblingAnnounceSameCumulativeGrant) {
+    ASSERT_TRUE(stream_.QueueCredit(credit_, false));
+    ASSERT_TRUE(sibling_.QueueCredit(credit_, false));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    Enqueue(0, URMA_CR_REM_ACCESS_ABORT_ERR);
+    const auto failed = stream_.OnCompletion(PollOne());
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.error().code, EagerTxErrorCode::kCompletion);
+    EXPECT_EQ(receive_.PublishedControl(peer_), 8u);
+    EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_control, 2u);
+    EXPECT_EQ(receive_.stats().publications, 0u);
+    EXPECT_FALSE(credits_.stats().stopped);
+    ASSERT_EQ(sibling_.Progress(), 1u);
+    Complete(1, &sibling_);
+    EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_control, 8u);
+    EXPECT_EQ(credits_.stats().spent[1], 2u);
+    EXPECT_EQ(receive_.PeerStats(peer_)->control_granted, 8u);
+}
+
+TEST_F(EagerTxPublicationTest, ReadyPublicationWithoutFailedCqeDoesNotStopReservedFinalCredit) {
+    // 新逻辑连接的 READY 可先发布更高共账；这不是 CREDIT 失败。future DONE 预留后
+    // 只剩最后一个额度时，应等待真正的新控制授信，不能误停整个 Peer。
+    ASSERT_TRUE(receive_.RecordPublishedControl(peer_, 8));
+    const auto prior = credits_.Reserve(CreditClass::kControl, 998);
+    ASSERT_TRUE(prior);
+    ASSERT_TRUE(credits_.Resolve(*prior, 998));
+    const auto future_done = credits_.ReserveControl();
+    ASSERT_TRUE(future_done);
+    ASSERT_EQ(credits_.available(CreditClass::kControl), 1u);
+    ASSERT_TRUE(stream_.QueueCredit(credit_, false));
+    ASSERT_EQ(stream_.Progress(), 0u);
+    EXPECT_FALSE(credits_.stats().stopped);
+    EXPECT_FALSE(receive_.PeerStats(peer_)->frozen);
+    EXPECT_EQ(receive_.PublicationFailed(peer_), false);
+    EXPECT_EQ(packet_count_, 0u);
+    ASSERT_TRUE(credits_.ReleaseControl(*future_done));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    Complete(0);
+}
+
+TEST_F(EagerTxPublicationTest, FailedAnnouncementWithOnlyFinalCreditFailsPeerRatherThanWaitingForever) {
+    const auto prior = credits_.Reserve(CreditClass::kControl, 998);
+    ASSERT_TRUE(prior);
+    ASSERT_TRUE(credits_.Resolve(*prior, 998));
+    ASSERT_TRUE(stream_.QueueCredit(credit_, false));
+    ASSERT_TRUE(sibling_.QueueCredit(credit_, false));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    Enqueue(0, URMA_CR_REM_ACCESS_ABORT_ERR);
+    EXPECT_FALSE(stream_.OnCompletion(PollOne()));
+    EXPECT_EQ(credits_.available(CreditClass::kControl), 1u);
+    const auto blocked = sibling_.Progress();
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code, EagerTxErrorCode::kCredit);
+    EXPECT_TRUE(credits_.stats().stopped);
+    EXPECT_TRUE(receive_.PeerStats(peer_)->frozen);
+    EXPECT_EQ(receive_.PublishedControl(peer_), 8u);
+    EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_control, 2u);
+    EXPECT_EQ(credits_.stats().spent[1], 999u);
+    EXPECT_EQ(packet_count_, 1u);
+}
+
+TEST_F(EagerTxPublicationTest, FailedDataOnlyAnnouncementWithFinalCreditFailsPeer) {
+    // control 上界已经确认，只有 data 新增；失败公告仍会阻止 Peer 继续送 RTS/DATA。
+    const auto prior = credits_.Reserve(CreditClass::kControl, 998);
+    ASSERT_TRUE(prior);
+    ASSERT_TRUE(credits_.Resolve(*prior, 998));
+    auto data_only = credit_;
+    data_only.max_control_credit_seq = 2;
+    ASSERT_TRUE(stream_.QueueCredit(data_only, false));
+    ASSERT_TRUE(sibling_.QueueCredit(data_only, false));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    Enqueue(0, URMA_CR_REM_ACCESS_ABORT_ERR);
+    EXPECT_FALSE(stream_.OnCompletion(PollOne()));
+    ASSERT_EQ(credits_.available(CreditClass::kControl), 1u);
+    ASSERT_EQ(receive_.ConfirmedCredits(peer_)->max_control, 2u);
+    ASSERT_EQ(receive_.PublicationFailed(peer_), true);
+    const auto stopped = sibling_.Progress();
+    ASSERT_FALSE(stopped);
+    EXPECT_EQ(stopped.error().code, EagerTxErrorCode::kCredit);
+    EXPECT_TRUE(credits_.stats().stopped);
+    EXPECT_TRUE(receive_.PeerStats(peer_)->frozen);
+    EXPECT_EQ(packet_count_, 1u);
+}
+
+TEST_F(EagerTxPublicationTest, FailedWindowOnlyAnnouncementRequiresLaterSuccessBeforeFinalCredit) {
+    // 物理上界已确认，但后来窗口-only CREDIT 的失败仍真实花掉了共享控制额度。
+    const auto prior = credits_.Reserve(CreditClass::kControl, 998);
+    ASSERT_TRUE(prior);
+    ASSERT_TRUE(credits_.Resolve(*prior, 998));
+    auto window_only = credit_;
+    window_only.max_credit_seq = 1;
+    window_only.max_control_credit_seq = 2;
+    ASSERT_TRUE(stream_.QueueCredit(window_only));
+    ASSERT_TRUE(sibling_.QueueCredit(window_only, false));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    Enqueue(0, URMA_CR_REM_ACCESS_ABORT_ERR);
+    EXPECT_FALSE(stream_.OnCompletion(PollOne()));
+    ASSERT_EQ(receive_.ConfirmedCredits(peer_)->max_data, 1u);
+    ASSERT_EQ(receive_.ConfirmedCredits(peer_)->max_control, 2u);
+    ASSERT_EQ(receive_.PublicationFailed(peer_), true);
+    const auto stopped = sibling_.Progress();
+    ASSERT_FALSE(stopped);
+    EXPECT_EQ(stopped.error().code, EagerTxErrorCode::kCredit);
+    EXPECT_TRUE(credits_.stats().stopped);
+    EXPECT_TRUE(receive_.PeerStats(peer_)->frozen);
+    EXPECT_EQ(packet_count_, 1u);
+}
+
+TEST_F(EagerTxPublicationTest, HealthySiblingRepublishesAfterWindowFailureWithoutOwnWindowChange) {
+    auto window_only = credit_;
+    window_only.max_credit_seq = 1;
+    window_only.max_control_credit_seq = 2;
+    ASSERT_TRUE(stream_.QueueCredit(window_only));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    Enqueue(0, URMA_CR_REM_ACCESS_ABORT_ERR);
+    EXPECT_FALSE(stream_.OnCompletion(PollOne()));
+    ASSERT_EQ(receive_.PublicationFailed(peer_), true);
+    // B 的私有窗口没有增长，且物理上界此前已确认；真实失败证据仍要求它公告一次。
+    ASSERT_TRUE(sibling_.QueueCredit(window_only, false));
+    ASSERT_EQ(sibling_.Progress(), 1u);
+    Complete(1, &sibling_);
+    EXPECT_EQ(receive_.PublicationFailed(peer_), false);
+    ASSERT_TRUE(sibling_.QueueCredit(window_only, false));
+    ASSERT_EQ(sibling_.Progress(), 0u);
+    EXPECT_FALSE(credits_.stats().stopped);
+    EXPECT_EQ(packet_count_, 2u);
+}
+
+class EagerTxPublicationDeathTest : public EagerTxPublicationTest {};
+TEST_F(EagerTxPublicationDeathTest, UnknownAcceptanceRetainsPublicationEvenAfterKnownCqe) {
+    // 接受集合未知的 CREDIT 必须连同 Peer 去重责任一起保留；隔离子进程不伪造清退证明。
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            ASSERT_TRUE(stream_.QueueCredit(credit_, false));
+            mode_ = PostMode::kUnknown;
+            const auto posted = stream_.Progress();
+            ASSERT_FALSE(posted);
+            EXPECT_EQ(posted.error().code, EagerTxErrorCode::kAcceptanceUnknown);
+            ASSERT_EQ(packet_count_, 1u);
+            EXPECT_TRUE(credits_.stats().stopped);
+            EXPECT_EQ(receive_.stats().publications, 1u);
+            EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_control, 2u);
+            EXPECT_FALSE(stream_.Close());
+            EXPECT_FALSE(receive_.RetirePeer(
+                peer_, {.sender_stopped = true, .accepted_set_settled = true, .unused_grants_revoked = true}));
+            EXPECT_FALSE(receive_.Close());
+            // Mock 已捕获这条 WR，真实 CQE 可释放其本地 DMA；仍不能把它解释为完整接受证明。
+            ASSERT_TRUE(ledger_.Commit(packets_[0].id, 1));
+            Enqueue(0);
+            const auto terminal = stream_.OnCompletion(PollOne());
+            ASSERT_FALSE(terminal);
+            EXPECT_EQ(terminal.error().code, EagerTxErrorCode::kRetained);
+            EXPECT_EQ(slab_.stats().local_dma, 0u);
+            EXPECT_EQ(receive_.stats().publications, 1u);
+            EXPECT_EQ(receive_.ConfirmedCredits(peer_)->max_control, 2u);
+            EXPECT_FALSE(stream_.Close());
+            EXPECT_FALSE(stream_.Progress());
+            EXPECT_EQ(post_calls_, 1u);
+            ::_exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
 
 TEST_F(EagerTxTest, LeaseAdmissionSegmentsOriginalSourceAndReturnsBoundedPrefix) {
     ReopenLargeSlab();
@@ -983,6 +1298,8 @@ TEST_F(EagerTxTest, ExternalRtsReservationBlocksDataButAllowsCreditAndCountsItsB
     EXPECT_EQ(blocked.error().code, EagerTxErrorCode::kWouldBlock);
     EXPECT_EQ(post_calls_, 0u);
     WireFrameInput credit{.type = WireFrameType::kControl,
+                          .token = {},
+                          .data = {},
                           .max_credit_seq = 10,
                           .max_control_credit_seq = 3,
                           .session = session_.session,
@@ -1124,6 +1441,8 @@ TEST_F(EagerTxTest, FinFollowsQueuedDataAndCreditCanPostAfterHalfCloseWithoutAll
     EXPECT_EQ(fin->frame.seq, 1u);
     EXPECT_TRUE(stream_.stats().fin_accepted);
     WireFrameInput credit{.type = WireFrameType::kControl,
+                          .token = {},
+                          .data = {},
                           .max_credit_seq = 10,
                           .max_control_credit_seq = 3,
                           .session = session_.session,
@@ -1254,6 +1573,8 @@ TEST_F(EagerTxTest, ReservedControlBufferSurvivesFullSharedSlabAndExhaustedDataC
     }
     EXPECT_EQ(slab_.stats().available, 0u);
     WireFrameInput credit{.type = WireFrameType::kControl,
+                          .token = {},
+                          .data = {},
                           .max_credit_seq = 3,
                           .max_control_credit_seq = 2,
                           .session = session_.session,
@@ -1304,6 +1625,8 @@ TEST_F(EagerTxTest, FinalControlCreditOnlyCarriesNewControlAuthorization) {
     ASSERT_TRUE(stream_.Open(config, sender_, slab_, imports_, endpoint_, limited));
     PumpImports();
     WireFrameInput credit{.type = WireFrameType::kControl,
+                          .token = {},
+                          .data = {},
                           .max_credit_seq = 3,
                           .max_control_credit_seq = 10,
                           .session = session_.session,
@@ -1360,6 +1683,8 @@ TEST_F(EagerTxTest, ConnectionsSharePublishedControlFrontierBeforeSpendingLastCr
     ASSERT_TRUE(sibling.Open(config, sender_, slab_, imports_, endpoint_, limited));
     PumpImports();
     WireFrameInput credit{.type = WireFrameType::kControl,
+                          .token = {},
+                          .data = {},
                           .max_control_credit_seq = 10,
                           .session = session_.session,
                           .credit_epoch = 1,
@@ -1436,8 +1761,12 @@ TEST_F(EagerTxTest, FailedLastControlReturnStopsSharedAccountAndFreezesPeerWitho
     PumpImports();
     const std::array<std::byte, 8> data{};
     ASSERT_EQ(sibling.Write(data), data.size());
-    const WireFrameInput credit{
-        .type = WireFrameType::kControl, .max_control_credit_seq = 1, .session = session_.session, .credit_epoch = 1};
+    const WireFrameInput credit{.type = WireFrameType::kControl,
+                                .token = {},
+                                .data = {},
+                                .max_control_credit_seq = 1,
+                                .session = session_.session,
+                                .credit_epoch = 1};
     ASSERT_TRUE(stream_.QueueCredit(credit));
     ASSERT_EQ(stream_.Progress(), 1u);
     Enqueue(0, URMA_CR_REM_ACCESS_ABORT_ERR);
@@ -1481,14 +1810,19 @@ TEST_F(EagerTxTest, LastControlCompletionErrorStopsAccountWithoutPublishedDomain
     EagerTxStream sibling;
     ASSERT_TRUE(sibling.Open(Config(4, 2), sender_, slab_, imports_, endpoint_, limited));
     PumpImports();
-    const WireFrameInput credit{
-        .type = WireFrameType::kControl, .max_control_credit_seq = 1, .session = session_.session, .credit_epoch = 1};
+    const WireFrameInput credit{.type = WireFrameType::kControl,
+                                .token = {},
+                                .data = {},
+                                .max_control_credit_seq = 1,
+                                .session = session_.session,
+                                .credit_epoch = 1};
     ASSERT_TRUE(stream_.QueueCredit(credit));
     ASSERT_EQ(stream_.Progress(), 1u);
     Enqueue(0);
     auto event = PollOne();
     // 已退休记录仍可能附带完成器错误；无 published-domain 宿主的原语也须显式停止同 peer 流。
-    event.error = raw::TxCompletionError{.code = raw::TxCompletionErrorCode::kPoolFailure};
+    event.error = raw::TxCompletionError{
+        .code = raw::TxCompletionErrorCode::kPoolFailure, .ledger_error = std::nullopt, .pool_error = std::nullopt};
     EXPECT_FALSE(stream_.OnCompletion(event));
     EXPECT_TRUE(limited.stats().stopped);
     const auto progress = sibling.Progress();
@@ -1506,8 +1840,12 @@ TEST_F(EagerTxTest, OldLastControlFailureCannotStopAReopenedCreditEpoch) {
     ASSERT_TRUE(limited.Update(identity_, 1, 1));
     ASSERT_TRUE(stream_.Open(Config(), sender_, slab_, imports_, endpoint_, limited));
     PumpImports();
-    const WireFrameInput credit{
-        .type = WireFrameType::kControl, .max_control_credit_seq = 1, .session = session_.session, .credit_epoch = 1};
+    const WireFrameInput credit{.type = WireFrameType::kControl,
+                                .token = {},
+                                .data = {},
+                                .max_control_credit_seq = 1,
+                                .session = session_.session,
+                                .credit_epoch = 1};
     ASSERT_TRUE(stream_.QueueCredit(credit));
     ASSERT_EQ(stream_.Progress(), 1u);
     ASSERT_TRUE(limited.Close());

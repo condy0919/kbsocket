@@ -764,6 +764,149 @@ TEST_F(ReceiveCreditDomainTest, StopAdmissionPreservesAuthorizedReceivesAndTrust
     CheckConservation();
 }
 
+TEST_F(ReceiveCreditDomainTest, PublicationSerializesPeerAndConfirmsBothPhysicalFrontiersWithoutAllocation) {
+    PostAll();
+    const auto peer = Admit(1);
+    ASSERT_TRUE(peer);
+    ASSERT_TRUE(domain_.Grant(*peer, CreditClass::kData, 2));
+    ASSERT_TRUE(domain_.Grant(*peer, CreditClass::kControl, 4));
+    const auto initial = domain_.ReservePublication(*peer, {1, 2});
+    ASSERT_TRUE(initial);
+    ASSERT_TRUE(domain_.ResolvePublication(*initial, CreditPublicationResult::kSuccess));
+    EXPECT_FALSE(domain_.ReservePublication(*peer, {3, 2}));
+    EXPECT_FALSE(domain_.ReservePublication(*peer, {2, 5}));
+    credit_allocations = 0;
+    count_credit_allocations = true;
+    const auto publication = domain_.ReservePublication(*peer, {2, 4});
+    const auto busy = domain_.ReservePublication(*peer, {2, 4});
+    const auto pending = domain_.PublicationPending(*peer);
+    const auto exposed = domain_.RecordPublishedControl(*peer, 4);
+    const auto before = domain_.ConfirmedCredits(*peer);
+    const auto resolved = publication ? domain_.ResolvePublication(*publication, CreditPublicationResult::kSuccess)
+                                      : std::expected<void, CreditError>{std::unexpected(CreditError{})};
+    count_credit_allocations = false;
+    ASSERT_TRUE(publication);
+    ASSERT_FALSE(busy);
+    EXPECT_EQ(busy.error().code, CreditErrorCode::kInUse);
+    ASSERT_TRUE(pending);
+    EXPECT_TRUE(*pending);
+    ASSERT_TRUE(exposed);
+    ASSERT_TRUE(before);
+    // provider 接受不等于成功交付；仅真实成功终结推进两类已确认上界。
+    EXPECT_EQ(before->max_data, 1u);
+    EXPECT_EQ(before->max_control, 2u);
+    ASSERT_TRUE(resolved);
+    EXPECT_EQ(domain_.ConfirmedCredits(*peer)->max_data, 2u);
+    EXPECT_EQ(domain_.ConfirmedCredits(*peer)->max_control, 4u);
+    EXPECT_EQ(domain_.stats().publications, 0u);
+    EXPECT_FALSE(*domain_.PublicationPending(*peer));
+    EXPECT_FALSE(domain_.ResolvePublication(*publication, CreditPublicationResult::kSuccess));
+    EXPECT_EQ(credit_allocations, 0u);
+}
+
+TEST_F(ReceiveCreditDomainTest, FailedPublicationReleasesDedupWithoutRevokingGrantOrAcceptedFrontier) {
+    PostAll();
+    const auto peer = Admit(1);
+    ASSERT_TRUE(peer);
+    ASSERT_TRUE(domain_.Grant(*peer, CreditClass::kData, 2));
+    ASSERT_TRUE(domain_.Grant(*peer, CreditClass::kControl, 4));
+    const auto first = domain_.ReservePublication(*peer, {2, 4});
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(domain_.RecordPublishedControl(*peer, 4));
+    const auto issued = domain_.PeerStats(*peer);
+    ASSERT_TRUE(issued);
+    ASSERT_TRUE(domain_.ResolvePublication(*first, CreditPublicationResult::kFailed));
+    EXPECT_EQ(domain_.PublishedControl(*peer), 4u);
+    EXPECT_EQ(domain_.ConfirmedCredits(*peer)->max_control, 0u);
+    EXPECT_EQ(domain_.PeerStats(*peer)->control_granted, issued->control_granted);
+    EXPECT_EQ(domain_.PeerStats(*peer)->max_control, issued->max_control);
+    // 新逻辑连接可通告同一累计上界，但旧票据不能完成新发送。
+    const auto replacement = domain_.ReservePublication(*peer, {2, 4});
+    ASSERT_TRUE(replacement);
+    EXPECT_NE(replacement->id, first->id);
+    EXPECT_FALSE(domain_.ResolvePublication(*first, CreditPublicationResult::kSuccess));
+    EXPECT_EQ(domain_.stats().publications, 1u);
+    ASSERT_TRUE(domain_.ResolvePublication(*replacement, CreditPublicationResult::kSuccess));
+    EXPECT_EQ(domain_.ConfirmedCredits(*peer)->max_data, 2u);
+    EXPECT_EQ(domain_.ConfirmedCredits(*peer)->max_control, 4u);
+}
+
+TEST_F(ReceiveCreditDomainTest, FailedWindowPublicationNeedsLaterCoveringSuccessToClear) {
+    PostAll();
+    const auto peer = Admit(1);
+    ASSERT_TRUE(peer);
+    ASSERT_TRUE(domain_.Grant(*peer, CreditClass::kData, 2));
+    ASSERT_TRUE(domain_.Grant(*peer, CreditClass::kControl, 4));
+    const auto first = domain_.ReservePublication(*peer, {2, 4});
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(domain_.ResolvePublication(*first, CreditPublicationResult::kSuccess));
+    const auto window_update = domain_.ReservePublication(*peer, {2, 4});
+    ASSERT_TRUE(window_update);
+    ASSERT_TRUE(domain_.ResolvePublication(*window_update, CreditPublicationResult::kFailed));
+    // 失败前已有相同 confirmed 不能抹掉后来真实损耗；零接受也不能制造恢复。
+    ASSERT_EQ(domain_.PublicationFailed(*peer), true);
+    const auto rejected = domain_.ReservePublication(*peer, {2, 4});
+    ASSERT_TRUE(rejected);
+    ASSERT_TRUE(domain_.ResolvePublication(*rejected, CreditPublicationResult::kNotAccepted));
+    EXPECT_EQ(domain_.PublicationFailed(*peer), true);
+    const auto older = domain_.ReservePublication(*peer, {1, 3});
+    ASSERT_TRUE(older);
+    ASSERT_TRUE(domain_.ResolvePublication(*older, CreditPublicationResult::kSuccess));
+    EXPECT_EQ(domain_.PublicationFailed(*peer), true);
+    const auto replacement = domain_.ReservePublication(*peer, {2, 4});
+    ASSERT_TRUE(replacement);
+    ASSERT_TRUE(domain_.ResolvePublication(*replacement, CreditPublicationResult::kSuccess));
+    EXPECT_EQ(domain_.PublicationFailed(*peer), false);
+}
+
+TEST_F(ReceiveCreditDomainTest, PublicationIdentityAndPendingResponsibilitySurviveFreezeUntilTerminal) {
+    PostAll();
+    const auto first = Admit(1);
+    const auto second = Admit(2);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    ASSERT_TRUE(domain_.Grant(*first, CreditClass::kControl, 2));
+    ASSERT_TRUE(domain_.Grant(*second, CreditClass::kControl, 2));
+    const auto publication = domain_.ReservePublication(*first, {0, 2});
+    const auto independent = domain_.ReservePublication(*second, {0, 2});
+    ASSERT_TRUE(publication);
+    ASSERT_TRUE(independent);
+    auto forged = *publication;
+    forged.peer = *second;
+    EXPECT_FALSE(domain_.ResolvePublication(forged, CreditPublicationResult::kSuccess));
+    ASSERT_TRUE(domain_.ResolvePublication(*independent, CreditPublicationResult::kNotAccepted));
+    // 未提供零接受/真实终结，冻结和完整远端静默声明也不能抹去本地在途通告责任。
+    const auto retired = domain_.RetirePeer(*first, kProof);
+    ASSERT_FALSE(retired);
+    EXPECT_EQ(retired.error().code, CreditErrorCode::kInUse);
+    EXPECT_FALSE(domain_.Close());
+    EXPECT_EQ(domain_.stats().publications, 1u);
+    ASSERT_TRUE(domain_.ResolvePublication(*publication, CreditPublicationResult::kSuccess));
+    ASSERT_TRUE(domain_.RetirePeer(*first, kProof));
+    EXPECT_FALSE(domain_.ReservePublication(*first, {0, 2}));
+}
+
+TEST_F(ReceiveCreditDomainTest, PublicationTicketCannotResolveAfterDomainReopen) {
+    PostAll();
+    const auto first = Admit(1);
+    ASSERT_TRUE(first);
+    const auto publication = domain_.ReservePublication(*first, {});
+    ASSERT_TRUE(publication);
+    ASSERT_TRUE(domain_.ResolvePublication(*publication, CreditPublicationResult::kNotAccepted));
+    ASSERT_TRUE(domain_.RetirePeer(*first, kProof));
+    ASSERT_TRUE(domain_.Close());
+    ASSERT_TRUE(domain_.Open(Config(11)));
+    PostAll();
+    const auto second = Admit(1, 1, 11);
+    ASSERT_TRUE(second);
+    const auto current = domain_.ReservePublication(*second, {});
+    ASSERT_TRUE(current);
+    EXPECT_GT(current->id, publication->id);
+    EXPECT_FALSE(domain_.ResolvePublication(*publication, CreditPublicationResult::kSuccess));
+    EXPECT_EQ(domain_.stats().publications, 1u);
+    ASSERT_TRUE(domain_.ResolvePublication(*current, CreditPublicationResult::kNotAccepted));
+}
+
 TEST_F(ReceiveCreditDomainTest, AdmissionStopResetsOnlyWhenNewDomainOpens) {
     // 初始 post 的可信结果即使在停准入后到达也必须入账；Stop 本身不改变物理责任。
     domain_.StopAdmission();

@@ -13,8 +13,10 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <expected>
 #include <new>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -173,7 +175,8 @@ protected:
             self.ready_connection_ = event.connection;
         }
     }
-    void Open(std::size_t capacity = 8, ConnectionMailboxCallback callback = &Notice, void* cookie = nullptr) {
+    void Open(std::size_t capacity = 8, ConnectionMailboxCallback callback = &Notice, void* cookie = nullptr,
+              std::size_t max_io_bytes = ConnectionCommandQueue::kMaxIoBytes) {
         ASSERT_TRUE(progress_.Open({.capacity = 8, .sweep_interval_ns = 60'000'000'000}, &Ready, this));
         progress_open_ = true;
         ASSERT_TRUE(owner_.Open(progress_, {.capacity = 4}));
@@ -184,7 +187,8 @@ protected:
         handles_[handle_count_++] = handle_;
         owned_fd_ = pair_.right;
         pair_.right = -1;
-        ASSERT_TRUE(mailbox_.Open(owner_, {.capacity = capacity}, callback, cookie ? cookie : this));
+        ASSERT_TRUE(mailbox_.Open(owner_, {.capacity = capacity, .max_io_bytes = max_io_bytes}, callback,
+                                  cookie ? cookie : this));
         mailbox_open_ = true;
     }
     ConnectionCommand Command(ConnectionCommandKind kind, std::uint32_t bytes = 0, std::uint64_t token = 17) {
@@ -223,7 +227,7 @@ protected:
                     break;
                 }
             }
-            std::array<std::byte, ConnectionCommandQueue::kMaxIoBytes> output{};
+            std::vector<std::byte> output(mailbox_.max_io_bytes());
             for (std::size_t i = 0; i < ticket_count_; ++i) {
                 (void)mailbox_.TakeCompletion(tickets_[i], output);
             }
@@ -248,6 +252,7 @@ TEST_F(ConnectionMailboxTest, OpenRequiresOwnerAndProvidesStableWaitFd) {
     EXPECT_TRUE(mailbox_.wait_fds().empty());
     Open(3);
     EXPECT_EQ(mailbox_.capacity(), 4u);
+    EXPECT_EQ(mailbox_.max_io_bytes(), ConnectionCommandQueue::kMaxIoBytes);
     EXPECT_EQ(mailbox_.exclusive_context(), nullptr);
     ASSERT_EQ(mailbox_.wait_fds().size(), 1u);
     const int fd = mailbox_.wait_fds()[0];
@@ -281,6 +286,74 @@ TEST_F(ConnectionMailboxTest, WriteCopiesInputBeforeReturningAndNotifiesOnlyItsI
     EXPECT_EQ(notices_[0].token, 101u);
     Run();
     EXPECT_EQ(notice_count_, 1u);
+}
+
+TEST_F(ConnectionMailboxTest, ExplicitLargePayloadExecutesWriteAndShortReadWithoutAllocatingOnDataPath) {
+    constexpr std::size_t kBytes = 16384;
+    Open(2, &Notice, nullptr, kBytes);
+    EXPECT_EQ(mailbox_.max_io_bytes(), kBytes);
+    std::array<std::byte, kBytes> input;
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        input[i] = static_cast<std::byte>(i % 251);
+    }
+    const auto expected = input;
+    const auto write = Command(ConnectionCommandKind::kWrite, kBytes, 301);
+    allocations = 0;
+    count_allocations = true;
+    const auto submitted = mailbox_.TrySubmit(write, input);
+    input.fill(std::byte{0});
+    const auto progressed = mailbox_.Progress(ProgressKind::kMailbox, 2, Now());
+    const auto taken = submitted ? mailbox_.TakeCompletion(*submitted)
+                                 : std::expected<ConnectionCommandCompletion, CommandQueueError>{
+                                       std::unexpected(CommandQueueError{QueueCode::kInvalidTicket})};
+    count_allocations = false;
+    ASSERT_TRUE(submitted);
+    tickets_[ticket_count_++] = *submitted;
+    ASSERT_TRUE(progressed);
+    ASSERT_TRUE(taken);
+    ASSERT_TRUE(taken->result);
+    // 空闲本地 TCP 发送缓冲允许一次接纳 16 KiB，传入数组修改后仍只能发送入队副本。
+    ASSERT_EQ(taken->result->bytes, kBytes);
+    EXPECT_EQ(allocations, 0u);
+    std::array<std::byte, kBytes> output;
+    std::size_t received = 0;
+    while (received < output.size()) {
+        ASSERT_TRUE(Wait(pair_.left, POLLIN));
+        const auto count = ::recv(pair_.left, output.data() + received, output.size() - received, 0);
+        ASSERT_GT(count, 0);
+        received += static_cast<std::size_t>(count);
+    }
+    EXPECT_EQ(output, expected);
+
+    // 请求 16 KiB 但对端只写入 3 B；仍只返回一次短读，输出容量按实际完成字节检查。
+    const std::array<std::byte, 3> response{std::byte{0x41}, std::byte{0}, std::byte{0xfe}};
+    ASSERT_EQ(::send(pair_.left, response.data(), response.size(), MSG_NOSIGNAL), 3);
+    ASSERT_TRUE(Wait(owned_fd_, POLLIN));
+    const auto read = Submit(Command(ConnectionCommandKind::kRead, kBytes, 302));
+    Run();
+    ExpectQueueError(mailbox_.TakeCompletion(read, std::span(output).first(2)), QueueCode::kOutputTooSmall);
+    EXPECT_EQ(mailbox_.outstanding(), 1u);
+    const auto read_done = mailbox_.TakeCompletion(read, std::span(output).first(3));
+    ASSERT_TRUE(read_done);
+    ASSERT_TRUE(read_done->result);
+    EXPECT_EQ(read_done->result->bytes, 3u);
+    EXPECT_TRUE(std::equal(response.begin(), response.end(), output.begin()));
+    EXPECT_EQ(notice_count_, 2u);
+}
+
+TEST_F(ConnectionMailboxTest, PayloadBudgetFailureDoesNotBindOwnerAndDefaultRejectsOversizedRead) {
+    Open();
+    ExpectQueueError(mailbox_.TrySubmit(Command(ConnectionCommandKind::kRead, 4097)), QueueCode::kInvalidArgument);
+    ConnectionMailbox large;
+    // 三个请求槽会向上取为四个，预算必须覆盖真正分配的整个 payload 环。
+    ExpectQueueError(large.Open(owner_, {.capacity = 3, .max_io_bytes = 16384, .payload_budget_bytes = 3 * 16384}),
+                     QueueCode::kInvalidArgument);
+    EXPECT_TRUE(large.wait_fds().empty());
+    EXPECT_EQ(large.capacity(), 0u);
+    ASSERT_TRUE(large.Open(owner_, {.capacity = 3, .max_io_bytes = 16384, .payload_budget_bytes = 4 * 16384}));
+    EXPECT_EQ(large.capacity(), 4u);
+    EXPECT_EQ(large.max_io_bytes(), 16384u);
+    EXPECT_TRUE(large.Close(true));
 }
 
 TEST_F(ConnectionMailboxTest, ReadRetainsCopiedOutputUntilLargeEnoughCollectorClaimsIt) {
@@ -610,8 +683,8 @@ TEST_F(ConnectionMailboxTest, TcpRuntimeGroupSchedulesThreadedCommandsAndSocketR
     std::array<ProgressSource*, 2> members{&progress_, &mailbox_};
     ASSERT_TRUE(group_.Open(members));
     group_open_ = true;
-    ASSERT_TRUE(
-        shard_.Open({}, {.reactor = {.events = true, .budget = 2, .busy_poll_ns = 0, .max_wait_ms = 1}}, &group_));
+    ASSERT_TRUE(shard_.Open(
+        {}, {.reactor = {.events = true, .budget = 2, .busy_poll_ns = 0, .max_wait_ms = 1}, .control = {}}, &group_));
     shard_open_ = true;
     const auto connection = handle_;
     const std::array<std::byte, 3> input{std::byte{7}, std::byte{0}, std::byte{0xfe}};

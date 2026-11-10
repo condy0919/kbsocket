@@ -33,7 +33,7 @@ std::expected<void, CommandQueueError> ConnectionMailbox::Open(ConnectionOwner& 
     if (!owner.stats().capacity) {
         return Error(CommandQueueErrorCode::kInvalidArgument);
     }
-    auto opened = queue_.Open(config.capacity);
+    auto opened = queue_.Open(config.capacity, config.max_io_bytes, config.payload_budget_bytes);
     if (!opened) {
         return opened;
     }

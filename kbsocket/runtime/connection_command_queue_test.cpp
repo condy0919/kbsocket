@@ -19,6 +19,7 @@
 #include <limits>
 #include <new>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -126,7 +127,7 @@ protected:
                 EXPECT_TRUE(queue_.Complete(requests[i].ticket, Failure()));
             }
         }
-        std::array<std::byte, ConnectionCommandQueue::kMaxIoBytes> output;
+        std::vector<std::byte> output(queue_.max_io_bytes());
         for (std::uint64_t sequence = 1; queue_.outstanding() && sequence <= 100000; ++sequence) {
             const ConnectionCommandTicket ticket{.queue = &queue_, .sequence = sequence};
             (void)queue_.Complete(ticket, Failure());
@@ -141,6 +142,7 @@ TEST_F(ConnectionCommandQueueTest, RequiresOpenAndValidCapacity) {
     std::array<ConnectionCommandRequest, 1> requests;
     EXPECT_EQ(queue_.command_fd(), -1);
     EXPECT_EQ(queue_.capacity(), 0u);
+    EXPECT_EQ(queue_.max_io_bytes(), 0u);
     EXPECT_EQ(queue_.outstanding(), 0u);
     EXPECT_FALSE(queue_.accepting());
     EXPECT_FALSE(queue_.runnable());
@@ -160,6 +162,7 @@ TEST_F(ConnectionCommandQueueTest, RequiresOpenAndValidCapacity) {
 TEST_F(ConnectionCommandQueueTest, CapacityFdAndSingleOpenProtectTicketIdentity) {
     ASSERT_TRUE(queue_.Open(3));
     EXPECT_EQ(queue_.capacity(), 4u);
+    EXPECT_EQ(queue_.max_io_bytes(), ConnectionCommandQueue::kMaxIoBytes);
     EXPECT_TRUE(queue_.accepting());
     const int fd = queue_.command_fd();
     EXPECT_NE(::fcntl(fd, F_GETFL) & O_NONBLOCK, 0);
@@ -169,6 +172,131 @@ TEST_F(ConnectionCommandQueueTest, CapacityFdAndSingleOpenProtectTicketIdentity)
     EXPECT_EQ(::fcntl(fd, F_GETFD), -1);
     EXPECT_EQ(errno, EBADF);
     EXPECT_EQ(queue_.Open(2).error().code, CommandQueueErrorCode::kStopped);
+}
+
+TEST_F(ConnectionCommandQueueTest, PayloadConfigurationAndRoundedCapacityRespectExplicitBudget) {
+    constexpr std::size_t kBytes = 16384;
+    // 所有拒绝均发生在分配和 fd 创建前，同一队列可修正配置重试。
+    for (const auto bytes :
+         {std::size_t{0}, ConnectionCommandQueue::kMaxPayloadBytes + 1, std::numeric_limits<std::size_t>::max()}) {
+        const auto result = queue_.Open(2, bytes);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, CommandQueueErrorCode::kInvalidArgument);
+    }
+    EXPECT_EQ(queue_.Open(2, kBytes, 0).error().code, CommandQueueErrorCode::kInvalidArgument);
+    EXPECT_EQ(queue_.Open(3, kBytes, 3 * kBytes).error().code, CommandQueueErrorCode::kInvalidArgument);
+    EXPECT_EQ(queue_.Open(1, kBytes, kBytes).error().code, CommandQueueErrorCode::kInvalidArgument);
+    EXPECT_EQ(queue_.command_fd(), -1);
+    EXPECT_EQ(queue_.max_io_bytes(), 0u);
+    ASSERT_TRUE(queue_.Open(3, kBytes, 4 * kBytes));
+    EXPECT_EQ(queue_.capacity(), 4u);
+    EXPECT_EQ(queue_.max_io_bytes(), kBytes);
+    EXPECT_EQ(queue_.TrySubmit(Command(ConnectionCommandKind::kRead, 0, kBytes + 1)).error().code,
+              CommandQueueErrorCode::kInvalidArgument);
+    EXPECT_EQ(queue_.outstanding(), 0u);
+}
+
+TEST_F(ConnectionCommandQueueTest, MaximumPayloadIsAcceptedOnlyWithEnoughBackingBudget) {
+    constexpr auto kBytes = ConnectionCommandQueue::kMaxPayloadBytes;
+    EXPECT_EQ(queue_.Open(2, kBytes, 2 * kBytes - 1).error().code, CommandQueueErrorCode::kInvalidArgument);
+    ASSERT_TRUE(queue_.Open(2, kBytes, 2 * kBytes));
+    std::vector<std::byte> input(kBytes, std::byte{0xa7});
+    const auto ticket = queue_.TrySubmit(Command(ConnectionCommandKind::kWrite, 0, kBytes), input);
+    ASSERT_TRUE(ticket);
+    std::array<ConnectionCommandRequest, 1> requests;
+    ASSERT_EQ(*queue_.PollCommands(requests), 1u);
+    ASSERT_EQ(requests[0].payload.size(), kBytes);
+    EXPECT_TRUE(std::equal(input.begin(), input.end(), requests[0].payload.begin()));
+    ASSERT_TRUE(queue_.Complete(*ticket, ConnectionCommandReply{.bytes = kBytes}));
+    ASSERT_TRUE(queue_.TakeCompletion(*ticket));
+}
+
+TEST_F(ConnectionCommandQueueTest, OddPayloadLengthUsesSeparateCacheLinesAndChargesAlignedBacking) {
+    constexpr std::size_t kBytes = 129;
+    constexpr std::size_t kStride = 192;
+    // 非缓存行倍数配置也不能让两个 producer/collector 的不同槽共享 payload 缓存行。
+    EXPECT_EQ(queue_.Open(2, kBytes, 2 * kBytes).error().code, CommandQueueErrorCode::kInvalidArgument);
+    ASSERT_TRUE(queue_.Open(2, kBytes, 2 * kStride));
+    EXPECT_EQ(queue_.max_io_bytes(), kBytes);
+    for (std::size_t i = 0; i < 2; ++i) {
+        ASSERT_TRUE(queue_.TrySubmit(Command(ConnectionCommandKind::kRead, i, kBytes)));
+    }
+    std::array<ConnectionCommandRequest, 2> requests;
+    ASSERT_EQ(*queue_.PollCommands(requests), 2u);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(requests[0].payload.data()) % 64, 0u);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(requests[1].payload.data()) % 64, 0u);
+    EXPECT_EQ(requests[1].payload.data() - requests[0].payload.data(), static_cast<std::ptrdiff_t>(kStride));
+    for (const auto& request : requests) {
+        EXPECT_EQ(request.payload.size(), kBytes);
+        ASSERT_TRUE(queue_.Complete(request.ticket, ConnectionCommandReply{}));
+        ASSERT_TRUE(queue_.TakeCompletion(request.ticket));
+    }
+}
+
+TEST_F(ConnectionCommandQueueTest, LargeWritesCopyIntoIndependentStableSlotsAndReuseOnlyAfterCollection) {
+    constexpr std::size_t kBytes = 16384;
+    ASSERT_TRUE(queue_.Open(2, kBytes, 2 * kBytes));
+    std::array<std::byte, kBytes> input;
+    input.fill(std::byte{0x31});
+    const auto first = queue_.TrySubmit(Command(ConnectionCommandKind::kWrite, 1, kBytes), input);
+    ASSERT_TRUE(first);
+    input.fill(std::byte{0xb2});
+    const auto second = queue_.TrySubmit(Command(ConnectionCommandKind::kWrite, 2, kBytes), input);
+    ASSERT_TRUE(second);
+    input.fill(std::byte{0xee});
+    std::array<ConnectionCommandRequest, 2> requests;
+    ASSERT_EQ(*queue_.PollCommands(requests), 2u);
+    ASSERT_EQ(requests[0].payload.size(), kBytes);
+    ASSERT_EQ(requests[1].payload.size(), kBytes);
+    const auto* first_address = requests[0].payload.data();
+    EXPECT_NE(first_address, requests[1].payload.data());
+    EXPECT_TRUE(std::all_of(requests[0].payload.begin(), requests[0].payload.end(),
+                            [](auto byte) { return byte == std::byte{0x31}; }));
+    EXPECT_TRUE(std::all_of(requests[1].payload.begin(), requests[1].payload.end(),
+                            [](auto byte) { return byte == std::byte{0xb2}; }));
+    ASSERT_TRUE(queue_.Complete(*first, ConnectionCommandReply{.bytes = kBytes}));
+    ASSERT_TRUE(queue_.Complete(*second, ConnectionCommandReply{.bytes = kBytes}));
+    EXPECT_EQ(queue_.TrySubmit(Command(ConnectionCommandKind::kWrite, 3, kBytes), input).error().code,
+              CommandQueueErrorCode::kFull);
+    ASSERT_TRUE(queue_.TakeCompletion(*first));
+    const auto reused = queue_.TrySubmit(Command(ConnectionCommandKind::kWrite, 3, kBytes), input);
+    ASSERT_TRUE(reused);
+    // 第一槽已领取后才复用 backing；仍未领取的第二份结果保持完整。
+    ASSERT_TRUE(queue_.TakeCompletion(*second));
+    ASSERT_EQ(*queue_.PollCommands(requests), 1u);
+    EXPECT_EQ(requests[0].payload.data(), first_address);
+    EXPECT_TRUE(std::equal(input.begin(), input.end(), requests[0].payload.begin()));
+    EXPECT_EQ(queue_.TakeCompletion(*first).error().code, CommandQueueErrorCode::kInvalidTicket);
+    ASSERT_TRUE(queue_.Complete(*reused, ConnectionCommandReply{.bytes = kBytes - 1}));
+    const auto done = queue_.TakeCompletion(*reused);
+    ASSERT_TRUE(done);
+    ASSERT_TRUE(done->result);
+    EXPECT_EQ(done->result->bytes, kBytes - 1);
+}
+
+TEST_F(ConnectionCommandQueueTest, LargeReadRetainsShortResultUntilOutputCanHoldActualPrefix) {
+    constexpr std::size_t kBytes = 16384;
+    constexpr std::size_t kReturned = 8193;
+    ASSERT_TRUE(queue_.Open(2, kBytes, 2 * kBytes));
+    const auto ticket = queue_.TrySubmit(Command(ConnectionCommandKind::kRead, 0, kBytes));
+    ASSERT_TRUE(ticket);
+    std::array<ConnectionCommandRequest, 1> requests;
+    ASSERT_EQ(*queue_.PollCommands(requests), 1u);
+    std::fill(requests[0].payload.begin(), requests[0].payload.end(), std::byte{0x52});
+    ASSERT_TRUE(queue_.Complete(*ticket, ConnectionCommandReply{.bytes = kReturned}));
+    std::array<std::byte, kBytes> output;
+    output.fill(std::byte{0xaf});
+    EXPECT_EQ(queue_.TakeCompletion(*ticket, std::span(output).first(kReturned - 1)).error().code,
+              CommandQueueErrorCode::kOutputTooSmall);
+    EXPECT_EQ(queue_.outstanding(), 1u);
+    EXPECT_EQ(output[0], std::byte{0xaf});
+    const auto done = queue_.TakeCompletion(*ticket, output);
+    ASSERT_TRUE(done);
+    ASSERT_TRUE(done->result);
+    EXPECT_EQ(done->result->bytes, kReturned);
+    EXPECT_TRUE(
+        std::all_of(output.begin(), output.begin() + kReturned, [](auto byte) { return byte == std::byte{0x52}; }));
+    EXPECT_EQ(output[kReturned], std::byte{0xaf});
 }
 
 TEST_F(ConnectionCommandQueueTest, ValidatesEveryCommandShapeBeforeReserving) {
@@ -499,22 +627,23 @@ TEST_F(ConnectionCommandQueueTest, MultipleProducersAndCollectorsPreserveEveryPa
 }
 
 TEST_F(ConnectionCommandQueueTest, ConcurrentCollectorsClaimSameTicketOnceBeforeSlotReuse) {
-    ASSERT_TRUE(queue_.Open(2));
+    constexpr std::size_t kBytes = 16384;
+    ASSERT_TRUE(queue_.Open(2, kBytes, 2 * kBytes));
     std::array<ConnectionCommandRequest, 2> requests;
     for (std::uint64_t iteration = 1; iteration <= 64; ++iteration) {
-        const auto ticket = queue_.TrySubmit(Command(ConnectionCommandKind::kRead, iteration, 4096));
+        const auto ticket = queue_.TrySubmit(Command(ConnectionCommandKind::kRead, iteration, kBytes));
         ASSERT_TRUE(ticket);
         ASSERT_EQ(*queue_.PollCommands(requests), 1u);
         const auto pattern = std::byte{static_cast<unsigned char>(iteration)};
         std::fill(requests[0].payload.begin(), requests[0].payload.end(), pattern);
-        ASSERT_TRUE(queue_.Complete(*ticket, ConnectionCommandReply{.bytes = 4096}));
+        ASSERT_TRUE(queue_.Complete(*ticket, ConnectionCommandReply{.bytes = kBytes}));
         std::barrier start(3);
         std::atomic<std::size_t> successes{0};
         std::atomic<bool> valid{true};
         std::array<std::thread, 2> collectors;
         for (auto& collector : collectors) {
             collector = std::thread([&] {
-                std::array<std::byte, 4096> output{};
+                std::array<std::byte, kBytes> output{};
                 start.arrive_and_wait();
                 const auto taken = queue_.TakeCompletion(*ticket, output);
                 if (taken) {
@@ -536,7 +665,7 @@ TEST_F(ConnectionCommandQueueTest, ConcurrentCollectorsClaimSameTicketOnceBefore
             std::this_thread::yield();
         }
         const auto filler = queue_.TrySubmit(Command());
-        std::array<std::byte, 4096> replacement{};
+        std::array<std::byte, kBytes> replacement{};
         auto reused = queue_.TrySubmit(Command(ConnectionCommandKind::kWrite, 0, replacement.size()), replacement);
         while (!reused && reused.error().code == CommandQueueErrorCode::kFull &&
                std::chrono::steady_clock::now() < deadline) {
@@ -558,9 +687,10 @@ TEST_F(ConnectionCommandQueueTest, ConcurrentCollectorsClaimSameTicketOnceBefore
 }
 
 TEST_F(ConnectionCommandQueueTest, SubmitPollCompleteTakeDoNotAllocate) {
-    ASSERT_TRUE(queue_.Open(2));
+    constexpr std::size_t kBytes = 16384;
+    ASSERT_TRUE(queue_.Open(2, kBytes, 2 * kBytes));
     std::array<ConnectionCommandRequest, 1> requests;
-    std::array<std::byte, 4096> input{};
+    std::array<std::byte, kBytes> input{};
     bool succeeded = true;
     allocation_count = 0;
     count_allocations = true;
@@ -580,15 +710,16 @@ TEST_F(ConnectionCommandQueueTest, SubmitPollCompleteTakeDoNotAllocate) {
 }
 
 TEST(ConnectionCommandQueueAllocationTest, FailedOpenCanRetryWithoutConsumingIdentity) {
-    for (int allocation = 0; allocation < 2; ++allocation) {
+    // 分别覆盖 State、槽元数据和独立 payload backing 的分配失败。
+    for (int allocation = 0; allocation < 3; ++allocation) {
         ConnectionCommandQueue queue;
         fail_allocation_after = allocation;
-        const auto opened = queue.Open(4);
+        const auto opened = queue.Open(4, 16384);
         fail_allocation_after = -1;
         ASSERT_FALSE(opened);
         EXPECT_EQ(opened.error().code, CommandQueueErrorCode::kNoMemory);
         EXPECT_EQ(queue.command_fd(), -1);
-        ASSERT_TRUE(queue.Open(4));
+        ASSERT_TRUE(queue.Open(4, 16384));
         EXPECT_TRUE(queue.Close(true));
     }
 }

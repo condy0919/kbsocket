@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 #include "kbsocket/api/raw_stream_runtime.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <optional>
 #include <stdexcept>
 
 #include "kbsocket/api/stream_error.hpp"
+#include "kbsocket/connection/write_rndv_engine.hpp"
+#include "kbsocket/control/rndv_arena.hpp"
 #include "kbsocket/control/tx_lane_snapshot.hpp"
 #include "kbsocket/transport/raw/urma_api.hpp"
 
@@ -24,6 +28,71 @@ auto HandshakeError(control::ConnectionHandshakeErrorCode code, int underlying =
 auto CreditError(connection::CreditErrorCode code) noexcept {
     return std::unexpected(
         MapStreamError(connection::ConnectionError{connection::ConnectionErrorCode::kCredit, static_cast<int>(code)}));
+}
+// 所有乘加在打开 provider 前完成；极大配置也不能回绕成较小准入量。
+bool Accumulate(std::uint64_t& total, std::uint64_t count, std::uint64_t size,
+                std::uint64_t limit = std::numeric_limits<std::uint64_t>::max()) noexcept {
+    if (total > limit || (count && size > (limit - total) / count)) {
+        return false;
+    }
+    total += count * size;
+    return true;
+}
+bool ValidateRndv(std::span<const RawStreamEndpointConfig> endpoints, const runtime::RawStackConfig& stack,
+                  const RawStreamRndvBudget& budget) noexcept {
+    RawStreamRndvBudget used;
+    std::uint64_t targets = 0, controls = 0;
+    for (const auto& endpoint : endpoints) {
+        const auto capacity = endpoint.streams.capacity;
+        const auto owner_capacity = endpoint.rndv
+                                        ? capacity
+                                        : (endpoint.endpoint.connection_capacity ? endpoint.endpoint.connection_capacity
+                                                                                 : stack.connections_per_context);
+        if (!Accumulate(controls, owner_capacity, 1)) {
+            return false;
+        }
+        if (!endpoint.rndv) {
+            continue;
+        }
+        const auto& config = endpoint.rndv->connection;
+        const auto& limits = endpoint.rndv->limits;
+        if (!stack.enable_rndv || !stack.rndv_target_slab || !endpoint.rndv->arena.id ||
+            !endpoint.rndv->arena.generation || !connection::RndvConnection::ValidConfig(config) ||
+            !control::ValidateRndvLimits(limits) || config.tx_capacity > limits.max_grants ||
+            config.receive_capacity < limits.max_grants || config.ingress_packets < limits.max_grants ||
+            config.threshold > limits.max_transfer_bytes || config.threshold > stack.slab.buffer_size ||
+            stack.slab.buffer_size < 256 || limits.max_transfer_bytes > stack.rndv_target_slab->buffer_size ||
+            !(stack.rndv_target_slab->access & URMA_ACCESS_WRITE) ||
+            (limits.max_transfer_bytes - 1) / std::min(config.chunk_bytes, limits.max_write_bytes) + 1 >
+                config.max_chunks) {
+            return false;
+        }
+        if (!Accumulate(used.connections, capacity, 1, budget.connections) ||
+            !Accumulate(used.tx_slots, capacity, config.tx_capacity, budget.tx_slots) ||
+            !Accumulate(used.receive_entries, capacity, config.receive_capacity, budget.receive_entries) ||
+            !Accumulate(used.write_chunks, capacity, std::uint64_t{config.tx_capacity} * config.max_chunks,
+                        budget.write_chunks) ||
+            !Accumulate(used.notification_slots, capacity, config.notification_capacity, budget.notification_slots) ||
+            !Accumulate(used.ingress_packets, capacity, std::uint64_t{3} * config.ingress_packets,
+                        budget.ingress_packets) ||
+            !Accumulate(used.grant_bytes, capacity, limits.max_bytes, budget.grant_bytes) ||
+            !Accumulate(targets, capacity, limits.max_grants)) {
+            return false;
+        }
+    }
+    if (!used.connections) {
+        return true;
+    }
+    const auto& target = *stack.rndv_target_slab;
+    std::uint64_t target_bytes = 0;
+    // 固定通知与 Eager 控制 buffer 有真实常驻 Lease；另留每 TX 一块拷贝源空间。
+    // 应用持有 Lease 或在途 Eager 仍可耗尽共享池，运行时必须正常返回 WOULD_BLOCK。
+    return Accumulate(target_bytes, target.buffer_count, target.buffer_size) && used.grant_bytes <= target_bytes &&
+           targets <= target.buffer_count && targets <= target.max_references &&
+           Accumulate(controls, 1, used.notification_slots, stack.slab.buffer_count) &&
+           Accumulate(controls, 1, used.tx_slots, stack.slab.buffer_count) &&
+           used.notification_slots <= stack.slab.max_references &&
+           used.tx_slots <= stack.slab.max_references - used.notification_slots;
 }
 // 导出仅发生在 Open 控制路径；保留公共扩展，不把手拼的基础结构冒充 provider 描述符。
 std::expected<void, kbs_stream_error> Export(raw::JettyPool& pool, control::HandshakeHello& hello) noexcept {
@@ -93,6 +162,7 @@ struct RawStreamRuntime::State {
         void* cookie = nullptr;
         std::optional<runtime::OwnedConnection> unpublished;
         std::optional<kbs_stream_error> callback_error;
+        std::optional<RawStreamRndvConfig> rndv;
 
         static void Observe(void* cookie, const runtime::ConnectionProgressEvent& event) noexcept {
             auto& self = *static_cast<Endpoint*>(cookie);
@@ -161,7 +231,8 @@ RawStreamRuntime::~RawStreamRuntime() {
     }
 }
 std::expected<void, kbs_stream_error> RawStreamRuntime::Open(std::span<const RawStreamEndpointConfig> endpoints,
-                                                             const runtime::RawStackConfig& config) noexcept {
+                                                             const runtime::RawStackConfig& config,
+                                                             const RawStreamRndvBudget& rndv_budget) noexcept {
     if (state_) {
         return Error(KBS_STREAM_BUSY);
     }
@@ -172,14 +243,19 @@ std::expected<void, kbs_stream_error> RawStreamRuntime::Open(std::span<const Raw
         const auto& e = endpoints[i];
         if (!e.streams.table_id || !e.streams.capacity || e.streams.capacity > config.connections_per_context ||
             !e.streams.max_io_bytes || e.streams.max_io_bytes > 1024u * 1024u || !e.endpoint_generation ||
-            !e.authorization || !e.credit_epoch) {
+            !e.authorization || !e.credit_epoch ||
+            (e.endpoint.connection_capacity && e.endpoint.connection_capacity < e.streams.capacity)) {
             return Error(KBS_STREAM_INVALID_ARGUMENT);
         }
         for (std::size_t j = 0; j < i; ++j) {
-            if (e.streams.table_id == endpoints[j].streams.table_id) {
+            if (e.streams.table_id == endpoints[j].streams.table_id ||
+                (e.rndv && endpoints[j].rndv && e.rndv->arena.id == endpoints[j].rndv->arena.id)) {
                 return Error(KBS_STREAM_INVALID_ARGUMENT);
             }
         }
+    }
+    if (!ValidateRndv(endpoints, config, rndv_budget)) {
+        return Error(KBS_STREAM_INVALID_ARGUMENT);
     }
     std::array<runtime::RawEndpointConfig, runtime::RawStack::kMaxContexts> raw_endpoints;
     try {
@@ -198,6 +274,11 @@ std::expected<void, kbs_stream_error> RawStreamRuntime::Open(std::span<const Raw
         const auto& input = endpoints[i];
         auto& e = s.endpoints[i];
         e.table_id = input.streams.table_id;
+        e.rndv = input.rndv;
+        if (e.rndv) {
+            // 使用底层 owner 的真实上限，C API、mailbox 与宿主入口不能绕过占用槽预算。
+            raw_endpoints[i].connection_capacity = input.streams.capacity;
+        }
         e.on_connection = input.endpoint.on_connection;
         e.on_command = input.endpoint.on_command;
         e.on_withdrawal = input.endpoint.on_withdrawal;
@@ -230,6 +311,33 @@ std::expected<void, kbs_stream_error> RawStreamRuntime::Open(std::span<const Raw
         auto& e = s.endpoints[i];
         if (const auto result = Export(*resources->domain.pool, e.local); !result) {
             return result;
+        }
+        if (e.rndv) {
+            const auto& pool = *resources->domain.pool;
+            const auto& rndv = *e.rndv;
+            // 对照实际硬件能力，避免公告连首个事务都无法提交的配置。
+            const auto references =
+                std::uint64_t{rndv.connection.max_chunks} *
+                    std::min<std::uint32_t>(connection::WriteRndvEngine::kMaxSources, pool.max_send_sge()) +
+                2;
+            if (rndv.limits.max_write_bytes > pool.max_write_size() || references > config.slab.max_references) {
+                return Error(KBS_STREAM_INVALID_ARGUMENT);
+            }
+            const auto shared = s.stack.shared();
+            if (!shared) {
+                return std::unexpected(MapStreamError(shared.error()));
+            }
+            const auto arena = control::ExportRndvArena(*shared->rndv_target, resources->context, rndv.arena);
+            if (!arena) {
+                return Error(KBS_STREAM_INVALID_ARGUMENT);
+            }
+            e.local.rndv.limits = rndv.limits;
+            e.local.rndv.arena_count = 1;
+            e.local.rndv.arenas[0] = *arena;
+            if (!control::ValidateRndvOffer(e.local.rndv)) {
+                return Error(KBS_STREAM_INVALID_ARGUMENT);
+            }
+            e.local.capabilities |= control::kHandshakeCapabilityWriteRndv;
         }
         if (const auto result = e.binding.OpenRaw(s.stack, i, endpoints[i].streams); !result) {
             return result;
@@ -327,7 +435,7 @@ RawStreamRuntime::AdoptProtocol(std::size_t context, int* fd, const RawStreamCon
                                                .expected_peer_runtime = options.expected_peer_runtime,
                                                .compatible_peer = options.compatible_peer,
                                                .deadline_ns = options.deadline_ns},
-                                              now_ns);
+                                              now_ns, e.rndv ? &e.rndv->connection : nullptr);
     if (!owned) {
         e.unpublished = owned.error().retained_handle;
         if (const auto cleaned = e.CleanUnpublished(*resources->connections); !cleaned) {
@@ -366,6 +474,20 @@ std::expected<control::HandshakeHello, kbs_stream_error> RawStreamRuntime::Peer(
         return std::unexpected(MapStreamError(peer.error()));
     }
     return **peer;
+}
+std::expected<runtime::OwnedConnection, kbs_stream_error> RawStreamRuntime::Resolve(kbs_stream_handle stream) noexcept {
+    if (!state_ || !state_->ready) {
+        return Error(KBS_STREAM_NOT_READY);
+    }
+    const auto index = state_->Find(stream);
+    if (!index) {
+        return std::unexpected(index.error());
+    }
+    const auto resources = HostResources(*index);
+    if (!resources) {
+        return std::unexpected(resources.error());
+    }
+    return state_->endpoints[*index].binding.Resolve(stream);
 }
 std::expected<void, kbs_stream_error> RawStreamRuntime::PrepareRaw(kbs_stream_handle stream,
                                                                    const RawStreamPreparation& prep) noexcept {
@@ -416,6 +538,26 @@ std::expected<void, kbs_stream_error> RawStreamRuntime::PrepareRaw(kbs_stream_ha
     if (credits->frozen || credits->retired || prep.sender_credits->stats().stopped) {
         return CreditError(connection::CreditErrorCode::kStopped);
     }
+    connection::RndvConnectionPreparation rndv;
+    if (endpoint.rndv && (peer->capabilities & control::kHandshakeCapabilityWriteRndv)) {
+        if (!prep.rndv_peer_authorized) {
+            return HandshakeError(control::ConnectionHandshakeErrorCode::kUnauthorized);
+        }
+        // 在握手取得资源前拒绝可修正的宿主参数，不把错误 Lane 变成不可重试的部分准备。
+        const auto lane = domain.pool->lane_state(prep.rndv_lane);
+        const auto& policy = *endpoint.rndv;
+        const auto grants = std::min(policy.limits.max_grants, peer->rndv.limits.max_grants);
+        const auto transfer = std::min(policy.limits.max_transfer_bytes, peer->rndv.limits.max_transfer_bytes);
+        const auto chunk =
+            std::min({policy.connection.chunk_bytes, policy.limits.max_write_bytes, peer->rndv.limits.max_write_bytes});
+        if (!shared->rndv_target || !shared->segments || prep.rndv_lane.pool != domain.pool || !lane ||
+            *lane != raw::JettyLaneState::kReady || peer->rndv.arena_count != 1 ||
+            policy.connection.tx_capacity > grants || !transfer || !chunk ||
+            (transfer - 1) / chunk + 1 > policy.connection.max_chunks) {
+            return Error(KBS_STREAM_INVALID_ARGUMENT);
+        }
+        rndv = {.target_slab = shared->rndv_target, .segments = shared->segments, .lane = prep.rndv_lane};
+    }
     const connection::RawConnectionPreparation bound{
         .handshake = {.imports = shared->imports,
                       .local_context = resources->context,
@@ -423,7 +565,8 @@ std::expected<void, kbs_stream_error> RawStreamRuntime::PrepareRaw(kbs_stream_ha
                       .descriptor_compatible = prep.descriptor_compatible,
                       .credits = domain.credits,
                       .credit_peer = prep.credit_peer,
-                      .reorder = prep.reorder},
+                      .reorder = prep.reorder,
+                      .rndv_peer_authorized = prep.rndv_peer_authorized},
         .receive = domain.receive,
         .sender = domain.sender,
         .slab = shared->slab,
@@ -433,7 +576,8 @@ std::expected<void, kbs_stream_error> RawStreamRuntime::PrepareRaw(kbs_stream_ha
         .peer_lanes_authorized = prep.peer_lanes_authorized,
         .authorize_lane_update = prep.authorize_lane_update,
         .lane_authorization_cookie = prep.lane_authorization_cookie,
-        .lane_update_timeout_ns = prep.lane_update_timeout_ns};
+        .lane_update_timeout_ns = prep.lane_update_timeout_ns,
+        .rndv = rndv};
     const auto result = resources->connections->PrepareRaw(*owned, bound, *domain.sources);
     if (!result) {
         return std::unexpected(MapStreamError(result.error()));

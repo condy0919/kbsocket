@@ -105,9 +105,11 @@ F 是可授出的已 post 槽，G 是已经授出的承诺，U 是尚未初始 p
 
 `SenderCreditAccount` 对同一个授信关系维护数据/控制两组累计上界、spent 和当前 reservation。`Reserve` 先扣可用额度；可信 partial post 只将接受前缀计为 spent，并解除未接受后缀 reservation。接受范围未知时把整批保守记为 spent，停止新准入，并将本 epoch 的 `accepted_known` 永久置为 false；这个上界不能作为授信撤回的确定接受量。TX 完成、超时和逻辑连接关闭都没有增加远端 credits 的接口。重复 CREDIT 更新只取累计最大值。
 
+M6.3.10 将物理 CREDIT 公告也按 Peer 合并：每 Peer 至多一个在途 publication，保存该报文实际携带的数据/控制上界，成功 CQE 后才用于抑制兄弟连接的重复公告。连接窗口更新仍独立发送。可信零接受或失败完成解除在途票据，未知接受保留；票据未解决时禁止退休 Peer 或销毁域。READY 的本地发布记录不等于对端已消费确认。接收路径按可信来源保存的会话、token 和远端授信 epoch 校验 CREDIT，并先更新共享发送账户，再解析逻辑路由；旧连接关闭不会阻断兄弟连接的物理授信，旧 epoch 或错误来源不能更新账户。
+
 M6.3.4 增加未来控制票据 `ReserveControl/ActivateControl/ReleaseControl`：从同一 Peer 共账保留 GRANT/DONE 的额度，避免等待 WRITE 时占用唯一即时 post 预约。最多 256 份，ReserveControl 始终留下一个 CREDIT 额度；普通 Reserve 不能使用已承诺额度。Activate 后只计入当前 reservation，零接受恢复原票据，已接受或未知接受消费票据。Stop 后仍可 Release/Resolve，但禁止新预约与激活；Close 和撤回停止快照都必须等待全部承诺结束。详细责任见 [通知发送器](rndv-notification-tx.md)。
 
-数据额度耗尽时控制额度仍可单独预留，但必须确实获得控制授权并取得本地 SQ 资源。RNDV RTS 属于数据入口需求，必须走 data；codec、接收域扣账及独立通知发送器已支持此分类，GRANT/DONE 使用 control，Connection/Runtime 的 RNDV 装配尚未接入。M5.3.7 的独立 TCP 控制流仅用于整份 Peer 授信撤回，尚未承担运行中 CREDIT 的通用逃生或跨 Peer 公平发放；不能仅凭两个额度分类就宣称完整协议没有死锁。
+数据额度耗尽时控制额度仍可单独预留，但必须确实获得控制授权并取得本地 SQ 资源。RNDV RTS 属于数据入口需求，必须走 data；GRANT/DONE 使用 control。M6.3.9 的 [Connection/Runtime 装配](rndv-connection.md) 与 M6.3.10 的 [应用 Runtime 入口](raw-stream-runtime.md) 均沿用此分类。M5.3.7 的独立 TCP 控制流仅用于整份 Peer 授信撤回，尚未承担运行中 CREDIT 的通用逃生或跨 Peer 公平发放；不能仅凭两个额度分类就宣称完整协议没有死锁。
 
 `RetirePeer` 要求宿主同时证明发送端已停止、真实接受集合已结清、未使用授权已撤销，并等待该 Peer 所有接收 receipt 正常 refill 结账；失联、TTL 或空 CQ 不构成证明。退休后保留 tombstone 到域关闭，不复用原表项和旧 epoch。相同 Peer 重新准入要求更高 epoch，且旧关系已经退休。Sender 重开也要求同 Peer/域且 epoch 严格增加，这不代替 Receiver 的终结证明。
 

@@ -14,6 +14,7 @@
 | `endpoint_generation` | 被动接收端点的不可复用代次，不能用可复用的 jetty ID 代替 |
 | `authorization` | 本地策略身份，供对端与独立认证结果比对；它不是认证凭证 |
 | `credit_epoch` | 本地接收授信代次，与本域的 Peer 接收账本保持一致 |
+| `rndv` | 可选的 WRITE RNDV 本端能力、固定连接配置及 Arena 身份；不配置时保持 Eager |
 
 `runtime_instance`、`receive_domain` 和 `context_incarnation` 仍由域配置提供，并遵守 RawStack 的唯一性及不复用约束。每条连接的 session 由 `AdoptProtocol` 单独提供，不能复用端点代次或 fd 作为 session。
 
@@ -39,11 +40,39 @@ Open 从实际被动接收 jetty 调用 `GetRjetty`，复制有界描述符并�
 
 同一物理 Peer 授信域上的连接共用账户，不能逐连接新建、清零或重复发放已有额度。`control_credit_target` 是共享 Peer 的固定控制额度目标，各连接保持一致且至少为 4。准备或连接关闭失败不证明已公告授信可以回收；单条流 Release 也不等于 Peer 撤回完成。外部发送账户、Lane authorizer cookie 和宿主回调 cookie 必须覆盖全部借用与保留责任。
 
+## M6.3.10：显式 RNDV Arena 与跨连接准入
+
+`Open(endpoints, stack_config, rndv_budget)` 可为选定 endpoint 启用 [Connection RNDV](rndv-connection.md)。宿主设置 `stack_config.enable_rndv=true` 和 `rndv_target_slab`，并在 endpoint 的 `rndv` 中提供 `RndvConnectionConfig`、`RndvLimits` 和非零 `GrantArena{id, generation}`。Arena ID 在本 runtime 内唯一，代次不能跨生命周期复用。目标池只有一份 backing，在各 context 分别注册；每个 endpoint 公告自己的真实注册快照。Runtime 对照实际 WRITE/SGE 能力检查配置，导出成功后才允许建链公告。
+
+全局 `RawStreamRndvBudget` 默认全零。Open 对每个启用 endpoint 按 `streams.capacity` 计算最坏情况之和；以下字段分别给出允许上限，超出时在打开 provider 前拒绝：
+
+| 预算字段 | 每条连接计入量 |
+| --- | --- |
+| `connections` | 1 |
+| `tx_slots` | `connection.tx_capacity` |
+| `receive_entries` | `connection.receive_capacity` |
+| `write_chunks` | `tx_capacity * max_chunks` |
+| `notification_slots` | `connection.notification_capacity` |
+| `ingress_packets` | `3 * connection.ingress_packets`，分别用于 RTS、GRANT、DONE |
+| `grant_bytes` | `limits.max_bytes` |
+
+这些是所列资源的容量上限，不能当作全部元数据的精确字节数；窗口及固定数组仍受连接数、协议窗口上限间接约束。连接元数据在 PrepareRaw 分配，不按全部槽位预先创建事务对象。底层 ConnectionOwner 与调度器的实际容量同时设为 `streams.capacity`：Preparing、Failed、Closing、EOF 和只协商到 Eager 的连接均占槽，直到成功 Release。C stream 关闭或 mailbox Cancel 不提前释放名额。通过 HostResources 借用成员不得另行 Adopt/Prepare 不同配置，否则不属于门面的预算契约。
+
+目标池的 buffer 数及引用槽至少覆盖全部连接的 `max_grants` 总和，buffer 大小覆盖最大事务，backing 容量覆盖累计 Grant 字节预算。源池还须容纳每条连接的 Eager 控制 buffer、RNDV 常驻通知 buffer 和每个 TX 槽的一块拷贝源；引用槽须通过实际 chunk/SGE 的首笔提交预检。源池和目标池共同消耗 `RawStackConfig::memory_budget_bytes`，不按 context 重复计 backing。该预算不包含域 RX、队列、mailbox 和 provider 内存。应用持有源 Lease、在途 Eager 或实际 Credit 不足仍会产生运行时背压，静态预检不保证每次业务写入成功。
+
+双端 HELLO 均声明 RNDV 时，PrepareRaw 必须额外提供独立认证后的 `rndv_peer_authorized=true` 和属于本 context 的当前 READY `rndv_lane`。缺失授权或错误 Lane 在资源准备前拒绝，可纠正后重试。只有一端启用时使用双方协商的 Eager，不自动增加 Arena 权限。当前每个 endpoint 仅一个 Arena，发送固定 Lane；在线替换不能迁移在途 WRITE 或重放旧事务。
+
+Peer 控制额度继续跨连接共账：提交新 RTS 前至少有三个可用额度，且没有未激活的未来 DONE 承诺；已接受 WRITE/DONE 则独立推进。后来的连接遇到背压返回 WouldBlock，由调用者重试未接受部分。连接建立或关闭均不重置该账户，不按连接重复授信。
+
+同一 Peer 的物理 CREDIT 更新使用共享在途票据合并，防止兄弟连接重复公告同一上界、不断消耗和补回控制额度。每条连接自己的接收窗口仍独立公告。provider 接受与成功 CQE 分开记录：成功才更新去重上界，可信零接受或失败完成解除票据，接受未知则保留责任；任何分支都不返还已花额度或重放业务 WR。可信来源上的入站 CREDIT 先更新 Peer 物理共账，再检查逻辑路由，因此关闭某条连接不会丢失兄弟连接所需的累计额度。宿主提供的发送账户须覆盖来源 registry 中仍保留的迟到来源；不能随逻辑 Close 销毁。
+
 ## 推进和应用表
 
 `table(context)` 返回借用的 C stream 表，后续使用 `kbs_stream_write/read/watch/poll_events/close/release`。表的存活依赖 Runtime；完整 Close 后已有表入口返回 NOT_READY，实例销毁后不得继续访问。句柄包含表身份与完整代次，不能跨表或在 Release 后复用。
 
 `Step(false)` 执行非阻塞 Tick；`Step(true)` 允许底层 RunOnce 等待，已有待取应用事件时仍只 Tick。事件通过每张表的 `kbs_stream_poll_events` 领取，Watch 为一次性订阅，Poll 不自动重新订阅。Runtime 同步转发连接进度至对应表，并保留配置中的连接、命令和授信撤回回调及其原 cookie；宿主回调不得反向调用 owner 或 Runtime。
+
+宿主可在 owner 上用 `Resolve(stream)` 获得完整 `OwnedConnection` 身份，再把身份和对应 mailbox 交给业务线程。解析校验表、槽、代次及 context 暂停门禁，不允许业务线程直接调用 owner。mailbox 默认单次载荷仍为 4096 B；大消息配置 `command_io_bytes`（最多 1 MiB）及每 context 的 `command_payload_budget_bytes`，初始化时按实际环容量和 64 B 对齐步长预分配。要通过默认 16 KiB 阈值进入 RNDV，单次命令、源 buffer 及协商最大事务须足够。mailbox 仍只执行一次 copy Read/Write，不提供跨线程 Lease 或自动拼接重试；C stream 调用还受 `streams.max_io_bytes` 限制。
 
 控制任务暂停某个 context 时，该 context 的宿主资源和流访问遵守原暂停门禁；准备涉及共享 Slab/import，必须避开全部 context 的暂停窗口。缓存借用指针不豁免此规则。宿主不能独立 Close/Open 栈内成员，也不能绕过发布表另外管理同一批连接。
 

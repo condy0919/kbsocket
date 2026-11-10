@@ -57,6 +57,11 @@ struct EagerReceiveSource {
     TokenDomain local_domain;
     WireReceiveContext peer_context;
     CreditPeerHandle peer;
+    // 可信来源绑定的反向 Peer 共账；独立于逻辑 Connection 存活至来源退休。
+    // identity/token 是准入时快照，旧帧不能借同一对象上新开的 epoch 更新额度。
+    SenderCreditAccount* sender_credits = nullptr;
+    CreditIdentity sender_identity{};
+    WireToken token{};
 };
 struct EagerRxPacketView {
     raw::RxBufferLease lease;
@@ -73,6 +78,7 @@ using EagerRxHandler = std::expected<EagerRxDisposition, EagerRxError> (*)(void*
 /// Open 要求整份初始物理容量已实际 post 并记账，此后本对象独占 refill/release/receipt 结账。
 /// 一个 ReceiveCreditDomain 只能绑定一个 EagerReceiveDomain，解绑前拒绝直接关闭信用账。
 /// callback 成功 kHeld 才转移 packet；kRelease 或失败由本对象归还。callback 不可重入 Dispatch。
+/// 绑定反向共账时，可信 CREDIT 先更新 Peer 累计额度，再验证仍存活的连接路由/业务窗口。
 class EagerReceiveDomain {
 public:
     EagerReceiveDomain() noexcept;

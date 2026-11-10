@@ -130,6 +130,15 @@ struct CreditPeerHandle {
     std::uint32_t slot = 0;
     std::uint64_t id = 0;
 };
+struct CreditPublicationLimits {
+    std::uint64_t max_data = 0, max_control = 0;
+};
+/// 同 Peer 的一份 CREDIT 在途去重票据；不代表物理授信或 DMA 已经终结。
+enum class CreditPublicationResult : std::uint8_t { kNotAccepted, kSuccess, kFailed };
+struct CreditPublication {
+    CreditPeerHandle peer;
+    std::uint64_t id = 0;
+};
 struct RxCreditReceipt {
     const ReceiveCreditDomain* domain = nullptr;
     std::uint32_t slot = 0;
@@ -154,6 +163,7 @@ struct CreditDomainStats {
     std::uint32_t active_peers = 0, tombstones = 0;
     // Peer 已退休仍可能被撤回控制器借用；物理域关闭前必须解除全部绑定。
     std::uint32_t withdrawal_bindings = 0;
+    std::uint32_t publications = 0;
     bool admission_stopped = false;
     bool frozen = false;
 };
@@ -197,6 +207,20 @@ public:
     /// Peer 共账上已经通过 READY 或可信 accepted CREDIT 暴露的控制授信；不能按逻辑连接重复计新。
     std::expected<std::uint64_t, CreditError> PublishedControl(CreditPeerHandle peer) const noexcept;
     std::expected<void, CreditError> RecordPublishedControl(CreditPeerHandle peer, std::uint64_t limit) noexcept;
+    /// 已通过成功 CREDIT CQE 终结的共账通告上界；不是远端应用层 ACK。
+    /// 去重依赖接收路径在逻辑路由失效前独立应用可信来源的物理授信。
+    std::expected<CreditPublicationLimits, CreditError> ConfirmedCredits(CreditPeerHandle peer) const noexcept;
+    std::expected<bool, CreditError> PublicationPending(CreditPeerHandle peer) const noexcept;
+    /// 真实 accepted CREDIT 失败后，直到后来成功通告覆盖其两类上界才清除此证据。
+    /// 已有 confirmed 相等不能掩盖后发生的窗口通告失败；READY/零接受不产生失败证据。
+    std::expected<bool, CreditError> PublicationFailed(CreditPeerHandle peer) const noexcept;
+    /// 每 Peer 至多一个在途 CREDIT，包括连接自身窗口更新；临时忙不丢调用方待发送内容。
+    std::expected<CreditPublication, CreditError> ReservePublication(CreditPeerHandle peer,
+                                                                     CreditPublicationLimits limits) noexcept;
+    /// 仅真实 CQE 可以选择 Success/Failed；NotAccepted 用于可信零接受，不撤销物理 Grant。
+    /// 接受未知时保留票据，不能凭连接失败、取消或超时释放。
+    std::expected<void, CreditError> ResolvePublication(CreditPublication publication,
+                                                        CreditPublicationResult result) noexcept;
     /// 以可信 CQE 的完整 Peer 授信归属结账；冻结/旧连接的合法迟到帧仍扣原 epoch。
     /// 若真实 RX CQE 已消耗 RQE 而本调用失败，必须改走 ConsumeUnknown 并隔离，不能只丢帧。
     /// 本接口不是收包前的额度探测；非法/重复调用本身不代表又一次真实 RQE 消耗。
@@ -239,7 +263,7 @@ private:
     std::expected<std::uint32_t, CreditError> Find(RxCreditReceipt receipt) const noexcept;
     std::expected<RxCreditReceipt, CreditError> NewReceipt(std::uint32_t peer, std::uint8_t bucket) noexcept;
     std::unique_ptr<State> state_;
-    std::uint64_t last_domain_ = 0, next_peer_ = 0, next_receipt_ = 0;
+    std::uint64_t last_domain_ = 0, next_peer_ = 0, next_receipt_ = 0, next_publication_ = 0;
 };
 
 } // namespace connection

@@ -65,7 +65,7 @@ ConnectionOwner 的所有接口都由单 owner 调用，遵守 context 暂停屏
 
 ## 有界业务命令与结果
 
-`ConnectionMailbox::Open(owner, config, callback, cookie)` 借用已打开的 ConnectionOwner，预分配命令及结果环，默认容量 256，上限 65536，实际容量向上取至少 2 的二次幂。每个槽固定保留最多 4096 B 数据，容量预算须包含这份 backing；没有每连接单独分配 mailbox。Open/Close 属于 owner 控制路径，同一个队列成功 Open 后不能重新打开。
+`ConnectionMailbox::Open(owner, config, callback, cookie)` 借用已打开的 ConnectionOwner，预分配命令及结果环，默认容量 256，上限 65536，实际容量向上取至少 2 的二次幂。`max_io_bytes` 默认 4096 B，可显式配置为 1 B–1 MiB；每槽载荷在 Open 一次性分配，基址及步长均按 64 B 对齐，取整后容量乘实际步长不得超过 `payload_budget_bytes`（默认 256 MiB）。预算只覆盖载荷 backing，另有槽元数据；不按连接创建 mailbox。Open/Close 属于 owner 控制路径，同一个队列成功 Open 后不能重新打开。
 
 | 命令 | 执行及完成结果 |
 | :--- | :--- |
@@ -74,7 +74,7 @@ ConnectionOwner 的所有接口都由单 owner 调用，遵守 context 暂停屏
 | `kShutdownWrite` / `kCancel` | owner 执行既有半关闭或取消，未完成 DMA 仍沿用原责任账本 |
 | `kInspect` / `kWatchTcp` | 返回执行时状态快照，或按需求设置一次性 TCP readiness |
 
-Write/Read 的 `bytes` 必须为 1–4096；Write 输入长度必须一致，其余命令不携带输入。Submit 返回票据只表示命令已复制入队；Write 的完成字节数表示 Connection 接受的前缀，并不证明 raw DMA、远端接收或应用消费已经结束。短读写、WouldBlock 和其他连接错误都作为结果交回；mailbox 不自动重试，也不重放已接受数据。业务可结合 ConnectionProgress 的通知自行决定下一条命令。
+Write/Read 的 `bytes` 必须为 1–已配置的 `max_io_bytes`；Write 输入长度必须一致，其余命令不携带输入。Submit 返回票据只表示命令已复制入队；Write 的完成字节数表示 Connection 接受的前缀，并不证明 raw DMA、远端接收或应用消费已经结束。短读写、WouldBlock 和其他连接错误都作为结果交回；mailbox 不自动重试，也不重放已接受数据。业务可结合 ConnectionProgress 的通知自行决定下一条命令。默认 mailbox 配额低于 RNDV 的 16 KiB 阈值，须显式调大，不能把连续若干小命令视为一个 RNDV 事务。
 
 队列允许多线程 Submit 与 TakeCompletion；owner 只按预留顺序消费连续已发布前缀，不等待 producer 发布空洞。单个 producer 的顺序保持，多个 producer 之间由预留顺序串行化。同一 Tick 最多执行 `min(budget, 16)` 条命令，预算不足保留 readiness；未轮到的 raw context 或控制暂停期间，命令只占槽、不访问连接。Read 执行时刷新单调时钟，避免旧 Tick 时间早于同轮 RX 更新。
 

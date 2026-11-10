@@ -56,7 +56,8 @@ std::expected<void, ErrorCode> HandshakeRxSources::Prepare(const control::RawSou
         request.buffers->pool()->context() != request.context ||
         request.context_incarnation != registry_->context_incarnation() ||
         request.local_domain.runtime_instance != domain.runtime_instance ||
-        request.local_domain.receive_domain != domain.receive_domain || !request.credit_peer.domain) {
+        request.local_domain.receive_domain != domain.receive_domain || !request.credit_peer.domain ||
+        !request.sender_credits) {
         return Error(ErrorCode::kInvalidArgument);
     }
     const auto& local = *request.local;
@@ -64,6 +65,8 @@ std::expected<void, ErrorCode> HandshakeRxSources::Prepare(const control::RawSou
     const auto passive = request.buffers->pool()->rx_target_jetty_id();
     const auto credit = request.credit_peer.domain->PeerStats(request.credit_peer);
     const connection::CreditIdentity identity{peer.identity.runtime, domain.receive_domain, local.credit_epoch};
+    const connection::CreditIdentity sender_identity{peer.identity.runtime, peer.identity.receive_domain,
+                                                     peer.credit_epoch};
     if (!ValidIdentity(local.identity) || !ValidIdentity(peer.identity) ||
         local.identity.runtime != domain.runtime_instance || local.identity.receive_domain != domain.receive_domain ||
         local.wire_version != connection::kWireVersion || peer.wire_version != connection::kWireVersion ||
@@ -72,7 +75,9 @@ std::expected<void, ErrorCode> HandshakeRxSources::Prepare(const control::RawSou
         !control::ValidateHandshakeTxLanes(local.tx_lanes) || !control::ValidateHandshakeTxLanes(peer.tx_lanes) ||
         !passive || passive->id != local.jetty_id ||
         std::memcmp(&passive->eid, local.eid.data(), local.eid.size()) != 0 || !credit || credit->retired ||
-        credit->frozen || request.credit_peer.domain->stats().frozen || credit->identity != identity) {
+        credit->frozen || request.credit_peer.domain->stats().frozen || credit->identity != identity ||
+        !request.sender_credits->ready() || request.sender_credits->identity() != sender_identity ||
+        request.sender_credits->stats().stopped) {
         return Error(ErrorCode::kInvalidArgument);
     }
     std::array<RxSourceRoute, control::kHandshakeMaxTxLanes> routes{};
@@ -91,7 +96,10 @@ std::expected<void, ErrorCode> HandshakeRxSources::Prepare(const control::RawSou
         route.source = {
             request.local_domain,
             {local.wire_version, peer.identity.runtime, local.identity.receive_domain, local.identity.session},
-            request.credit_peer};
+            request.credit_peer,
+            request.sender_credits,
+            sender_identity,
+            local.identity.token};
     }
     const auto added = registry_->RegisterBatch(std::span(routes).first(peer.tx_lanes.count),
                                                 std::span(leases_).first(peer.tx_lanes.count));
@@ -184,7 +192,9 @@ std::expected<void, ErrorCode> HandshakeRxSources::Check() const noexcept {
     }
     const auto credit = credit_peer_.domain->PeerStats(credit_peer_);
     if (!credit || credit->frozen || credit->retired || credit_peer_.domain->stats().frozen ||
-        credit->identity != credit_identity_) {
+        credit->identity != credit_identity_ || !route_template_.source.sender_credits->ready() ||
+        route_template_.source.sender_credits->identity() != route_template_.source.sender_identity ||
+        route_template_.source.sender_credits->stats().stopped) {
         return Error(ErrorCode::kRegistry);
     }
     for (std::size_t i = 0; i < count_; ++i) {

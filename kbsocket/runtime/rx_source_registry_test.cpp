@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include "kbsocket/connection/connection.hpp"
 #include "kbsocket/runtime/connection_io.hpp"
 #include "kbsocket/runtime/handshake_rx_sources.hpp"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
@@ -113,6 +114,7 @@ protected:
         route_.remote_id.uasid = 3;
         route_.token = {1, 1};
         route_.source = {{11, 33}, {connection::kWireVersion, 22, 33, 44}, *peer};
+        ASSERT_TRUE(sender_credits_.Open({22, 66, 99}));
         ASSERT_TRUE(registry_.Open(Config()));
     }
     void TearDown() override {
@@ -125,6 +127,7 @@ protected:
         }
         EXPECT_EQ(registry_.size(), 0u);
         EXPECT_TRUE(registry_.Close());
+        EXPECT_TRUE(sender_credits_.Close());
         // 每个 mock Posted 都生成真实终结事件后归还，来源拒绝不等于释放 DMA 责任。
         for (const auto lease : leases_) {
             EXPECT_TRUE(buffers_.Release(lease));
@@ -177,7 +180,7 @@ protected:
     }
     control::RawSourceAdmissionRequest Request(const control::HandshakeHello& local,
                                                const control::HandshakeHello& peer) {
-        return {&local, &peer, &context_, &buffers_, 101, {11, 33}, route_.source.peer, true};
+        return {&local, &peer, &context_, &buffers_, 101, {11, 33}, route_.source.peer, true, &sender_credits_};
     }
     RxSourceLease Register(const RxSourceRoute& route) {
         auto result = registry_.Register(route);
@@ -189,16 +192,19 @@ protected:
         return *result;
     }
     raw::RxBufferEvent Event(const RxSourceRoute& route) {
+        const std::array data{std::byte{0x56}};
+        connection::WireFrameInput input;
+        input.token = route.token;
+        input.data = data;
+        return Event(route, input);
+    }
+    raw::RxBufferEvent Event(const RxSourceRoute& route, const connection::WireFrameInput& input) {
         EXPECT_FALSE(posted_.empty());
         if (posted_.empty()) {
             return {};
         }
         auto posted = posted_.front();
         posted_.pop_front();
-        const std::array data{std::byte{0x56}};
-        connection::WireFrameInput input;
-        input.token = route.token;
-        input.data = data;
         auto encoded = connection::EncodeWireFrame(input, posted.memory);
         EXPECT_TRUE(encoded);
         if (!encoded) {
@@ -241,6 +247,7 @@ protected:
     raw::JettyPool pool_;
     raw::RxBufferPool buffers_;
     connection::ReceiveCreditDomain credits_;
+    connection::SenderCreditAccount sender_credits_;
     RxSourceRegistry registry_;
     RxSourceRoute route_;
     std::vector<RxSourceLease> handles_;
@@ -546,6 +553,105 @@ TEST_F(RxSourceRegistryTest, BridgeAccountsAndRefillsKnownStaleFrame) {
     EXPECT_TRUE(progress.Close());
     EXPECT_TRUE(receive.Close());
     EXPECT_TRUE(routes.Close());
+}
+
+TEST_F(RxSourceRegistryTest, DelayedCreditUpdatesSharedAccountAfterConnectionAndRouteClose) {
+    connection::ConnectionTable routes;
+    ASSERT_TRUE(routes.Open({11, 33}, 2));
+    connection::Connection closed;
+    auto token = routes.Reserve();
+    ASSERT_TRUE(token);
+    route_.token = token->token;
+    route_.source.sender_credits = &sender_credits_;
+    route_.source.sender_identity = sender_credits_.identity();
+    route_.source.token = token->token;
+    Register(route_);
+    ASSERT_TRUE(routes.Publish(*token, {route_.source.peer_context, token->token, 99}, &closed));
+    ASSERT_TRUE(sender_credits_.Update(sender_credits_.identity(), 1, 2));
+    ASSERT_TRUE(credits_.Grant(route_.source.peer, connection::CreditClass::kControl, 2));
+    connection::EagerReceiveDomain receive;
+    ASSERT_TRUE(receive.Open(buffers_, credits_, routes));
+    connection::WireFrameInput credit{.type = connection::WireFrameType::kControl,
+                                      .token = route_.token,
+                                      .data = {},
+                                      .max_credit_seq = 12,
+                                      .max_control_credit_seq = 8,
+                                      .session = route_.source.peer_context.session,
+                                      .credit_epoch = 99};
+    // SEND 已进入远端 RQE，而应用尚未消费 CQE；这时先关闭连接并退休逻辑 token。
+    const auto delayed = Event(route_, credit);
+    ASSERT_TRUE(closed.Close());
+    ASSERT_TRUE(routes.Withdraw(*token));
+    ASSERT_TRUE(routes.Retire(*token));
+    const auto source = registry_.Resolve(delayed);
+    ASSERT_TRUE(source);
+    const auto dispatched = receive.Dispatch(delayed, *source, &connection::Connection::DispatchRx, 100);
+    ASSERT_FALSE(dispatched);
+    EXPECT_EQ(dispatched.error().code, connection::EagerRxErrorCode::kRouteRejected);
+    EXPECT_EQ(sender_credits_.stats().limits, (std::array<std::uint64_t, 2>{12, 8}));
+    EXPECT_FALSE(receive.frozen());
+
+    // 即使路由尚在，已关闭 Connection 会拒绝业务回调；其 CREDIT 仍属于活着的 Peer 共账。
+    token = routes.Reserve();
+    ASSERT_TRUE(token);
+    route_.token = token->token;
+    route_.source.token = token->token;
+    Register(route_);
+    ASSERT_TRUE(routes.Publish(*token, {route_.source.peer_context, token->token, 99}, &closed));
+    credit.token = token->token;
+    ++credit.max_credit_seq;
+    ++credit.max_control_credit_seq;
+    const auto late = Event(route_, credit);
+    const auto late_source = registry_.Resolve(late);
+    ASSERT_TRUE(late_source);
+    allocations = 0;
+    count_allocations = true;
+    const auto rejected = receive.Dispatch(late, *late_source, &connection::Connection::DispatchRx, 101);
+    count_allocations = false;
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code, connection::EagerRxErrorCode::kStopped);
+    EXPECT_EQ(sender_credits_.stats().limits, (std::array<std::uint64_t, 2>{13, 9}));
+    EXPECT_EQ(allocations, 0u);
+    EXPECT_EQ(receive.held(), 0u);
+    EXPECT_EQ(receive.pending_refill(), 2u);
+    ASSERT_EQ(receive.Refill(), 2u);
+    EXPECT_TRUE(receive.Close());
+    ASSERT_TRUE(routes.Withdraw(*token));
+    ASSERT_TRUE(routes.Retire(*token));
+    EXPECT_TRUE(routes.Close());
+}
+
+TEST_F(RxSourceRegistryTest, SharedCreditBindingCannotBeForgedOrReinterpretedBySiblingSource) {
+    auto bound = route_;
+    bound.source.sender_credits = &sender_credits_;
+    bound.source.sender_identity = sender_credits_.identity();
+    bound.source.token = bound.token;
+    auto invalid = bound;
+    ++invalid.source.sender_identity.epoch;
+    EXPECT_FALSE(registry_.Register(invalid));
+    invalid = bound;
+    ++invalid.source.token.generation;
+    EXPECT_FALSE(registry_.Register(invalid));
+    invalid = bound;
+    invalid.source.sender_credits = nullptr;
+    EXPECT_FALSE(registry_.Register(invalid));
+    Register(bound);
+    connection::SenderCreditAccount other;
+    ASSERT_TRUE(other.Open(sender_credits_.identity()));
+    auto sibling = bound;
+    ++sibling.token.slot;
+    sibling.source.token = sibling.token;
+    sibling.source.sender_credits = &other;
+    const auto conflict = registry_.Register(sibling);
+    ASSERT_FALSE(conflict);
+    EXPECT_EQ(conflict.error(), RxSourceError::kIdentityConflict);
+    // 即使帧 token 合法，伪造的物理发送 Lane 不得得到可更新共账的来源绑定。
+    const auto event = HeldEvent(bound);
+    auto forged = event;
+    ++forged.completion.remote_id.id;
+    EXPECT_FALSE(registry_.Resolve(forged));
+    EXPECT_EQ(sender_credits_.stats().limits, (std::array<std::uint64_t, 2>{0, 0}));
+    EXPECT_TRUE(other.Close());
 }
 
 TEST_F(RxSourceRegistryTest, BridgeAccountsUnknownSourceAndFreezesDomain) {
@@ -884,6 +990,9 @@ TEST_F(RxSourceRegistryTest, HelloAdmissionRegistersEveryActiveLaneAndLocalSessi
         EXPECT_EQ(source->local_domain.runtime_instance, 11u);
         EXPECT_EQ(source->peer.id, route_.source.peer.id);
         EXPECT_EQ(source->peer.domain, &credits_);
+        EXPECT_EQ(source->sender_credits, &sender_credits_);
+        EXPECT_EQ(source->sender_identity, (connection::CreditIdentity{22, 66, 99}));
+        EXPECT_EQ(source->token, local.identity.token);
     }
     auto passive_source = route_;
     passive_source.remote_id.id = peer.jetty_id;
@@ -903,6 +1012,9 @@ TEST_F(RxSourceRegistryTest, HelloAdmissionRejectsUntrustedAndMismatchedDependen
     ASSERT_TRUE(admission.Open(registry_));
     EXPECT_FALSE(admission.Open(registry_));
     auto request = Request(local, peer);
+    request.sender_credits = nullptr;
+    EXPECT_FALSE(admission.Prepare(request));
+    request = Request(local, peer);
     request.peer_lanes_authorized = false;
     auto untrusted = admission.Prepare(request);
     ASSERT_FALSE(untrusted);
@@ -970,6 +1082,9 @@ TEST_F(RxSourceRegistryTest, HelloAdmissionCapacityFailureLeavesNoPrefix) {
     for (std::uint32_t i = 0; i < 7; ++i) {
         auto route = route_;
         route.token.slot = 100 + i;
+        route.source.sender_credits = &sender_credits_;
+        route.source.sender_identity = sender_credits_.identity();
+        route.source.token = route.token;
         Register(route);
     }
     HandshakeRxSources admission;
@@ -1139,6 +1254,9 @@ TEST_F(RxSourceRegistryTest, LaneUpdateRegistryCapacityFailurePreservesOldSnapsh
     for (std::uint32_t i = 0; i < 5; ++i) {
         auto other = route_;
         other.token.slot = 10 + i;
+        other.source.sender_credits = &sender_credits_;
+        other.source.sender_identity = sender_credits_.identity();
+        other.source.token = other.token;
         Register(other);
     }
     auto update = peer.tx_lanes;

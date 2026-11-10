@@ -163,6 +163,27 @@ std::expected<void, EagerRxError> EagerReceiveDomain::Dispatch(const raw::RxBuff
         }
         return Error(EagerRxErrorCode::kInvalidArgument);
     }
+    const auto& frame = decoded->frame;
+    const bool carries_credit =
+        frame.type == WireFrameType::kDataWithCredit ||
+        (frame.type == WireFrameType::kControl && frame.control == WireControlType::kCreditUpdate);
+    if (carries_credit && source.sender_credits) {
+        // SEND 成功只证明进入远端 RQE；连接可能已关闭/撤路由。先按独立物理来源的
+        // session/token/epoch 快照更新 Peer 共账，不能让兄弟流丢失已成功发送的 CREDIT。
+        // 连接私有窗口仍只由下方有效路由处理，不从旧帧恢复关闭的连接。
+        const WireSessionBinding binding{source.peer_context, source.token, source.sender_identity.epoch};
+        const bool valid_binding = source.sender_identity.peer_runtime == source.peer_context.peer_runtime &&
+                                   source.sender_identity.receive_domain && source.sender_identity.epoch &&
+                                   ValidateWireIdentity(*decoded, binding, source.peer_context).has_value();
+        if (!valid_binding || !source.sender_credits->Update(source.sender_identity, frame.max_credit_seq,
+                                                             frame.max_control_credit_seq)) {
+            const auto released = Release(packet);
+            if (!released) {
+                return released;
+            }
+            return Error(EagerRxErrorCode::kCreditFailed);
+        }
+    }
     // 必须先做物理扣账，再拒绝旧 token；token 回收从不抹除 PeerRuntime 的旧授信责任。
     auto route = s.routes->Resolve(*decoded, source.local_domain, source.peer_context);
     if (!route) {

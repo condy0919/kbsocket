@@ -279,6 +279,7 @@ cc_test(
         ":connection_io",
         ":handshake_rx_sources",
         ":rx_source_registry",
+        "//kbsocket/connection",
         "//kbsocket/connection:connection_table",
         "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",

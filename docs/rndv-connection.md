@@ -1,6 +1,6 @@
 # M6.3.9：Connection 与 Runtime 的 RNDV 装配
 
-[`Connection`](../kbsocket/connection/connection.hpp) 现可显式启用 WRITE RNDV，将发送事务、接收入口和共用通知队列接到真实 Eager RX/TX 分发。默认连接仍使用 Eager；`RawStreamRuntime` 便捷入口尚不自动创建或公告目标 Arena。本阶段覆盖单连接固定 Lane、本地与远端各一个 Arena，不代表 UB 真机或规模验收通过。
+[`Connection`](../kbsocket/connection/connection.hpp) 现可显式启用 WRITE RNDV，将发送事务、接收入口和共用通知队列接到真实 Eager RX/TX 分发。默认连接仍使用 Eager；M6.3.10 的 [RawStreamRuntime](raw-stream-runtime.md) 已提供显式配置后的 Arena 注册、导出和跨连接准入。本组件使用固定 Lane、本地与远端各一个 Arena，不代表 UB 真机或规模验收通过。
 
 ## 准备与能力门禁
 
@@ -18,7 +18,7 @@
 - chunk 数、每次 post 数、单次进度预算、源引用余量和实际注册 backing 分别受限。单 WRITE 不超过协商值及 200 MiB 上限；完整事务还须能由本地 chunk 预算表达。
 - 当前共同序号从零开始，目标授权窗口使用协商的 RNDV window；共同接收窗口可更大。
 
-元数据在 Open/PrepareRaw 控制路径分配，Write/Progress/接收和完成路径不分配。Slab/MemoryBudget 约束实际 backing，跨连接完整元数据总预算仍待后续接入。
+元数据在 Open/PrepareRaw 控制路径分配，Write/Progress/接收和完成路径不分配。Slab/MemoryBudget 约束实际 backing；RawStreamRuntime 按连接硬上限检查核心元数据数量及 Grant 字节总额，不将这些计数误作全部元数据字节预算。
 
 ## 混合流、背压与半关闭
 
@@ -48,4 +48,4 @@ Connection 进度推进 Eager、接收入口、发送协调器和通知队列；
 
 [Connection RNDV 回归](../kbsocket/connection/connection_rndv_test.cpp) 使用真实软件握手、Slab、两类导入缓存、收发账本及完成处理器，Mock provider 执行实际目标内存 WRITE 和通知交付。覆盖双向 copy/Lease、跨窗口混合流、通知乱序、早到 RTS、独立 WRITE/DONE 责任、取消后迟到 DONE、非法准备及通知预算。Runtime 回归覆盖子 owner 防伪、段导入暂停、DMA pin 与异步关闭。
 
-具体测试计数见 [roadmap](roadmap.md)。下一步是将显式 Arena/预算与准入策略接入 `RawStreamRuntime` 便捷入口，补应用 mailbox/Runtime 全链路 RNDV 和跨连接资源总预算。多 Arena 选择、故障后迁移及 UB WN1–WN4 回归未在本阶段交付。
+具体测试计数见 [roadmap](roadmap.md)。M6.3.10 已补应用 C stream、mailbox 到 Runtime 的双向 RNDV 组合回归。多 Arena 选择、UB WN1–WN4 和规模验收仍未交付；不会在故障后迁移或重放已接受的事务。

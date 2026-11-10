@@ -6,18 +6,44 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <span>
 
 #include "kbsocket/api/buffer_binding.hpp"
 #include "kbsocket/api/stream_binding.hpp"
 #include "kbsocket/connection/connection.hpp"
 #include "kbsocket/connection/credit_account.hpp"
+#include "kbsocket/connection/grant_manager.hpp"
 #include "kbsocket/connection/reorder_window.hpp"
+#include "kbsocket/connection/rndv_connection.hpp"
 #include "kbsocket/control/handshake_channel.hpp"
+#include "kbsocket/control/rndv_capabilities.hpp"
+#include "kbsocket/runtime/connection_owner.hpp"
 #include "kbsocket/runtime/raw_stack.hpp"
+#include "kbsocket/transport/raw/jetty_pool.hpp"
 
 namespace kbsocket {
 namespace api {
+/// 显式授权本端公告 WRITE RNDV；Arena 目录由真实注册导出，不接受调用方拼接地址。
+/// arena 的 id/generation 须在本 runtime 的生命周期内唯一且不可复用。
+struct RawStreamRndvConfig {
+    connection::RndvConnectionConfig connection;
+    control::RndvLimits limits;
+    connection::GrantArena arena;
+};
+/// 跨 endpoint 的静态最坏情况预算，按 streams.capacity 累加，默认全零不启用 RNDV。
+/// counts 限制固定元数据；grant_bytes 限制同时授予的远端写字节数。
+/// 注册 backing 另由 RawStackConfig::memory_budget_bytes 统一约束，不能互相替代。
+struct RawStreamRndvBudget {
+    std::uint64_t connections = 0;
+    std::uint64_t tx_slots = 0;
+    std::uint64_t receive_entries = 0;
+    std::uint64_t write_chunks = 0;
+    std::uint64_t notification_slots = 0;
+    // RTS / GRANT / DONE 三路 packet 槽之和。
+    std::uint64_t ingress_packets = 0;
+    std::uint64_t grant_bytes = 0;
+};
 struct RawStreamEndpointConfig {
     runtime::RawEndpointConfig endpoint;
     StreamBindingConfig streams;
@@ -25,6 +51,9 @@ struct RawStreamEndpointConfig {
     std::uint64_t endpoint_generation = 0;
     std::uint64_t authorization = 0;
     std::uint64_t credit_epoch = 0;
+    // 开启时 streams.capacity 同时成为底层 owner 硬上限，直到 Release 才归还槽。
+    // Preparing、Failed、Closing、仅协商 Eager 的连接也占该额度。
+    std::optional<RawStreamRndvConfig> rndv = std::nullopt;
 };
 struct RawStreamConnectOptions {
     std::uint64_t session = 0;
@@ -35,6 +64,7 @@ struct RawStreamConnectOptions {
 };
 struct RawStreamPreparation {
     // 宿主按 Peer 管理并跨连接共用，不能逐连接新建或重置同一物理授信账户。
+    // 账户须存活至 RetireSources 及所有保留责任结束，不能随逻辑流 Close 销毁。
     connection::CreditPeerHandle credit_peer;
     connection::SenderCreditAccount* sender_credits = nullptr;
     connection::ReorderConfig reorder;
@@ -46,6 +76,10 @@ struct RawStreamPreparation {
     connection::LaneUpdateAuthorizer authorize_lane_update = nullptr;
     void* lane_authorization_cookie = nullptr;
     std::uint64_t lane_update_timeout_ns = 5'000'000'000;
+    // 独立认证对端成功 WRITE/DONE 契约及 Arena 导入权限，不从 HELLO 能力位推导。
+    bool rndv_peer_authorized = false;
+    // 显式选择本 context 的当前 READY Lane；本阶段固定 Lane，不自动迁移在途 WRITE。
+    raw::JettyLane rndv_lane{};
 };
 
 /// 单 owner raw 应用编排：拥有 RawStack、每 context 的 C stream 表及同步事件转发。
@@ -59,7 +93,8 @@ public:
     RawStreamRuntime(const RawStreamRuntime&) = delete;
     RawStreamRuntime& operator=(const RawStreamRuntime&) = delete;
     std::expected<void, kbs_stream_error> Open(std::span<const RawStreamEndpointConfig> endpoints,
-                                               const runtime::RawStackConfig& config = {}) noexcept;
+                                               const runtime::RawStackConfig& config = {},
+                                               const RawStreamRndvBudget& rndv_budget = {}) noexcept;
     kbs_stream_table* table(std::size_t context) noexcept;
     // 可选应用 Lease 表借用整栈共享注册 Slab，不另建池；每次 C 操作遵守全部 context 暂停门禁。
     std::expected<void, kbs_stream_error> OpenBuffers(const BufferBindingConfig& config) noexcept;
@@ -68,12 +103,15 @@ public:
     bool paused(std::size_t context) const noexcept;
     std::expected<runtime::RawStackSnapshot, kbs_stream_error> Inspect() const noexcept;
     // 仅供宿主 Peer 授信/撤回/mailbox 等编排；不得独立关闭成员或绕过暂停访问缓存视图。
+    // 建链/Prepare 须经过本门面；自行传入其他 RNDV 配置不在本门面的静态预算契约内。
     std::expected<runtime::RawStackContextResources, kbs_stream_error> HostResources(std::size_t context) noexcept;
     // fd 接管后立即置 -1（包括随后发布失败）；失败且 fd 非负时仍由调用者拥有。
     std::expected<kbs_stream_handle, kbs_stream_error>
     AdoptProtocol(std::size_t context, int* fd, const RawStreamConnectOptions& options, std::uint64_t now_ns) noexcept;
     // 返回副本，允许宿主在 Preparing 时进行认证；不会自动信任 HELLO 的自报字段。
     std::expected<control::HandshakeHello, kbs_stream_error> Peer(kbs_stream_handle stream) noexcept;
+    // 宿主在 owner 上校验并取得 mailbox 所需身份；复制句柄不能延长流或 owner 生命周期。
+    std::expected<runtime::OwnedConnection, kbs_stream_error> Resolve(kbs_stream_handle stream) noexcept;
     std::expected<void, kbs_stream_error> PrepareRaw(kbs_stream_handle stream,
                                                      const RawStreamPreparation& preparation) noexcept;
     std::expected<void, kbs_stream_error> RetireSources(kbs_stream_handle stream,

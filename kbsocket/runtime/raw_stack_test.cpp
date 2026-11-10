@@ -503,6 +503,8 @@ TEST_F(RawStackTest, OwnsTwoDevicesTwoEidsWithDistinctDomainsAndSharedSlab) {
     EXPECT_TRUE(snapshot->progress_attached);
     EXPECT_FALSE(snapshot->rndv_enabled);
     EXPECT_EQ(shared_->segments, nullptr);
+    EXPECT_EQ(shared_->rndv_target, nullptr);
+    EXPECT_EQ(snapshot->rndv_target.buffers, 0u);
     EXPECT_EQ(init_calls_, 1u);
     EXPECT_EQ(query_calls_, 2u);
     EXPECT_EQ(context_create_calls_, 4u);
@@ -949,6 +951,175 @@ TEST_F(RawStackTest, SegmentAndEndpointImportsShareOneContextPause) {
     EXPECT_EQ(shared_->segments->Get(segment).value()->urma_ctx, &contexts_[1]);
     EXPECT_TRUE(shared_->imports->Release(endpoint));
     EXPECT_TRUE(shared_->segments->Release(segment));
+}
+
+TEST_F(RawStackTest, OptionalTargetPoolRequiresRndvBeforeProviderInitialization) {
+    config_.rndv_target_slab = memory::SlabConfig{2, 4096, 8};
+    const auto opened = stack_.Open(endpoints_, config_);
+    ASSERT_FALSE(opened);
+    EXPECT_EQ(opened.error().code, RawStackErrorCode::kInvalidArgument);
+    EXPECT_EQ(stack_.stage(), RawStackStage::kEmpty);
+    EXPECT_EQ(init_calls_, 0u);
+}
+
+TEST_F(RawStackTest, TargetBackingSharesOneBudgetAndRegistersEveryContext) {
+    config_.enable_rndv = true;
+    config_.rndv_target_slab = memory::SlabConfig{2, 4096, 8};
+    config_.memory_budget_bytes += 8192;
+    Open();
+    ASSERT_NE(shared_->rndv_target, nullptr);
+    EXPECT_NE(shared_->rndv_target, shared_->slab);
+    const auto snapshot = stack_.Inspect();
+    ASSERT_TRUE(snapshot);
+    // 源池、目标池各只有一份 backing；四 context 的注册不重复扣预算。
+    EXPECT_EQ(snapshot->budget_bytes, 40960u);
+    EXPECT_EQ(snapshot->slab.backing_bytes, 32768u);
+    EXPECT_EQ(snapshot->rndv_target.backing_bytes, 8192u);
+    EXPECT_EQ(snapshot->rndv_target.buffers, 2u);
+    EXPECT_EQ(register_calls_, 12u);
+    for (std::size_t i = 0; i < contexts_.size(); ++i) {
+        EXPECT_EQ(segments_[4 + i].urma_ctx, &contexts_[i]);
+        EXPECT_EQ(segments_[4 + i].seg.ubva.va, segments_[4].seg.ubva.va);
+    }
+    Close();
+    EXPECT_EQ(Deleted(Kind::kMr), 12u);
+    EXPECT_EQ(stack_.Inspect()->budget_bytes, 0u);
+    EXPECT_EQ(stack_.Inspect()->rndv_target.backing_bytes, 0u);
+    // 目标和源 MR 都必须先于任何 context 删除。
+    const auto first_context =
+        std::ranges::find_if(deletions_, [](const auto& item) { return item.kind == Kind::kContext; });
+    ASSERT_NE(first_context, deletions_.end());
+    EXPECT_EQ(
+        std::ranges::count_if(first_context, deletions_.end(), [](const auto& item) { return item.kind == Kind::kMr; }),
+        0);
+}
+
+TEST_F(RawStackTest, TargetAllocationCannotExceedSharedSourceBudget) {
+    config_.enable_rndv = true;
+    config_.rndv_target_slab = memory::SlabConfig{2, 4096, 8};
+    // 源池已占满预算，目标池不能偷偷申请另一份独立预算。
+    const auto opened = stack_.Open(endpoints_, config_);
+    ASSERT_FALSE(opened);
+    ASSERT_TRUE(opened.error().memory);
+    EXPECT_EQ(opened.error().memory->code, memory::MemoryErrorCode::kExhausted);
+    EXPECT_EQ(stack_.Inspect()->budget_bytes, 32768u);
+    EXPECT_EQ(register_calls_, 4u);
+    EXPECT_FALSE(stack_.shared());
+    Close();
+    EXPECT_EQ(Deleted(Kind::kMr), 4u);
+    EXPECT_EQ(Deleted(Kind::kContext), 4u);
+    EXPECT_EQ(stack_.Inspect()->budget_bytes, 0u);
+}
+
+TEST_F(RawStackTest, PartialTargetRegistrationFailureKeepsExplicitClosePath) {
+    config_.enable_rndv = true;
+    config_.rndv_target_slab = memory::SlabConfig{2, 4096, 8};
+    config_.memory_budget_bytes += 8192;
+    // 四次源注册后，目标第二 context 注册失败，逆序回滚也首次失败。
+    // 整份目标 backing 与预算必须留到显式关闭，不可先删 context。
+    fail_register_call_ = 6;
+    fail_unregister_call_ = 1;
+    const auto opened = stack_.Open(endpoints_, config_);
+    ASSERT_FALSE(opened);
+    ASSERT_TRUE(opened.error().memory);
+    EXPECT_EQ(opened.error().memory->code, memory::MemoryErrorCode::kRegisterFailed);
+    EXPECT_EQ(opened.error().memory->cleanup_error, URMA_EAGAIN);
+    EXPECT_EQ(stack_.Inspect()->budget_bytes, 40960u);
+    EXPECT_EQ(Deleted(Kind::kContext), 0u);
+    EXPECT_FALSE(stack_.shared());
+    fail_unregister_call_ = 0;
+    Close();
+    EXPECT_EQ(Deleted(Kind::kMr), 5u);
+    EXPECT_EQ(Deleted(Kind::kContext), 4u);
+    EXPECT_EQ(stack_.Inspect()->budget_bytes, 0u);
+}
+
+TEST_F(RawStackTest, TargetCpuDmaAndRemoteGrantIndependentlyPreventDetach) {
+    config_.enable_rndv = true;
+    config_.rndv_target_slab = memory::SlabConfig{2, 4096, 8};
+    config_.memory_budget_bytes += 8192;
+    Open();
+    auto& target = *shared_->rndv_target;
+    const auto lease = target.Acquire(64);
+    ASSERT_TRUE(lease);
+    const auto dma = target.Reserve(*lease, memory::BufferUse::kLocalDma);
+    const auto grant = target.Reserve(*lease, memory::BufferUse::kRemoteGrant);
+    ASSERT_TRUE(dma);
+    ASSERT_TRUE(grant);
+    ASSERT_TRUE(target.Commit(*dma));
+    ASSERT_TRUE(target.Commit(*grant));
+    ASSERT_TRUE(stack_.BeginClose());
+    EXPECT_FALSE(target.Acquire(64));
+    EXPECT_FALSE(stack_.AdvanceClose(Proof()));
+    ExpectStillRunning();
+    // CPU 归还和本地 CQE 都不能代替远端 Grant 的独立终结。
+    ASSERT_TRUE(target.ReleaseCpu(*lease));
+    EXPECT_FALSE(stack_.AdvanceClose(Proof()));
+    ASSERT_TRUE(target.CompleteDma(*dma));
+    EXPECT_FALSE(stack_.AdvanceClose(Proof()));
+    ExpectStillRunning();
+    ASSERT_TRUE(target.EndGrant(*grant));
+    Close();
+}
+
+TEST_F(RawStackTest, TargetUnregisterFailureKeepsSourceAndAllContextsUntilRetry) {
+    config_.enable_rndv = true;
+    config_.rndv_target_slab = memory::SlabConfig{2, 4096, 8};
+    config_.memory_budget_bytes += 8192;
+    Open();
+    // 四份 RX MR 已关闭；目标 MR 的首次注销失败，源池尚不得注销。
+    fail_unregister_call_ = 5;
+    ASSERT_TRUE(stack_.BeginClose());
+    const auto closed = stack_.AdvanceClose(Proof());
+    ASSERT_FALSE(closed);
+    EXPECT_EQ(closed.error().code, RawStackErrorCode::kMemory);
+    EXPECT_EQ(stack_.stage(), RawStackStage::kClosingMemory);
+    EXPECT_EQ(Deleted(Kind::kMr), 4u);
+    EXPECT_EQ(Deleted(Kind::kContext), 0u);
+    EXPECT_EQ(stack_.Inspect()->budget_bytes, 40960u);
+    fail_unregister_call_ = 0;
+    Close();
+    EXPECT_EQ(unregister_calls_, 13u);
+    EXPECT_EQ(Deleted(Kind::kMr), 12u);
+    EXPECT_EQ(stack_.Inspect()->budget_bytes, 0u);
+}
+
+TEST_F(RawStackTest, EndpointCapacityCannotExceedStackCeiling) {
+    endpoints_[2].connection_capacity = config_.connections_per_context + 1;
+    const auto opened = stack_.Open(endpoints_, config_);
+    ASSERT_FALSE(opened);
+    EXPECT_EQ(opened.error().code, RawStackErrorCode::kInvalidArgument);
+    EXPECT_EQ(opened.error().context_index, 2u);
+    EXPECT_EQ(init_calls_, 0u);
+}
+
+TEST_F(RawStackTest, EndpointCapacityBindsOwnerAndSchedulerUntilConnectionRelease) {
+    endpoints_[0].connection_capacity = 1;
+    Open();
+    auto& owner = *resources_[0]->connections;
+    EXPECT_EQ(owner.stats().capacity, 1u);
+    EXPECT_EQ(owner.scheduler_capacity(), 1u);
+    EXPECT_EQ(resources_[1]->connections->stats().capacity, 4u);
+    const auto first = AdoptTcp();
+    ASSERT_TRUE(first.owner);
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+    ASSERT_GE(fd, 0);
+    const auto full = owner.AdoptTcp(fd);
+    ASSERT_FALSE(full);
+    EXPECT_EQ(full.error().code, ConnectionOwnerErrorCode::kExhausted);
+    ASSERT_TRUE(owner.CloseConnection(first));
+    // Closed 仍占元数据槽；显式 Release 才恢复配额，也不因直接借用 Owner 绕过。
+    const auto still_full = owner.AdoptTcp(fd);
+    ASSERT_FALSE(still_full);
+    EXPECT_EQ(still_full.error().code, ConnectionOwnerErrorCode::kExhausted);
+    EXPECT_EQ(::close(fd), 0);
+    ASSERT_TRUE(owner.Release(first));
+    const auto second = AdoptTcp();
+    ASSERT_TRUE(second.owner);
+    EXPECT_EQ(second.slot, first.slot);
+    EXPECT_NE(second.generation, first.generation);
+    ASSERT_TRUE(owner.CloseConnection(second));
+    ASSERT_TRUE(owner.Release(second));
 }
 
 TEST_F(RawStackTest, SegmentDmaPinAndDeferredUnimportPreventRuntimeDetach) {
