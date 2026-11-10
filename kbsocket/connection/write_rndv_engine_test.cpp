@@ -360,6 +360,173 @@ protected:
     std::size_t partial_ = 0;
 };
 
+TEST_F(WriteRndvEngineTest, PinnedSlicesRemainWritableAfterCpuAndOriginalPinsAreReleased) {
+    const auto grant = Target(55);
+    const auto first = Source(80, 3);
+    const auto second = Source(24, 7);
+    const auto first_view = source_.Readable(first);
+    const auto second_view = source_.Readable(second);
+    ASSERT_TRUE(first_view);
+    ASSERT_TRUE(second_view);
+    std::array<std::byte, 55> expected{};
+    std::copy_n(first_view->begin() + 5, 19, expected.begin());
+    std::copy_n(first_view->begin() + 33, 21, expected.begin() + 19);
+    std::copy_n(second_view->begin() + 3, 15, expected.begin() + 40);
+    const auto first_pin = source_.Reserve(first, memory::BufferUse::kLocalDma);
+    const auto second_pin = source_.Reserve(second, memory::BufferUse::kLocalDma);
+    ASSERT_TRUE(first_pin);
+    ASSERT_TRUE(second_pin);
+    const std::array sources{WriteRndvSource{first, 5, 19}, WriteRndvSource{first, 33, 21},
+                             WriteRndvSource{second, 3, 15}};
+    const std::array pins{*first_pin, *first_pin, *second_pin};
+    ReleaseCpu(first);
+    ReleaseCpu(second);
+    ASSERT_TRUE(engine_.Open(Config(24), sender_, source_));
+    // GRANT 到达前应用已经归还 CPU；同一 Lease 的两个 slice 可共用原 pin，分块仍各有责任。
+    ASSERT_TRUE(engine_.StartPinned(grant.identity.transfer, Destination(grant), sources, pins));
+    EXPECT_FALSE(source_.Readable(first));
+    EXPECT_FALSE(source_.Writable(second));
+    ASSERT_TRUE(source_.Cancel(*first_pin));
+    ASSERT_TRUE(source_.Cancel(*second_pin));
+    EXPECT_GT(source_.stats().local_dma, 0u);
+    EXPECT_EQ(source_.stats().available, 14u);
+    ASSERT_EQ(engine_.Progress(), 3u);
+    Complete(2);
+    Complete(0);
+    EXPECT_FALSE(engine_.DoneEvidence());
+    Complete(1);
+    EXPECT_EQ(source_.stats().local_dma, 0u);
+    EXPECT_EQ(source_.stats().available, 16u);
+    const auto done = engine_.DoneEvidence();
+    ASSERT_TRUE(done);
+    ASSERT_TRUE(grants_.CompleteDone(*done));
+    const auto view = grants_.Borrow(grant.handle);
+    ASSERT_TRUE(view);
+    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), view->begin(), view->end()));
+    ASSERT_TRUE(grants_.Return(grant.handle));
+}
+
+TEST_F(WriteRndvEngineTest, InvalidPinnedSourcesRollbackClonesAndPreserveCallerResponsibilities) {
+    const auto grant = Target(32);
+    const auto first = Source(48);
+    const auto second = Source(48);
+    const auto first_pin = source_.Reserve(first, memory::BufferUse::kLocalDma);
+    const auto second_pin = source_.Reserve(second, memory::BufferUse::kLocalDma);
+    const auto remote_pin = source_.Reserve(second, memory::BufferUse::kRemoteGrant);
+    ASSERT_TRUE(first_pin);
+    ASSERT_TRUE(second_pin);
+    ASSERT_TRUE(remote_pin);
+    ASSERT_TRUE(engine_.Open(Config(16), sender_, source_));
+    const std::array sources{WriteRndvSource{first, 2, 16}, WriteRndvSource{second, 3, 16}};
+    const std::array pins{*first_pin, *second_pin};
+    EXPECT_FALSE(engine_.StartPinned(grant.identity.transfer, Destination(grant), sources, {}));
+    EXPECT_FALSE(engine_.StartPinned(grant.identity.transfer, Destination(grant), sources, std::span(pins).first(1)));
+    // 第二个 pin 的区间合法但 Lease 或责任种类错误，必须撤销前一个 slice 已派生的引用。
+    for (const auto bad : {memory::BufferReference{}, *first_pin, *remote_pin}) {
+        const std::array wrong{*first_pin, bad};
+        EXPECT_FALSE(engine_.StartPinned(grant.identity.transfer, Destination(grant), sources, wrong));
+        EXPECT_EQ(source_.stats().local_dma, 2u);
+        EXPECT_EQ(source_.stats().remote_grants, 1u);
+        EXPECT_EQ(engine_.stats().planned, 0u);
+        EXPECT_EQ(post_calls_, 0u);
+    }
+    auto bad_sources = sources;
+    bad_sources[1].offset = std::numeric_limits<std::size_t>::max() - 1;
+    EXPECT_FALSE(engine_.StartPinned(grant.identity.transfer, Destination(grant), bad_sources, pins));
+    bad_sources[1].offset = 33;
+    EXPECT_FALSE(engine_.StartPinned(grant.identity.transfer, Destination(grant), bad_sources, pins));
+    ASSERT_TRUE(source_.Commit(*second_pin));
+    EXPECT_FALSE(engine_.StartPinned(grant.identity.transfer, Destination(grant), sources, pins));
+    ASSERT_TRUE(source_.CompleteDma(*second_pin));
+    EXPECT_FALSE(engine_.StartPinned(grant.identity.transfer, Destination(grant), sources, pins));
+    ASSERT_TRUE(source_.Cancel(*remote_pin));
+    ASSERT_TRUE(source_.Cancel(*first_pin));
+    EXPECT_EQ(source_.stats().local_dma, 0u);
+    EXPECT_EQ(post_calls_, 0u);
+    DiscardGrant(grant);
+}
+
+TEST_F(WriteRndvEngineTest, PinnedAdmissionRejectsQuarantineAndContextMismatchBeforePosting) {
+    const auto grant = Target(32);
+    const auto source = Source(32);
+    const auto pin = source_.Reserve(source, memory::BufferUse::kLocalDma);
+    ASSERT_TRUE(pin);
+    const std::array sources{WriteRndvSource{source, 0, 32}};
+    const std::array pins{*pin};
+    ASSERT_TRUE(engine_.Open(Config(), sender_, source_));
+    auto destination = Destination(grant);
+    endpoint_.urma_ctx = &foreign_context_;
+    EXPECT_FALSE(engine_.StartPinned(grant.identity.transfer, destination, sources, pins));
+    endpoint_.urma_ctx = &context_;
+    ASSERT_TRUE(source_.Quarantine(source));
+    EXPECT_FALSE(engine_.StartPinned(grant.identity.transfer, destination, sources, pins));
+    EXPECT_EQ(source_.stats().local_dma, 1u);
+    EXPECT_EQ(post_calls_, 0u);
+    ASSERT_TRUE(source_.Cancel(*pin));
+    ReleaseCpu(source);
+    DiscardGrant(grant);
+}
+
+TEST_F(WriteRndvEngineTest, PinnedStartAndCompletionHaveNoFastpathAllocationOrFree) {
+    const auto grant = Target(77);
+    const auto source = Source(77);
+    const auto pin = source_.Reserve(source, memory::BufferUse::kLocalDma);
+    ASSERT_TRUE(pin);
+    const std::array sources{WriteRndvSource{source, 0, 77}};
+    const std::array pins{*pin};
+    ReleaseCpu(source);
+    ASSERT_TRUE(engine_.Open(Config(), sender_, source_));
+    allocations = deallocations = 0;
+    bool succeeded = true;
+    count_allocations = true;
+    succeeded &= engine_.StartPinned(grant.identity.transfer, Destination(grant), sources, pins).has_value();
+    succeeded &= source_.Cancel(*pin).has_value();
+    succeeded &= engine_.Progress().has_value();
+    for (std::size_t i = packet_count_; i > 0; --i) {
+        succeeded &= engine_.OnCompletion(Completion(i - 1)).has_value();
+    }
+    const auto done = engine_.DoneEvidence();
+    succeeded &= done.has_value();
+    count_allocations = false;
+    EXPECT_TRUE(succeeded);
+    EXPECT_EQ(allocations, 0u);
+    EXPECT_EQ(deallocations, 0u);
+    ASSERT_TRUE(done);
+    ASSERT_TRUE(grants_.CompleteDone(*done));
+    ASSERT_TRUE(grants_.Cancel(grant.handle));
+}
+
+TEST_F(WriteRndvEngineTest, UnknownPinnedAcceptanceQuarantinesOwningLeaseAfterOriginalPinCancellation) {
+    const auto grant = Target(64);
+    const auto source = Source(80);
+    const auto pin = source_.Reserve(source, memory::BufferUse::kLocalDma);
+    ASSERT_TRUE(pin);
+    const std::array sources{WriteRndvSource{source, 8, 64}};
+    const std::array pins{*pin};
+    ReleaseCpu(source);
+    ASSERT_TRUE(engine_.Open(Config(16, 3), sender_, source_));
+    ASSERT_TRUE(engine_.StartPinned(grant.identity.transfer, Destination(grant), sources, pins));
+    ASSERT_TRUE(source_.Cancel(*pin));
+    mode_ = PostMode::kUnknown;
+    EXPECT_FALSE(engine_.Progress());
+    EXPECT_FALSE(engine_.stats().acceptance_known);
+    EXPECT_EQ(source_.stats().quarantined_buffers, 1u);
+    EXPECT_EQ(source_.stats().local_dma, 3u);
+    EXPECT_FALSE(engine_.DoneEvidence());
+    EXPECT_FALSE(engine_.TerminalEvidence());
+    // Mock 明确执行了这三个 WR，真实 CQE 只允许终结它们的本地责任，不补造远端证明。
+    for (std::size_t i = 0; i < packet_count_; ++i) {
+        ASSERT_TRUE(ledger_.Commit(packets_[i].id, i + 1));
+        Complete(i);
+    }
+    EXPECT_EQ(source_.stats().local_dma, 0u);
+    EXPECT_EQ(source_.stats().available, 16u);
+    EXPECT_FALSE(engine_.TerminalEvidence());
+    ASSERT_TRUE(engine_.Close());
+    DiscardGrant(grant, packet_count_);
+    DrainFaultedLane();
+}
+
 TEST_F(WriteRndvEngineTest, ReorderedCompletionsGateFullDoneAndTargetVisibility) {
     const auto grant = Target(77);
     const auto lease = Source(90);
@@ -1265,6 +1432,39 @@ protected:
         return 2;
     }
 };
+class PinnedWriteReferenceTest : public WriteRndvEngineTest {
+protected:
+    std::uint32_t SourceReferences() const noexcept override {
+        return 3;
+    }
+};
+TEST_F(PinnedWriteReferenceTest, PinCapacityFailureRollsBackThenRetriesWithoutReplacingOriginalPin) {
+    const auto grant = Target(32);
+    const auto source = Source(32);
+    const auto pin = source_.Reserve(source, memory::BufferUse::kLocalDma);
+    const auto pressure = source_.Reserve(source, memory::BufferUse::kLocalDma);
+    ASSERT_TRUE(pin);
+    ASSERT_TRUE(pressure);
+    const std::array sources{WriteRndvSource{source, 0, 32}};
+    const std::array pins{*pin};
+    ReleaseCpu(source);
+    ASSERT_TRUE(engine_.Open(Config(16), sender_, source_));
+    // 只剩一个引用槽，第二分块准入失败必须归还第一个派生引用，原始两个 pin 不变。
+    const auto started = engine_.StartPinned(grant.identity.transfer, Destination(grant), sources, pins);
+    ASSERT_FALSE(started);
+    EXPECT_EQ(started.error().code, WriteRndvErrorCode::kWouldBlock);
+    EXPECT_EQ(source_.stats().local_dma, 2u);
+    EXPECT_EQ(source_.stats().available_references, 1u);
+    EXPECT_EQ(engine_.stats().planned, 0u);
+    EXPECT_EQ(post_calls_, 0u);
+    ASSERT_TRUE(source_.Cancel(*pressure));
+    ASSERT_TRUE(engine_.StartPinned(grant.identity.transfer, Destination(grant), sources, pins));
+    ASSERT_TRUE(source_.Cancel(*pin));
+    ASSERT_EQ(engine_.Progress(), 2u);
+    Complete(0);
+    Complete(1);
+    DeliverAndReturn(grant);
+}
 TEST_F(SmallWriteReferenceTest, InsufficientDmaReferenceCapacityRollsBackAllAdmissionPins) {
     const auto grant = Target(48);
     const auto source = Source(48);

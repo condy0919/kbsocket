@@ -80,6 +80,11 @@ struct WriteRndvPool::State {
     WriteRndvPoolConfig config;
     control::EndpointImportCache* endpoints = nullptr;
     control::TsegImportCache* segments = nullptr;
+    memory::SlabAllocator* slab = nullptr;
+    const RndvTxCoordinator* coordinator = nullptr;
+    raw::TxSender* sender = nullptr;
+    std::size_t source_reference_budget = 0;
+    std::uint64_t chunk_bytes_limit = 0;
     std::unique_ptr<Slot[]> slots;
     std::unique_ptr<WindowPhase[]> window;
     // 即使 SN tombstone 已推进，也拒绝同一远端 Grant 槽的旧代次换 SN 重放。
@@ -139,13 +144,22 @@ std::expected<void, WriteRndvPoolError> WriteRndvPool::Open(const WriteRndvPoolC
         }
     }
     state->config = config;
+    state->sender = &sender;
     state->endpoints = &endpoints;
     state->segments = &segments;
+    state->slab = &slab;
+    state->source_reference_budget = static_cast<std::size_t>(config.max_chunks) *
+                                     std::min<std::size_t>(WriteRndvEngine::kMaxSources, sender.pool()->max_send_sge());
+    state->chunk_bytes_limit =
+        std::min({config.chunk_bytes, raw::TxSender::kMaxWriteSize, sender.pool()->max_write_size()});
     state->next_generation = config.slots;
     state->window_begin = config.initial_seq;
     state_ = std::move(state);
     opened_once_ = true;
     return {};
+}
+raw::TxSender* WriteRndvPool::sender() const noexcept {
+    return state_ ? state_->sender : nullptr;
 }
 std::expected<WriteRndvPool::Slot*, WriteRndvPoolError> WriteRndvPool::Find(WriteRndvHandle handle) const noexcept {
     if (!state_) {
@@ -302,6 +316,19 @@ std::expected<WriteRndvHandle, WriteRndvPoolError> WriteRndvPool::Reserve(const 
 }
 std::expected<void, WriteRndvPoolError> WriteRndvPool::Start(WriteRndvHandle handle,
                                                              std::span<const WriteRndvSource> sources) noexcept {
+    return StartImpl(handle, sources, {});
+}
+std::expected<void, WriteRndvPoolError>
+WriteRndvPool::StartPinned(WriteRndvHandle handle, std::span<const WriteRndvSource> sources,
+                           std::span<const memory::BufferReference> pins) noexcept {
+    if (pins.empty() || pins.size() != sources.size()) {
+        return Error(WriteRndvPoolErrorCode::kInvalidArgument);
+    }
+    return StartImpl(handle, sources, pins);
+}
+std::expected<void, WriteRndvPoolError>
+WriteRndvPool::StartImpl(WriteRndvHandle handle, std::span<const WriteRndvSource> sources,
+                         std::span<const memory::BufferReference> pins) noexcept {
     const auto found = Find(handle);
     if (!found) {
         return std::unexpected(found.error());
@@ -320,7 +347,8 @@ std::expected<void, WriteRndvPoolError> WriteRndvPool::Start(WriteRndvHandle han
         }
         return std::unexpected(destination.error());
     }
-    const auto started = slot.engine.Start(slot.identity.transfer, *destination, sources);
+    const auto started = pins.empty() ? slot.engine.Start(slot.identity.transfer, *destination, sources)
+                                      : slot.engine.StartPinned(slot.identity.transfer, *destination, sources, pins);
     if (!started) {
         return EngineError(started.error());
     }
@@ -498,6 +526,9 @@ std::expected<void, WriteRndvPoolError> WriteRndvPool::Close() noexcept {
     if (!state_) {
         return {};
     }
+    if (state_->coordinator) {
+        return Error(WriteRndvPoolErrorCode::kInUse);
+    }
     Stop();
     std::optional<WriteRndvPoolError> failure;
     for (std::uint32_t i = 0; i < state_->config.slots; ++i) {
@@ -546,6 +577,47 @@ WriteRndvPoolStats WriteRndvPool::stats() const noexcept {
         }
     }
     return result;
+}
+const WriteRndvPoolConfig* WriteRndvPool::config() const noexcept {
+    return state_ ? &state_->config : nullptr;
+}
+std::size_t WriteRndvPool::source_reference_budget() const noexcept {
+    return state_ ? state_->source_reference_budget : 0;
+}
+std::uint64_t WriteRndvPool::chunk_bytes_limit() const noexcept {
+    return state_ ? state_->chunk_bytes_limit : 0;
+}
+std::expected<void, WriteRndvPoolError> WriteRndvPool::BindCoordinator(const RndvTxCoordinator& owner,
+                                                                       memory::SlabAllocator& slab,
+                                                                       control::EndpointImportCache& endpoints,
+                                                                       control::TsegImportCache& segments) noexcept {
+    if (!state_) {
+        return Error(WriteRndvPoolErrorCode::kNotReady);
+    }
+    if (state_->stopped) {
+        return Error(WriteRndvPoolErrorCode::kStopped);
+    }
+    if (state_->coordinator || state_->active) {
+        return Error(WriteRndvPoolErrorCode::kInUse);
+    }
+    if (state_->slab != &slab || state_->endpoints != &endpoints || state_->segments != &segments) {
+        return Error(WriteRndvPoolErrorCode::kWrongIdentity);
+    }
+    state_->coordinator = &owner;
+    return {};
+}
+std::expected<void, WriteRndvPoolError> WriteRndvPool::UnbindCoordinator(const RndvTxCoordinator& owner) noexcept {
+    if (!state_) {
+        return Error(WriteRndvPoolErrorCode::kNotReady);
+    }
+    if (state_->coordinator != &owner) {
+        return Error(WriteRndvPoolErrorCode::kWrongIdentity);
+    }
+    if (state_->active) {
+        return Error(WriteRndvPoolErrorCode::kInUse);
+    }
+    state_->coordinator = nullptr;
+    return {};
 }
 } // namespace connection
 } // namespace kbsocket

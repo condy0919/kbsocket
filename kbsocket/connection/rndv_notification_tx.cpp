@@ -112,6 +112,8 @@ struct RndvNotificationTx::State {
     TxSequenceWindow* sequence = nullptr;
     control::ImportLease endpoint;
     const RndvRxIngress* ingress = nullptr;
+    const RndvTxCoordinator* coordinator = nullptr;
+    TxSequenceWindow* coordinator_sequence = nullptr;
     std::unique_ptr<Entry[]> entries;
     std::uint64_t next_generation = 0;
     std::uint64_t accepted = 0;
@@ -266,7 +268,8 @@ RndvNotificationTx::QueueRts(const GrantTransfer& transfer, TxSequenceWindow& se
     }
     const auto& destination = state.config.destination;
     const auto frame = BuildRndvRts(transfer, destination);
-    if ((state.sequence && state.sequence != &sequence) || !frame ||
+    if ((state.sequence && state.sequence != &sequence) ||
+        (state.coordinator_sequence && state.coordinator_sequence != &sequence) || !frame ||
         sequence.session() != SequenceSession{destination.runtime, destination.receive_domain, destination.session} ||
         transfer.seq != sequence.next_sequence()) {
         return Error(RndvNotificationErrorCode::kWrongIdentity);
@@ -808,11 +811,56 @@ std::expected<void, RndvNotificationError> RndvNotificationTx::UnbindIngress(con
     state_->ingress = nullptr;
     return {};
 }
+const RndvNotificationConfig* RndvNotificationTx::config() const noexcept {
+    return state_ ? &state_->config : nullptr;
+}
+std::expected<void, RndvNotificationError> RndvNotificationTx::BindCoordinator(const RndvTxCoordinator& owner,
+                                                                               memory::SlabAllocator& slab,
+                                                                               control::EndpointImportCache& endpoints,
+                                                                               TxSequenceWindow& sequence,
+                                                                               raw::TxSender* sender) noexcept {
+    if (!state_) {
+        return Error(RndvNotificationErrorCode::kNotReady);
+    }
+    if (state_->coordinator) {
+        return Error(RndvNotificationErrorCode::kInUse);
+    }
+    if (state_->stopped || state_->failed) {
+        return Error(RndvNotificationErrorCode::kStopped);
+    }
+    if (state_->sender != sender || state_->slab != &slab || state_->imports != &endpoints ||
+        (state_->sequence && state_->sequence != &sequence)) {
+        return Error(RndvNotificationErrorCode::kWrongIdentity);
+    }
+    // 接收端 GRANT 可共存；已存在的本地 RTS/DONE 不可绕过唯一发送协调器。
+    for (std::uint32_t i = 0; i < state_->config.capacity; ++i) {
+        if (state_->entries[i].active && state_->entries[i].status.type != WireControlType::kRndvGrant) {
+            return Error(RndvNotificationErrorCode::kInUse);
+        }
+    }
+    state_->coordinator_sequence = &sequence;
+    state_->coordinator = &owner;
+    return {};
+}
+std::expected<void, RndvNotificationError>
+RndvNotificationTx::UnbindCoordinator(const RndvTxCoordinator& owner) noexcept {
+    if (!state_ || state_->coordinator != &owner) {
+        return Error(RndvNotificationErrorCode::kWrongIdentity);
+    }
+    for (std::uint32_t i = 0; i < state_->config.capacity; ++i) {
+        if (state_->entries[i].active && state_->entries[i].status.type != WireControlType::kRndvGrant) {
+            return Error(RndvNotificationErrorCode::kInUse);
+        }
+    }
+    state_->coordinator = nullptr;
+    state_->coordinator_sequence = nullptr;
+    return {};
+}
 std::expected<void, RndvNotificationError> RndvNotificationTx::Close() noexcept {
     if (!state_) {
         return {};
     }
-    if (state_->ingress) {
+    if (state_->ingress || state_->coordinator) {
         // ingress 仍可能持有精确通知 handle；不能越过其 RX/远端授权责任关闭或取消整队列。
         return Error(RndvNotificationErrorCode::kInUse);
     }

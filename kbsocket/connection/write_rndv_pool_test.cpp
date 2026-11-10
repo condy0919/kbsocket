@@ -553,6 +553,95 @@ protected:
     std::size_t partial_ = 0;
 };
 
+TEST_F(WriteRndvPoolTest, SourceAdmissionLimitsAndConfigSnapshotMatchOpenedEngines) {
+    EXPECT_EQ(transactions_.config(), nullptr);
+    EXPECT_EQ(transactions_.source_reference_budget(), 0u);
+    EXPECT_EQ(transactions_.chunk_bytes_limit(), 0u);
+    auto config = Config();
+    config.max_chunks = 7;
+    config.chunk_bytes = std::numeric_limits<std::uint64_t>::max();
+    ASSERT_TRUE(transactions_.Open(config, sender_, source_, endpoints_, segments_cache_));
+    ASSERT_NE(transactions_.config(), nullptr);
+    EXPECT_EQ(transactions_.source_reference_budget(), 14u);
+    EXPECT_EQ(transactions_.chunk_bytes_limit(), raw::TxSender::kMaxWriteSize);
+    // 返回只读的已打开快照；宿主原始配置的后续变化不能改变引擎预算。
+    config.max_chunks = 99;
+    EXPECT_EQ(transactions_.config()->max_chunks, 7u);
+    EXPECT_EQ(transactions_.config()->binding, Binding());
+    ASSERT_TRUE(transactions_.Close());
+    EXPECT_EQ(transactions_.config(), nullptr);
+    EXPECT_EQ(transactions_.source_reference_budget(), 0u);
+    EXPECT_EQ(transactions_.chunk_bytes_limit(), 0u);
+}
+
+TEST_F(WriteRndvPoolTest, PinnedSourcesFinishAfterCpuReturnWithoutFastpathAllocation) {
+    Open();
+    const auto grant = Target(77);
+    const auto source = Source(85);
+    const auto pin = source_.Reserve(source, memory::BufferUse::kLocalDma);
+    ASSERT_TRUE(pin);
+    const std::array sources{WriteRndvSource{source, 8, 77}};
+    const std::array pins{*pin};
+    const auto handle = Reserve(grant);
+    ReleaseCpu(source);
+    // 排队阶段原 pin 保活，StartPinned 后可归还它，池只拥有自己派生的三个分块引用。
+    allocations = deallocations = 0;
+    bool succeeded = true;
+    count_allocations = true;
+    succeeded &= transactions_.StartPinned(handle, sources, pins).has_value();
+    succeeded &= source_.Cancel(*pin).has_value();
+    succeeded &= transactions_.Progress(handle).has_value();
+    for (std::size_t i = packet_count_; i > 0; --i) {
+        succeeded &= transactions_.OnCompletion(Completion(i - 1)).has_value();
+    }
+    const auto done = transactions_.DoneEvidence(handle);
+    succeeded &= done.has_value();
+    succeeded &= transactions_.Release(handle).has_value();
+    count_allocations = false;
+    EXPECT_TRUE(succeeded);
+    EXPECT_EQ(allocations, 0u);
+    EXPECT_EQ(deallocations, 0u);
+    EXPECT_EQ(packet_count_, 3u);
+    EXPECT_EQ(source_.stats().local_dma, 0u);
+    EXPECT_EQ(source_.stats().available, 16u);
+    ASSERT_TRUE(done);
+    ASSERT_TRUE(grants_.CompleteDone(*done));
+    const auto received = grants_.Borrow(grant.handle);
+    ASSERT_TRUE(received);
+    for (std::size_t i = 0; i < received->size(); ++i) {
+        EXPECT_EQ((*received)[i], static_cast<std::byte>(((i + 8) * 17 + 1) & 255));
+    }
+    ASSERT_TRUE(grants_.Return(grant.handle));
+    MarkEnded(grant);
+}
+
+TEST_F(WriteRndvPoolTest, InvalidPinnedAdmissionLeavesHandleAndOriginalPinAvailableForRetry) {
+    Open();
+    const auto grant = Target(32);
+    const auto source = Source(32);
+    const auto other = Source(32);
+    const auto pin = source_.Reserve(source, memory::BufferUse::kLocalDma);
+    ASSERT_TRUE(pin);
+    const auto handle = Reserve(grant);
+    const std::array sources{WriteRndvSource{source, 0, 32}};
+    const std::array wrong_sources{WriteRndvSource{other, 0, 32}};
+    const std::array pins{*pin};
+    EXPECT_FALSE(transactions_.StartPinned(handle, sources, {}));
+    EXPECT_FALSE(transactions_.StartPinned(handle, wrong_sources, pins));
+    EXPECT_EQ(source_.stats().local_dma, 1u);
+    EXPECT_EQ(transactions_.stats().reserved, 1u);
+    EXPECT_EQ(post_calls_, 0u);
+    ReleaseCpu(source);
+    ASSERT_TRUE(transactions_.StartPinned(handle, sources, pins));
+    ASSERT_TRUE(transactions_.Cancel(handle));
+    EXPECT_EQ(source_.stats().local_dma, 1u);
+    // 事务取消只归还派生引用；原排队 pin 的取消责任始终留给调用者。
+    ASSERT_TRUE(source_.Sge(*pin, &context_, 0, 32));
+    ASSERT_TRUE(source_.Cancel(*pin));
+    EndFailedGrant(handle, grant);
+    ASSERT_TRUE(transactions_.Release(handle));
+}
+
 TEST_F(WriteRndvPoolTest, CompleteAllChunksBeforeDoneAndKeepImportsUntilRelease) {
     Open();
     const auto grant = Target(77);
@@ -1317,6 +1406,29 @@ protected:
         return 1;
     }
 };
+TEST_F(WriteRndvPoolSmallReferencesTest, PinnedChunkExhaustionLeavesCallerPinAndHandleIntact) {
+    Open(16);
+    const auto grant = Target(32);
+    const auto source = Source(32);
+    const auto pin = source_.Reserve(source, memory::BufferUse::kLocalDma);
+    ASSERT_TRUE(pin);
+    const auto handle = Reserve(grant);
+    const std::array sources{WriteRndvSource{source, 0, 32}};
+    const std::array pins{*pin};
+    ReleaseCpu(source);
+    const auto started = transactions_.StartPinned(handle, sources, pins);
+    ASSERT_FALSE(started);
+    EXPECT_EQ(started.error().code, WriteRndvPoolErrorCode::kWouldBlock);
+    EXPECT_EQ(source_.stats().local_dma, 1u);
+    EXPECT_EQ(transactions_.stats().reserved, 1u);
+    EXPECT_EQ(post_calls_, 0u);
+    ASSERT_TRUE(transactions_.Cancel(handle));
+    EndFailedGrant(handle, grant);
+    ASSERT_TRUE(transactions_.Release(handle));
+    EXPECT_EQ(source_.stats().local_dma, 1u);
+    ASSERT_TRUE(source_.Cancel(*pin));
+}
+
 TEST_F(WriteRndvPoolSmallReferencesTest, SourcePinExhaustionRollsBackWithoutLosingReservedHandle) {
     Open();
     const auto grant = Target(64);

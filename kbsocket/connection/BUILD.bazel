@@ -2,6 +2,40 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "rndv_tx_coordinator",
+    srcs = ["rndv_tx_coordinator.cpp"],
+    hdrs = ["rndv_tx_coordinator.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":grant_manager",
+        ":rndv_notification_tx",
+        ":rndv_protocol",
+        ":rndv_rx_ingress",
+        ":tx_sequence_window",
+        ":wire_frame",
+        ":write_rndv_engine",
+        ":write_rndv_pool",
+        "//kbsocket/control:endpoint_import_cache",
+        "//kbsocket/control:rndv_capabilities",
+        "//kbsocket/control:tseg_import_cache",
+        "//kbsocket/memory:slab_allocator",
+        "//kbsocket/transport/raw:tx_completion_processor",
+    ],
+)
+
+cc_test(
+    name = "rndv_tx_coordinator_test",
+    srcs = ["rndv_tx_coordinator_test.cpp"],
+    deps = [
+        ":rndv_protocol",
+        ":rndv_tx_coordinator",
+        "//kbsocket/runtime:control_executor",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "rndv_rx_ingress",
     srcs = ["rndv_rx_ingress.cpp"],
     hdrs = ["rndv_rx_ingress.hpp"],

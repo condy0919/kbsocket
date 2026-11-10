@@ -97,6 +97,9 @@ public:
     /// Reserve 在 post/Grant 发布之前取得责任；Commit 表示可能已暴露，包括接受未知情况。
     /// 只有明确未暴露的 Reserved 责任可 Cancel；不能用取消替代 DMA/远端授权终结证明。
     std::expected<BufferReference, MemoryError> Reserve(BufferLease lease, BufferUse use) noexcept;
+    /// 从同一 Lease 的 Reserved 本地 DMA pin 派生独立责任，允许 CPU 已归还；不转移原 pin。
+    /// 已提交、远端 Grant、过期引用及已隔离 Lease 均不得派生新的提交责任。
+    std::expected<BufferReference, MemoryError> RetainLocalDma(BufferLease lease, BufferReference source) noexcept;
     std::expected<void, MemoryError> Commit(BufferReference reference) noexcept;
     std::expected<void, MemoryError> Cancel(BufferReference reference) noexcept;
     /// 从 Reserved 责任构造 SGE，不能用其他 context 的注册句柄。offset/bytes 受 Lease 实际长度限制。
@@ -120,6 +123,7 @@ private:
                                               MemoryBudget& budget, bool host) noexcept;
     std::expected<std::uint32_t, MemoryError> Find(BufferLease lease) const noexcept;
     std::expected<std::uint32_t, MemoryError> Find(BufferReference reference) const noexcept;
+    std::expected<BufferReference, MemoryError> AllocateReference(BufferLease lease, BufferUse use) noexcept;
     std::expected<void, MemoryError> Finish(BufferReference reference, BufferUse use, bool committed) noexcept;
     void Recycle(std::uint32_t index) noexcept;
     std::unique_ptr<State> state_;

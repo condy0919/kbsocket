@@ -91,6 +91,12 @@ public:
     std::expected<void, WriteRndvError> Start(const GrantTransfer& expected_transfer,
                                               const WriteRndvDestination& destination,
                                               std::span<const WriteRndvSource> sources) noexcept;
+    /// 排队源已经由逐 slice 的 Reserved 本地 DMA pin 保活；CPU 可已归还。
+    /// 成功派生独立分块责任，失败完整回滚；调用者的原始 pin 始终由调用者归还。
+    std::expected<void, WriteRndvError> StartPinned(const GrantTransfer& expected_transfer,
+                                                    const WriteRndvDestination& destination,
+                                                    std::span<const WriteRndvSource> sources,
+                                                    std::span<const memory::BufferReference> pins) noexcept;
     /// 每次最多一次有界 post；部分接受只推进可信前缀，保留原偏移的未接受后缀。
     std::expected<std::size_t, WriteRndvError> Progress() noexcept;
     /// 仅消费可信 TxCompletionProcessor 的逐 WR 退休事件；重复/错身份事件不释放源引用。
@@ -110,6 +116,10 @@ private:
     friend class WriteRndvPool;
     struct Chunk;
     struct State;
+    std::expected<void, WriteRndvError> StartImpl(const GrantTransfer& expected_transfer,
+                                                  const WriteRndvDestination& destination,
+                                                  std::span<const WriteRndvSource> sources,
+                                                  std::span<const memory::BufferReference> pins) noexcept;
     // 仅供有 SN/Grant 防重放账本的事务池使用，保留预分配存储。
     std::expected<void, WriteRndvError> Recycle(std::uint64_t generation) noexcept;
     std::expected<void, WriteRndvError> CanRecycle() const noexcept;

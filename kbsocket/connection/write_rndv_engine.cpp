@@ -74,6 +74,7 @@ struct WriteRndvEngine::Chunk {
     struct Source {
         memory::BufferLease lease;
         memory::BufferReference dma;
+        memory::BufferReference pin;
         std::size_t offset = 0;
         bool committed = false;
     };
@@ -144,6 +145,21 @@ std::expected<void, WriteRndvError> WriteRndvEngine::Open(const WriteRndvConfig&
 std::expected<void, WriteRndvError> WriteRndvEngine::Start(const GrantTransfer& expected_transfer,
                                                            const WriteRndvDestination& destination,
                                                            std::span<const WriteRndvSource> sources) noexcept {
+    return StartImpl(expected_transfer, destination, sources, {});
+}
+std::expected<void, WriteRndvError>
+WriteRndvEngine::StartPinned(const GrantTransfer& expected_transfer, const WriteRndvDestination& destination,
+                             std::span<const WriteRndvSource> sources,
+                             std::span<const memory::BufferReference> pins) noexcept {
+    if (pins.empty() || pins.size() != sources.size()) {
+        return Error(WriteRndvErrorCode::kInvalidArgument);
+    }
+    return StartImpl(expected_transfer, destination, sources, pins);
+}
+std::expected<void, WriteRndvError> WriteRndvEngine::StartImpl(const GrantTransfer& expected_transfer,
+                                                               const WriteRndvDestination& destination,
+                                                               std::span<const WriteRndvSource> sources,
+                                                               std::span<const memory::BufferReference> pins) noexcept {
     if (!state_) {
         return Error(WriteRndvErrorCode::kNotReady);
     }
@@ -182,14 +198,24 @@ std::expected<void, WriteRndvError> WriteRndvEngine::Start(const GrantTransfer& 
         return Error(WriteRndvErrorCode::kInvalidArgument);
     }
     std::uint64_t total = 0;
-    // 在任何 Reserve 前校验全部 CPU 区间；同一 Lease 多个 slice 不会因前一 slice 已 pin 而误拒绝。
-    for (const auto& source : sources) {
+    // 在派生责任前校验全部源区间；同一 Lease 的多个 slice 可以共享原始排队 pin。
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+        const auto& source = sources[i];
         if (source.lease.allocator != &slab || !source.bytes || source.bytes > grant.transfer.bytes - total) {
             return Error(WriteRndvErrorCode::kInvalidArgument);
         }
-        const auto view = slab.Readable(source.lease);
-        if (!view || source.offset > view->size() || source.bytes > view->size() - source.offset) {
-            return Error(WriteRndvErrorCode::kInvalidArgument);
+        if (pins.empty()) {
+            const auto view = slab.Readable(source.lease);
+            if (!view || source.offset > view->size() || source.bytes > view->size() - source.offset) {
+                return Error(WriteRndvErrorCode::kInvalidArgument);
+            }
+        } else {
+            // 单个源 slice 可大于单 SGE 的 32 位长度；端点核对覆盖完整区间并避免加法溢出。
+            if (source.offset > std::numeric_limits<std::size_t>::max() - source.bytes ||
+                !slab.Sge(pins[i], sender.context(), source.offset, 1) ||
+                !slab.Sge(pins[i], sender.context(), source.offset + source.bytes - 1, 1)) {
+                return Error(WriteRndvErrorCode::kInvalidArgument);
+            }
         }
         total += source.bytes;
     }
@@ -227,6 +253,7 @@ std::expected<void, WriteRndvError> WriteRndvEngine::Start(const GrantTransfer& 
                 std::min<std::uint64_t>(source.bytes - source_offset, chunk_limit - chunk.remote.len));
             const auto i = chunk.source_count++;
             chunk.sources[i].lease = source.lease;
+            chunk.sources[i].pin = pins.empty() ? memory::BufferReference{} : pins[source_index];
             chunk.sources[i].offset = source.offset + source_offset;
             chunk.sges[i].len = static_cast<std::uint32_t>(bytes);
             chunk.remote.len += static_cast<std::uint32_t>(bytes);
@@ -251,7 +278,8 @@ std::expected<void, WriteRndvError> WriteRndvEngine::Start(const GrantTransfer& 
         auto& chunk = state_->chunks[index];
         for (std::size_t i = 0; i < chunk.source_count; ++i) {
             auto& source = chunk.sources[i];
-            const auto reference = slab.Reserve(source.lease, memory::BufferUse::kLocalDma);
+            const auto reference = pins.empty() ? slab.Reserve(source.lease, memory::BufferUse::kLocalDma)
+                                                : slab.RetainLocalDma(source.lease, source.pin);
             if (!reference) {
                 return rollback(reference.error().code == memory::MemoryErrorCode::kExhausted
                                     ? WriteRndvErrorCode::kWouldBlock

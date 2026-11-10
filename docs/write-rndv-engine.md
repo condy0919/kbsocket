@@ -2,7 +2,7 @@
 
 [`WriteRndvEngine`](../kbsocket/connection/write_rndv_engine.hpp) 接通现有 `TxSender`、`TxCompletionProcessor` 和注册 Slab，将一份已验证 Grant 对应的源区间拆成有界 WRITE。引擎记录每个分块的接受与终结，全部成功后才提供供 DONE 使用的证据。
 
-当前是单 owner、单事务原语。它不发送 RTS/GRANT/DONE，不执行导入、分配流序号或推进接收重排，也不代替应用 Runtime。[WriteRndvPool](write-rndv-pool.md) 已提供有界槽复用和两种导入引用的绑定；wire codec 和 Connection 接线仍待完成。
+当前是单 owner、单事务原语。它不发送 RTS/GRANT/DONE，不执行导入、分配流序号或推进接收重排，也不代替应用 Runtime。[WriteRndvPool](write-rndv-pool.md) 提供有界槽复用和两种导入引用的绑定；[发送协调器](rndv-tx-coordinator.md) 已接通源排队、控制通知、导入等待及真实完成后的 DONE。应用 Connection/Runtime 自动装配仍待完成。
 
 ## 准入、来源与分块
 
@@ -22,6 +22,10 @@
 全部分块必须能装入固定 `max_chunks`，其源责任也必须能装入 Slab 的引用表。默认预分配 256 个分块，硬上限 4096，宿主应按并发事务数和消息大小预算配置元数据。容量不足时不提交部分初始化的事务，不临时扩容，也不分配新的 payload 缓冲区。Start 失败只回滚本地源责任；如果远端已发布 Grant，仍须由协调层凭“未开始任何 WRITE”的可信事实完成授权取消，不能让源初始化失败悄悄回收目标。
 
 每个分块的每个本地 SGE 都在 Start 时取得独立 DMA 引用和真实 SGE。源 CPU 所有权继续归应用，成功 Start 后可以提前归还 CPU Lease；既有 CPU 视图须停止使用。后续 Progress 使用已经保留的引用重新核验 SGE，检查 Slab 的停止/隔离状态，不依赖应用仍持有 CPU Lease。一个分块结束只解除它自己的引用，同一 Lease 的其他分块仍阻止内存复用。
+
+排队期间已有源 pin 的调用者可使用 `StartPinned(expected_transfer, destination, sources, pins)`。它与 Start 共用完整身份、计划和回滚逻辑，但源 CPU 可以已归还：每个源 slice 的原始 pin 先通过 Slab SGE 接口验证 context 与完整范围，再由 `RetainLocalDma` 校验同一 Lease、Reserved 状态及本地 DMA 类型，派生独立分块责任。远端 Grant 引用、已提交、过期、错 Lease、停止或隔离状态均不能取得新的发送责任；地址加长度溢出在准入时拒绝。
+
+原始 pin 始终归调用者所有，可以在 StartPinned 成功后取消；引擎的分块引用继续保护 backing。失败时只回滚新派生的责任，不修改原 pin，容量恢复后可用相同 pin 重试。同一 Lease 的多个源 slice 可以引用同一原 pin，目标仍按源列表顺序拼接。未知接受隔离记录绑定真实源 Lease，不能只跟踪某个原 pin 的寿命。
 
 ## 提交、背压与故障
 

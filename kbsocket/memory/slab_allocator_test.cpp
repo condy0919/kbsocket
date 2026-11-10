@@ -147,6 +147,118 @@ protected:
     std::size_t fail_unregister_call_ = 0;
 };
 
+TEST_F(SlabAllocatorTest, RetainedLocalDmaSurvivesCpuAndOriginalPinReleaseWithoutAllocation) {
+    ASSERT_TRUE(slab_.Open(Contexts(), Config(1, 2), budget_));
+    const auto lease = slab_.Acquire(37);
+    ASSERT_TRUE(lease);
+    const auto pin = slab_.Reserve(*lease, BufferUse::kLocalDma);
+    ASSERT_TRUE(pin);
+    ASSERT_TRUE(slab_.ReleaseCpu(*lease));
+    // 排队 pin 在 CPU 归还后仍可派生独立责任，取消原 pin 不能提前回收 backing。
+    allocation_count = 0;
+    count_allocations = true;
+    const auto retained = slab_.RetainLocalDma(*lease, *pin);
+    count_allocations = false;
+    ASSERT_TRUE(retained);
+    EXPECT_EQ(allocation_count, 0u);
+    EXPECT_NE(*retained, *pin);
+    EXPECT_EQ(slab_.stats().local_dma, 2u);
+    EXPECT_FALSE(slab_.Readable(*lease));
+    EXPECT_FALSE(slab_.Writable(*lease));
+    ASSERT_TRUE(slab_.Cancel(*pin));
+    EXPECT_EQ(slab_.stats().available, 0u);
+    ASSERT_TRUE(slab_.Sge(*retained, contexts_[3], 7, 30));
+    ASSERT_TRUE(slab_.Commit(*retained));
+    EXPECT_FALSE(slab_.Cancel(*retained));
+    ASSERT_TRUE(slab_.CompleteDma(*retained));
+    EXPECT_EQ(slab_.stats().available, 1u);
+    EXPECT_EQ(slab_.stats().available_references, 2u);
+}
+
+TEST_F(SlabAllocatorTest, RetainLocalDmaRejectsWrongLeaseRemoteCommittedAndStaleReferences) {
+    ASSERT_TRUE(slab_.Open(Contexts(), Config(2), budget_));
+    const auto lease = slab_.Acquire(37);
+    const auto other = slab_.Acquire(37);
+    ASSERT_TRUE(lease);
+    ASSERT_TRUE(other);
+    const auto pin = slab_.Reserve(*lease, BufferUse::kLocalDma);
+    const auto grant = slab_.Reserve(*lease, BufferUse::kRemoteGrant);
+    ASSERT_TRUE(pin);
+    ASSERT_TRUE(grant);
+    // 同大小、同 allocator 仍不能把另一 Lease 的 pin 用于当前源。
+    EXPECT_FALSE(slab_.RetainLocalDma(*other, *pin));
+    EXPECT_FALSE(slab_.RetainLocalDma(*lease, *grant));
+    auto wrong_generation = *lease;
+    ++wrong_generation.generation;
+    EXPECT_FALSE(slab_.RetainLocalDma(wrong_generation, *pin));
+    auto foreign_pin = *pin;
+    foreign_pin.allocator = nullptr;
+    EXPECT_FALSE(slab_.RetainLocalDma(*lease, foreign_pin));
+    EXPECT_EQ(slab_.stats().local_dma, 1u);
+    EXPECT_EQ(slab_.stats().remote_grants, 1u);
+    ASSERT_TRUE(slab_.Commit(*pin));
+    EXPECT_FALSE(slab_.RetainLocalDma(*lease, *pin));
+    ASSERT_TRUE(slab_.CompleteDma(*pin));
+    const auto replacement = slab_.Reserve(*lease, BufferUse::kLocalDma);
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(replacement->slot, pin->slot);
+    EXPECT_FALSE(slab_.RetainLocalDma(*lease, *pin));
+    EXPECT_TRUE(slab_.Sge(*replacement, contexts_[0], 0, 37));
+    ASSERT_TRUE(slab_.Cancel(*replacement));
+    ASSERT_TRUE(slab_.Cancel(*grant));
+    ASSERT_TRUE(slab_.ReleaseCpu(*lease));
+    ASSERT_TRUE(slab_.ReleaseCpu(*other));
+}
+
+TEST_F(SlabAllocatorTest, RetainLocalDmaCapacityFailureLeavesOriginalPinUsable) {
+    ASSERT_TRUE(slab_.Open(Contexts(), Config(1, 2), budget_));
+    const auto lease = slab_.Acquire(37);
+    ASSERT_TRUE(lease);
+    const auto pin = slab_.Reserve(*lease, BufferUse::kLocalDma);
+    ASSERT_TRUE(pin);
+    ASSERT_TRUE(slab_.ReleaseCpu(*lease));
+    const auto first = slab_.RetainLocalDma(*lease, *pin);
+    ASSERT_TRUE(first);
+    const auto exhausted = slab_.RetainLocalDma(*lease, *pin);
+    ASSERT_FALSE(exhausted);
+    EXPECT_EQ(exhausted.error().code, MemoryErrorCode::kExhausted);
+    EXPECT_EQ(slab_.stats().local_dma, 2u);
+    ASSERT_TRUE(slab_.Cancel(*first));
+    // 使用回收的固定槽重试，不复制旧 token，也不消耗原责任。
+    const auto retried = slab_.RetainLocalDma(*lease, *pin);
+    ASSERT_TRUE(retried);
+    EXPECT_NE(retried->sequence, first->sequence);
+    ASSERT_TRUE(slab_.Cancel(*retried));
+    ASSERT_TRUE(slab_.Cancel(*pin));
+    EXPECT_EQ(slab_.stats().available, 1u);
+}
+
+TEST_F(SlabAllocatorTest, RetainLocalDmaHonorsQuarantineAndStopWithoutDroppingPins) {
+    ASSERT_TRUE(slab_.Open(Contexts(), Config(2), budget_));
+    const auto lease = slab_.Acquire(37);
+    const auto other = slab_.Acquire(37);
+    ASSERT_TRUE(lease);
+    ASSERT_TRUE(other);
+    const auto pin = slab_.Reserve(*lease, BufferUse::kLocalDma);
+    const auto other_pin = slab_.Reserve(*other, BufferUse::kLocalDma);
+    ASSERT_TRUE(pin);
+    ASSERT_TRUE(other_pin);
+    ASSERT_TRUE(slab_.Quarantine(*lease));
+    const auto quarantined = slab_.RetainLocalDma(*lease, *pin);
+    ASSERT_FALSE(quarantined);
+    EXPECT_EQ(quarantined.error().code, MemoryErrorCode::kInUse);
+    slab_.StopAccepting();
+    const auto stopped = slab_.RetainLocalDma(*other, *other_pin);
+    ASSERT_FALSE(stopped);
+    EXPECT_EQ(stopped.error().code, MemoryErrorCode::kStopped);
+    EXPECT_EQ(slab_.stats().local_dma, 2u);
+    // 已知未提交的原 pin 即使停止或隔离仍可准确取消。
+    ASSERT_TRUE(slab_.Cancel(*pin));
+    ASSERT_TRUE(slab_.Cancel(*other_pin));
+    ASSERT_TRUE(slab_.ReleaseCpu(*lease));
+    ASSERT_TRUE(slab_.ReleaseCpu(*other));
+}
+
 TEST_F(SlabAllocatorTest, FourContextsShareBackingButHaveDistinctRegistrationHandles) {
     ASSERT_TRUE(slab_.Open(Contexts(), Config(3), budget_));
     ASSERT_EQ(register_calls_, 4u);

@@ -10,6 +10,10 @@ Open 在控制路径预分配活动引擎槽、逻辑 SN 窗口和远端 Grant �
 
 `Start(handle, sources)` 才构造分块计划并预留源引用。应用必须持有源 CPU Lease 至 Start 成功；之后可以归还 CPU Lease，由引擎保留每个分块的 DMA 责任。若 Start 因源范围或引用容量失败，事务句柄和导入引用仍在，可以重试或显式取消；回滚未完成时保留责任，不能释放槽位冒充未准入。
 
+`StartPinned(handle, sources, pins)` 为已经排队保活的源提供同一分块路径。每个 pin 必须是对应同一 Lease 的 Reserved 本地 DMA 引用，CPU 所有权可以已经归还。引擎校验完整区间与 context，再派生独立分块引用；成功或失败均不取消调用者的原 pin。错误类型、错 Lease、过期、已提交或隔离 pin 不得提交；引用容量不足完整回滚已派生项，保留原 pin 和事务句柄以供重试。
+
+`config()` 返回已打开配置的只读快照。`chunk_bytes_limit()` 返回配置、provider 和 200 MiB 契约的实际最小值；`source_reference_budget()` 返回单事务 `max_chunks × min(16, max_send_sge)` 的保守源引用上限。[发送协调器](rndv-tx-coordinator.md) 用它们在发布 RTS 前检查分块可表达性，并为源排队保留分块及通知进度余量。
+
 Reserve/Start/Progress、完成处理、取消、Release 和窗口推进均不分配或释放内部存储。公共 `WriteRndvEngine` 仍是一次成功 Start 的原语；只有池能够在责任结束后调用其私有复用入口，保留预分配分块数组。
 
 ## 提交、失效和独立责任
@@ -40,8 +44,10 @@ DoneEvidence 只在全分块成功且未取消/失败时返回；TerminalEvidenc
 
 Stop 仅禁止新的 Reserve；已准入事务可以继续 Start/Progress 或取消。Close 是控制路径操作，会停止准入并取消全部事务；未终结或接受未知的事务使 Close 失败，析构保留池内部状态，宿主仍须保留全部外部依赖。需要成功通知时应先取得证据并正常 Release，而非用 Close 替代成功收尾。
 
+发送协调器只能独占绑定已打开、未停止且没有活动事务的池，并核对同一 Slab 与两种缓存。绑定期间 Close 直接返回 InUse，不先 Stop 或取消已有事务；协调器结清全部活动责任后才解除借用。宿主不得在绑定期间绕过协调器为该池增加独立事务。
+
 ## 验证与范围
 
 Mock 测试使用真实 Slab、发送/完成账本、两种导入缓存和 ControlExecutor，验证槽位复用、身份拒绝、旧完成、缓存失效、部分接受、取消及零分配路径。验证结果记录在 [roadmap](roadmap.md)。
 
-本阶段尚未开放 RTS/GRANT/DONE wire codec、统一 Eager/RNDV SN 准入、RawDomain/RawStack 自动装配及应用 RNDV 入口。UB 真机、端到端 WRITE 通知和规模性能回归均未执行。
+[线格式与共同序号](rndv-protocol.md)、[实际通知发送](rndv-notification-tx.md)、[双向协商](rndv-negotiation.md)、[接收分发](rndv-rx-ingress.md) 和 [发送事务协调](rndv-tx-coordinator.md) 已分别提供可独立装配组件。Connection/Runtime 自动装配、多 Arena 调度和应用 RNDV 入口仍待后续，现有应用 capability 门禁保持。UB 真机、完整应用 WRITE 通知和规模性能回归均未执行。

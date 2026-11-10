@@ -23,6 +23,7 @@ namespace kbsocket {
 namespace connection {
 class RndvNotificationTx;
 class RndvRxIngress;
+class RndvTxCoordinator;
 struct RndvNotificationHandle {
     const RndvNotificationTx* owner = nullptr;
     std::uint32_t slot = 0;
@@ -127,11 +128,19 @@ public:
     std::expected<RndvNotificationStatus, RndvNotificationError> status(RndvNotificationHandle handle) const noexcept;
     RndvNotificationStats stats() const noexcept;
     /// 停止新 RTS/GRANT，已有 WRITE 仍可 QueueDone 和推进；失败由 Cancel/Close 显式处理。
+    const RndvNotificationConfig* config() const noexcept;
     void Stop() noexcept;
     std::expected<void, RndvNotificationError> Close() noexcept;
 
 private:
     friend class RndvRxIngress;
+    friend class RndvTxCoordinator;
+    std::expected<void, RndvNotificationError> BindCoordinator(const RndvTxCoordinator& owner,
+                                                               memory::SlabAllocator& slab,
+                                                               control::EndpointImportCache& endpoints,
+                                                               TxSequenceWindow& sequence,
+                                                               raw::TxSender* sender) noexcept;
+    std::expected<void, RndvNotificationError> UnbindCoordinator(const RndvTxCoordinator& owner) noexcept;
     std::expected<void, RndvNotificationError> BindIngress(const RndvRxIngress& ingress, urma_context_t* context,
                                                            std::uint64_t peer) noexcept;
     std::expected<void, RndvNotificationError> UnbindIngress(const RndvRxIngress& ingress) noexcept;

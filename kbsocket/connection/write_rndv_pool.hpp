@@ -15,6 +15,7 @@
 
 namespace kbsocket {
 namespace connection {
+class RndvTxCoordinator;
 class WriteRndvPool;
 struct WriteRndvHandle {
     const WriteRndvPool* owner = nullptr;
@@ -71,7 +72,7 @@ struct WriteRndvPoolStats {
 
 /// 单 owner、固定连接/Arena/Lane 的有界事务池；Open 分配全部引擎与 SN 窗口。
 /// Reserve 保留独立的两个缓存引用；调用者原票据仍归调用者，不转移所有权。
-/// 源 CPU Lease 至 Start 成功才允许归还。各数据路径不分配，不直接调用慢 provider。
+/// Start 要求源 CPU Lease 保留；StartPinned 可从独立排队 pin 派生责任。各数据路径不分配。
 /// connection_id 的命名空间由宿主分配，旧完成可能存在时不得跨池对象复用。
 /// 宿主认证 Grant 并独占其写入权；本池防重放不代替跨池授权与连接统一 SN 准入。
 /// 缓存/发送器/Slab/context/provider 活到 Close 成功，宿主遵守整个 context 的暂停屏障。
@@ -96,6 +97,9 @@ public:
                                                                control::TsegImportLease segment) noexcept;
     std::expected<void, WriteRndvPoolError> Start(WriteRndvHandle handle,
                                                   std::span<const WriteRndvSource> sources) noexcept;
+    std::expected<void, WriteRndvPoolError> StartPinned(WriteRndvHandle handle,
+                                                        std::span<const WriteRndvSource> sources,
+                                                        std::span<const memory::BufferReference> pins) noexcept;
     /// 每次至多一次有界 post；每次新提交前重新检查缓存失效，绝不重放已接受前缀。
     std::expected<std::size_t, WriteRndvPoolError> Progress(WriteRndvHandle handle) noexcept;
     std::expected<void, WriteRndvPoolError> OnCompletion(const raw::TxCompletionEvent& event) noexcept;
@@ -113,10 +117,22 @@ public:
     std::expected<void, WriteRndvPoolError> Close() noexcept;
     std::expected<WriteRndvStats, WriteRndvPoolError> stats(WriteRndvHandle handle) const noexcept;
     WriteRndvPoolStats stats() const noexcept;
+    const WriteRndvPoolConfig* config() const noexcept;
+    /// 单事务最坏分块 DMA 引用数；排队准入须额外保留控制帧等推进余量。
+    std::size_t source_reference_budget() const noexcept;
+    std::uint64_t chunk_bytes_limit() const noexcept;
 
 private:
+    friend class RndvTxCoordinator;
+    raw::TxSender* sender() const noexcept;
     struct Slot;
     struct State;
+    std::expected<void, WriteRndvPoolError> BindCoordinator(const RndvTxCoordinator& owner, memory::SlabAllocator& slab,
+                                                            control::EndpointImportCache& endpoints,
+                                                            control::TsegImportCache& segments) noexcept;
+    std::expected<void, WriteRndvPoolError> UnbindCoordinator(const RndvTxCoordinator& owner) noexcept;
+    std::expected<void, WriteRndvPoolError> StartImpl(WriteRndvHandle handle, std::span<const WriteRndvSource> sources,
+                                                      std::span<const memory::BufferReference> pins) noexcept;
     std::expected<Slot*, WriteRndvPoolError> Find(WriteRndvHandle handle) const noexcept;
     std::expected<WriteRndvDestination, WriteRndvPoolError>
     Destination(const GrantIdentity& grant, control::ImportLease endpoint,

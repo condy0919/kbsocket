@@ -368,6 +368,28 @@ std::expected<BufferReference, MemoryError> SlabAllocator::Reserve(BufferLease l
     if (!entry.cpu || state_->quarantine.Contains(lease)) {
         return Error(MemoryErrorCode::kInUse);
     }
+    return AllocateReference(lease, use);
+}
+std::expected<BufferReference, MemoryError> SlabAllocator::RetainLocalDma(BufferLease lease,
+                                                                          BufferReference source) noexcept {
+    const auto index = Find(source);
+    if (!index) {
+        return std::unexpected(index.error());
+    }
+    const auto& reference = state_->references[*index];
+    if (reference.lease != lease || reference.use != BufferUse::kLocalDma || reference.committed) {
+        return Error(MemoryErrorCode::kInvalidReference);
+    }
+    if (state_->stopping) {
+        return Error(MemoryErrorCode::kStopped);
+    }
+    if (state_->quarantine.Contains(lease)) {
+        return Error(MemoryErrorCode::kInUse);
+    }
+    return AllocateReference(lease, BufferUse::kLocalDma);
+}
+std::expected<BufferReference, MemoryError> SlabAllocator::AllocateReference(BufferLease lease,
+                                                                             BufferUse use) noexcept {
     if (next_reference_ == std::numeric_limits<std::uint64_t>::max()) {
         return Error(MemoryErrorCode::kSequenceExhausted);
     }
@@ -378,6 +400,7 @@ std::expected<BufferReference, MemoryError> SlabAllocator::Reserve(BufferLease l
     auto& reference = state_->references[ref_index];
     state_->free_reference = reference.next;
     reference = {.lease = lease, .sequence = ++next_reference_, .use = use, .active = true};
+    auto& entry = state_->entries[lease.slot];
     if (use == BufferUse::kLocalDma) {
         ++entry.local;
         ++state_->stats.local_dma;

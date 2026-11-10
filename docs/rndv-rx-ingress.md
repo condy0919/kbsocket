@@ -2,7 +2,7 @@
 
 [`RndvRxIngress`](../kbsocket/connection/rndv_rx_ingress.hpp) 连接真实 `EagerReceiveDomain`、[接收协调器](rndv-receiver.md) 和 [GRANT 通知队列](rndv-notification-tx.md)。RTS、GRANT、DONE 分别使用预分配的暂存槽，接收器和通知发送器均绑定到唯一 ingress。`EagerRxStream` 可显式绑定同一接收器，按共同序号读取 Eager、WRITE 结果和 FIN。
 
-这是可独立装配的接收路径。应用 `Connection::Open` 仍拒绝提前声明 RNDV capability；发送事务调度、协商预算到实际资源的映射、Connection/Runtime 自动装配与完整应用关闭尚未完成。
+这是可独立装配的接收路径。应用 `Connection::Open` 仍拒绝提前声明 RNDV capability；[发送事务协调器](rndv-tx-coordinator.md) 已提供 GRANT 回调及后续 WRITE/DONE 推进，协商预算到实际资源的映射、Connection/Runtime 自动装配与完整应用关闭尚未完成。
 
 ## 接收责任与重试
 

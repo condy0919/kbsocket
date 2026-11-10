@@ -11,6 +11,14 @@
 | [连接协议原语](connection-primitives.md) | IMM 短/扩展帧、身份代次、发送序号、乱序交付与应用驻留、数据/控制 Credit 守恒 |
 | [copy-stream C 接口](stream-api.md) | owner 上的 Eager/NativeTCP 有界读写、稳定错误、暂停门禁与关闭/释放生命周期 |
 | [连接建链与导入缓存](connection-handshake.md) | 非阻塞 HELLO/READY、完整身份路由、Single-Flight 导入、首包与 fd 交接门禁 |
+| [WRITE 分块引擎](write-rndv-engine.md) | 有界多 SGE 分块、独立源 DMA 引用、可信逐 WR 完成与 DONE 证据 |
+| [WRITE 事务池](write-rndv-pool.md) | 可复用事务槽、导入缓存 pin、排队源 StartPinned 与 SN/Grant 防重放 |
+| [RNDV 线格式](rndv-protocol.md) | RTS/GRANT/DONE 身份、实际来源校验、共同 Eager/RNDV 序号与通知证据 |
+| [RNDV 通知发送](rndv-notification-tx.md) | 实际 SEND_WITH_IMM、未来 DONE 控制额度与独立通知责任 |
+| [RNDV 接收协调](rndv-receiver.md) | 可信 DONE、目标 Grant 终结、共同重排与只读借用归还 |
+| [RNDV 能力协商](rndv-negotiation.md) | HELLO/READY 限额、Arena 目录、认证门禁与段导入请求适配 |
+| [RNDV 接收分发](rndv-rx-ingress.md) | RTS/GRANT/DONE 分发、RX 背压、GRANT job 与 Eager/RNDV 混合读取 |
+| [RNDV 发送事务协调](rndv-tx-coordinator.md) | 源排队 pin、RTS/GRANT、按需导入、WRITE 到真实 DONE 完成及宿主进度边界 |
 | [硬件观测记录](hardware-observations.md) | 用户实测的 SEND/RMA、水线重配、错误事件与隔离、资源回收及验证边界 |
 | [硬件验证矩阵](hardware-validation-matrix.md) | 残留 RX、provider 边界、进程/链路故障、持续多设备收发、JFC 通知与 READ/WRITE 的完整运行顺序 |
 | [URMA 加载与运行时](urma-runtime.md) | 动态加载、gMock 替换、context 校验、会话与进程退出 |
