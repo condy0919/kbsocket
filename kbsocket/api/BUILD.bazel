@@ -228,6 +228,30 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "raw_stream_runtime_test_support",
+    testonly = True,
+    hdrs = ["testing/raw_stream_runtime_fixture.hpp"],
+    deps = [
+        ":lease_receive",
+        ":lease_send",
+        ":raw_stream_runtime",
+        ":stream",
+        "//kbsocket/connection:credit_account",
+        "//kbsocket/connection:wire_frame",
+        "//kbsocket/control:rndv_capabilities",
+        "//kbsocket/memory:slab_allocator",
+        "//kbsocket/runtime:connection_mailbox",
+        "//kbsocket/runtime:connection_progress",
+        "//kbsocket/runtime:peer_credit_progress",
+        "//kbsocket/runtime:raw_stack",
+        "//kbsocket/transport/raw:receive_domain_closer",
+        "//kbsocket/transport/raw:urma_api",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest",
+    ],
+)
+
 cc_test(
     name = "raw_stream_runtime_test",
     srcs = ["raw_stream_runtime_test.cpp"],
@@ -235,8 +259,41 @@ cc_test(
         ":lease_receive",
         ":lease_send",
         ":raw_stream_runtime",
+        ":raw_stream_runtime_test_support",
         "//kbsocket/connection:wire_frame",
         "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "raw_stream_runtime_failure_test",
+    srcs = ["raw_stream_runtime_failure_test.cpp"],
+    deps = [
+        ":buffer_lease",
+        ":lease_receive",
+        ":lease_send",
+        ":raw_stream_runtime",
+        ":raw_stream_runtime_test_support",
+        ":stream",
+        "//kbsocket/connection:wire_frame",
+        "//kbsocket/transport/raw:jetty_pool",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "raw_stream_runtime_large_test",
+    srcs = ["raw_stream_runtime_large_test.cpp"],
+    deps = [
+        ":buffer_lease",
+        ":lease_receive",
+        ":lease_send",
+        ":raw_stream_runtime",
+        ":raw_stream_runtime_test_support",
+        ":stream",
+        "//kbsocket/memory:slab_allocator",
+        "//kbsocket/runtime:raw_stack",
         "@googletest//:gtest_main",
     ],
 )

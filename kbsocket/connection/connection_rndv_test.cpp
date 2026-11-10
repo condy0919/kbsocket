@@ -563,6 +563,70 @@ protected:
 };
 
 // 双端都走公开 Connection 接口，通知、授权、真实 WRITE 与应用消费必须组成完整闭环。
+TEST_F(ConnectionRndvTest, InvalidOrDuplicateRndvCompletionCannotPublishForgedAckTimeoutFailure) {
+    ASSERT_NO_FATAL_FAILURE(Activate());
+    ASSERT_NO_FATAL_FAILURE(Pump());
+    auto& sender = endpoints_[0];
+    sender.hold_tx = true;
+    const std::vector<std::byte> payload(16384, std::byte{0x5a});
+    ASSERT_EQ(sender.connection.Write(payload), payload.size());
+    for (unsigned turn = 0; turn < 100 && sender.writes != 4; ++turn) {
+        ASSERT_NO_FATAL_FAILURE(Step());
+    }
+    ASSERT_EQ(sender.writes, 4u);
+
+    // 先由真实 provider CQE 和账本产生完成事件；只破坏事件副本，合法原件仍须独立退休源责任。
+    raw::TxCompletionProcessor processor(sender.ledger, true);
+    std::array<raw::TxCompletionEvent, 64> events;
+    const auto batch = processor.Poll(events);
+    ASSERT_TRUE(batch);
+    unsigned writes = 0, notifications = 0;
+    for (std::size_t i = 0; i < batch->count; ++i) {
+        const auto& event = events[i];
+        ASSERT_TRUE(event.record);
+        const auto kind = event.record->metadata.connection_id >> 62;
+        if (kind == 1 || kind == 2) {
+            writes += kind == 1;
+            notifications += kind == 2;
+            const auto dma = sender.slab.stats().local_dma;
+            const auto retired = sender.connection.rndv_retired();
+            auto malformed = event;
+            ++malformed.record->metadata.operation_generation;
+            malformed.completion.status = URMA_CR_ACK_TIMEOUT_ERR;
+            const auto rejected = sender.connection.OnTxCompletion(malformed);
+            ASSERT_FALSE(rejected);
+            EXPECT_EQ(rejected.error().code, ConnectionErrorCode::kInvalidCompletion);
+            EXPECT_EQ(sender.connection.state(), ConnectionState::kRawActive);
+            EXPECT_FALSE(sender.connection.failure());
+            EXPECT_EQ(sender.connection.rndv_retired(), retired);
+            EXPECT_EQ(sender.slab.stats().local_dma, dma);
+        }
+        ASSERT_TRUE(sender.connection.OnTxCompletion(event));
+        if (kind == 1 || kind == 2) {
+            // 已终结事件即使带 fatal 状态也不再可信，不能覆盖首错或重复扣减 DMA 引用。
+            const auto dma = sender.slab.stats().local_dma;
+            const auto retired = sender.connection.rndv_retired();
+            auto duplicate = event;
+            duplicate.completion.status = URMA_CR_ACK_TIMEOUT_ERR;
+            const auto rejected = sender.connection.OnTxCompletion(duplicate);
+            ASSERT_FALSE(rejected);
+            EXPECT_EQ(rejected.error().code, ConnectionErrorCode::kInvalidCompletion);
+            EXPECT_EQ(sender.connection.state(), ConnectionState::kRawActive);
+            EXPECT_FALSE(sender.connection.failure());
+            EXPECT_EQ(sender.connection.rndv_retired(), retired);
+            EXPECT_EQ(sender.slab.stats().local_dma, dma);
+        }
+    }
+    EXPECT_EQ(writes, 4u);
+    EXPECT_GT(notifications, 0u);
+    sender.hold_tx = false;
+    ASSERT_NO_FATAL_FAILURE(Pump());
+    ASSERT_NO_FATAL_FAILURE(ExpectRead(1, payload));
+    EXPECT_FALSE(sender.connection.failure());
+    EXPECT_EQ(sender.slab.stats().local_dma, 0u);
+    EXPECT_EQ(endpoints_[1].target_slab.stats().remote_grants, 0u);
+}
+
 TEST_F(ConnectionRndvTest, BidirectionalLargeCopiesDetachCallerMemoryAndDeliverExactBytes) {
     Activate();
     std::array<std::vector<std::byte>, 2> input{std::vector<std::byte>(16391), std::vector<std::byte>(32768)};

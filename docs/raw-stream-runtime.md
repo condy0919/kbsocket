@@ -104,3 +104,32 @@ BeginClose 停止新分配/可写视图，允许合法只读/归还；Close 在�
 M5.4.7 的 `kbs_stream_write_lease` 从同一共享 Slab 直接引用应用源，入队即冻结 CPU 视图；扩展身份需要至少两个发送 SGE。使用 `kbs_buffer_inspect` 查询整份源的可复用状态，取消/连接失败与源责任终结分别处理。详见 [Eager Lease 发送](lease-send.md)。
 
 M5.4.8 的 `kbs_stream_read_lease` / `kbs_stream_release_read_lease` 通过同一 stream 表借用和归还有序 RX 视图，每流最多一个；无需打开应用 BufferBinding。应用持有时 Close 保留，Failed/Closing 仍允许归还。该视图遵守所属 context 暂停门禁，生命周期与授信规则见 [接收 Lease](lease-receive.md)。
+
+## M6.3.11：应用 RNDV 故障与有界大流回归
+
+[共享测试装配](../kbsocket/api/testing/raw_stream_runtime_fixture.hpp) 复用真实 RawStreamRuntime、协议 fd、Slab、导入缓存、授信及完成处理器；Mock provider 执行目标内存 WRITE 和 SEND/IMM 数据搬运。它可以分别延迟真实 WRITE CQE、DONE TX CQE 和 DONE RX，或接受通知后只返回错误 CQE、不交付远端 RX。测试用容器允许分配，不据此声称整个 Mock 流程零分配或测得 UB 性能。
+
+[故障回归](../kbsocket/api/raw_stream_runtime_failure_test.cpp) 区分以下责任：
+
+- WRITE status 8 使当前逻辑连接失败，同一 Lane 的兄弟连接继续收发；status 9 停用 Lane 并阻止后续投递。经 RNDV 完整身份校验的错误 CQE 状态保存在 C stream `failure.underlying`，`failure.detail` 仍为 RNDV 错误类别。无效或重复完成不覆盖连接首错。
+- 取消不替代源 DMA 完成。真正的 WRITE CQE 终结本地责任；没有成功 DONE 的远端 Grant 仍保留，源已可回收不等于双端均可关闭。
+- 取消接收端之后，合法迟到 DONE 只清理目标 Grant，不恢复应用交付。远端处理 DONE 与本地 DONE TX CQE 独立，后者尚未到达时仍保留通知源。
+- 已接受但未交付的通知、未知 WRITE 接受范围不能通过重发业务或伪造静默证明消除。无法终结的用例在子进程中创建全部 Runtime/线程/provider 依赖，保留至进程退出，不执行正常关闭测试所用的终结证明。
+
+[大流回归](../kbsocket/api/raw_stream_runtime_large_test.cpp) 使用 32 个 1 MiB 源 buffer 和 8 个 1 MiB 目标 buffer，总注册 backing 为 40 MiB，在两个 context 之间共享而不重复计费。64 KiB 与 1 MiB 走单事务 RNDV，16 MiB 是连续应用流：C copy/Lease 入口单次最多接受 1 MiB，调用者按返回值推进短写，每笔事务再拆成最多 64 个 16 KiB WRITE，每次 provider post 最多两个 WRITE。该覆盖不能替代单事务 16 MiB、多 SGE 或硬件吞吐验收。
+
+测试校验逐字节载荷、copy 返回后覆盖应用源、Lease 原地址分块、源 CPU 句柄提前归还以及最终责任归零。单独扣留 bulk 的 WRITE CQE 时，同 Lane 兄弟连接的小消息、CREDIT 和 FIN 必须在 bulk 仍不可读时完成；慢读/持有目标 Lease 时，后续 Grant 背压且目标不被覆盖，归还后继续推进。
+
+GTest XML 保存 `source_local_dma_peak`、`source_buffers_peak`、`source_cpu_leases_peak`、`target_grants_peak`、`target_buffers_peak`、`segment_leases_peak`、`registered_backing_bytes` 和 `runtime_steps`。这些是 Step 或应用调用边界的**采样峰值**，不覆盖步骤内部瞬时最高值；`local_dma` 包含 Reserved 源引用，并非硬件在途 WR 数；完成后源可用数/CPU 引用恢复基线，目标 Grant、目标 CPU Lease、源 DMA 和段 Lease 归零。backing 数不包括域 RX、元数据、mailbox 或 provider 内存，软件 Step 数也不是延迟/吞吐指标。
+
+2026-11-10 本地回归的一次采样如下，单位均为引用或 buffer 个数；三个场景的注册 backing 均为 41,943,040 B。源 buffer/CPU 列包含连接常驻控制与通知占用，目标 buffer 列包含已 DONE 但尚未由应用归还的目标，因此它可以大于远端 Grant 列。
+
+| 场景 | 源 DMA 引用 | 源 buffer | 源 CPU 引用 | 远端 Grant | 目标 buffer | 段 Lease |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 KiB / 1 MiB / 16 MiB copy 流 | 64 | 13 | 12 | 1 | 1 | 2 |
+| 扣留 bulk CQE、兄弟小流推进 | 65 | 26 | 25 | 1 | 1 | 2 |
+| 慢读与持有目标 Lease | 64 | 13 | 12 | 1 | 2 | 2 |
+
+该次兄弟小流的数据、CREDIT 和 FIN 在 3 个 owner Step 内完成；用例要求不超过 128 个 Step。慢读用例保持 64 个 Step 不归还目标，确认第三笔没有新增 WRITE，随后归还并完成全部载荷。这些是软件模型下的推进证据，不是 UB 时延上界。
+
+UB WN1–WN4、多 Arena、跨线程 Lease 与 40k 规模测试仍未执行；具体软件回归计数见 [roadmap](roadmap.md)。

@@ -647,7 +647,11 @@ std::expected<void, ConnectionError> Connection::OnTxCompletion(const raw::TxCom
             if (result.error() == RndvConnectionError::kInvalidCompletion) {
                 return std::unexpected(RndvError(result.error()));
             }
-            return std::unexpected(Fail(RndvError(result.error())));
+            // RNDV 已核验完成身份；保留真实 CQE 状态，让应用能区分远端错误和 Lane 超时。
+            // 无效/重复完成在上面拒绝，不能把其未经认证的状态写入连接首错。
+            auto error = RndvError(result.error());
+            error.underlying_error = static_cast<int>(event.completion.status);
+            return std::unexpected(Fail(error));
         }
         return {};
     }
