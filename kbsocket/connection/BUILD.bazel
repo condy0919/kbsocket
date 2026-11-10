@@ -2,6 +2,29 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "rndv_receiver",
+    srcs = ["rndv_receiver.cpp"],
+    hdrs = ["rndv_receiver.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":grant_manager",
+        ":reorder_window",
+        ":rndv_protocol",
+        ":wire_frame",
+    ],
+)
+
+cc_test(
+    name = "rndv_receiver_test",
+    srcs = ["rndv_receiver_test.cpp"],
+    deps = [
+        ":rndv_receiver",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "rndv_notification_tx",
     srcs = ["rndv_notification_tx.cpp"],
     hdrs = ["rndv_notification_tx.hpp"],
@@ -26,6 +49,7 @@ cc_test(
     srcs = ["rndv_notification_tx_test.cpp"],
     deps = [
         ":rndv_notification_tx",
+        ":rndv_receiver",
         ":write_rndv_pool",
         "//kbsocket/runtime:control_executor",
         "//kbsocket/transport/raw:urma_test_support",
@@ -272,6 +296,7 @@ cc_library(
     hdrs = ["reorder_window.hpp"],
     visibility = ["//visibility:public"],
     deps = [
+        ":grant_manager",
         "//kbsocket/memory:buffer_lease",
         "//kbsocket/transport/raw:rx_buffer_pool",
     ],
@@ -308,6 +333,7 @@ cc_test(
     srcs = ["reorder_window_test.cpp"],
     deps = [
         ":reorder_window",
+        "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",
     ],
 )

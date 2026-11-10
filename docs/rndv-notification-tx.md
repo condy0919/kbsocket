@@ -39,4 +39,6 @@ Close 直接释放已知成功终结的本地通知，对其他条目尝试取�
 
 ## 后续边界
 
-本阶段的 Mock 回归验证实际 raw 提交、逐 WR 完成与 Slab/import/credit 账务，不代表 UB 真机通过。接下来需建立可信 DONE 到接收端 Grant 终结及只读借用的适配，再将 Grant 的真实归还接入共同重排流。当前 DONE 线上没有 WRITE 数量，不能伪造 accepted/terminal 计数调用 `CompleteDone`；`Borrow` 返回的 span 也不能冒充独立拥有内存的 BufferLease。
+本阶段的 Mock 回归验证实际 raw 提交、逐 WR 完成与 Slab/import/credit 账务，不代表 UB 真机通过。M6.3.5 的 [接收协调器](rndv-receiver.md) 已提供可信 DONE 到 Grant 终结、只读借用及共同重排归还的适配。当前 DONE 线上没有 WRITE 数量，接收端采用私有无计数入口；GrantHandle 作为独立的借用类型进入重排，span 不冒充 BufferLease。能力协商、Arena 目录和 Connection/Runtime 自动装配仍待后续。
+
+远端 DONE/应用归还可以早于本地 GRANT CQE；通知取消只隔离仍未完成的发布责任，不抢回 Ready/Borrowed 目标。已退休的旧 Grant 即使被复用，也不会因迟到本地错误而影响新授权。GrantManager 必须存活且保持打开，直到相应通知记录结束。

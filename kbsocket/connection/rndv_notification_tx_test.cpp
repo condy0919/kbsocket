@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include "kbsocket/connection/rndv_receiver.hpp"
 #include "kbsocket/runtime/control_executor.hpp"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
 
@@ -1304,6 +1305,111 @@ TEST_F(NotificationTxTest, RemoteGrantCompletionBeforeNotificationCloseDoesNotCa
     ASSERT_TRUE(notifications_.Close());
     EXPECT_EQ(return_grants_.stats().active, 0u);
     EXPECT_EQ(source_.stats().remote_grants, 0u);
+}
+
+TEST_F(NotificationTxTest, LateGrantSendErrorDoesNotReclaimBorrowedRemoteResult) {
+    Open();
+    const auto grant = ReturnGrant();
+    const auto handle = notifications_.QueueGrant(return_grants_, grant);
+    ASSERT_TRUE(handle);
+    ASSERT_EQ(notifications_.Progress(), 1u);
+    // 模拟远端已取得授权、完成唯一 WRITE 并通知；本地 GRANT 的发送 CQE 尚未消费。
+    std::memset(reinterpret_cast<void*>(grant.target.addr), 0x6a, grant.target.len);
+    ASSERT_TRUE(return_grants_.CompleteDone({.identity = grant.identity,
+                                             .no_future_writes = true,
+                                             .acceptance_known = true,
+                                             .accepted_writes = 1,
+                                             .terminal_writes = 1,
+                                             .successful_writes = 1,
+                                             .completed_bytes = grant.identity.transfer.bytes}));
+    const auto view = return_grants_.Borrow(grant.handle);
+    ASSERT_TRUE(view);
+    CompleteNotification(0, URMA_CR_REM_ACCESS_ABORT_ERR);
+    EXPECT_EQ(return_grants_.stats().borrowed, 1u);
+    EXPECT_EQ(return_grants_.stats().quarantined, 0u);
+    EXPECT_EQ((*view)[0], std::byte{0x6a});
+    // 发送者结束的是通知源责任，目标仍由应用实际 Return；Close 不能抢回它。
+    ASSERT_TRUE(notifications_.Close());
+    EXPECT_EQ(return_grants_.stats().borrowed, 1u);
+    ASSERT_TRUE(return_grants_.Return(grant.handle));
+}
+
+TEST_F(NotificationTxTest, LateGrantCancellationAfterWindowAdvanceCannotTouchNewTarget) {
+    Open();
+    const auto old = ReturnGrant();
+    const auto handle = notifications_.QueueGrant(return_grants_, old);
+    ASSERT_TRUE(handle);
+    ASSERT_EQ(notifications_.Progress(), 1u);
+    // 独立终结证明先归还旧授权，再推进并复用同一物理 Grant 槽，保留旧通知在途。
+    ProveNoRemoteWrites(old);
+    ASSERT_TRUE(return_grants_.AdvanceWindow(32));
+    const auto replacement = ReturnGrant(32);
+    ASSERT_EQ(old.handle.slot, replacement.handle.slot);
+    ASSERT_NE(old.handle.generation, replacement.handle.generation);
+    ASSERT_TRUE(return_grants_.CommitPublication(replacement.handle));
+    ASSERT_TRUE(notifications_.Cancel(*handle));
+    EXPECT_EQ(return_grants_.stats().published, 1u);
+    EXPECT_EQ(return_grants_.stats().quarantined, 0u);
+    CompleteNotification(0, URMA_CR_REM_ACCESS_ABORT_ERR);
+    ASSERT_TRUE(notifications_.Release(*handle));
+    ASSERT_TRUE(notifications_.Close());
+    EXPECT_EQ(return_grants_.stats().published, 1u);
+    ProveNoRemoteWrites(replacement);
+}
+
+TEST_F(NotificationTxTest, ActualWriteAndEncodedDoneDeliverThroughReceiverAndCommonWindow) {
+    Open();
+    OpenWrites();
+    ReorderWindow reorder;
+    ASSERT_TRUE(reorder.Open({11, 33, 44, 55, 66}, {.window = 32, .max_resident_bytes = 16384}));
+    RndvReceiver receiver;
+    const WireReceiveContext observed{kWireVersion, 11, 33, 44};
+    ASSERT_TRUE(receiver.Open(
+        {.binding = Binding(), .route = {observed, {55, 66}, 1}, .capacity = 4, .peer_successful_write_done = true},
+        grants_, reorder));
+    const auto pair = notifications_.QueueRts(Transfer(), sequence_);
+    ASSERT_TRUE(pair);
+    ASSERT_EQ(notifications_.Progress(), 1u);
+    auto rts = DecodeWireFrame(packets_[0].imm, std::span(packets_[0].payload).first(packets_[0].bytes));
+    ASSERT_TRUE(rts);
+    const auto request = receiver.OnRts(*rts, observed, 1);
+    ASSERT_TRUE(request);
+    CompleteNotification(0);
+    ASSERT_TRUE(notifications_.Release(pair->rts));
+    const auto grant = receiver.PrepareGrant(*request);
+    ASSERT_TRUE(grant);
+    // 本夹具直接交接反向 GRANT，发布责任仍先提交；正向 RTS/WRITE/DONE 均走实际发送组件。
+    ASSERT_TRUE(grants_.CommitPublication(grant->handle));
+    const auto source = Source(77, 7);
+    const auto write = Begin(*grant, source);
+    ASSERT_EQ(transactions_.Progress(write), 3u);
+    Complete(1);
+    Complete(2);
+    Complete(3);
+    ASSERT_TRUE(notifications_.QueueDone(pair->done, transactions_, write));
+    ASSERT_TRUE(transactions_.Release(write));
+    ASSERT_EQ(notifications_.Progress(), 1u);
+    auto done = DecodeWireFrame(packets_[4].imm, std::span(packets_[4].payload).first(packets_[4].bytes));
+    ASSERT_TRUE(done);
+    // 接收器只消费真实发送引擎成功后编码的 DONE；没有构造接收侧 WRITE 数量证明。
+    ASSERT_TRUE(receiver.OnDone(*done, observed, 2));
+    EXPECT_EQ(target_.stats().remote_grants, 0u);
+    std::array<ReorderDelivery, 1> output;
+    ASSERT_EQ(reorder.Poll(output, 3), 1u);
+    EXPECT_EQ(std::get<GrantHandle>(output[0].frame.lease), grant->handle);
+    ASSERT_EQ(output[0].frame.payload.size(), 77u);
+    for (std::size_t i = 0; i < output[0].frame.payload.size(); ++i) {
+        EXPECT_EQ(output[0].frame.payload[i], static_cast<std::byte>((i * 17 + 7) & 255));
+    }
+    ASSERT_TRUE(receiver.ReturnGrant(output[0]));
+    ASSERT_TRUE(receiver.Progress(4));
+    ASSERT_TRUE(receiver.Close());
+    ASSERT_TRUE(reorder.Close());
+    // 目标已真实归还后，本地 DONE 源仍独立等待 SEND CQE，随后再关闭通知队列。
+    EXPECT_EQ(source_.stats().local_dma, 1u);
+    CompleteNotification(4);
+    ASSERT_TRUE(notifications_.Close());
+    EXPECT_FALSE(sequence_.stopped());
 }
 
 TEST_F(NotificationTxTest, SuccessfulRtsAndDoneClosePreservesSharedSequence) {

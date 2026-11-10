@@ -65,6 +65,8 @@ struct GrantIdentity {
     bool operator==(const GrantIdentity&) const = default;
 };
 class GrantManager;
+class RndvReceiver;
+class RndvNotificationTx;
 struct GrantHandle {
     const GrantManager* owner = nullptr;
     std::uint32_t slot = 0;
@@ -138,6 +140,9 @@ public:
     /// 终结证明只允许丢弃；即使全部成功也不交付。零接受合法，但必须禁止后续提交。
     std::expected<void, GrantError> ConfirmTerminal(const GrantTerminalEvidence& evidence) noexcept;
     std::expected<std::span<const std::byte>, GrantError> Borrow(GrantHandle handle) noexcept;
+    /// 只读核验真实 Borrowed 状态和整个借用区间，不能以伪造句柄/span 进入共同重排窗口。
+    std::expected<void, GrantError> ValidateBorrow(GrantHandle handle,
+                                                   std::span<const std::byte> payload) const noexcept;
     /// 成功归还后全部 span 副本失效；部分清理失败保留 handle 供重试，不允许重新借用。
     std::expected<void, GrantError> Return(GrantHandle handle) noexcept;
     /// consumed_prefix 为独占下界；宿主已确认其前全部逻辑 SN 消费完毕（包括非 RNDV）。
@@ -149,11 +154,25 @@ public:
     std::expected<void, GrantError> Close() noexcept;
     GrantStats stats() const noexcept;
     bool accepting() const noexcept;
+    std::optional<GrantBinding> binding() const noexcept;
+    std::uint32_t window_size() const noexcept;
 
 private:
+    friend class RndvReceiver;
+    friend class RndvNotificationTx;
+    std::expected<void, GrantError> BindReceiver(const RndvReceiver& receiver) noexcept;
+    std::expected<void, GrantError> UnbindReceiver(const RndvReceiver& receiver) noexcept;
+    /// 只由接收适配器在来源/完整身份校验及可信发送端成功通知契约成立后调用。
+    /// 不编造逐 WR 数量；true 表示 Ready，false 表示取消后的终结丢弃。
+    std::expected<bool, GrantError> CompleteNotification(const GrantIdentity& identity, bool discard) noexcept;
+    /// 通知发布者取消不能抢回已完成并交给接收适配器的目标；旧前缀仅作无副作用终结确认。
+    std::expected<void, GrantError> CancelPublication(GrantHandle handle, const GrantIdentity& identity) noexcept;
+    /// 仅查询相同授权的退休事实；已推进前缀不再访问可能复用的原槽。
+    std::expected<bool, GrantError> IsRetired(GrantHandle handle, const GrantIdentity& identity) const noexcept;
     struct Entry;
     struct State;
     std::expected<Entry*, GrantError> Find(GrantHandle handle) noexcept;
+    std::expected<const Entry*, GrantError> Find(GrantHandle handle) const noexcept;
     std::expected<Entry*, GrantError> Find(const GrantIdentity& identity) noexcept;
     std::expected<void, GrantError> Discard(Entry& entry) noexcept;
     std::expected<void, GrantError> EndRemote(Entry& entry) noexcept;

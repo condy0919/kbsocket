@@ -10,6 +10,7 @@
 #include <span>
 #include <variant>
 
+#include "kbsocket/connection/grant_manager.hpp"
 #include "kbsocket/memory/buffer_lease.hpp"
 #include "kbsocket/transport/raw/rx_buffer_pool.hpp"
 
@@ -48,7 +49,7 @@ struct ReorderError {
 };
 
 enum class ReorderFrameKind : std::uint8_t { kEager, kValidatedRmaDone, kFin };
-using ReorderLease = std::variant<std::monostate, raw::RxBufferLease, memory::BufferLease>;
+using ReorderLease = std::variant<std::monostate, raw::RxBufferLease, memory::BufferLease, GrantHandle>;
 struct ReorderFrame {
     ReorderSession session{};
     std::uint32_t sequence = 0;
@@ -124,6 +125,9 @@ public:
     std::expected<void, ReorderError> AbandonRndv(ReorderReservation reservation) noexcept;
     /// 最多交付 min(output.size(), 64) 个连续帧；失败后仍可取出已经验证的连续前缀。
     std::expected<std::size_t, ReorderError> Poll(std::span<ReorderDelivery> output, std::uint64_t now_ns) noexcept;
+    /// 只读核验真实已交付 receipt 及完整描述符；用于归还底层 Lease 之前的身份门禁。
+    /// 不重新核验底层 Lease 存活，允许真实归还成功后重试尚未完成的窗口 Release。
+    std::expected<void, ReorderError> ValidateDelivery(const ReorderDelivery& delivery) const noexcept;
     /// 仅在真实 Lease 已归还且应用不再访问后解除驻留；它不调用底层 ReleaseCpu/Release。
     std::expected<void, ReorderError> Release(ReorderReceipt receipt) noexcept;
     /// 仅停止/失败后使用，按预算交出 Buffered 描述符供清理；不抢回已交付给应用的 Lease。
@@ -137,8 +141,12 @@ public:
     bool accepting() const noexcept;
     std::optional<ReorderError> failure() const noexcept;
     ReorderStats stats() const noexcept;
+    std::optional<ReorderSession> session() const noexcept;
 
 private:
+    friend class RndvReceiver;
+    std::expected<void, ReorderError> BindReceiver(const RndvReceiver& receiver) noexcept;
+    std::expected<void, ReorderError> UnbindReceiver(const RndvReceiver& receiver) noexcept;
     struct State;
     std::expected<void, ReorderError> CheckAdmission(const ReorderFrame& frame, std::uint64_t bytes,
                                                      std::uint64_t now_ns, bool reserving) noexcept;

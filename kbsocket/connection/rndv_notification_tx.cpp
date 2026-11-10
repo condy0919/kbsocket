@@ -686,10 +686,14 @@ std::expected<void, RndvNotificationError> RndvNotificationTx::CancelEntry(Entry
     }
     if (entry.manager && !entry.grant_cancelled) {
         // 只有唯一发布者确认所有 SEND 均未被接受，才能证明零 WRITE；CQE 成功不终结目标授权。
-        const auto cancelled = entry.status.grant_published && !entry.possibly_exposed && entry.status.acceptance_known
-                                   ? entry.manager->ConfirmTerminal(
-                                         {.identity = entry.grant, .no_future_writes = true, .acceptance_known = true})
-                                   : entry.manager->Cancel(entry.grant_handle);
+        // 远端 DONE/归还可能早于本地 GRANT CQE；发布者不得取消已完成或已借出的目标，也不得碰新代次。
+        const auto retired = entry.manager->IsRetired(entry.grant_handle, entry.grant);
+        const auto cancelled =
+            retired && *retired ? std::expected<void, GrantError>{}
+            : entry.status.grant_published && !entry.possibly_exposed && entry.status.acceptance_known
+                ? entry.manager->ConfirmTerminal(
+                      {.identity = entry.grant, .no_future_writes = true, .acceptance_known = true})
+                : entry.manager->CancelPublication(entry.grant_handle, entry.grant);
         if (cancelled) {
             entry.grant_cancelled = true;
         } else {

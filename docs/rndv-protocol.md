@@ -23,7 +23,7 @@
 
 `BuildRndvDone` 只接受真实 `WriteRndvEngine`，或 `WriteRndvPool` 加当前事务句柄；内部调用其 `DoneEvidence`。未提交完、在途、失败、取消、未知接受或失效句柄均不能构造成功通知。即使取消后所有已提交 WR 最终成功，通用 `TerminalEvidence` 也不能通过此入口。成功构造取得的是当时的快照，后续取消不能撤回已经交给宿主的通知。
 
-编码/身份校验本身不证明远端 DMA 已终结。收到合法 DONE 不会自动构造 `GrantTerminalEvidence`、解除 Grant 或交付目标；接收状态机仍须确认当前已发布 Grant、可信发送端遵守逐 WR 成功与完整覆盖契约，以及取消状态。也不能从单独的网络计数、本地 CQE 或空 CQ 推导上述事实。未完成证明的 Grant 继续隔离保留。
+编码/身份校验本身不证明远端 DMA 已终结。收到合法 DONE 不会自动构造 `GrantTerminalEvidence`、解除 Grant 或交付目标；M6.3.5 的 [接收协调器](rndv-receiver.md) 在明确的可信发送端成功通知契约下，确认实际来源、当前已发布 Grant 及取消状态后，经私有无计数入口终结授权。它不伪造 WRITE 数量，也不能从单独的网络计数、本地 CQE 或空 CQ 推导这些事实。未完成证明的 Grant 继续隔离保留。
 
 成功 WRITE 后的 DONE 仍须通过 SEND_WITH_IMM 提交，并取得真实控制授信、SQ 票据和注册源责任。M6.3.4 的 [通知发送器](rndv-notification-tx.md) 已提供独立的有界提交与退休组件；单独构造帧仍不等同于对端收到通知。接收域已按 RTS 使用 data 授信、GRANT/DONE 使用 control 授信扣除真实 RQE 消耗；物理 refill 与逻辑序号释放保持独立。
 
@@ -45,4 +45,4 @@
 
 无真机测试覆盖双向不同 session/token、短/扩展编码、错误来源与完整 Grant 身份、取消后的 DONE 禁发、旧事务句柄、Eager/RNDV/FIN 共同窗口、数量/字节额度和零分配。Mock 测试中的显式 DMA 事实不代表 UB 真机端到端验证。
 
-M6.3.4 已绑定 RTS 发送 SN、未来 DONE 额度、本地通知槽、Grant 发布及导入引用。后续仍须完成接收端可信 DONE 终结、Grant 只读借用与共同接收流归还、能力协商及 Arena 描述交换，随后接入 Connection/RawDomain/Runtime 和应用入口。
+M6.3.4 已绑定 RTS 发送 SN、未来 DONE 额度、本地通知槽、Grant 发布及导入引用。M6.3.5 已增加接收端可信 DONE 终结和共同重排窗口中的 Grant 只读借用/真实归还。后续仍须完成能力协商、Arena 描述交换、混合应用流及 Connection/RawDomain/Runtime 装配。

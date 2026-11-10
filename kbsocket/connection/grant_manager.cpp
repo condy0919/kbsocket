@@ -43,6 +43,7 @@ struct GrantManager::State {
     std::uint64_t window_begin = 0;
     std::uint64_t bytes = 0;
     std::size_t active = 0;
+    const RndvReceiver* receiver = nullptr;
     bool stopped = false;
 };
 
@@ -52,6 +53,29 @@ GrantManager::~GrantManager() {
         // 账本保留并不延长借用依赖的 C++ 生命周期；宿主必须同时保留 Slab/provider/budget。
         (void)state_.release();
     }
+}
+std::expected<void, GrantError> GrantManager::BindReceiver(const RndvReceiver& receiver) noexcept {
+    if (!state_) {
+        return Error(GrantErrorCode::kNotReady);
+    }
+    if (state_->receiver || state_->active) {
+        return Error(GrantErrorCode::kInUse);
+    }
+    if (state_->stopped) {
+        return Error(GrantErrorCode::kStopped);
+    }
+    state_->receiver = &receiver;
+    return {};
+}
+std::expected<void, GrantError> GrantManager::UnbindReceiver(const RndvReceiver& receiver) noexcept {
+    if (!state_) {
+        return Error(GrantErrorCode::kNotReady);
+    }
+    if (state_->receiver != &receiver) {
+        return Error(GrantErrorCode::kWrongBinding);
+    }
+    state_->receiver = nullptr;
+    return {};
 }
 std::expected<void, GrantError> GrantManager::Open(GrantBinding binding, GrantArena arena, memory::SlabAllocator& slab,
                                                    urma_context_t* context, const GrantConfig& config) noexcept {
@@ -153,13 +177,20 @@ std::expected<GrantReservation, GrantError> GrantManager::Reserve(const GrantTra
     return GrantReservation{{this, slot, entry.identity.generation}, entry.identity, *target};
 }
 std::expected<GrantManager::Entry*, GrantError> GrantManager::Find(GrantHandle handle) noexcept {
+    const auto found = std::as_const(*this).Find(handle);
+    if (!found) {
+        return std::unexpected(found.error());
+    }
+    return &state_->entries[handle.slot];
+}
+std::expected<const GrantManager::Entry*, GrantError> GrantManager::Find(GrantHandle handle) const noexcept {
     if (!state_) {
         return Error(GrantErrorCode::kNotReady);
     }
     if (handle.owner != this || !handle.generation || handle.slot >= state_->config.window) {
         return Error(GrantErrorCode::kInvalidHandle);
     }
-    auto& entry = state_->entries[handle.slot];
+    const auto& entry = state_->entries[handle.slot];
     if (!Active(entry.phase) || entry.identity.generation != handle.generation || entry.rollback) {
         return Error(GrantErrorCode::kInvalidHandle);
     }
@@ -265,6 +296,46 @@ std::expected<void, GrantError> GrantManager::Cancel(GrantHandle handle) noexcep
         return Error(GrantErrorCode::kInvalidState);
     }
 }
+std::expected<void, GrantError> GrantManager::CancelPublication(GrantHandle handle,
+                                                                const GrantIdentity& identity) noexcept {
+    const auto retired = IsRetired(handle, identity);
+    if (!retired) {
+        return std::unexpected(retired.error());
+    }
+    if (*retired) {
+        return {};
+    }
+    const auto& entry = state_->entries[handle.slot];
+    if (entry.phase == Phase::kReady || entry.phase == Phase::kBorrowed) {
+        return {};
+    }
+    return Cancel(handle);
+}
+std::expected<bool, GrantError> GrantManager::IsRetired(GrantHandle handle,
+                                                        const GrantIdentity& identity) const noexcept {
+    if (!state_) {
+        return Error(GrantErrorCode::kNotReady);
+    }
+    if (handle.owner != this || handle.slot >= state_->config.window || !handle.generation ||
+        handle.slot != identity.slot || handle.generation != identity.generation ||
+        handle.slot != identity.transfer.seq % state_->config.window) {
+        return Error(GrantErrorCode::kInvalidHandle);
+    }
+    if (identity.transfer.binding != state_->binding || identity.arena != state_->arena ||
+        !identity.transfer.transfer_id || !identity.transfer.bytes || !identity.target_address ||
+        identity.transfer.seq == std::numeric_limits<std::uint32_t>::max()) {
+        return Error(GrantErrorCode::kIdentityMismatch);
+    }
+    // 前缀推进只能跨过空槽/退休槽；旧 tombstone 已擦除或复用时也绝不触碰当前槽。
+    if (identity.transfer.seq < state_->window_begin) {
+        return true;
+    }
+    const auto& entry = state_->entries[handle.slot];
+    if (entry.identity != identity || entry.rollback) {
+        return Error(GrantErrorCode::kIdentityMismatch);
+    }
+    return entry.phase == Phase::kRetired;
+}
 std::expected<void, GrantError> GrantManager::ValidateEvidence(const GrantTerminalEvidence& evidence,
                                                                bool success) const noexcept {
     if (!evidence.no_future_writes || !evidence.acceptance_known ||
@@ -290,14 +361,34 @@ std::expected<void, GrantError> GrantManager::CompleteDone(const GrantTerminalEv
     if (auto valid = ValidateEvidence(evidence, true); !valid) {
         return valid;
     }
+    const auto completed = CompleteNotification(evidence.identity, false);
+    if (!completed) {
+        return std::unexpected(completed.error());
+    }
+    return {};
+}
+std::expected<bool, GrantError> GrantManager::CompleteNotification(const GrantIdentity& identity,
+                                                                   bool discard) noexcept {
+    auto entry = Find(identity);
+    if (!entry) {
+        return std::unexpected(entry.error());
+    }
+    if ((*entry)->phase != Phase::kPublished && (*entry)->phase != Phase::kQuarantined) {
+        return Error(GrantErrorCode::kInvalidState);
+    }
+    // 一旦按取消路径消费通知，后续局部清理失败也不能重新成为可交付数据。
+    (*entry)->discarding |= discard;
     if (auto result = EndRemote(**entry); !result) {
-        return result;
+        return std::unexpected(result.error());
     }
     if ((*entry)->phase == Phase::kQuarantined || (*entry)->discarding) {
-        return Discard(**entry);
+        if (auto result = Discard(**entry); !result) {
+            return std::unexpected(result.error());
+        }
+        return false;
     }
     (*entry)->phase = Phase::kReady;
-    return {};
+    return true;
 }
 std::expected<void, GrantError> GrantManager::ConfirmTerminal(const GrantTerminalEvidence& evidence) noexcept {
     auto entry = Find(evidence.identity);
@@ -349,6 +440,30 @@ std::expected<void, GrantError> GrantManager::Return(GrantHandle handle) noexcep
     }
     return Discard(**entry);
 }
+std::expected<void, GrantError> GrantManager::ValidateBorrow(GrantHandle handle,
+                                                             std::span<const std::byte> payload) const noexcept {
+    const auto entry = Find(handle);
+    if (!entry) {
+        return std::unexpected(entry.error());
+    }
+    if ((*entry)->phase != Phase::kBorrowed || (*entry)->discarding) {
+        return Error(GrantErrorCode::kInvalidState);
+    }
+    const auto view = state_->slab->Readable((*entry)->lease);
+    if (!view) {
+        return MemoryError(view.error());
+    }
+    if (view->data() != payload.data() || view->size() != payload.size()) {
+        return Error(GrantErrorCode::kIdentityMismatch);
+    }
+    return {};
+}
+std::optional<GrantBinding> GrantManager::binding() const noexcept {
+    return state_ ? std::optional<GrantBinding>(state_->binding) : std::nullopt;
+}
+std::uint32_t GrantManager::window_size() const noexcept {
+    return state_ ? state_->config.window : 0;
+}
 std::expected<void, GrantError> GrantManager::AdvanceWindow(std::uint64_t consumed_prefix) noexcept {
     if (!state_) {
         return Error(GrantErrorCode::kNotReady);
@@ -378,6 +493,10 @@ void GrantManager::Stop() noexcept {
 std::expected<void, GrantError> GrantManager::Close() noexcept {
     if (!state_) {
         return {};
+    }
+    // 协调器仍绑定时不能关闭或悄悄停止其依赖；失败 Close 不影响健康流推进。
+    if (state_->receiver) {
+        return Error(GrantErrorCode::kInUse);
     }
     Stop();
     // Reserve 未返回授权时的内部回滚也允许在控制路径重试；绝不清理已交给调用方的活跃授权。

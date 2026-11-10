@@ -19,7 +19,15 @@ bool ValidLease(const ReorderLease& lease) noexcept {
     if (const auto* memory = std::get_if<memory::BufferLease>(&lease)) {
         return memory->allocator && memory->generation;
     }
+    if (const auto* grant = std::get_if<GrantHandle>(&lease)) {
+        return grant->owner && grant->generation;
+    }
     return false;
+}
+bool ValidGrantLease(const ReorderFrame& frame) noexcept {
+    const auto* grant = std::get_if<GrantHandle>(&frame.lease);
+    return !grant || (frame.kind == ReorderFrameKind::kValidatedRmaDone && grant->owner &&
+                      grant->owner->ValidateBorrow(*grant, frame.payload).has_value());
 }
 bool SameLease(const ReorderLease& left, const ReorderLease& right) noexcept {
     if (left.index() != right.index()) {
@@ -31,6 +39,9 @@ bool SameLease(const ReorderLease& left, const ReorderLease& right) noexcept {
     }
     if (const auto* memory = std::get_if<memory::BufferLease>(&left)) {
         return *memory == std::get<memory::BufferLease>(right);
+    }
+    if (const auto* grant = std::get_if<GrantHandle>(&left)) {
+        return *grant == std::get<GrantHandle>(right);
     }
     return false;
 }
@@ -55,6 +66,7 @@ struct ReorderWindow::State {
     std::optional<std::uint64_t> gap_since;
     std::uint64_t last_now = 0;
     std::uint32_t drain_cursor = 0;
+    const RndvReceiver* receiver = nullptr;
     bool stopping = false;
 };
 
@@ -64,6 +76,29 @@ ReorderWindow::~ReorderWindow() {
         // 未归还时保留描述符账本，不替宿主释放仍被借用的真实 Lease/backing。
         (void)state_.release();
     }
+}
+std::expected<void, ReorderError> ReorderWindow::BindReceiver(const RndvReceiver& receiver) noexcept {
+    if (!state_) {
+        return Error(ReorderErrorCode::kNotReady);
+    }
+    if (state_->receiver || state_->stats.pending_frames) {
+        return Error(ReorderErrorCode::kInUse);
+    }
+    if (!accepting()) {
+        return Error(ReorderErrorCode::kStopped);
+    }
+    state_->receiver = &receiver;
+    return {};
+}
+std::expected<void, ReorderError> ReorderWindow::UnbindReceiver(const RndvReceiver& receiver) noexcept {
+    if (!state_) {
+        return Error(ReorderErrorCode::kNotReady);
+    }
+    if (state_->receiver != &receiver) {
+        return Error(ReorderErrorCode::kInvalidArgument);
+    }
+    state_->receiver = nullptr;
+    return {};
 }
 std::expected<void, ReorderError> ReorderWindow::Open(ReorderSession session, const ReorderConfig& config) noexcept {
     if (state_) {
@@ -90,6 +125,9 @@ std::expected<void, ReorderError> ReorderWindow::Open(ReorderSession session, co
 std::expected<void, ReorderError> ReorderWindow::Close() noexcept {
     if (!state_) {
         return {};
+    }
+    if (state_->receiver) {
+        return Error(ReorderErrorCode::kInUse);
     }
     state_->stopping = true;
     if (state_->stats.pending_frames || state_->stats.buffered_frames || state_->stats.delivered_frames) {
@@ -143,6 +181,9 @@ ReorderStats ReorderWindow::stats() const noexcept {
                                   ? std::numeric_limits<std::uint64_t>::max()
                                   : result.consumed_bytes + capacity;
     return result;
+}
+std::optional<ReorderSession> ReorderWindow::session() const noexcept {
+    return state_ ? std::optional<ReorderSession>(state_->session) : std::nullopt;
 }
 std::expected<void, ReorderError> ReorderWindow::ObserveTime(std::uint64_t now_ns) noexcept {
     if (!state_) {
@@ -199,7 +240,8 @@ std::expected<void, ReorderError> ReorderWindow::CheckAdmission(const ReorderFra
         return Error(ReorderErrorCode::kInvalidArgument);
     }
     if ((!fin && (!bytes || (!reserving && (!frame.payload.data() || !ValidLease(frame.lease))))) ||
-        (fin && (!frame.payload.empty() || (frame.lease.index() != 0 && !ValidLease(frame.lease))))) {
+        (fin && (!frame.payload.empty() || (frame.lease.index() != 0 && !ValidLease(frame.lease)))) ||
+        !ValidGrantLease(frame)) {
         return Error(ReorderErrorCode::kInvalidArgument);
     }
     if (!fin && frame.sequence == std::numeric_limits<std::uint32_t>::max()) {
@@ -318,7 +360,8 @@ std::expected<void, ReorderError> ReorderWindow::CompleteRndv(ReorderReservation
         return Error(ReorderErrorCode::kStopped);
     }
     if (frame.kind != ReorderFrameKind::kValidatedRmaDone || frame.sequence != entry.frame.sequence ||
-        frame.payload.size() != entry.reserved_bytes || !frame.payload.data() || !ValidLease(frame.lease)) {
+        frame.payload.size() != entry.reserved_bytes || !frame.payload.data() || !ValidLease(frame.lease) ||
+        !ValidGrantLease(frame)) {
         return Error(ReorderErrorCode::kInvalidArgument);
     }
     // 占位时没有目标 Lease；完成时仍须检查所有已缓冲和应用持有项，防止双重归还。
@@ -406,6 +449,26 @@ std::expected<std::size_t, ReorderError> ReorderWindow::Poll(std::span<ReorderDe
         return std::unexpected(*state_->failure);
     }
     return count;
+}
+std::expected<void, ReorderError> ReorderWindow::ValidateDelivery(const ReorderDelivery& delivery) const noexcept {
+    if (!state_) {
+        return Error(ReorderErrorCode::kNotReady);
+    }
+    const auto& receipt = delivery.receipt;
+    if (receipt.owner != this || !receipt.generation || receipt.slot >= state_->config.window) {
+        return Error(ReorderErrorCode::kInvalidReceipt);
+    }
+    const auto& entry = state_->entries[receipt.slot];
+    const auto& frame = delivery.frame;
+    const bool same_lease =
+        (frame.lease.index() == 0 && entry.frame.lease.index() == 0) || SameLease(frame.lease, entry.frame.lease);
+    if (entry.status != State::Status::kDelivered || entry.receipt != receipt.generation ||
+        entry.discarded != delivery.discarded || entry.frame.session != frame.session ||
+        entry.frame.sequence != frame.sequence || entry.frame.kind != frame.kind || !same_lease ||
+        entry.frame.payload.data() != frame.payload.data() || entry.frame.payload.size() != frame.payload.size()) {
+        return Error(ReorderErrorCode::kInvalidReceipt);
+    }
+    return {};
 }
 std::expected<void, ReorderError> ReorderWindow::Release(ReorderReceipt receipt) noexcept {
     if (!state_) {

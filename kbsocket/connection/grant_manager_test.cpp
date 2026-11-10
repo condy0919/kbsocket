@@ -439,6 +439,44 @@ TEST_F(GrantManagerTest, SuccessfulDoneExposesOnlyReadOnlyPayloadAndReturnEndsCp
     EXPECT_EQ(manager_.stats().active, 0u);
 }
 
+TEST_F(GrantManagerTest, BorrowValidationRequiresLiveBorrowAndExactWholeSpan) {
+    EXPECT_FALSE(manager_.binding());
+    EXPECT_EQ(manager_.window_size(), 0u);
+    Open();
+    ASSERT_TRUE(manager_.binding());
+    EXPECT_EQ(*manager_.binding(), Binding());
+    EXPECT_EQ(manager_.window_size(), Config().window);
+    auto reservation = manager_.Reserve(Transfer());
+    ASSERT_TRUE(reservation);
+    const std::span<const std::byte> target(reinterpret_cast<const std::byte*>(reservation->target.addr),
+                                            reservation->target.len);
+    // 拥有授权地址还不等于应用借用；Reserved、Published、Ready 都不能直接送入重排窗口。
+    EXPECT_FALSE(manager_.ValidateBorrow(reservation->handle, target));
+    ASSERT_TRUE(manager_.CommitPublication(reservation->handle));
+    EXPECT_FALSE(manager_.ValidateBorrow(reservation->handle, target));
+    ASSERT_TRUE(manager_.CompleteDone(Done(reservation->identity)));
+    EXPECT_FALSE(manager_.ValidateBorrow(reservation->handle, target));
+    const auto borrowed = manager_.Borrow(reservation->handle);
+    ASSERT_TRUE(borrowed);
+    const auto& read_only = manager_;
+    ASSERT_TRUE(read_only.ValidateBorrow(reservation->handle, *borrowed));
+    EXPECT_FALSE(read_only.ValidateBorrow(reservation->handle, borrowed->first(borrowed->size() - 1)));
+    EXPECT_FALSE(read_only.ValidateBorrow(reservation->handle, borrowed->subspan(1)));
+    auto stale = reservation->handle;
+    ++stale.generation;
+    EXPECT_FALSE(read_only.ValidateBorrow(stale, *borrowed));
+    GrantManager foreign;
+    EXPECT_FALSE(foreign.ValidateBorrow(reservation->handle, *borrowed));
+    // Stop 不抢回真实应用借用；Return 后即使描述符仍在，也不能重新准入。
+    manager_.Stop();
+    ASSERT_TRUE(read_only.ValidateBorrow(reservation->handle, *borrowed));
+    ASSERT_TRUE(manager_.Return(reservation->handle));
+    EXPECT_FALSE(read_only.ValidateBorrow(reservation->handle, *borrowed));
+    ASSERT_TRUE(manager_.Close());
+    EXPECT_FALSE(manager_.binding());
+    EXPECT_EQ(manager_.window_size(), 0u);
+}
+
 TEST_F(GrantManagerTest, LocalSourceDmaRetirementDoesNotEndIndependentReceiverGrant) {
     Open();
     memory::SlabAllocator source;
@@ -918,7 +956,11 @@ TEST_F(GrantManagerTest, AdmissionCompletionRejectionCancellationAndWindowAdvanc
         succeeded &= !manager_.CompleteDone(invalid).has_value();
         if ((seq & 1) == 0) {
             succeeded &= manager_.CompleteDone(proof).has_value();
-            succeeded &= manager_.Borrow(reserved->handle).has_value();
+            const auto borrowed = manager_.Borrow(reserved->handle);
+            succeeded &= borrowed.has_value();
+            if (borrowed) {
+                succeeded &= manager_.ValidateBorrow(reserved->handle, *borrowed).has_value();
+            }
             succeeded &= manager_.Return(reserved->handle).has_value();
         } else {
             succeeded &= manager_.Cancel(reserved->handle).has_value();

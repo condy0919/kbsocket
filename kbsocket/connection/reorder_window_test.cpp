@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 #include "kbsocket/connection/reorder_window.hpp"
 
+#include <unistd.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +11,8 @@
 #include <new>
 
 #include <gtest/gtest.h>
+
+#include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
 
 namespace {
 // 只包围已初始化后的纯状态机调用，排除 GTest 和 Open 的控制路径分配。
@@ -146,6 +150,244 @@ TEST_F(ReorderWindowTest, ReadableOnlyForContinuousHeadOrConsumedEofWithoutMutat
     EXPECT_TRUE(window_.readable());
     window_.Fail();
     EXPECT_FALSE(window_.readable());
+}
+
+TEST_F(ReorderWindowTest, DeliveryValidationRequiresActualReceiptAndExactDescriptor) {
+    EXPECT_FALSE(window_.session());
+    ASSERT_TRUE(window_.Open(Session(), Config()));
+    ASSERT_TRUE(window_.session());
+    EXPECT_EQ(*window_.session(), Session());
+    const auto frame = Frame(0);
+    ASSERT_TRUE(window_.Push(frame, 0));
+    // 凭 buffer 描述符和猜测的 receipt 不能提前归还尚未 Poll 的槽。
+    EXPECT_FALSE(window_.ValidateDelivery({frame, {&window_, 0, 1}, false}));
+    std::array<ReorderDelivery, 1> output;
+    ASSERT_EQ(Poll(output), 1u);
+    const auto original = output[0];
+    ASSERT_TRUE(window_.ValidateDelivery(original));
+    for (unsigned field = 0; field < 8; ++field) {
+        auto changed = original;
+        switch (field) {
+        case 0:
+            ++changed.receipt.generation;
+            break;
+        case 1:
+            ++changed.frame.session.session;
+            break;
+        case 2:
+            ++changed.frame.sequence;
+            break;
+        case 3:
+            changed.frame.kind = ReorderFrameKind::kValidatedRmaDone;
+            break;
+        case 4:
+            ++std::get<memory::BufferLease>(changed.frame.lease).generation;
+            break;
+        case 5:
+            changed.frame.payload = changed.frame.payload.first(1);
+            break;
+        case 6:
+            changed.frame.payload = std::span<const std::byte>(payload_).subspan(1, 4);
+            break;
+        case 7:
+            changed.discarded = true;
+            break;
+        }
+        EXPECT_FALSE(window_.ValidateDelivery(changed));
+        ASSERT_TRUE(window_.ValidateDelivery(original));
+    }
+    allocation_count = free_count = 0;
+    count_allocations = true;
+    const auto validated = window_.ValidateDelivery(original);
+    count_allocations = false;
+    EXPECT_TRUE(validated);
+    EXPECT_EQ(allocation_count, 0u);
+    EXPECT_EQ(free_count, 0u);
+    ASSERT_TRUE(window_.Release(original.receipt));
+    EXPECT_FALSE(window_.ValidateDelivery(original));
+    ASSERT_TRUE(window_.Close());
+    EXPECT_FALSE(window_.session());
+}
+
+TEST_F(ReorderWindowTest, DeliveryValidationPreservesFinAndDiscardDisposition) {
+    ASSERT_TRUE(window_.Open(Session(), Config()));
+    ASSERT_TRUE(window_.Push(Frame(1), 0));
+    ASSERT_TRUE(window_.Push(Fin(2), 0));
+    window_.StopAccepting();
+    std::array<ReorderDelivery, 2> output;
+    ASSERT_EQ(window_.Drain(output), 1u);
+    ASSERT_TRUE(output[0].discarded);
+    ASSERT_TRUE(window_.ValidateDelivery(output[0]));
+    auto fake_normal = output[0];
+    fake_normal.discarded = false;
+    EXPECT_FALSE(window_.ValidateDelivery(fake_normal));
+    ASSERT_TRUE(window_.Release(output[0].receipt));
+    ASSERT_EQ(window_.Drain(output), 1u);
+    EXPECT_EQ(output[0].frame.kind, ReorderFrameKind::kFin);
+    ASSERT_TRUE(window_.ValidateDelivery(output[0]));
+    ASSERT_TRUE(window_.Release(output[0].receipt));
+}
+
+class GrantReorderWindowTest : public ReorderWindowTest {
+protected:
+    static raw::UrmaFunctions Functions() {
+        raw::UrmaFunctions functions{};
+        functions.register_seg = [](auto* context, auto* config) {
+            auto& segment = active_->segment_;
+            segment.urma_ctx = context;
+            segment.seg.ubva.eid = context->eid;
+            segment.seg.ubva.va = config->va;
+            segment.seg.len = config->len;
+            segment.seg.attr.bs.access = config->flag.bs.access;
+            segment.seg.token_id = 1;
+            return &segment;
+        };
+        functions.unregister_seg = [](auto*) { return URMA_SUCCESS; };
+        return functions;
+    }
+    void SetUp() override {
+        active_ = this;
+        context_.eid.raw[0] = 1;
+        const std::array contexts{&context_};
+        ASSERT_TRUE(slab_.Open(contexts, {.buffer_count = 4, .buffer_size = 64, .max_references = 8}, budget_));
+        ASSERT_TRUE(
+            grants_.Open(Binding(), {91, 2}, slab_, &context_, {.window = 4, .max_active = 4, .max_bytes = 256}));
+        ASSERT_TRUE(window_.Open(Session(), Config(4, 128)));
+    }
+    void TearDown() override {
+        count_allocations = false;
+        // 目标借用与窗口 receipt 分别归还，任何失败路径都不让窗口描述符抢回真实 Grant。
+        for (std::size_t i = 0; i < grant_count_; ++i) {
+            (void)grants_.Return(grants_handles_[i]);
+            (void)grants_.Cancel(grants_handles_[i]);
+        }
+        ReorderWindowTest::TearDown();
+        EXPECT_TRUE(grants_.Close());
+        EXPECT_TRUE(slab_.Close());
+        active_ = nullptr;
+    }
+    static GrantBinding Binding() {
+        return {7, 9, 11, 19, {4, 3}};
+    }
+    std::expected<GrantReservation, GrantError> Grant(std::uint32_t seq = 0) {
+        auto result = grants_.Reserve({Binding(), 101 + seq, seq, 32});
+        if (result) {
+            grants_handles_[grant_count_++] = result->handle;
+        }
+        return result;
+    }
+    static GrantTerminalEvidence Done(const GrantIdentity& identity) {
+        // 本层测试模拟可信 WRITE 账本事实；网络 DONE 的无计数授权由接收适配器另测。
+        return {identity, true, true, 1, 1, 1, identity.transfer.bytes};
+    }
+    static ReorderFrame BorrowedFrame(const GrantReservation& grant, std::span<const std::byte> payload) {
+        return {Session(), grant.identity.transfer.seq, ReorderFrameKind::kValidatedRmaDone, grant.handle, payload};
+    }
+    static inline GrantReorderWindowTest* active_ = nullptr;
+    raw::test_support::ScopedUrmaOverride override_{Functions()};
+    urma_context_t context_{};
+    urma_target_seg_t segment_{};
+    memory::MemoryBudget budget_{static_cast<std::size_t>(::sysconf(_SC_PAGESIZE)) * 2};
+    memory::SlabAllocator slab_;
+    GrantManager grants_;
+    std::array<GrantHandle, 4> grants_handles_{};
+    std::size_t grant_count_ = 0;
+};
+
+TEST_F(GrantReorderWindowTest, RealBorrowedGrantCompletesPendingSlotAndReturnsBeforeReceipt) {
+    const auto pending = Reserve(0, 32);
+    ASSERT_TRUE(pending);
+    const auto grant = Grant();
+    ASSERT_TRUE(grant);
+    ASSERT_TRUE(grants_.CommitPublication(grant->handle));
+    ASSERT_TRUE(grants_.CompleteDone(Done(grant->identity)));
+    const auto borrowed = grants_.Borrow(grant->handle);
+    ASSERT_TRUE(borrowed);
+    ASSERT_TRUE(window_.CompleteRndv(*pending, BorrowedFrame(*grant, *borrowed), 0));
+    std::array<ReorderDelivery, 1> output;
+    ASSERT_EQ(Poll(output), 1u);
+    ASSERT_TRUE(std::holds_alternative<GrantHandle>(output[0].frame.lease));
+    EXPECT_EQ(std::get<GrantHandle>(output[0].frame.lease), grant->handle);
+    ASSERT_TRUE(window_.ValidateDelivery(output[0]));
+    EXPECT_EQ(slab_.stats().cpu_leases, 1u);
+    EXPECT_EQ(window_.stats().released_prefix, 0u);
+    // 底层归还先完成：窗口校验仍允许相同 receipt 重试，不能要求已终结 Grant 再次 Borrowed。
+    ASSERT_TRUE(grants_.Return(grant->handle));
+    ASSERT_TRUE(window_.ValidateDelivery(output[0]));
+    ASSERT_TRUE(window_.Release(output[0].receipt));
+    EXPECT_FALSE(window_.ValidateDelivery(output[0]));
+    EXPECT_EQ(window_.stats().released_prefix, 1u);
+    EXPECT_EQ(slab_.stats().cpu_leases, 0u);
+    ASSERT_TRUE(grants_.AdvanceWindow(1));
+}
+
+TEST_F(GrantReorderWindowTest, GrantLeaseRejectsUnborrowedWrongSpanAndNonRndvKinds) {
+    const auto grant = Grant();
+    ASSERT_TRUE(grant);
+    const std::span<const std::byte> target(reinterpret_cast<const std::byte*>(grant->target.addr), grant->target.len);
+    EXPECT_FALSE(window_.Push(BorrowedFrame(*grant, target), 0));
+    ASSERT_TRUE(grants_.CommitPublication(grant->handle));
+    ASSERT_TRUE(grants_.CompleteDone(Done(grant->identity)));
+    EXPECT_FALSE(window_.Push(BorrowedFrame(*grant, target), 0));
+    const auto borrowed = grants_.Borrow(grant->handle);
+    ASSERT_TRUE(borrowed);
+    auto frame = BorrowedFrame(*grant, *borrowed);
+    frame.kind = ReorderFrameKind::kEager;
+    EXPECT_FALSE(window_.Push(frame, 0));
+    frame.kind = ReorderFrameKind::kFin;
+    frame.payload = {};
+    EXPECT_FALSE(window_.Push(frame, 0));
+    frame = BorrowedFrame(*grant, borrowed->subspan(1));
+    EXPECT_FALSE(window_.Push(frame, 0));
+    frame = BorrowedFrame(*grant, *borrowed);
+    auto stale = frame;
+    ++std::get<GrantHandle>(stale.lease).generation;
+    EXPECT_FALSE(window_.Push(stale, 0));
+    EXPECT_EQ(window_.stats().resident_bytes, 0u);
+    ASSERT_TRUE(window_.Push(frame, 0));
+    auto aliased = frame;
+    aliased.sequence = 1;
+    const auto duplicate = window_.Push(aliased, 0);
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error().code, ReorderErrorCode::kLeaseAlreadyHeld);
+    std::array<ReorderDelivery, 1> output;
+    ASSERT_EQ(Poll(output), 1u);
+    ASSERT_TRUE(grants_.Return(grant->handle));
+    ASSERT_TRUE(window_.Release(output[0].receipt));
+}
+
+TEST_F(GrantReorderWindowTest, DrainTransfersRealBorrowWithoutReturningItOrAllocating) {
+    const auto grant = Grant(1);
+    ASSERT_TRUE(grant);
+    ASSERT_TRUE(grants_.CommitPublication(grant->handle));
+    ASSERT_TRUE(grants_.CompleteDone(Done(grant->identity)));
+    const auto borrowed = grants_.Borrow(grant->handle);
+    ASSERT_TRUE(borrowed);
+    const auto frame = BorrowedFrame(*grant, *borrowed);
+    std::array<ReorderDelivery, 1> output;
+    allocation_count = free_count = 0;
+    count_allocations = true;
+    const auto pushed = window_.Push(frame, 0);
+    window_.Fail();
+    const auto first = window_.Drain(output);
+    const auto drained = window_.Drain(output);
+    const auto valid = window_.ValidateDelivery(output[0]);
+    const auto held = grants_.ValidateBorrow(grant->handle, *borrowed);
+    const auto returned = grants_.Return(grant->handle);
+    const auto released = window_.Release(output[0].receipt);
+    count_allocations = false;
+    EXPECT_TRUE(pushed);
+    EXPECT_EQ(first, 0u);
+    EXPECT_EQ(drained, 1u);
+    EXPECT_TRUE(valid);
+    EXPECT_TRUE(held);
+    EXPECT_TRUE(returned);
+    EXPECT_TRUE(released);
+    EXPECT_TRUE(output[0].discarded);
+    EXPECT_EQ(window_.stats().consumed_bytes, 0u);
+    EXPECT_EQ(window_.stats().released_prefix, 0u);
+    EXPECT_EQ(allocation_count, 0u);
+    EXPECT_EQ(free_count, 0u);
 }
 
 TEST_F(ReorderWindowTest, DeliversTwoZeroThreeOneInOrderWithBoundedBatches) {
