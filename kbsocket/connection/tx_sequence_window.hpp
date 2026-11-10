@@ -64,9 +64,11 @@ public:
     /// 仅整批从未被接受时可撤销；已接受前缀的后缀必须继续同 SN 或令连接显式失败。
     std::expected<void, SequenceError> Cancel(SequenceTicket ticket) noexcept;
     void Fail() noexcept {
-        stopped_ = true;
+        stopped_ = failed_ = true;
     }
     std::span<const TxSequencedFrame> pending() const noexcept;
+    /// 共同 Eager/RNDV 序号窗口中，只允许持有当前票据的发送器解释 pending 后缀。
+    bool OwnsReservation(SequenceTicket ticket) const noexcept;
     SequenceSession session() const noexcept {
         return session_;
     }
@@ -79,6 +81,10 @@ public:
     bool stopped() const noexcept {
         return stopped_;
     }
+    /// FIN 只停止新业务准入；显式失败或未知接受才要求取消已准入的 RNDV。
+    bool failed() const noexcept {
+        return failed_;
+    }
     bool fin_accepted() const noexcept {
         return fin_;
     }
@@ -89,7 +95,7 @@ private:
     std::array<TxSequencedFrame, kMaxBatch> frames_{};
     std::size_t begin_ = 0, end_ = 0;
     std::uint64_t next_seq_ = 0, accepted_bytes_ = 0, frame_limit_ = 0, byte_limit_ = 0, generation_ = 0;
-    bool open_ = false, stopped_ = false, unknown_ = false, fin_ = false;
+    bool open_ = false, stopped_ = false, unknown_ = false, fin_ = false, failed_ = false;
 };
 } // namespace connection
 } // namespace kbsocket

@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <limits>
 
+#include "kbsocket/connection/rndv_connection.hpp"
+
 namespace kbsocket {
 namespace api {
 namespace {
@@ -77,6 +79,23 @@ int TxCode(int detail) noexcept {
         return KBS_STREAM_STOPPED;
     case static_cast<int>(Code::kRetained):
     case static_cast<int>(Code::kAcceptanceUnknown):
+        return KBS_STREAM_RETAINED;
+    default:
+        return KBS_STREAM_TRANSPORT;
+    }
+}
+int RndvCode(int detail) noexcept {
+    using Code = connection::RndvConnectionError;
+    switch (detail) {
+    case static_cast<int>(Code::kInvalidArgument):
+        return KBS_STREAM_INVALID_ARGUMENT;
+    case static_cast<int>(Code::kNotReady):
+        return KBS_STREAM_NOT_READY;
+    case static_cast<int>(Code::kWouldBlock):
+        return KBS_STREAM_WOULD_BLOCK;
+    case static_cast<int>(Code::kProtocol):
+        return KBS_STREAM_PROTOCOL;
+    case static_cast<int>(Code::kRetained):
         return KBS_STREAM_RETAINED;
     default:
         return KBS_STREAM_TRANSPORT;
@@ -230,6 +249,11 @@ kbs_stream_error MapStreamError(const connection::ConnectionError& error) noexce
         break;
     case Code::kTx:
         code = TxCode(error.detail);
+        break;
+    case Code::kRndv:
+        code = RndvCode(error.detail);
+        break;
+    case Code::kInvalidCompletion:
         break;
     case Code::kRx:
         code = RxCode(error.detail);

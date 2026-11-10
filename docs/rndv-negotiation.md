@@ -2,7 +2,7 @@
 
 `ConnectionHandshake` 在原有非阻塞 HELLO/READY 流程中交换可选的 WRITE RNDV 能力和最多 8 项 Arena 目录。未启用时 HELLO/READY 保持原有 v3 编码；只有双方声明 RAW 与 WRITE RNDV 后才形成候选限额，双方 READY 完整确认后 `rndv()` 才返回结果。旧二进制会拒绝未知 capability，显式启用 RNDV 不承诺与旧版本透明互通。
 
-本阶段提供协商与导入请求适配，还没有装配 Connection/Runtime 的自动 RTS/GRANT/WRITE/DONE 收发。现有 `Connection::Open` 在接管 fd 前拒绝 RNDV capability，避免 Eager 接收端公告尚不能处理的能力。底层 `ConnectionHandshake` 可供后续装配和显式测试使用。
+本阶段提供协商与导入请求适配。M6.3.9 的 [Connection/Runtime 装配](rndv-connection.md) 已接通 RTS/GRANT/WRITE/DONE：宿主须向 `Connection::Open` 或 `ConnectionOwner::AdoptProtocol` 显式传入 `RndvConnectionConfig`，并在 PrepareRaw 提供目标 Slab、段缓存和固定 Lane。未提供配置时仍拒绝 RNDV capability；默认连接及 `RawStreamRuntime` 便捷入口保持 Eager。协议目录支持多项，但当前 Connection 装配只接受单 Arena。
 
 ## 能力与限额
 
@@ -38,4 +38,4 @@ Offer 包含单 WR WRITE 大小、整条事务大小、最大 Grant 数量、共
 
 无硬件测试覆盖规范编码、双方及单方协商、READY 回显、身份/范围拒绝、真实 Mock Slab 导出、缓存失效、fd 所有权及零分配路径，具体结果见 [roadmap](roadmap.md)。UB 真机未执行。
 
-M6.3.7 已提供 [实际接收分发及共同 Eager/RNDV 读取](rndv-rx-ingress.md)。M6.3.8 已提供 [有界发送事务协调](rndv-tx-coordinator.md)，可通过可信 resolver 适配上述导入请求。下一阶段装配 Connection/Runtime 的双方协商资源、通知/WRITE 进度及关闭流程；在这些路径完成前，应用流继续使用 Eager。
+M6.3.7 已提供 [实际接收分发及共同 Eager/RNDV 读取](rndv-rx-ingress.md)，M6.3.8 已提供 [有界发送事务协调](rndv-tx-coordinator.md)。M6.3.9 将协商资源、通知/WRITE 进度和关闭流程接入显式启用的 Connection；`RawStackConfig::enable_rndv` 提供共用 context 暂停屏障下的段缓存调度。多 Arena 选择及便捷入口启用仍留待后续。

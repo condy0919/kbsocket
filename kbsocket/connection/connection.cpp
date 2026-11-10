@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <limits>
 
 #include "kbsocket/control/tx_lane_snapshot.hpp"
@@ -22,6 +23,19 @@ ConnectionError HandshakeError(const control::ConnectionHandshakeError& error) n
 ConnectionError TxError(const EagerTxError& error) noexcept {
     return {error.code == EagerTxErrorCode::kWouldBlock ? ConnectionErrorCode::kWouldBlock : ConnectionErrorCode::kTx,
             static_cast<int>(error.code), error.provider_status};
+}
+ConnectionError RndvError(RndvConnectionError error) noexcept {
+    auto code = ConnectionErrorCode::kRndv;
+    if (error == RndvConnectionError::kWouldBlock) {
+        code = ConnectionErrorCode::kWouldBlock;
+    }
+    if (error == RndvConnectionError::kInvalidArgument) {
+        code = ConnectionErrorCode::kInvalidArgument;
+    }
+    if (error == RndvConnectionError::kInvalidCompletion) {
+        code = ConnectionErrorCode::kInvalidCompletion;
+    }
+    return {code, static_cast<int>(error)};
 }
 ConnectionError RxError(const EagerRxError& error) noexcept {
     return {ConnectionErrorCode::kRx, static_cast<int>(error.code), error.provider_error};
@@ -54,18 +68,23 @@ Connection::~Connection() {
 
 std::expected<void, ConnectionError> Connection::Open(int fd, ConnectionTable& table,
                                                       const control::ConnectionHandshakeConfig& config,
-                                                      std::uint64_t now_ns) noexcept {
+                                                      std::uint64_t now_ns, const RndvConnectionConfig* rndv) noexcept {
     if (opened_once_) {
         return Error(ConnectionErrorCode::kInUse);
     }
-    // 当前应用流仍只有 Eager 接收装配；不能公告尚不能处理的 RTS/DONE 和目标 Arena。
-    if (config.local.capabilities & control::kHandshakeCapabilityWriteRndv) {
+    // RNDV 显式预算先于 HELLO，未准备好接收链路的默认连接不公告能力。
+    if ((rndv && !RndvConnection::ValidConfig(*rndv)) ||
+        ((config.local.capabilities & control::kHandshakeCapabilityWriteRndv) && !rndv)) {
         return Error(ConnectionErrorCode::kInvalidArgument);
     }
     auto opened = handshake_.Open(fd, table, config, now_ns);
     if (!opened) {
         return std::unexpected(HandshakeError(opened.error()));
     }
+    if (rndv) {
+        rndv_config_ = *rndv;
+    }
+    ObserveTime(now_ns);
     opened_once_ = true;
     state_ = ConnectionState::kNegotiating;
     return {};
@@ -106,8 +125,8 @@ std::expected<void, ConnectionError> Connection::PrepareRaw(const RawConnectionP
     const auto* peer = handshake_.peer();
     if (!peer || !prep.receive || !prep.sender || !prep.slab || !prep.sender_credits || !prep.connection_id ||
         !prep.handshake.credits || !prep.handshake.imports || !prep.sources || !prep.sender->pool() ||
-        prep.control_credit_target < 4 || !prep.lane_update_timeout_ns ||
-        !prep.receive->Matches(*prep.handshake.credits, *handshake_.route().owner) ||
+        (prep.connection_id & RndvConnection::kOwnerMask) || prep.control_credit_target < 4 ||
+        !prep.lane_update_timeout_ns || !prep.receive->Matches(*prep.handshake.credits, *handshake_.route().owner) ||
         prep.receive->context() != prep.handshake.local_context) {
         return Error(ConnectionErrorCode::kInvalidArgument);
     }
@@ -139,11 +158,6 @@ std::expected<void, ConnectionError> Connection::PrepareRaw(const RawConnectionP
         {local.wire_version, peer->identity.runtime, local.identity.receive_domain, local.identity.session},
         local.identity.token,
         peer->credit_epoch};
-    auto rx_open = rx_.Open(*prep.receive, handshake_.receive_window(), binding);
-    if (!rx_open) {
-        return std::unexpected(Fail(RxError(rx_open.error())));
-    }
-    rx_open_ = true;
     tx_session_ = {peer->identity.runtime, peer->identity.receive_domain, peer->identity.session};
     tx_identity_ = {peer->identity.runtime, peer->identity.receive_domain, peer->credit_epoch};
     EagerTxConfig tx_config;
@@ -161,6 +175,33 @@ std::expected<void, ConnectionError> Connection::PrepareRaw(const RawConnectionP
         return std::unexpected(Fail(TxError(tx_open.error())));
     }
     tx_open_ = true;
+    if (handshake_.negotiated_rndv()) {
+        if (prep.handshake.reorder.initial_sequence != 0) {
+            return std::unexpected(Fail({ConnectionErrorCode::kInvalidArgument}));
+        }
+        if (!rndv_config_) {
+            return std::unexpected(Fail({ConnectionErrorCode::kInvalidArgument}));
+        }
+        // 失败时也保留装配器，Close 统一收束可能部分成功的控制路径准备。
+        rndv_open_ = true;
+        const auto opened = rndv_.Open(*rndv_config_, prep.rndv, handshake_, tx_, *prep.receive, *prep.sender,
+                                       *prep.slab, *prep.sender_credits, *prep.handshake.imports, prep.connection_id);
+        if (!opened) {
+            return std::unexpected(Fail(RndvError(opened.error())));
+        }
+    }
+    auto rx_open = rx_.Open(*prep.receive, handshake_.receive_window(), binding, rndv_.receiver());
+    if (!rx_open) {
+        return std::unexpected(Fail(RxError(rx_open.error())));
+    }
+    rx_open_ = true;
+    if (rndv_open_) {
+        const auto retained = handshake_.RetainRndvRoute();
+        if (!retained) {
+            return std::unexpected(Fail(HandshakeError(retained.error())));
+        }
+        rndv_route_ = true;
+    }
     // 最后一次性安装来源；任何失败都不能发布 READY 或留下已提交的业务 WR。
     auto admitted = prep.sources->Prepare({.local = &local,
                                            .peer = peer,
@@ -219,6 +260,9 @@ std::expected<void, ConnectionError> Connection::ApplyPeerReady() noexcept {
     const auto* local_ready = handshake_.local_ready();
     if (!ready || !local_ready) {
         return Error(ConnectionErrorCode::kNotReady);
+    }
+    if (rndv_open_ && ready->max_control_credit_seq < 3) {
+        return Error(ConnectionErrorCode::kCredit);
     }
     auto published =
         raw_.handshake.credits->RecordPublishedControl(raw_.handshake.credit_peer, local_ready->max_control_credit_seq);
@@ -285,6 +329,16 @@ std::expected<void, ConnectionError> Connection::RefreshCredit() noexcept {
     return {};
 }
 std::expected<std::size_t, ConnectionError> Connection::Progress(std::uint64_t now_ns) noexcept {
+    ObserveTime(now_ns);
+    now_ns = last_now_ns_;
+    if (rndv_open_ && (failure_ || state_ == ConnectionState::kClosing)) {
+        const auto progress = rndv_.Progress(last_now_ns_, false);
+        if (rx_open_) {
+            (void)rx_.Drain();
+        }
+        // 清理结果不复活应用状态；调度器仍可据此继续处理迟到 DONE/CQE。
+        return progress ? *progress : 0;
+    }
     if (failure_) {
         return std::unexpected(*failure_);
     }
@@ -391,13 +445,18 @@ std::expected<std::size_t, ConnectionError> Connection::Progress(std::uint64_t n
         return std::unexpected(Fail(credit.error()));
     }
     auto sent = tx_.Progress();
-    if (!sent) {
-        if (sent.error().code == EagerTxErrorCode::kWouldBlock) {
-            return lane_progress->processed;
-        }
+    if (!sent && sent.error().code != EagerTxErrorCode::kWouldBlock) {
         return std::unexpected(Fail(TxError(sent.error())));
     }
-    return *sent + lane_progress->processed;
+    std::size_t processed = sent ? *sent : 0;
+    if (rndv_open_) {
+        const auto progressed = rndv_.Progress(last_now_ns_, true);
+        if (!progressed) {
+            return std::unexpected(Fail(RndvError(progressed.error())));
+        }
+        processed += *progressed;
+    }
+    return processed + lane_progress->processed;
 }
 std::expected<std::size_t, ConnectionError> Connection::Write(std::span<const std::byte> input) noexcept {
     if (failure_) {
@@ -415,6 +474,22 @@ std::expected<std::size_t, ConnectionError> Connection::Write(std::span<const st
     }
     if (state_ != ConnectionState::kRawActive) {
         return Error(ConnectionErrorCode::kNotReady);
+    }
+    if (rndv_open_ && !input.empty() && !tx_.stats().write_shutdown) {
+        if (rndv_.pending_sequence()) {
+            return Error(ConnectionErrorCode::kWouldBlock);
+        }
+        if (input.size() >= rndv_config_->threshold) {
+            const auto result = rndv_.Write(input, SubmissionTime());
+            if (!result) {
+                if (result.error() != RndvConnectionError::kWouldBlock &&
+                    result.error() != RndvConnectionError::kInvalidArgument) {
+                    return std::unexpected(Fail(RndvError(result.error())));
+                }
+                return std::unexpected(RndvError(result.error()));
+            }
+            return *result;
+        }
     }
     auto result = tx_.Write(input);
     if (!result) {
@@ -435,6 +510,22 @@ std::expected<std::size_t, ConnectionError> Connection::WriteLease(memory::Buffe
     }
     if (state_ != ConnectionState::kRawActive) {
         return Error(ConnectionErrorCode::kNotReady);
+    }
+    if (rndv_open_ && bytes && !tx_.stats().write_shutdown) {
+        if (rndv_.pending_sequence()) {
+            return Error(ConnectionErrorCode::kWouldBlock);
+        }
+        if (bytes >= rndv_config_->threshold) {
+            const auto result = rndv_.WriteLease(source, offset, bytes, SubmissionTime());
+            if (!result) {
+                if (result.error() != RndvConnectionError::kWouldBlock &&
+                    result.error() != RndvConnectionError::kInvalidArgument) {
+                    return std::unexpected(Fail(RndvError(result.error())));
+                }
+                return std::unexpected(RndvError(result.error()));
+            }
+            return *result;
+        }
     }
     const auto result = tx_.WriteLease(source, offset, bytes);
     if (!result) {
@@ -466,6 +557,8 @@ std::expected<ConnectionReadResult, ConnectionError> Connection::Read(std::span<
     if (state_ != ConnectionState::kRawActive) {
         return Error(ConnectionErrorCode::kNotReady);
     }
+    ObserveTime(now_ns);
+    now_ns = last_now_ns_;
     auto result = rx_.Read(output, now_ns);
     if (!result) {
         if (result.error().code == EagerRxErrorCode::kInUse) {
@@ -489,6 +582,8 @@ std::expected<EagerReadLeaseResult, ConnectionError> Connection::ReadLease(std::
     if (state_ != ConnectionState::kRawActive) {
         return Error(ConnectionErrorCode::kNotReady);
     }
+    ObserveTime(now_ns);
+    now_ns = last_now_ns_;
     const auto result = rx_.ReadLease(max_bytes, now_ns);
     if (!result) {
         const auto error = RxError(result.error());
@@ -540,13 +635,26 @@ std::expected<void, ConnectionError> Connection::ShutdownWrite() noexcept {
     return {};
 }
 std::expected<void, ConnectionError> Connection::OnTxCompletion(const raw::TxCompletionEvent& event) noexcept {
+    if (!event.record || !OwnsTxOwner(event.record->metadata.connection_id)) {
+        return Error(ConnectionErrorCode::kInvalidCompletion);
+    }
+    if (rndv_.Owns(event.record->metadata.connection_id)) {
+        const auto result = rndv_.OnCompletion(event);
+        if (!result) {
+            if (result.error() == RndvConnectionError::kInvalidCompletion) {
+                return std::unexpected(RndvError(result.error()));
+            }
+            return std::unexpected(Fail(RndvError(result.error())));
+        }
+        return {};
+    }
     if (!tx_open_) {
-        return Error(ConnectionErrorCode::kNotReady);
+        return Error(ConnectionErrorCode::kInvalidCompletion);
     }
     auto result = tx_.OnCompletion(event);
     if (!result) {
         if (result.error().code == EagerTxErrorCode::kInvalidCompletion) {
-            return std::unexpected(TxError(result.error()));
+            return Error(ConnectionErrorCode::kInvalidCompletion, static_cast<int>(result.error().code));
         }
         return std::unexpected(Fail(TxError(result.error())));
     }
@@ -581,11 +689,23 @@ std::expected<EagerRxDisposition, EagerRxError> Connection::DispatchRx(void* own
         return std::unexpected(EagerRxError{EagerRxErrorCode::kInvalidArgument});
     }
     auto& self = *static_cast<Connection*>(owner);
-    if (!self.raw_prepared_ || self.raw_.receive != &domain || self.failure_ ||
-        self.state_ == ConnectionState::kClosing || self.state_ == ConnectionState::kClosed) {
+    const auto& frame = decoded.frame;
+    const bool done = frame.type == WireFrameType::kControl && frame.control == WireControlType::kRndvDone;
+    if (!self.raw_prepared_ || self.raw_.receive != &domain || self.state_ == ConnectionState::kClosed ||
+        ((self.failure_ || self.state_ == ConnectionState::kClosing) && !(done && self.rndv_open_))) {
         return std::unexpected(EagerRxError{EagerRxErrorCode::kStopped});
     }
-    const auto& frame = decoded.frame;
+    self.ObserveTime(now_ns);
+    now_ns = self.last_now_ns_;
+    if (self.rndv_open_ && frame.type == WireFrameType::kControl &&
+        (done || frame.control == WireControlType::kRndvRts || frame.control == WireControlType::kRndvGrant)) {
+        const auto accepted = self.rndv_.Accept(packet);
+        if (!accepted) {
+            (void)self.Fail(RndvError(accepted.error()));
+            return std::unexpected(EagerRxError{EagerRxErrorCode::kStopped});
+        }
+        return EagerRxDisposition::kHeld;
+    }
     if (frame.type == WireFrameType::kDataWithCredit ||
         (frame.type == WireFrameType::kControl && frame.control == WireControlType::kCreditUpdate)) {
         auto updated = self.tx_.ApplyCredit(self.tx_session_, self.tx_identity_, frame.max_credit_seq,
@@ -593,6 +713,16 @@ std::expected<EagerRxDisposition, EagerRxError> Connection::DispatchRx(void* own
         if (!updated) {
             (void)self.Fail(TxError(updated.error()));
             return std::unexpected(EagerRxError{EagerRxErrorCode::kCreditFailed});
+        }
+        if (self.rndv_open_ && self.handshake_.peer_ready()) {
+            const auto initial = self.handshake_.peer_ready()->max_frame_seq;
+            if (frame.max_frame_seq >= initial) {
+                const auto consumed = self.rndv_.Consumed(frame.max_frame_seq - initial);
+                if (!consumed) {
+                    (void)self.Fail(RndvError(consumed.error()));
+                    return std::unexpected(EagerRxError{EagerRxErrorCode::kCreditFailed});
+                }
+            }
         }
         if (frame.type == WireFrameType::kControl) {
             return EagerRxDisposition::kRelease;
@@ -609,6 +739,24 @@ std::expected<EagerRxDisposition, EagerRxError> Connection::DispatchRx(void* own
     }
     return EagerRxDisposition::kHeld;
 }
+void Connection::ObserveTime(std::uint64_t now_ns) noexcept {
+    last_now_ns_ = std::max(last_now_ns_, now_ns);
+    if (rndv_config_) {
+        last_clock_ns_ = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
+}
+std::uint64_t Connection::SubmissionTime() noexcept {
+    const auto clock = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    const auto elapsed = clock >= last_clock_ns_ ? clock - last_clock_ns_ : 0;
+    // 使用宿主时钟域，但不把长时间空闲前的 Progress 时间当作新事务的开始时间。
+    last_now_ns_ += std::min(elapsed, std::numeric_limits<std::uint64_t>::max() - last_now_ns_);
+    last_clock_ns_ = clock;
+    return last_now_ns_;
+}
 ConnectionError Connection::Fail(ConnectionError error) noexcept {
     if (!failure_) {
         failure_ = error;
@@ -618,6 +766,7 @@ ConnectionError Connection::Fail(ConnectionError error) noexcept {
     handshake_.Cancel();
     tx_.Fail();
     rx_.Fail();
+    rndv_.Cancel();
     tcp_.Cancel();
     return *failure_;
 }
@@ -635,6 +784,7 @@ std::expected<void, ConnectionError> Connection::Close() noexcept {
     handshake_.Cancel();
     tx_.Fail();
     rx_.Fail();
+    rndv_.Cancel();
     (void)tcp_.Close();
     if (rx_open_) {
         auto drained = rx_.Drain();
@@ -646,6 +796,20 @@ std::expected<void, ConnectionError> Connection::Close() noexcept {
             return Error(ConnectionErrorCode::kRetained);
         }
         rx_open_ = false;
+    }
+    if (rndv_open_) {
+        const auto closed = rndv_.Close();
+        if (!closed) {
+            return Error(ConnectionErrorCode::kRetained, static_cast<int>(closed.error()));
+        }
+        rndv_open_ = false;
+    }
+    if (rndv_route_) {
+        const auto released = handshake_.ReleaseRndvRoute();
+        if (!released) {
+            return std::unexpected(HandshakeError(released.error()));
+        }
+        rndv_route_ = false;
     }
     if (tx_open_) {
         auto closed = tx_.Close();
@@ -672,7 +836,7 @@ ConnectionReadiness Connection::readiness() const noexcept {
         return {};
     }
     if (state_ == ConnectionState::kRawActive) {
-        return {rx_.readable(), tx_.writable(), rx_.eof(), tx_.stats().write_shutdown};
+        return {rx_.readable(), tx_.writable() && !rndv_.pending_sequence(), rx_.eof(), tx_.stats().write_shutdown};
     }
     if (state_ == ConnectionState::kTcpActive) {
         return {.read_eof = tcp_.read_eof(), .write_closed = tcp_.write_shutdown()};

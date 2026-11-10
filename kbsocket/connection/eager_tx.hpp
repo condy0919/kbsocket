@@ -105,6 +105,10 @@ public:
     EagerTxStats stats() const noexcept;
     /// 至少可复制一个字节的本地准入提示；不要求远端 DATA credit 或可立即提交 SQ。
     bool writable() const noexcept;
+    /// 借用共同序号账本；借用者必须先结束，才能 Close 本流。不得绕过发送准入顺序。
+    TxSequenceWindow* sequence_window() noexcept;
+    /// 先前 Eager 已准入数据没有尚未分配 SN 的排队项，才允许后续 RNDV 预留 SN。
+    bool can_start_rndv() const noexcept;
 
 private:
     struct State;

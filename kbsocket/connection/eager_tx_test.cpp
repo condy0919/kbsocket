@@ -943,6 +943,93 @@ TEST_F(EagerTxTest, StoppingSharedCreditBlocksEveryStreamWhileAcceptedDmaRemains
     EXPECT_EQ(imports_.leases(), 1u);
 }
 
+TEST_F(EagerTxTest, RndvAdmissionWaitsForQueuedEagerButNotAcceptedDma) {
+    EXPECT_EQ(stream_.sequence_window(), nullptr);
+    EXPECT_FALSE(stream_.can_start_rndv());
+    Open();
+    ASSERT_NE(stream_.sequence_window(), nullptr);
+    EXPECT_TRUE(stream_.can_start_rndv());
+    const std::array<std::byte, 8> data{};
+    ASSERT_EQ(stream_.Write(data), data.size());
+    EXPECT_FALSE(stream_.can_start_rndv());
+    ASSERT_EQ(stream_.Progress(), 1u);
+    EXPECT_EQ(stream_.stats().in_flight, 1u);
+    EXPECT_TRUE(stream_.can_start_rndv());
+    Complete(0);
+    ASSERT_TRUE(stream_.ShutdownWrite());
+    EXPECT_FALSE(stream_.can_start_rndv());
+    ASSERT_TRUE(stream_.Close());
+    EXPECT_EQ(stream_.sequence_window(), nullptr);
+}
+
+TEST_F(EagerTxTest, ExternalRtsReservationBlocksDataButAllowsCreditAndCountsItsByteBudget) {
+    auto config = Config();
+    config.max_stream_bytes = 100;
+    ASSERT_TRUE(stream_.Open(config, sender_, slab_, imports_, endpoint_, credits_));
+    PumpImports();
+    auto* sequence = stream_.sequence_window();
+    ASSERT_NE(sequence, nullptr);
+    const std::array plans{TxFramePlan{.bytes = 80}};
+    const auto ticket = sequence->Reserve(plans);
+    ASSERT_TRUE(ticket);
+    EXPECT_TRUE(sequence->OwnsReservation(*ticket));
+    EXPECT_FALSE(sequence->OwnsReservation({}));
+    EXPECT_FALSE(stream_.can_start_rndv());
+    const std::array<std::byte, 30> data{};
+    ASSERT_EQ(stream_.Write(data), 20u);
+    EXPECT_FALSE(stream_.writable());
+    auto blocked = stream_.Progress();
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code, EagerTxErrorCode::kWouldBlock);
+    EXPECT_EQ(post_calls_, 0u);
+    WireFrameInput credit{.type = WireFrameType::kControl,
+                          .max_credit_seq = 10,
+                          .max_control_credit_seq = 3,
+                          .session = session_.session,
+                          .credit_epoch = 9,
+                          .max_frame_seq = 16,
+                          .max_stream_bytes = 1024};
+    ASSERT_TRUE(stream_.QueueCredit(credit));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    ASSERT_EQ(packet_count_, 1u);
+    EXPECT_TRUE(sequence->OwnsReservation(*ticket));
+    EXPECT_EQ(sequence->next_sequence(), 0u);
+    Complete(0);
+    ASSERT_TRUE(sequence->Resolve(*ticket, 1));
+    EXPECT_FALSE(sequence->OwnsReservation(*ticket));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    ASSERT_EQ(packet_count_, 2u);
+    const auto decoded = DecodeWireFrame(packets_[1].imm, std::span(packets_[1].payload).first(packets_[1].bytes));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->frame.seq, 1u);
+    EXPECT_EQ(sequence->accepted_bytes(), 100u);
+    Complete(1);
+}
+
+TEST_F(EagerTxTest, ExternalRtsReservationAlsoLimitsLeaseAdmission) {
+    auto config = Config();
+    config.max_stream_bytes = 100;
+    ASSERT_TRUE(stream_.Open(config, sender_, slab_, imports_, endpoint_, credits_));
+    PumpImports();
+    auto* sequence = stream_.sequence_window();
+    ASSERT_NE(sequence, nullptr);
+    const std::array plans{TxFramePlan{.bytes = 80}};
+    const auto ticket = sequence->Reserve(plans);
+    ASSERT_TRUE(ticket);
+    const auto source = slab_.Acquire(30);
+    ASSERT_TRUE(source);
+    ASSERT_EQ(stream_.WriteLease(*source, 0, 30), 20u);
+    ASSERT_TRUE(slab_.ReleaseCpu(*source));
+    EXPECT_FALSE(stream_.writable());
+    EXPECT_FALSE(stream_.Progress());
+    EXPECT_EQ(post_calls_, 0u);
+    ASSERT_TRUE(sequence->Resolve(*ticket, 1));
+    ASSERT_EQ(stream_.Progress(), 1u);
+    EXPECT_EQ(sequence->accepted_bytes(), 100u);
+    Complete(0);
+    EXPECT_EQ(slab_.stats().local_dma, 0u);
+}
+
 TEST_F(EagerTxTest, PendingImportAndEarlyCreditsAreValidBeforeRawActive) {
     auto config = Config();
     config.max_frame_seq = config.max_stream_bytes = 0;

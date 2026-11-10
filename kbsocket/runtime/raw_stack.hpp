@@ -11,6 +11,7 @@
 #include <span>
 
 #include "kbsocket/control/endpoint_import_cache.hpp"
+#include "kbsocket/control/tseg_import_cache.hpp"
 #include "kbsocket/memory/buffer_lease.hpp"
 #include "kbsocket/memory/slab_allocator.hpp"
 #include "kbsocket/runtime/connection_command_queue.hpp"
@@ -41,6 +42,9 @@ struct RawStackConfig {
     std::uint32_t withdrawals_per_context = 256;
     std::size_t commands_per_context = 256;
     RuntimeShardConfig runtime;
+    // 默认保持 Eager-only；启用后段导入与 endpoint 导入共用每 context 的独占暂停屏障。
+    bool enable_rndv = false;
+    control::TsegImportCacheConfig segments;
 };
 enum class RawStackStage : std::uint8_t {
     kEmpty,
@@ -78,6 +82,7 @@ struct RawStackError {
     std::optional<ProgressError> progress = {};
     std::optional<ConnectionOwnerError> connection = {};
     std::optional<CommandQueueError> mailbox = {};
+    std::optional<control::TsegImportCacheError> segment = {};
 };
 struct RawStackContextResources {
     urma_context_t* context;
@@ -89,6 +94,7 @@ struct RawStackContextResources {
 struct RawStackSharedResources {
     memory::SlabAllocator* slab;
     control::EndpointImportCache* imports;
+    control::TsegImportCache* segments = nullptr;
 };
 struct RawStackContextSnapshot {
     RawDomainSnapshot domain;
@@ -101,6 +107,8 @@ struct RawStackSnapshot {
     std::array<RawStackContextSnapshot, RuntimeShard::kMaxContexts> contexts{};
     memory::SlabStats slab;
     std::size_t budget_bytes = 0, import_entries = 0, import_leases = 0, import_tasks = 0;
+    bool rndv_enabled = false;
+    std::size_t segment_entries = 0, segment_leases = 0, segment_tasks = 0;
     std::optional<RawStackError> open_error;
     std::optional<RawStackError> close_error;
 };

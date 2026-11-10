@@ -156,6 +156,7 @@ public:
     void StopAccepting() noexcept;
     /// 停止新引用并使全部条目失效；未结束时返回 kInUse，继续 Release/调度清理/收割后重试。
     std::expected<void, TsegImportCacheError> Close() noexcept;
+    bool accepting() const noexcept;
     std::size_t entries() const noexcept;
     std::size_t leases() const noexcept;
     std::size_t in_flight() const noexcept;

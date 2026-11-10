@@ -73,6 +73,20 @@ struct EagerTxStream::State {
         }
         return std::max(advertised_control, *published);
     }
+    std::uint64_t BufferedBytes() const noexcept {
+        auto bytes = sequence.accepted_bytes();
+        const auto add = [&bytes](std::uint64_t value) {
+            bytes += std::min(value, std::numeric_limits<std::uint64_t>::max() - bytes);
+        };
+        add(queued_bytes);
+        // 自己的 pending 已包含于 queued_bytes；外部 RTS 的未接受长度也占共同业务窗口。
+        if (!sequence.OwnsReservation(ticket)) {
+            for (const auto& frame : sequence.pending()) {
+                add(frame.bytes);
+            }
+        }
+        return bytes;
+    }
     void Enqueue(std::uint32_t index) noexcept {
         if (tail != kEnd) {
             records[tail].next = index;
@@ -184,7 +198,7 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Write(std::span<const st
             break;
         }
         // 不能把小字节窗口装成一个永远无法 Reserve 的大帧；超出当前授权的尾部留给调用方。
-        const auto buffered = s.sequence.accepted_bytes() + s.queued_bytes;
+        const auto buffered = s.BufferedBytes();
         if (buffered >= s.config.max_stream_bytes) {
             break;
         }
@@ -251,7 +265,7 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::WriteLease(memory::Buffe
         if (s.slab->stats().available_references <= (s.header ? 2u : 1u)) {
             break;
         }
-        const auto buffered = s.sequence.accepted_bytes() + s.queued_bytes;
+        const auto buffered = s.BufferedBytes();
         if (buffered >= s.config.max_stream_bytes) {
             break;
         }
@@ -334,7 +348,14 @@ bool EagerTxStream::writable() const noexcept {
     }
     const auto& s = *state_;
     return s.free != kEnd && s.generation != std::numeric_limits<std::uint64_t>::max() && s.slab->accepting() &&
-           s.slab->stats().available && s.sequence.accepted_bytes() + s.queued_bytes < s.config.max_stream_bytes;
+           s.slab->stats().available && s.BufferedBytes() < s.config.max_stream_bytes;
+}
+TxSequenceWindow* EagerTxStream::sequence_window() noexcept {
+    return state_ && !state_->closed ? &state_->sequence : nullptr;
+}
+bool EagerTxStream::can_start_rndv() const noexcept {
+    return state_ && !state_->closed && !state_->stats.failed && !state_->stats.write_shutdown &&
+           !state_->sequence.stopped() && state_->stats.queued == 0 && state_->sequence.pending().empty();
 }
 std::expected<void, EagerTxError> EagerTxStream::ShutdownWrite() noexcept {
     if (!state_ || state_->closed) {
@@ -524,6 +545,9 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexc
                                         .kind = State::Kind::kCredit,
                                         .active = true};
     } else {
+        if (!s.sequence.pending().empty() && !s.sequence.OwnsReservation(s.ticket)) {
+            return Error(EagerTxErrorCode::kWouldBlock);
+        }
         std::size_t n = 0;
         auto index = s.head;
         if (s.sequence.pending().empty()) {

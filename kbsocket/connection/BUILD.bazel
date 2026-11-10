@@ -247,6 +247,7 @@ cc_library(
     deps = [
         ":eager_rx",
         ":eager_tx",
+        ":rndv_connection",
         "//kbsocket/control:connection_handshake",
         "//kbsocket/control:lane_control",
         "//kbsocket/control:raw_source_admission",
@@ -423,6 +424,49 @@ cc_test(
         ":tx_sequence_window",
         ":wire_frame",
         "//kbsocket/memory:slab_allocator",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "rndv_connection",
+    srcs = ["rndv_connection.cpp"],
+    hdrs = ["rndv_connection.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":credit_account",
+        ":eager_rx",
+        ":eager_tx",
+        ":grant_manager",
+        ":rndv_notification_tx",
+        ":rndv_receiver",
+        ":rndv_rx_ingress",
+        ":rndv_tx_coordinator",
+        ":write_rndv_pool",
+        "//kbsocket/control:connection_handshake",
+        "//kbsocket/control:endpoint_import_cache",
+        "//kbsocket/control:rndv_arena",
+        "//kbsocket/control:tseg_import_cache",
+        "//kbsocket/memory:buffer_lease",
+        "//kbsocket/memory:slab_allocator",
+        "//kbsocket/transport/raw:jetty_pool",
+        "//kbsocket/transport/raw:tx_completion_processor",
+        "//kbsocket/transport/raw:tx_sender",
+    ],
+)
+
+cc_test(
+    name = "connection_rndv_test",
+    srcs = ["connection_rndv_test.cpp"],
+    deps = [
+        ":connection",
+        "//kbsocket/control:rndv_arena",
+        "//kbsocket/control:tseg_import_cache",
+        "//kbsocket/control:tx_lane_snapshot",
+        "//kbsocket/runtime:connection_progress",
+        "//kbsocket/runtime:control_executor",
+        "//kbsocket/transport/raw:receive_domain_closer",
         "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",
     ],

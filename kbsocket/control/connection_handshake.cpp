@@ -47,6 +47,29 @@ bool ConnectionHandshake::active() const noexcept {
 const RndvLimits* ConnectionHandshake::rndv() const noexcept {
     return state_ == ConnectionHandshakeState::kRawActive && rndv_.version ? &rndv_ : nullptr;
 }
+const RndvLimits* ConnectionHandshake::negotiated_rndv() const noexcept {
+    return peer_hello_ && transport_ == HandshakeTransport::kRaw && state_ != ConnectionHandshakeState::kClosed &&
+                   rndv_.version
+               ? &rndv_
+               : nullptr;
+}
+std::expected<void, ConnectionHandshakeError> ConnectionHandshake::RetainRndvRoute() noexcept {
+    if (rndv_route_retained_) {
+        return Error(ConnectionHandshakeErrorCode::kInUse);
+    }
+    if (!prepared_ || !negotiated_rndv() || failure_ || !table_ || !route_.owner) {
+        return Error(ConnectionHandshakeErrorCode::kNotReady);
+    }
+    rndv_route_retained_ = true;
+    return {};
+}
+std::expected<void, ConnectionHandshakeError> ConnectionHandshake::ReleaseRndvRoute() noexcept {
+    if (!rndv_route_retained_) {
+        return Error(ConnectionHandshakeErrorCode::kNotReady);
+    }
+    rndv_route_retained_ = false;
+    return {};
+}
 std::expected<TsegImportRequest, ConnectionHandshakeError>
 ConnectionHandshake::PrepareRndvImport(const connection::GrantIdentity& grant) const noexcept {
     if (!rndv()) {
@@ -55,7 +78,8 @@ ConnectionHandshake::PrepareRndvImport(const connection::GrantIdentity& grant) c
     if (!raw_.rndv_peer_authorized) {
         return Error(ConnectionHandshakeErrorCode::kUnauthorized);
     }
-    if (!receive_.accepting()) {
+    // 接收方向正常 EOF 不撤销反向 WRITE 的已协商权限；失败窗口仍禁止新导入。
+    if (!receive_.accepting() && !receive_.eof()) {
         return Error(ConnectionHandshakeErrorCode::kReorder);
     }
     const auto endpoint = raw_.imports->Get(import_);
@@ -157,11 +181,13 @@ ConnectionHandshakeError ConnectionHandshake::Fail(ConnectionHandshakeError erro
     }
     state_ = ConnectionHandshakeState::kFailed;
     (void)channel_.Close();
-    if (table_ && route_.owner) {
+    if (table_ && route_.owner && !rndv_route_retained_) {
         // 不退休 token，保留到 Close 处理完窗口；授信账本独立保留迟到责任。
         (void)table_->Withdraw(route_);
     }
-    published_ = false;
+    if (!rndv_route_retained_) {
+        published_ = false;
+    }
     receive_.Fail();
     return *failure_;
 }
@@ -418,6 +444,9 @@ void ConnectionHandshake::Cancel() noexcept {
     }
 }
 std::expected<void, ConnectionHandshakeError> ConnectionHandshake::Close() noexcept {
+    if (rndv_route_retained_) {
+        return Error(ConnectionHandshakeErrorCode::kInUse);
+    }
     if (state_ == ConnectionHandshakeState::kClosed) {
         return {};
     }

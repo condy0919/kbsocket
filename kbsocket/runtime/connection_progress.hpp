@@ -49,6 +49,7 @@ struct ConnectionProgressStats {
 /// 单 owner 连接进度源，借用 Connection；与同 context 的 raw/import 源组成 ContextProgressGroup。
 /// 固定槽、就绪队列和有界巡检；动态 fd 由内部 epoll 汇聚为一个固定 Reactor fd。
 /// Attach 在 PrepareRaw 前执行，其 id 必须用作 RawConnectionPreparation.connection_id。
+/// id 高两位保留给 RNDV 子 owner；完成分发还须校验完整代次、连接登记身份与本地 context。
 /// 应用 Write/Read/Prepare/Shutdown 后 Wake；跨线程操作先经宿主 mailbox 转交 owner。
 /// 回调只报告状态/就绪，不得重入或销毁调度器。context 暂停期间宿主不得调用本类或借用连接。
 /// 关闭连接后仍保留注册直到 Close 成功，确保迟到 TX 终结继续按完整 id 分发。

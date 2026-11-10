@@ -12,6 +12,7 @@
 
 #include "kbsocket/connection/eager_rx.hpp"
 #include "kbsocket/connection/eager_tx.hpp"
+#include "kbsocket/connection/rndv_connection.hpp"
 #include "kbsocket/control/connection_handshake.hpp"
 #include "kbsocket/control/lane_control.hpp"
 #include "kbsocket/control/raw_source_admission.hpp"
@@ -51,7 +52,9 @@ enum class ConnectionErrorCode : std::uint8_t {
     kControlProtocol,
     kSourceAdmission,
     kLaneChanged,
-    kLaneUpdateTimeout
+    kLaneUpdateTimeout,
+    kRndv,
+    kInvalidCompletion
 };
 struct ConnectionError {
     ConnectionErrorCode code;
@@ -88,6 +91,7 @@ struct RawConnectionPreparation {
     LaneUpdateAuthorizer authorize_lane_update = nullptr;
     void* lane_authorization_cookie = nullptr;
     std::uint64_t lane_update_timeout_ns = 5'000'000'000;
+    RndvConnectionPreparation rndv;
 };
 
 /// 单 owner 的有界 copy-stream 接口；Write 返回的前缀可立即复用，Read 只交付连续字节。
@@ -101,8 +105,8 @@ public:
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
     std::expected<void, ConnectionError> Open(int fd, ConnectionTable& table,
-                                              const control::ConnectionHandshakeConfig& config,
-                                              std::uint64_t now_ns) noexcept;
+                                              const control::ConnectionHandshakeConfig& config, std::uint64_t now_ns,
+                                              const RndvConnectionConfig* rndv = nullptr) noexcept;
     /// 普通 TCP 服务不探测私有协议；只接管干净、已连接的非阻塞 TCP fd。
     std::expected<void, ConnectionError> OpenTcp(int fd) noexcept;
     /// 数值地址上的非阻塞直连，不发送私有 HELLO；成功启动后由 Progress 推进至 Active/Failed。
@@ -129,7 +133,7 @@ public:
                                                                       const WireFrameView& frame, EagerRxPacket packet,
                                                                       std::uint64_t now_ns) noexcept;
     void Cancel() noexcept;
-    /// 撤路由并有界清理未提交/未读数据；有在途 DMA 时返回 Retained，继续分发终结再重试。
+    /// 有界清理未提交/未读数据；有 DMA/Grant 时保留路由并返回 Retained，终结后才撤路由。
     std::expected<void, ConnectionError> Close() noexcept;
     ConnectionState state() const noexcept {
         return state_;
@@ -140,8 +144,18 @@ public:
     const control::ConnectionHandshake& handshake() const noexcept {
         return handshake_;
     }
+    /// 保留 Eager 统计口径；RNDV 真实 WRITE/通知退休单独计数，避免 accepted/retired 混账。
     EagerTxStats tx_stats() const noexcept {
         return tx_.stats();
+    }
+    std::uint64_t rndv_retired() const noexcept {
+        return rndv_.retired();
+    }
+    bool OwnsTxOwner(std::uint64_t owner) const noexcept {
+        return raw_prepared_ && (owner == raw_.connection_id || rndv_.Owns(owner));
+    }
+    bool needs_cleanup_progress() const noexcept {
+        return rndv_open_ && state_ != ConnectionState::kClosed;
     }
     int fd() const noexcept;
     bool control_output_pending() const noexcept {
@@ -164,13 +178,15 @@ public:
         return raw_prepared_ ? raw_.handshake.local_context : nullptr;
     }
     std::size_t rx_pending() const noexcept {
-        return rx_.pending();
+        return rx_.pending() + rndv_.pending_rx();
     }
     /// O(1) 快照，不消费数据、不查询 provider；TCP IN/OUT 由宿主 fd 通知提供。
     ConnectionReadiness readiness() const noexcept;
 
 private:
     ConnectionError Fail(ConnectionError error) noexcept;
+    void ObserveTime(std::uint64_t now_ns) noexcept;
+    std::uint64_t SubmissionTime() noexcept;
     std::expected<void, ConnectionError> RefreshCredit() noexcept;
     std::expected<void, ConnectionError> ApplyPeerReady() noexcept;
     std::expected<void, ConnectionError> CheckRawBindings() const noexcept;
@@ -179,6 +195,10 @@ private:
     EagerTxStream tx_;
     EagerRxStream rx_;
     tcp::NativeTcpBackend tcp_;
+    RndvConnection rndv_;
+    std::optional<RndvConnectionConfig> rndv_config_;
+    std::uint64_t last_now_ns_ = 0, last_clock_ns_ = 0;
+    bool rndv_open_ = false, rndv_route_ = false;
     RawConnectionPreparation raw_;
     const raw::JettyPool* tx_pool_ = nullptr;
     SequenceSession tx_session_;

@@ -434,7 +434,8 @@ protected:
         if (view) {
             self.last_observed_ = view->observed;
         }
-        if (self.use_mixed_stream_ && frame.frame.type != WireFrameType::kControl) {
+        if (self.use_mixed_stream_ &&
+            (frame.frame.type != WireFrameType::kControl || frame.frame.control == WireControlType::kFin)) {
             const auto accepted = self.mixed_stream_.Accept(packet, ++self.now_);
             if (!accepted) {
                 return std::unexpected(accepted.error());
@@ -1003,6 +1004,73 @@ TEST_F(RndvIngressTest, RtsWaitsForEarlierEagerFrameAndThenUsesCommonStreamPrefi
     EXPECT_TRUE(std::all_of(target.begin(), target.end(), [](std::byte value) { return value == std::byte{0x5a}; }));
     Pump();
     EXPECT_EQ(receiver_.stats().active, 0u);
+}
+
+TEST_F(RndvIngressTest, NormalReceiveEofPreservesReverseGrantWhilePendingDoneDelaysFin) {
+    Open();
+    ASSERT_TRUE(mixed_stream_.Open(domain_, window_, route_binding_, &receiver_));
+    use_mixed_stream_ = true;
+    ASSERT_TRUE(Dispatch(RtsFrame(0)));
+    Pump();
+    PostOne();
+    CompleteTx(0);
+    WireFrameInput fin;
+    fin.type = WireFrameType::kControl;
+    fin.control = WireControlType::kFin;
+    fin.token = route_.token;
+    fin.session = route_binding_.context.session;
+    fin.seq = 1;
+    ASSERT_TRUE(Dispatch(fin));
+    Pump();
+    std::array<std::byte, 32> output{};
+    const auto blocked = mixed_stream_.Read(output, ++now_);
+    ASSERT_TRUE(blocked);
+    EXPECT_TRUE(blocked->would_block);
+    EXPECT_FALSE(blocked->eof);
+    EXPECT_FALSE(window_.eof());
+    ASSERT_TRUE(Dispatch(DoneFrame(0)));
+    Pump();
+    const auto payload = mixed_stream_.Read(output, ++now_);
+    ASSERT_TRUE(payload);
+    EXPECT_EQ(payload->bytes, output.size());
+    const auto eof = mixed_stream_.Read(output, ++now_);
+    ASSERT_TRUE(eof);
+    EXPECT_TRUE(eof->eof);
+    EXPECT_EQ(eof->bytes, 0u);
+    Pump();
+    EXPECT_TRUE(receiver_.stats().stopped);
+    EXPECT_FALSE(ingress_.stats().stopped);
+    EXPECT_TRUE(window_.eof());
+    ASSERT_TRUE(Dispatch(GrantFrame()));
+    Pump();
+    EXPECT_EQ(grant_consumed_, 1u);
+    EXPECT_EQ(ingress_.stats().grant_packets, 0u);
+    EXPECT_EQ(domain_.held(), 0u);
+    EXPECT_TRUE(mixed_stream_.eof());
+    EXPECT_FALSE(mixed_stream_.failed());
+    EXPECT_FALSE(ingress_.stats().stopped);
+}
+
+TEST_F(RndvIngressTest, ExplicitCancelAfterNormalEofStillRejectsReverseGrant) {
+    Open();
+    ASSERT_TRUE(mixed_stream_.Open(domain_, window_, route_binding_, &receiver_));
+    use_mixed_stream_ = true;
+    WireFrameInput fin;
+    fin.type = WireFrameType::kControl;
+    fin.control = WireControlType::kFin;
+    fin.token = route_.token;
+    fin.session = route_binding_.context.session;
+    ASSERT_TRUE(Dispatch(fin));
+    std::array<std::byte, 1> output{};
+    const auto eof = mixed_stream_.Read(output, ++now_);
+    ASSERT_TRUE(eof);
+    EXPECT_TRUE(eof->eof);
+    Pump();
+    ASSERT_TRUE(ingress_.Cancel());
+    EXPECT_FALSE(Dispatch(GrantFrame()));
+    EXPECT_EQ(accept_error_, RndvIngressErrorCode::kStopped);
+    EXPECT_EQ(grant_consumed_, 0u);
+    EXPECT_EQ(domain_.held(), 0u);
 }
 
 TEST_F(RndvIngressTest, MissingPredecessorExpiresHeldRtsWithoutOccupyingReceiverOrTarget) {

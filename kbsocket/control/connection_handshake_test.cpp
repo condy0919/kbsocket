@@ -776,6 +776,10 @@ TEST_F(ConnectionHandshakeTest, RndvNegotiatesCommonLimitsOnlyAfterBothReadyFram
     right.rndv.limits.window = 16;
     right.rndv.limits.max_bytes = 131072;
     OpenPairHello(left, right);
+    ASSERT_NE(a_.negotiated_rndv(), nullptr);
+    ASSERT_NE(b_.negotiated_rndv(), nullptr);
+    EXPECT_EQ(*a_.negotiated_rndv(), right.rndv.limits);
+    EXPECT_EQ(*b_.negotiated_rndv(), right.rndv.limits);
     EXPECT_EQ(a_.rndv(), nullptr);
     EXPECT_EQ(b_.rndv(), nullptr);
     ExpectError(a_.PrepareRndvImport(RndvGrant(a_)), Code::kNotReady);
@@ -800,6 +804,8 @@ TEST_F(ConnectionHandshakeTest, RndvNegotiatesCommonLimitsOnlyAfterBothReadyFram
 
 TEST_F(ConnectionHandshakeTest, OneSidedRndvOfferKeepsRawEagerWithoutImportPermission) {
     OpenPairHello(RndvHello(1), Hello(2));
+    EXPECT_EQ(a_.negotiated_rndv(), nullptr);
+    EXPECT_EQ(b_.negotiated_rndv(), nullptr);
     // 不共同声明能力时无需 RNDV 授权，普通 RAW 建链仍可完成。
     PreparePair();
     DriveCache();
@@ -812,6 +818,8 @@ TEST_F(ConnectionHandshakeTest, OneSidedRndvOfferKeepsRawEagerWithoutImportPermi
 
 TEST_F(ConnectionHandshakeTest, SelectedTcpNeverEnablesRndvFromOneRawOffer) {
     OpenPairHello(RndvHello(1), Hello(2, false));
+    EXPECT_EQ(a_.negotiated_rndv(), nullptr);
+    EXPECT_EQ(b_.negotiated_rndv(), nullptr);
     ASSERT_TRUE(a_.PrepareTcp());
     ASSERT_TRUE(b_.PrepareTcp());
     Activate(State::kTcpActive);
@@ -1110,6 +1118,27 @@ TEST_F(ConnectionHandshakeTest, FrozenCreditDomainPreventsNewRndvImportRequests)
     a_credits_.Freeze();
     ExpectError(a_.PrepareRndvImport(grant), Code::kCredit);
     EXPECT_EQ(import_calls_, 2);
+}
+
+TEST_F(ConnectionHandshakeTest, NormalReceiveEofPreservesReverseRndvImportPermission) {
+    OpenPairHello(RndvHello(1), RndvHello(2));
+    PreparePair(true);
+    DriveCache();
+    Activate(State::kRawActive);
+    auto& window = a_.receive_window();
+    const auto session = window.session();
+    ASSERT_TRUE(session);
+    ASSERT_TRUE(window.Push({.session = *session, .sequence = 0, .kind = connection::ReorderFrameKind::kFin}, ++now_));
+    std::array<connection::ReorderDelivery, 1> deliveries;
+    ASSERT_EQ(window.Poll(deliveries, ++now_), 1u);
+    ASSERT_TRUE(window.Release(deliveries[0].receipt));
+    EXPECT_FALSE(window.accepting());
+    EXPECT_TRUE(window.eof());
+    const auto grant = RndvGrant(a_);
+    EXPECT_TRUE(a_.PrepareRndvImport(grant));
+    // EOF 后的明确失败不能继续借半关闭状态绕过导入门禁。
+    window.Fail();
+    ExpectError(a_.PrepareRndvImport(grant), Code::kReorder);
 }
 
 TEST_F(ConnectionHandshakeTest, FailedCommonReceiveWindowPreventsNewRndvImportRequests) {

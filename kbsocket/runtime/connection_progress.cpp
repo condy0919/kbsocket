@@ -161,8 +161,9 @@ struct ConnectionProgress::State {
             (void)connection.OnControlReady();
         }
         std::size_t processed = 0;
-        if (connection.state() != ConnectionState::kIdle && connection.state() != ConnectionState::kFailed &&
-            connection.state() != ConnectionState::kClosing && connection.state() != ConnectionState::kClosed) {
+        if ((connection.state() != ConnectionState::kIdle && connection.state() != ConnectionState::kFailed &&
+             connection.state() != ConnectionState::kClosing && connection.state() != ConnectionState::kClosed) ||
+            connection.needs_cleanup_progress()) {
             // Reactor 的批次时间可能早于本轮 RX 回调/应用 Read；每次访问刷新同一单调时钟，
             // 防止把旧时间传入已见到较新 RX 的重排窗口。传入值仍作为测试/调度时间下界。
             const auto current = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -282,7 +283,8 @@ ConnectionProgress::Attach(connection::Connection& connection) noexcept {
         return Error(ProgressErrorCode::kNotReady);
     }
     auto& state = *state_;
-    if (!state.free_count || generation_ == std::numeric_limits<std::uint32_t>::max()) {
+    // owner 高两位用于同一连接的 RNDV WRITE/通知；基础调度代次不得进入子 owner 命名空间。
+    if (!state.free_count || generation_ == 0x3fffffffu) {
         return Error(ProgressErrorCode::kResourceExhausted);
     }
     if (connection.connection_id() || connection.state() == ConnectionState::kClosed ||
@@ -389,14 +391,19 @@ std::expected<void, ProgressError> ConnectionProgress::OnTxCompletion(const raw:
         return event.kind == raw::TxCompletionKind::kRejected ? Error(ProgressErrorCode::kProvider)
                                                               : std::expected<void, ProgressError>{};
     }
-    auto* slot = state_->Lookup(event.record->metadata.connection_id);
-    if (!slot || !event.lane || !event.lane->pool || event.lane->pool->context() != state_->config.context) {
+    const auto owner = event.record->metadata.connection_id;
+    const auto kind = owner >> 62;
+    const auto base = kind == 1 || kind == 2 ? owner & ((std::uint64_t{1} << 62) - 1) : owner;
+    auto* slot = kind == 3 ? nullptr : state_->Lookup(base);
+    // 只允许连接已登记的精确子 owner；掩码不得把伪造、旧代次或其他 context 完成投到现有连接。
+    if (!slot || (kind && !slot->connection->OwnsTxOwner(owner)) || !event.lane || !event.lane->pool ||
+        event.lane->pool->context() != state_->config.context) {
         return Error(ProgressErrorCode::kRetained);
     }
     const auto retired = slot->connection->OnTxCompletion(event);
     state_->Enqueue(*slot);
-    if (!retired && (!slot->connection->failure() ||
-                     retired.error().detail == static_cast<int>(connection::EagerTxErrorCode::kInvalidCompletion))) {
+    if (!retired &&
+        (!slot->connection->failure() || retired.error().code == connection::ConnectionErrorCode::kInvalidCompletion)) {
         return Error(ProgressErrorCode::kRetained, static_cast<int>(retired.error().code));
     }
     ++slot->retired;

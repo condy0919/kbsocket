@@ -80,6 +80,9 @@ std::expected<SequenceTicket, SequenceError> TxSequenceWindow::Reserve(std::span
 bool TxSequenceWindow::Matches(SequenceTicket ticket) const noexcept {
     return ticket.owner == this && ticket.generation == generation_ && begin_ != end_;
 }
+bool TxSequenceWindow::OwnsReservation(SequenceTicket ticket) const noexcept {
+    return Matches(ticket);
+}
 std::span<const TxSequencedFrame> TxSequenceWindow::pending() const noexcept {
     return std::span(frames_).subspan(begin_, end_ - begin_);
 }
@@ -92,7 +95,7 @@ std::expected<void, SequenceError> TxSequenceWindow::Resolve(SequenceTicket tick
         return std::unexpected(SequenceError::kAcceptanceUnknown);
     }
     if (!accepted_prefix) {
-        unknown_ = stopped_ = true;
+        unknown_ = stopped_ = failed_ = true;
         return std::unexpected(SequenceError::kAcceptanceUnknown);
     }
     if (*accepted_prefix > end_ - begin_) {

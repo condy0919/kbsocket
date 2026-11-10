@@ -1,6 +1,6 @@
 # M6.3.5：接收端 DONE、Grant 借用与共同重排
 
-[`RndvReceiver`](../kbsocket/connection/rndv_receiver.hpp) 将已校验的 RTS、接收端 Grant 和 [共同重排窗口](connection-primitives.md) 绑定。它使用预分配的事务槽，处理 DONE 后借出真实目标，并在应用归还时先结束 Grant 借用，再释放重排 receipt。本文组件不直接读取 JFC、不发布 GRANT，也未接入 Connection/Runtime 自动 RNDV。
+[`RndvReceiver`](../kbsocket/connection/rndv_receiver.hpp) 将已校验的 RTS、接收端 Grant 和 [共同重排窗口](connection-primitives.md) 绑定。它使用预分配的事务槽，处理 DONE 后借出真实目标，并在应用归还时先结束 Grant 借用，再释放重排 receipt。本文组件不直接读取 JFC、不发布 GRANT；M6.3.9 的 [Connection/Runtime 装配](rndv-connection.md) 已将它接入显式启用的 RNDV 连接，当前限定单 Arena、固定 Lane。
 
 ## 成功通知的信任边界
 
@@ -45,4 +45,4 @@ Close 没有活动 RNDV 责任时仅结束协调器；存在活动责任时先�
 
 测试使用真实 Slab/Grant/重排账本与 Mock URMA 注册，覆盖来源和身份校验、资源背压、乱序混合交付、取消、迟到通知、借用保留、槽复用及热路径零分配。结果记录在 [roadmap](roadmap.md)，不代表 UB 真机验证。
 
-M6.3.6 已提供 [RNDV 能力/Arena 协商](rndv-negotiation.md)。M6.3.7 的 [接收分发与混合流](rndv-rx-ingress.md) 已将真实 RX 的来源、物理归还、RNDV 背压和 Eager/Grant/FIN 短读及 Lease 归还接通。Receiver 在 stream 或 ingress 绑定期间拒绝 Close，即使当前为空；整个窗口也只允许一个 stream。后续仍需完成发送事务调度、Connection/Runtime 自动分发与完整应用关闭。
+M6.3.6 已提供 [RNDV 能力/Arena 协商](rndv-negotiation.md)。M6.3.7 的 [接收分发与混合流](rndv-rx-ingress.md) 已将真实 RX 的来源、物理归还、RNDV 背压和 Eager/Grant/FIN 短读及 Lease 归还接通。Receiver 在 stream 或 ingress 绑定期间拒绝 Close，即使当前为空；整个窗口也只允许一个 stream。M6.3.8–M6.3.9 已补齐发送协调与显式启用的 Connection/Runtime 分发、关闭；未启用的连接及 `RawStreamRuntime` 便捷入口仍使用 Eager。

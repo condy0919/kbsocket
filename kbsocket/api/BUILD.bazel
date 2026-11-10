@@ -72,6 +72,7 @@ cc_library(
     deps = [
         ":stream",
         "//kbsocket/connection",
+        "//kbsocket/connection:rndv_connection",
         "//kbsocket/runtime:connection_owner",
         "//kbsocket/runtime:connection_progress",
         "//kbsocket/runtime:progress_source",

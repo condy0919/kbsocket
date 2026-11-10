@@ -130,7 +130,11 @@ std::expected<void, RndvIngressError> RndvRxIngress::Accept(EagerRxPacket handle
          frame.control != WireControlType::kRndvDone)) {
         return Error(RndvIngressErrorCode::kUnsupportedFrame);
     }
-    if ((state.stopped || state.receiver->stats().stopped) && frame.control != WireControlType::kRndvDone) {
+    // 接收方向正常 FIN 不关闭反向事务的 GRANT 通道；显式取消仍只接受终结证明 DONE。
+    const bool receive_eof = state.reorder->eof();
+    if ((state.stopped || (state.receiver->stats().stopped && !receive_eof) ||
+         (receive_eof && frame.control == WireControlType::kRndvRts)) &&
+        frame.control != WireControlType::kRndvDone) {
         return Error(RndvIngressErrorCode::kStopped);
     }
     if (frame.control == WireControlType::kRndvGrant && !state.config.on_grant) {
@@ -337,8 +341,8 @@ std::expected<std::size_t, RndvIngressError> RndvRxIngress::Progress(std::uint64
     } else {
         progressed += *received;
     }
-    if (!state.stopped && (state.receiver->stats().stopped || state.notifications->stats().failed ||
-                           state.notifications->stats().stopped)) {
+    if (!state.stopped && ((state.receiver->stats().stopped && !state.reorder->eof()) ||
+                           state.notifications->stats().failed || state.notifications->stats().stopped)) {
         error = RndvIngressError{RndvIngressErrorCode::kStopped};
         (void)Cancel();
     }

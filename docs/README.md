@@ -19,6 +19,7 @@
 | [RNDV 能力协商](rndv-negotiation.md) | HELLO/READY 限额、Arena 目录、认证门禁与段导入请求适配 |
 | [RNDV 接收分发](rndv-rx-ingress.md) | RTS/GRANT/DONE 分发、RX 背压、GRANT job 与 Eager/RNDV 混合读取 |
 | [RNDV 发送事务协调](rndv-tx-coordinator.md) | 源排队 pin、RTS/GRANT、按需导入、WRITE 到真实 DONE 完成及宿主进度边界 |
+| [RNDV Connection 装配](rndv-connection.md) | 显式预算、双向混合流、Runtime 段导入暂停与迟到 DONE 清理 |
 | [硬件观测记录](hardware-observations.md) | 用户实测的 SEND/RMA、水线重配、错误事件与隔离、资源回收及验证边界 |
 | [硬件验证矩阵](hardware-validation-matrix.md) | 残留 RX、provider 边界、进程/链路故障、持续多设备收发、JFC 通知与 READ/WRITE 的完整运行顺序 |
 | [URMA 加载与运行时](urma-runtime.md) | 动态加载、gMock 替换、context 校验、会话与进程退出 |

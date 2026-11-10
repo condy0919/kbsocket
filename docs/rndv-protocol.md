@@ -1,6 +1,6 @@
 # M6.3.3：WRITE RNDV 线格式与共同序号占位
 
-本阶段提供 [`wire_frame`](../kbsocket/connection/wire_frame.hpp) 的 RTS/GRANT/DONE 编解码、[`rndv_protocol`](../kbsocket/connection/rndv_protocol.hpp) 的路由和事务身份适配，以及 [`ReorderWindow`](../kbsocket/connection/reorder_window.hpp) 的待完成占位。已有 Eager/FIN/CREDIT/RST 编码不变。Connection/Runtime 尚未启用自动 RNDV；当前 Eager 入口仍拒绝 RNDV 业务处理。
+本阶段提供 [`wire_frame`](../kbsocket/connection/wire_frame.hpp) 的 RTS/GRANT/DONE 编解码、[`rndv_protocol`](../kbsocket/connection/rndv_protocol.hpp) 的路由和事务身份适配，以及 [`ReorderWindow`](../kbsocket/connection/reorder_window.hpp) 的待完成占位。已有 Eager/FIN/CREDIT/RST 编码不变。M6.3.9 的 [Connection/Runtime 装配](rndv-connection.md) 支持通过 `RndvConnectionConfig` 显式启用单 Arena、固定 Lane 的 RNDV；默认连接和 `RawStreamRuntime` 便捷入口仍使用 Eager。
 
 ## 固定格式与方向身份
 
@@ -45,4 +45,4 @@
 
 无真机测试覆盖双向不同 session/token、短/扩展编码、错误来源与完整 Grant 身份、取消后的 DONE 禁发、旧事务句柄、Eager/RNDV/FIN 共同窗口、数量/字节额度和零分配。Mock 测试中的显式 DMA 事实不代表 UB 真机端到端验证。
 
-M6.3.4 已绑定 RTS 发送 SN、未来 DONE 额度、本地通知槽、Grant 发布及导入引用。M6.3.5 已增加接收端可信 DONE 终结和共同重排窗口中的 Grant 只读借用/真实归还。M6.3.6 已提供能力/Arena 协商；M6.3.7 已提供实际 RX 的 RNDV 暂存/背压与混合 copy/Lease 读取。完整发送事务调度及 Connection/RawDomain/Runtime 自动装配仍待完成。
+M6.3.4 已绑定 RTS 发送 SN、未来 DONE 额度、本地通知槽、Grant 发布及导入引用。M6.3.5 已增加接收端可信 DONE 终结和共同重排窗口中的 Grant 只读借用/真实归还。M6.3.6–M6.3.8 已接通能力/Arena 协商、实际 RX 暂存/背压、混合读取和发送事务调度；M6.3.9 将这些路径装配到显式启用的 Connection，并由 Runtime 分发子 owner 完成和调度段导入。多 Arena 选择及便捷入口启用仍留待后续。

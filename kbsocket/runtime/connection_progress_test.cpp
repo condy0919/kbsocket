@@ -161,6 +161,7 @@ TEST(ConnectionProgress, BoundedFairQueueAndStaleHandleRejection) {
         auto handle = progress.Attach(connections[i]);
         ASSERT_TRUE(handle);
         handles[i] = *handle;
+        EXPECT_EQ(handle->id >> 62, 0u);
         ASSERT_TRUE(handle->slot_index());
         EXPECT_LT(*handle->slot_index(), progress.capacity());
     }
@@ -187,6 +188,16 @@ TEST(ConnectionProgress, BoundedFairQueueAndStaleHandleRejection) {
     old.record.emplace();
     old.record->metadata.connection_id = handles[0].id;
     EXPECT_FALSE(progress.OnTxCompletion(old));
+    // 子 owner 的高位不能绕过槽代次；也不能把未开启 RNDV 的新连接伪装成 WRITE/通知 owner。
+    for (std::uint64_t kind = 1; kind <= 3; ++kind) {
+        old.record->metadata.connection_id = handles[0].id | (kind << 62);
+        EXPECT_FALSE(progress.OnTxCompletion(old));
+        old.record->metadata.connection_id = newer->id | (kind << 62);
+        EXPECT_FALSE(progress.OnTxCompletion(old));
+        EXPECT_FALSE(progress.Wake({&progress, newer->id | (kind << 62)}));
+    }
+    EXPECT_EQ(replacement.state(), ConnectionState::kIdle);
+    EXPECT_FALSE(replacement.failure());
     ASSERT_TRUE(replacement.Close());
     ASSERT_TRUE(progress.Detach(*newer));
     for (std::size_t i = 1; i < handles.size(); ++i) {

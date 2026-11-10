@@ -607,6 +607,9 @@ std::expected<void, TsegImportCacheError> TsegImportCache::Close() noexcept {
     state_.reset();
     return {};
 }
+bool TsegImportCache::accepting() const noexcept {
+    return state_ && !state_->stopped;
+}
 std::size_t TsegImportCache::entries() const noexcept {
     return state_ ? state_->entry_count : 0;
 }

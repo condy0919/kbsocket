@@ -187,7 +187,8 @@ std::expected<OwnedConnection, ConnectionOwnerError> ConnectionOwner::ConnectTcp
 }
 std::expected<OwnedConnection, ConnectionOwnerError>
 ConnectionOwner::AdoptProtocol(int fd, connection::ConnectionTable& routes,
-                               const control::ConnectionHandshakeConfig& config, std::uint64_t now_ns) noexcept {
+                               const control::ConnectionHandshakeConfig& config, std::uint64_t now_ns,
+                               const connection::RndvConnectionConfig* rndv) noexcept {
     if (!state_) {
         return Error(Code::kNotReady);
     }
@@ -195,7 +196,7 @@ ConnectionOwner::AdoptProtocol(int fd, connection::ConnectionTable& routes,
     if (!handle) {
         return handle;
     }
-    const auto opened = state_->Find(*handle)->connection->Open(fd, routes, config, now_ns);
+    const auto opened = state_->Find(*handle)->connection->Open(fd, routes, config, now_ns, rndv);
     if (!opened) {
         return std::unexpected(state_->Rollback(*handle, ConnectionError(opened.error()).error()));
     }

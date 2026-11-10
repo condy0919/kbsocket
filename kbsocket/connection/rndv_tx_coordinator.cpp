@@ -107,7 +107,8 @@ std::expected<void, RndvTxError> RndvTxCoordinator::Open(const RndvTxConfig& con
     if (!key || *key != pool->endpoint) {
         return Error(RndvTxErrorCode::kWrongIdentity);
     }
-    if (!endpoints.Get(endpoint)) {
+    const auto target = endpoints.Get(endpoint);
+    if (!target && target.error().code != control::ImportCacheErrorCode::kPending) {
         return Error(RndvTxErrorCode::kImport);
     }
     if (sequence.stopped()) {
@@ -571,7 +572,7 @@ std::expected<std::size_t, RndvTxError> RndvTxCoordinator::Progress(std::uint64_
         return Error(RndvTxErrorCode::kInvalidArgument);
     }
     auto& state = *state_;
-    if (state.sequence->stopped() && !state.stats.failed) {
+    if (state.sequence->failed() && !state.stats.failed) {
         (void)Cancel();
     }
     std::size_t progressed = 0;

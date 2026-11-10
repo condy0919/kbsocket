@@ -1,6 +1,6 @@
 # M6.3.4：RNDV 通知发送与未来控制额度
 
-[`RndvNotificationTx`](../kbsocket/connection/rndv_notification_tx.hpp) 将 [RTS/GRANT/DONE 线格式](rndv-protocol.md) 提交为实际 SEND_WITH_IMM，并跟踪各 WR 的源 DMA、物理授信和退休。它是单 owner、固定 Lane 的有界组件；[接收协调器](rndv-receiver.md)、[能力与 Arena 协商](rndv-negotiation.md) 及 [发送事务协调器](rndv-tx-coordinator.md) 已提供独立装配组件，Connection/Runtime 自动装配仍待完成。
+[`RndvNotificationTx`](../kbsocket/connection/rndv_notification_tx.hpp) 将 [RTS/GRANT/DONE 线格式](rndv-protocol.md) 提交为实际 SEND_WITH_IMM，并跟踪各 WR 的源 DMA、物理授信和退休。它是单 owner、固定 Lane 的有界组件；M6.3.9 的 [Connection/Runtime 装配](rndv-connection.md) 已绑定接收协调、能力协商与发送事务。当前通过 `RndvConnectionConfig` 显式启用，限定单 Arena、固定 Lane；默认连接及 `RawStreamRuntime` 便捷入口仍使用 Eager。
 
 ## 资源与准入
 
@@ -41,6 +41,6 @@ Close 直接释放已知成功终结的本地通知，对其他条目尝试取�
 
 ## 后续边界
 
-本阶段的 Mock 回归验证实际 raw 提交、逐 WR 完成与 Slab/import/credit 账务，不代表 UB 真机通过。M6.3.5 的 [接收协调器](rndv-receiver.md) 已提供可信 DONE 到 Grant 终结、只读借用及共同重排归还的适配。当前 DONE 线上没有 WRITE 数量，接收端采用私有无计数入口；GrantHandle 作为独立的借用类型进入重排，span 不冒充 BufferLease。M6.3.6 已提供能力/Arena 目录协商，M6.3.7 的 [接收分发](rndv-rx-ingress.md) 接通 GRANT job；M6.3.8 的 [发送协调器](rndv-tx-coordinator.md) 接通源准入、RTS/GRANT、导入等待、WRITE 和真实完成后的 DONE。通知 Progress、缓存控制任务和物理 CQE 仍由宿主显式推进，Connection/Runtime 自动装配及应用 RNDV capability 开放待后续。
+本阶段的 Mock 回归验证实际 raw 提交、逐 WR 完成与 Slab/import/credit 账务，不代表 UB 真机通过。M6.3.5 的 [接收协调器](rndv-receiver.md) 已提供可信 DONE 到 Grant 终结、只读借用及共同重排归还的适配。当前 DONE 线上没有 WRITE 数量，接收端采用私有无计数入口；GrantHandle 作为独立的借用类型进入重排，span 不冒充 BufferLease。M6.3.6–M6.3.8 已接通能力/Arena 协商、GRANT job、源准入、RTS/GRANT、导入等待、WRITE 和真实完成后的 DONE。M6.3.9 的 Connection 负责通知推进和精确 owner 分发，Runtime 负责有界调度及共享暂停域中的段导入；宿主仍须驱动 Runtime 并保留所有依赖，未启用时不会公告 RNDV 能力。
 
 远端 DONE/应用归还可以早于本地 GRANT CQE；通知取消只隔离仍未完成的发布责任，不抢回 Ready/Borrowed 目标。已退休的旧 Grant 即使被复用，也不会因迟到本地错误而影响新授权。GrantManager 必须存活且保持打开，直到相应通知记录结束。

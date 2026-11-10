@@ -16,6 +16,9 @@
 #include "kbsocket/control/tseg_import_cache.hpp"
 
 namespace kbsocket {
+namespace connection {
+class Connection;
+}
 namespace control {
 
 enum class ConnectionHandshakeState : std::uint8_t {
@@ -104,6 +107,8 @@ public:
 
     /// 双方 READY 完成后才返回共同 RNDV 上限；限额不是动态空闲量，也不代表目标 Grant 已授予。
     const RndvLimits* rndv() const noexcept;
+    /// HELLO 已协商的静态限额，仅供控制路径准备资源；不表示 READY 完成或允许业务发送。
+    const RndvLimits* negotiated_rndv() const noexcept;
     /// 只从当前已确认的 peer 目录与完整 Grant 构造请求，不调用 provider、不取得缓存引用或授权 WRITE。
     /// 调用方仍须核验对应 RTS、经共享暂停域驱动导入，并由 WRITE pool 持有逐 WR 所需引用。
     std::expected<TsegImportRequest, ConnectionHandshakeError>
@@ -147,6 +152,10 @@ public:
     }
 
 private:
+    friend class connection::Connection;
+    /// 仅完整 Connection 在接收协调器准备好后保留路由；失败期仍需处理迟到 DONE。
+    std::expected<void, ConnectionHandshakeError> RetainRndvRoute() noexcept;
+    std::expected<void, ConnectionHandshakeError> ReleaseRndvRoute() noexcept;
     ConnectionHandshakeError Fail(ConnectionHandshakeError error) noexcept;
     std::expected<void, ConnectionHandshakeError> Handle(const HandshakeMessage& message) noexcept;
     std::expected<void, ConnectionHandshakeError> PublishRaw() noexcept;
@@ -167,6 +176,7 @@ private:
     std::uint64_t expected_authorization_ = 0, expected_runtime_ = 0;
     bool hello_queued_ = false, peer_hello_ = false, prepared_ = false, published_ = false;
     bool ready_queued_ = false, peer_ready_ = false;
+    bool rndv_route_retained_ = false;
     std::optional<ConnectionHandshakeError> failure_;
 };
 

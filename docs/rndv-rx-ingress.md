@@ -2,7 +2,7 @@
 
 [`RndvRxIngress`](../kbsocket/connection/rndv_rx_ingress.hpp) 连接真实 `EagerReceiveDomain`、[接收协调器](rndv-receiver.md) 和 [GRANT 通知队列](rndv-notification-tx.md)。RTS、GRANT、DONE 分别使用预分配的暂存槽，接收器和通知发送器均绑定到唯一 ingress。`EagerRxStream` 可显式绑定同一接收器，按共同序号读取 Eager、WRITE 结果和 FIN。
 
-这是可独立装配的接收路径。应用 `Connection::Open` 仍拒绝提前声明 RNDV capability；[发送事务协调器](rndv-tx-coordinator.md) 已提供 GRANT 回调及后续 WRITE/DONE 推进，协商预算到实际资源的映射、Connection/Runtime 自动装配与完整应用关闭尚未完成。
+这是可独立装配的接收路径。[发送事务协调器](rndv-tx-coordinator.md) 提供 GRANT 回调及后续 WRITE/DONE 推进；M6.3.9 的 [Connection/Runtime 装配](rndv-connection.md) 已接通协商预算、混合应用流及关闭。宿主须通过 `RndvConnectionConfig` 显式启用，当前限定单 Arena、固定 Lane；默认连接与 `RawStreamRuntime` 便捷入口仍使用 Eager。
 
 ## 接收责任与重试
 
@@ -18,7 +18,7 @@
 
 宿主继续显式调用通知队列的 `Progress` 并分发真实 TX 完成；Ingress 不轮询 JFC、不代替通知 CQE，也不关闭整条共享通知队列。它只取消和释放自己创建的 GRANT 通知。
 
-收到 GRANT 时调用配置的 `on_grant`。发送侧回调必须将完整身份与尚未完成的原 RTS 匹配，成功表示已复制或接管事务状态；返回 WouldBlock 必须无副作用。回调不能保留输入 span，也不能重入 ingress。本阶段提供分发与保留接口，WRITE pool 的完整发送事务编排仍待下一步。
+收到 GRANT 时调用配置的 `on_grant`。发送侧回调必须将完整身份与尚未完成的原 RTS 匹配，成功表示已复制或接管事务状态；返回 WouldBlock 必须无副作用。回调不能保留输入 span，也不能重入 ingress。M6.3.8 的发送协调器实现此回调，M6.3.9 在显式启用的 Connection 中完成绑定。
 
 ## 乱序与容量
 
@@ -42,4 +42,4 @@ Cancel 使整个逻辑接收流失败，停止新 RTS/GRANT，仍接受匹配的
 
 ## 验证范围
 
-测试使用真实 Slab、Grant、重排、物理 Credit、RX buffer、TX ledger 与通知组件，URMA 注册/收发由 Mock 提供。覆盖乱序与单槽背压、控制帧独立暂存、通知终结、真实来源拒绝、混合短读/Lease/FIN、取消与迟到 DONE、依赖绑定及热路径零分配。测试计数见 [roadmap](roadmap.md)。UB 真机及完整应用 WRITE RNDV 端到端测试未执行。
+测试使用真实 Slab、Grant、重排、物理 Credit、RX buffer、TX ledger 与通知组件，URMA 注册/收发由 Mock 提供。覆盖乱序与单槽背压、控制帧独立暂存、通知终结、真实来源拒绝、混合短读/Lease/FIN、取消与迟到 DONE、依赖绑定及热路径零分配。测试计数及 Connection 集成验证范围见 [roadmap](roadmap.md) 和 [Connection/Runtime 装配](rndv-connection.md)。UB 真机端到端测试未执行。

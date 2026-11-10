@@ -7,6 +7,8 @@
 
 #include "gtest/gtest.h"
 
+#include "kbsocket/connection/rndv_connection.hpp"
+
 namespace kbsocket {
 namespace api {
 namespace {
@@ -35,6 +37,24 @@ TEST(StreamErrorTest, PreservesProviderCompletionWithoutTreatingItAsErrno) {
     EXPECT_EQ(error.detail, input.detail);
     EXPECT_EQ(error.underlying, 9);
     EXPECT_EQ(error.reserved, 0u);
+}
+
+TEST(StreamErrorTest, RndvErrorsRetainLifecycleMeaningAndSeparateCompletionIdentity) {
+    using Code = connection::RndvConnectionError;
+    // 新的内部错误空间不能按 Eager 枚举解释，尤其不能将保留责任映射为普通可重试。
+    EXPECT_EQ(
+        MapStreamError(connection::ConnectionError{ConnectionCode::kRndv, static_cast<int>(Code::kRetained)}).code,
+        KBS_STREAM_RETAINED);
+    EXPECT_EQ(
+        MapStreamError(connection::ConnectionError{ConnectionCode::kRndv, static_cast<int>(Code::kProtocol)}).code,
+        KBS_STREAM_PROTOCOL);
+    EXPECT_EQ(
+        MapStreamError(connection::ConnectionError{ConnectionCode::kRndv, static_cast<int>(Code::kWouldBlock)}).code,
+        KBS_STREAM_WOULD_BLOCK);
+    const auto invalid = MapStreamError(connection::ConnectionError{ConnectionCode::kInvalidCompletion});
+    EXPECT_EQ(invalid.code, KBS_STREAM_TRANSPORT);
+    EXPECT_EQ(invalid.native_code, static_cast<int>(ConnectionCode::kInvalidCompletion));
+    EXPECT_EQ(MapStreamError(connection::ConnectionError{ConnectionCode::kRndv, 256}).code, KBS_STREAM_TRANSPORT);
 }
 
 TEST(StreamErrorTest, TcpLifecycleAndSystemFailuresHaveDistinctCategories) {

@@ -434,6 +434,25 @@ TEST_F(ConnectionOwnerTest, FailedProtocolConfigKeepsFdAndRouteTableReusable) {
     ExpectError(owner_.Peer(*adopted), Code::kNotReady);
 }
 
+TEST_F(ConnectionOwnerTest, InvalidRndvConfigRollsBackWithoutTakingSocketOwnership) {
+    Open(1);
+    TcpPair pair;
+    ASSERT_TRUE(pair.Open());
+    connection::RndvConnectionConfig rndv;
+    rndv.tx_capacity = 0;
+    // 可选 RNDV 参数必须转交 Connection 校验；失败不消耗 owner 槽、路由 token 或 TCP fd。
+    const auto adopted = owner_.AdoptProtocol(pair.right, routes_[0], Config(1), Now(), &rndv);
+    ExpectError(adopted, Code::kConnection);
+    EXPECT_EQ(owner_.stats().occupied, 0u);
+    EXPECT_EQ(progress_.stats()->attached, 0u);
+    EXPECT_GE(::fcntl(pair.right, F_GETFD), 0);
+    const auto retry = owner_.AdoptProtocol(pair.right, routes_[0], Config(1), Now());
+    ASSERT_TRUE(retry);
+    pair.right = -1;
+    Track(*retry);
+    EXPECT_EQ(owner_.Inspect(*retry)->state, ConnectionState::kNegotiating);
+}
+
 TEST_F(ConnectionOwnerTest, CloseAndReleaseInvalidateOldHandleBeforeSlotReuse) {
     Open(1);
     TcpPair first, second;

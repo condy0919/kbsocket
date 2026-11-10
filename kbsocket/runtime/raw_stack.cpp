@@ -5,7 +5,9 @@
 #include <stdexcept>
 #include <vector>
 
+#include "kbsocket/runtime/context_progress_group.hpp"
 #include "kbsocket/runtime/import_progress.hpp"
+#include "kbsocket/runtime/tseg_import_progress.hpp"
 
 namespace kbsocket {
 namespace runtime {
@@ -35,6 +37,8 @@ struct RawStack::State {
         ConnectionMailbox commands;
         PeerCreditProgress withdrawals;
         ImportProgress imports;
+        TsegImportProgress segments;
+        ContextProgressGroup import_group;
         RawQueueBinding binding;
     };
     // 未完成的析构保留整份 State；绝不能先析构 session 再留下借用它的域、MR 或 worker。
@@ -42,11 +46,12 @@ struct RawStack::State {
     memory::MemoryBudget budget;
     memory::SlabAllocator slab;
     control::EndpointImportCache imports;
+    control::TsegImportCache segments;
     std::array<Context, kMaxContexts> contexts;
     RuntimeShard runtime;
     std::size_t count = 0;
     RawStackStage stage = RawStackStage::kOpenFailed;
-    bool published = false, attached = false;
+    bool published = false, attached = false, rndv_enabled = false;
     std::optional<RawStackError> open_error, close_error;
 
     explicit State(std::size_t bytes) noexcept : budget(bytes) {}
@@ -112,6 +117,7 @@ std::expected<void, RawStackError> RawStack::Open(std::span<const RawEndpointCon
     }
     auto& s = *state_;
     s.count = endpoints.size();
+    s.rndv_enabled = config.enable_rndv;
     // 生命周期控制路径允许分配；失败也留下单次 State，统一通过显式关闭处理。
     try {
         std::vector<raw::DeviceConfig> devices;
@@ -138,6 +144,11 @@ std::expected<void, RawStackError> RawStack::Open(std::span<const RawEndpointCon
     }
     if (const auto opened = s.imports.Open(config.imports); !opened) {
         return s.FailOpen({.code = Code::kImport, .import = opened.error()});
+    }
+    if (s.rndv_enabled) {
+        if (const auto opened = s.segments.Open(config.segments); !opened) {
+            return s.FailOpen({.code = Code::kImport, .segment = opened.error()});
+        }
     }
     std::array<RawContextBinding, kMaxContexts> bindings{};
     for (std::size_t i = 0; i < s.count; ++i) {
@@ -171,6 +182,16 @@ std::expected<void, RawStackError> RawStack::Open(std::span<const RawEndpointCon
         if (const auto opened = c.imports.Open(s.imports, handles[i], endpoint.domain.context_incarnation); !opened) {
             return s.FailOpen(ProgressErrorAt(opened.error(), i));
         }
+        if (s.rndv_enabled) {
+            if (const auto opened = c.segments.Open(s.segments, handles[i], endpoint.domain.context_incarnation);
+                !opened) {
+                return s.FailOpen(ProgressErrorAt(opened.error(), i));
+            }
+            std::array<ProgressSource*, 2> imports{&c.imports, &c.segments};
+            if (const auto opened = c.import_group.Open(imports); !opened) {
+                return s.FailOpen(ProgressErrorAt(opened.error(), i));
+            }
+        }
         const auto bound = c.domain.Bind(c.progress);
         if (!bound) {
             return s.FailOpen(DomainErrorAt(bound.error(), i));
@@ -179,7 +200,7 @@ std::expected<void, RawStackError> RawStack::Open(std::span<const RawEndpointCon
         bindings[i] = {.context = handles[i],
                        .queues = std::span(&c.binding, 1),
                        .connections = &c.progress,
-                       .control = &c.imports,
+                       .control = s.rndv_enabled ? static_cast<ProgressSource*>(&c.import_group) : &c.imports,
                        .mailbox = &c.commands,
                        .peers = &c.withdrawals};
     }
@@ -218,7 +239,7 @@ std::expected<RawStackSharedResources, RawStackError> RawStack::shared() noexcep
     if (state_->AnyPaused()) {
         return Error(Code::kInUse);
     }
-    return RawStackSharedResources{&state_->slab, &state_->imports};
+    return RawStackSharedResources{&state_->slab, &state_->imports, state_->rndv_enabled ? &state_->segments : nullptr};
 }
 std::expected<RawStackSnapshot, RawStackError> RawStack::Inspect() const noexcept {
     if (!state_) {
@@ -237,6 +258,10 @@ std::expected<RawStackSnapshot, RawStackError> RawStack::Inspect() const noexcep
     snapshot.import_entries = s.imports.entries();
     snapshot.import_leases = s.imports.leases();
     snapshot.import_tasks = s.imports.in_flight();
+    snapshot.rndv_enabled = s.rndv_enabled;
+    snapshot.segment_entries = s.segments.entries();
+    snapshot.segment_leases = s.segments.leases();
+    snapshot.segment_tasks = s.segments.in_flight();
     snapshot.open_error = s.open_error;
     snapshot.close_error = s.close_error;
     for (std::size_t i = 0; i < s.count; ++i) {
@@ -290,6 +315,7 @@ std::expected<void, RawStackError> RawStack::BeginClose() noexcept {
     }
     s.slab.StopAccepting();
     s.imports.StopAccepting();
+    s.segments.StopAccepting();
     std::optional<RawStackError> failure;
     for (std::size_t i = 0; i < s.count; ++i) {
         auto& c = s.contexts[i];
@@ -354,7 +380,8 @@ std::expected<RawStackSnapshot, RawStackError> RawStack::AdvanceClose(const RawS
             }
         }
         const auto memory = s.slab.stats();
-        if (memory.available != memory.buffers || s.imports.entries() || s.imports.leases() || s.imports.in_flight()) {
+        if (memory.available != memory.buffers || s.imports.entries() || s.imports.leases() || s.imports.in_flight() ||
+            s.segments.entries() || s.segments.leases() || s.segments.in_flight()) {
             return Error(Code::kInUse);
         }
         if (const auto closed = s.runtime.Close(); !closed) {
@@ -374,6 +401,12 @@ std::expected<RawStackSnapshot, RawStackError> RawStack::AdvanceClose(const RawS
                 return s.FailClose({.code = Code::kConnection, .context_index = i - 1, .connection = closed.error()});
             }
             if (const auto closed = c.withdrawals.Close(); !closed) {
+                return s.FailClose(ProgressErrorAt(closed.error(), i - 1));
+            }
+            if (const auto closed = c.import_group.Close(); !closed) {
+                return s.FailClose(ProgressErrorAt(closed.error(), i - 1));
+            }
+            if (const auto closed = c.segments.Close(); !closed) {
                 return s.FailClose(ProgressErrorAt(closed.error(), i - 1));
             }
             if (const auto closed = c.imports.Close(); !closed) {
@@ -400,6 +433,9 @@ std::expected<RawStackSnapshot, RawStackError> RawStack::AdvanceClose(const RawS
         }
         if (const auto closed = s.imports.Close(); !closed) {
             return s.FailClose({.code = Code::kImport, .import = closed.error()});
+        }
+        if (const auto closed = s.segments.Close(); !closed) {
+            return s.FailClose({.code = Code::kImport, .segment = closed.error()});
         }
         s.stage = RawStackStage::kClosingMemory;
     }

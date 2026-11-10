@@ -174,6 +174,9 @@ protected:
     virtual std::uint32_t SourceReferences() const noexcept {
         return 128;
     }
+    virtual bool ImportBeforeOpen() const noexcept {
+        return true;
+    }
     void SetUp() override {
         active_ = this;
         context_.eid.raw[15] = 1;
@@ -242,9 +245,11 @@ protected:
         auto segment = segments_cache_.Acquire({segment_key_, segments_[1].seg, {}});
         ASSERT_TRUE(segment);
         segment_lease_ = *segment;
-        ASSERT_TRUE(DriveCaches());
-        ASSERT_TRUE(endpoints_.Get(endpoint_lease_));
-        ASSERT_TRUE(segments_cache_.Get(segment_lease_));
+        if (ImportBeforeOpen()) {
+            ASSERT_TRUE(DriveCaches());
+            ASSERT_TRUE(endpoints_.Get(endpoint_lease_));
+            ASSERT_TRUE(segments_cache_.Get(segment_lease_));
+        }
     }
     void TearDown() override {
         count_allocations = false;
@@ -618,6 +623,36 @@ protected:
     urma_status_t rejection_ = URMA_ENOMEM;
     std::size_t partial_ = 0;
 };
+
+class PendingNotificationTxTest : public NotificationTxTest {
+protected:
+    bool ImportBeforeOpen() const noexcept override {
+        return false;
+    }
+};
+
+TEST_F(PendingNotificationTxTest, PreallocatesBeforeImportButPostsOnlyAfterExactTargetIsReady) {
+    ASSERT_FALSE(endpoints_.Get(endpoint_lease_));
+    auto wrong = Config();
+    ++wrong.endpoint.jetty_id;
+    RndvNotificationTx other;
+    ExpectError(other.Open(wrong, sender_, source_, endpoints_, endpoint_lease_, credits_),
+                RndvNotificationErrorCode::kWrongIdentity);
+    Open();
+    EXPECT_EQ(endpoints_.leases(), 2u);
+    const auto pair = notifications_.QueueRts(Transfer(), sequence_);
+    ASSERT_TRUE(pair);
+    ExpectError(notifications_.Progress(), RndvNotificationErrorCode::kWouldBlock);
+    EXPECT_EQ(packet_count_, 0u);
+    EXPECT_EQ(post_calls_, 0u);
+    EXPECT_EQ(jetty_imports_.load(), 0u);
+    ASSERT_TRUE(DriveCaches());
+    ASSERT_EQ(notifications_.Progress(), 1u);
+    CompleteNotification(0);
+    ASSERT_TRUE(notifications_.Release(pair->rts));
+    ASSERT_TRUE(notifications_.Cancel(pair->done));
+    ASSERT_TRUE(notifications_.Release(pair->done));
+}
 
 TEST_F(NotificationTxTest, OpenPreallocatesRegisteredSlotsAndOwnsEndpointPin) {
     const auto free = source_.stats().available;

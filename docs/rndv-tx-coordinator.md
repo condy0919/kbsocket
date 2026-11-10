@@ -2,7 +2,7 @@
 
 [`RndvTxCoordinator`](../kbsocket/connection/rndv_tx_coordinator.hpp) 将源区间准入、RTS、GRANT 验证、远端段导入、分块 WRITE 和 DONE 通知串成一个单 owner 事务。它组合 [通知发送器](rndv-notification-tx.md)、[WRITE 事务池](write-rndv-pool.md)、共同 `TxSequenceWindow` 与导入缓存，绑定一条连接、一个远端 Arena 和一条完整 Lane。
 
-这是可独立装配的发送路径。应用 `Connection::Open` 的 RNDV capability 门禁仍保留；协商资源到 Connection/Runtime 的自动装配、应用发送入口及多 Arena 选择尚未接通。当前实现和 Mock 证据不代表 UB 真机验证通过。
+这是可独立装配的发送路径。M6.3.9 的 [Connection/Runtime 装配](rndv-connection.md) 已接通协商资源、应用发送及关闭；`Connection::Open` 或 `ConnectionOwner::AdoptProtocol` 须显式传入 `RndvConnectionConfig`，当前限定单 Arena、固定 Lane。默认连接和 `RawStreamRuntime` 便捷入口仍使用 Eager，多 Arena 选择尚未接通。当前实现和 Mock 证据不代表 UB 真机验证通过。
 
 ## 准入与源内存
 
@@ -64,4 +64,4 @@ Close 先停止新提交；有未完成事务时走取消并继续保留未终�
 
 ## 验证范围与下一步
 
-验证基于 Mock URMA 和真实软件 Slab、缓存、通知队列、发送/完成账本及事务池；以源码回归和 [roadmap](roadmap.md) 的验证记录为准。本阶段不增加真机通过结论。后续需要将双向协商、收发协调器、进度调度、错误传播和关闭装配到 Connection/Runtime，再开放应用 RNDV 能力与多 Arena 选择。
+验证基于 Mock URMA 和真实软件 Slab、缓存、通知队列、发送/完成账本及事务池；以源码回归和 [roadmap](roadmap.md) 的验证记录为准。本阶段不增加真机通过结论。M6.3.9 已将双方协商、收发协调器、调度、错误传播和关闭接入显式启用的 Connection/Runtime；`RawStackConfig::enable_rndv` 提供共享段缓存及生命周期门禁。多 Arena 选择、固定 Lane 以外的策略和便捷入口启用仍留待后续。

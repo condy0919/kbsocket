@@ -163,6 +163,9 @@ protected:
         f.unimport_seg = [](auto*) { return URMA_SUCCESS; };
         return f;
     }
+    virtual bool ImportBeforeOpen() const noexcept {
+        return true;
+    }
     void SetUp() override {
         active_ = this;
         context_.eid.raw[15] = 1;
@@ -225,8 +228,10 @@ protected:
         const auto endpoint = endpoints_.Acquire({endpoint_key_, std::as_bytes(std::span(&descriptor, 1)), {}});
         ASSERT_TRUE(endpoint);
         endpoint_lease_ = *endpoint;
-        ASSERT_TRUE(DriveCaches());
-        ASSERT_TRUE(endpoints_.Get(endpoint_lease_));
+        if (ImportBeforeOpen()) {
+            ASSERT_TRUE(DriveCaches());
+            ASSERT_TRUE(endpoints_.Get(endpoint_lease_));
+        }
     }
     void TearDown() override {
         count_allocations = false;
@@ -592,6 +597,47 @@ protected:
     std::size_t partial_ = 0;
 };
 
+class PendingRndvTxCoordinatorTest : public RndvTxCoordinatorTest {
+protected:
+    bool ImportBeforeOpen() const noexcept override {
+        return false;
+    }
+};
+
+TEST_F(PendingRndvTxCoordinatorTest, PreparesWithPendingEndpointAndRetainsSourceUntilImportCompletes) {
+    ASSERT_FALSE(endpoints_.Get(endpoint_lease_));
+    Open();
+    const auto source = Source(77);
+    const auto handle = Submit(source);
+    ReleaseCpu(source);
+    EXPECT_EQ(source_.stats().local_dma, 1u);
+    const auto blocked = notifications_.Progress();
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code, RndvNotificationErrorCode::kWouldBlock);
+    EXPECT_EQ(packet_count_, 0u);
+    ASSERT_TRUE(DriveCaches());
+    ASSERT_EQ(notifications_.Progress(), 1u);
+    Complete(0);
+    Progress();
+    const auto grant = Target(handle);
+    Grant(grant);
+    Progress();
+    ASSERT_TRUE(DriveCaches());
+    for (unsigned i = 0; i < 4; ++i) {
+        Progress();
+    }
+    Finish(handle);
+    const auto evidence = coordinator_.TerminalEvidence(handle);
+    ASSERT_TRUE(evidence);
+    ASSERT_TRUE(grants_.CompleteDone(*evidence));
+    const auto payload = grants_.Borrow(grant.handle);
+    ASSERT_TRUE(payload);
+    ASSERT_EQ(payload->size(), 77u);
+    ASSERT_TRUE(grants_.Return(grant.handle));
+    grant_ended_[0] = true;
+    ASSERT_TRUE(coordinator_.Release(handle));
+}
+
 TEST_F(RndvTxCoordinatorTest, PinsSourceAcrossDelayedGrantAndImportThenWaitsForDoneCompletion) {
     Open();
     const auto source = Source(77);
@@ -859,6 +905,59 @@ TEST_F(RndvTxCoordinatorTest, StopAllowsExistingTransferToFinishAndRejectsNewSub
     EXPECT_TRUE(source_.Readable(source));
     StartWrites(Target(handle));
     Finish(handle);
+}
+
+TEST_F(RndvTxCoordinatorTest, AcceptedFinStopsNewAdmissionButLetsEarlierRtsFinish) {
+    Open();
+    const auto source = Source(77);
+    const auto handle = Submit(source);
+    ReleaseCpu(source);
+    ASSERT_EQ(notifications_.Progress(), 1u);
+    Complete(0);
+    const std::array fin{TxFramePlan{.fin = true}};
+    const auto ticket = sequence_.Reserve(fin);
+    ASSERT_TRUE(ticket);
+    ASSERT_TRUE(sequence_.Resolve(*ticket, 1));
+    EXPECT_TRUE(sequence_.stopped());
+    EXPECT_TRUE(sequence_.fin_accepted());
+    EXPECT_FALSE(sequence_.failed());
+    Progress();
+    EXPECT_FALSE(Status(handle).cancelled);
+    EXPECT_EQ(source_.stats().local_dma, 1u);
+    const auto later = Source(77);
+    const std::array input{WriteRndvSource{later, 0, 77}};
+    ExpectError(coordinator_.Submit(input, now_++), RndvTxErrorCode::kStopped);
+    StartWrites(Target(handle));
+    Finish(handle);
+    EXPECT_TRUE(Status(handle).success);
+    EXPECT_FALSE(coordinator_.stats().failed);
+    EXPECT_FALSE(sequence_.failed());
+}
+
+TEST_F(RndvTxCoordinatorTest, ExplicitFailureAfterAcceptedFinStillCancelsEarlierRts) {
+    Open();
+    const auto source = Source(77);
+    const auto handle = Submit(source);
+    ReleaseCpu(source);
+    ASSERT_EQ(notifications_.Progress(), 1u);
+    Complete(0);
+    const std::array fin{TxFramePlan{.fin = true}};
+    const auto ticket = sequence_.Reserve(fin);
+    ASSERT_TRUE(ticket);
+    ASSERT_TRUE(sequence_.Resolve(*ticket, 1));
+    sequence_.Fail();
+    EXPECT_TRUE(sequence_.fin_accepted());
+    EXPECT_TRUE(sequence_.failed());
+    Progress();
+    EXPECT_TRUE(Status(handle).cancelled);
+    EXPECT_TRUE(Status(handle).complete);
+    EXPECT_FALSE(Status(handle).success);
+    EXPECT_TRUE(coordinator_.stats().failed);
+    EXPECT_EQ(source_.stats().local_dma, 0u);
+    const auto stopped = notifications_.Progress();
+    ASSERT_FALSE(stopped);
+    EXPECT_EQ(stopped.error().code, RndvNotificationErrorCode::kStopped);
+    EXPECT_EQ(packet_count_, 1u);
 }
 
 TEST_F(RndvTxCoordinatorTest, CommonSequenceIncludesEagerAndWindowRequiresExplicitConsumedPrefix) {

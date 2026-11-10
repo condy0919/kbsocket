@@ -90,9 +90,9 @@ public:
     /// 先预留有界槽/调度身份，再非阻塞直连；返回句柄不代表已连通，状态/错误由原调度回调交付。
     std::expected<OwnedConnection, ConnectionOwnerError>
     ConnectTcp(const sockaddr* address, socklen_t length, std::uint64_t now_ns, std::uint64_t deadline_ns) noexcept;
-    std::expected<OwnedConnection, ConnectionOwnerError> AdoptProtocol(int fd, connection::ConnectionTable& routes,
-                                                                       const control::ConnectionHandshakeConfig& config,
-                                                                       std::uint64_t now_ns) noexcept;
+    std::expected<OwnedConnection, ConnectionOwnerError>
+    AdoptProtocol(int fd, connection::ConnectionTable& routes, const control::ConnectionHandshakeConfig& config,
+                  std::uint64_t now_ns, const connection::RndvConnectionConfig* rndv = nullptr) noexcept;
     /// preparation 的 connection_id/sources 必须留空，由本所有者注入真实调度身份与槽内来源。
     /// Peer 信用、Slab、import、接收域仍由宿主共用，不能为每条连接复制授信。
     /// 来源适配器首次 Open 后固定 registry；准备失败可纠正授权重试，但换 registry 须重新建链。

@@ -122,7 +122,7 @@ struct RndvNotificationTx::State {
     bool stopped = false;
     bool failed = false;
 
-    std::expected<urma_target_jetty_t*, RndvNotificationError> Destination() const noexcept {
+    std::expected<urma_target_jetty_t*, RndvNotificationError> Destination(bool allow_pending = false) const noexcept {
         const auto key = imports->GetKey(endpoint);
         if (!key) {
             return ImportError(key.error());
@@ -132,6 +132,9 @@ struct RndvNotificationTx::State {
         }
         const auto target = imports->Get(endpoint);
         if (!target) {
+            if (allow_pending && target.error().code == control::ImportCacheErrorCode::kPending) {
+                return nullptr;
+            }
             return ImportError(target.error());
         }
         if (!*target || (*target)->urma_ctx != key->local_context || (*target)->id.id != key->jetty_id ||
@@ -202,7 +205,8 @@ std::expected<void, RndvNotificationError> RndvNotificationTx::Open(const RndvNo
     state->imports = &imports;
     state->credits = &credits;
     state->endpoint = endpoint;
-    const auto destination = state->Destination();
+    // 只在建链预分配阶段允许 Pending；实际提交始终要求精确匹配且已经 Ready 的目标。
+    const auto destination = state->Destination(true);
     if (!destination) {
         return std::unexpected(destination.error());
     }

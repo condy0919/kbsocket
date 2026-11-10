@@ -231,6 +231,22 @@ protected:
             active_->unimport_calls_.fetch_add(1);
             return URMA_SUCCESS;
         };
+        f.import_seg = [](auto* context, auto* descriptor, auto*, std::uint64_t,
+                          urma_import_seg_flag_t) -> urma_target_seg_t* {
+            auto& s = *active_;
+            const auto index = s.segment_import_calls_.fetch_add(1);
+            while (s.block_segment_import_.load()) {
+                s.block_segment_import_.wait(true);
+            }
+            auto& target = s.imported_segments_[index];
+            target.urma_ctx = context;
+            target.seg = *descriptor;
+            return &target;
+        };
+        f.unimport_seg = [](auto*) {
+            active_->segment_unimport_calls_.fetch_add(1);
+            return URMA_SUCCESS;
+        };
         return f;
     }
     void SetUp() override {
@@ -238,6 +254,7 @@ protected:
         config_.connections_per_context = config_.withdrawals_per_context = 4;
         config_.commands_per_context = 4;
         config_.imports = {8, 16, 4};
+        config_.segments = {8, 16, 4};
         config_.slab = {8, 4096, 16};
         config_.memory_budget_bytes = 32768;
         for (std::size_t device = 0; device < 2; ++device) {
@@ -317,6 +334,8 @@ protected:
     void TearDown() override {
         block_import_.store(false);
         block_import_.notify_all();
+        block_segment_import_.store(false);
+        block_segment_import_.notify_all();
         if (stack_.stage() != RawStackStage::kEmpty && stack_.stage() != RawStackStage::kClosed &&
             stack_.stage() != RawStackStage::kRetained) {
             // 兜底仅收割本测试已经知道的责任；不伪造生产代码的终结或静默证据。
@@ -331,12 +350,23 @@ protected:
             for (const auto lease : import_leases_) {
                 (void)shared_->imports->Release(lease);
             }
+            for (const auto lease : segment_leases_) {
+                (void)shared_->segments->Release(lease);
+            }
             fail_jfr_delete_.reset();
             fail_context_delete_.reset();
             fail_unregister_call_ = 0;
             ASSERT_TRUE(stack_.BeginClose());
             if (shared_) {
-                ASSERT_TRUE(SpinUntil([this] { return shared_->imports->entries() == 0; }));
+                ASSERT_TRUE(SpinUntil([this] {
+                    for (std::size_t i = 0; i < endpoint_count_; ++i) {
+                        if (stack_.paused(i)) {
+                            return false;
+                        }
+                    }
+                    return shared_->imports->entries() == 0 &&
+                           (!shared_->segments || shared_->segments->entries() == 0);
+                }));
             }
             Close();
         }
@@ -366,6 +396,28 @@ protected:
             return {};
         }
         import_leases_.push_back(*acquired);
+        return *acquired;
+    }
+    control::TsegImportLease AcquireSegment(std::size_t context = 0) {
+        control::TsegImportRequest request;
+        request.key = {.local_context = &contexts_[context],
+                       .local_context_incarnation = 101 + context,
+                       .peer_runtime = 20,
+                       .receive_domain = 21,
+                       .slab_id = 22,
+                       .slab_generation = 1,
+                       .authorization_identity = 23};
+        request.key.eid[15] = 9;
+        std::memcpy(&request.descriptor.ubva.eid, request.key.eid.data(), request.key.eid.size());
+        request.descriptor.ubva.va = 0x10000;
+        request.descriptor.len = 4096;
+        request.descriptor.attr.bs.access = URMA_ACCESS_WRITE;
+        const auto acquired = shared_->segments->Acquire(request);
+        EXPECT_TRUE(acquired);
+        if (!acquired) {
+            return {};
+        }
+        segment_leases_.push_back(*acquired);
         return *acquired;
     }
     OwnedConnection AdoptTcp(std::size_t context = 0) {
@@ -414,6 +466,7 @@ protected:
     std::array<urma_jfr_t, 4> jfrs_{};
     std::array<std::array<urma_jetty_t, 2>, 4> jetties_{};
     std::array<urma_target_seg_t, 16> segments_{};
+    std::array<urma_target_seg_t, 8> imported_segments_{};
     std::array<urma_target_jetty_t, 8> targets_{};
     std::array<std::deque<Posted>, 4> posted_;
     std::array<std::deque<urma_cr_t>, 4> completions_;
@@ -428,6 +481,7 @@ protected:
     std::vector<Deletion> deletions_;
     std::vector<int> peer_fds_;
     std::vector<control::ImportLease> import_leases_;
+    std::vector<control::TsegImportLease> segment_leases_;
     std::size_t init_calls_ = 0, uninit_calls_ = 0, query_calls_ = 0, context_create_calls_ = 0;
     std::size_t context_delete_calls_ = 0, register_calls_ = 0, unregister_calls_ = 0, jfr_delete_calls_ = 0;
     std::size_t fail_register_call_ = 0, fail_context_create_ = 0, fail_unregister_call_ = 0;
@@ -435,7 +489,9 @@ protected:
     std::optional<std::size_t> failed_cq_context_;
     urma_status_t uninit_status_ = URMA_SUCCESS;
     std::atomic<std::size_t> import_calls_{0}, unimport_calls_{0};
+    std::atomic<std::size_t> segment_import_calls_{0}, segment_unimport_calls_{0};
     std::atomic<bool> block_import_{false};
+    std::atomic<bool> block_segment_import_{false};
 };
 
 TEST_F(RawStackTest, OwnsTwoDevicesTwoEidsWithDistinctDomainsAndSharedSlab) {
@@ -445,6 +501,8 @@ TEST_F(RawStackTest, OwnsTwoDevicesTwoEidsWithDistinctDomainsAndSharedSlab) {
     EXPECT_EQ(snapshot->stage, RawStackStage::kReady);
     EXPECT_EQ(snapshot->context_count, 4u);
     EXPECT_TRUE(snapshot->progress_attached);
+    EXPECT_FALSE(snapshot->rndv_enabled);
+    EXPECT_EQ(shared_->segments, nullptr);
     EXPECT_EQ(init_calls_, 1u);
     EXPECT_EQ(query_calls_, 2u);
     EXPECT_EQ(context_create_calls_, 4u);
@@ -842,6 +900,98 @@ TEST_F(RawStackTest, InflightImportPauseRejectsGlobalInspectionAndShutdownMutati
     block_import_.notify_all();
     ASSERT_TRUE(SpinUntil([&] { return !stack_.paused(1) && shared_->imports->Get(lease).has_value(); }));
     ASSERT_TRUE(shared_->imports->Release(lease));
+}
+
+TEST_F(RawStackTest, SegmentAndEndpointImportsShareOneContextPause) {
+    config_.enable_rndv = true;
+    Open();
+    ASSERT_NE(shared_->segments, nullptr);
+    block_import_.store(true);
+    block_segment_import_.store(true);
+    const auto endpoint = AcquireImport(1);
+    const auto segment = AcquireSegment(1);
+    ASSERT_TRUE(endpoint.owner);
+    ASSERT_TRUE(segment.owner);
+    ASSERT_TRUE(SpinUntil([&] { return stack_.paused(1) && import_calls_.load() == 1; }));
+    // 同 context 的两个慢导入不可并发；暂停还须覆盖 raw poll，其他 context 继续工作。
+    const auto before = polls_;
+    for (int i = 0; i < 8; ++i) {
+        ASSERT_TRUE(stack_.Tick());
+    }
+    EXPECT_EQ(segment_import_calls_.load(), 0u);
+    EXPECT_EQ(polls_[1], before[1]);
+    EXPECT_GT(polls_[0], before[0]);
+    EXPECT_FALSE(stack_.Inspect());
+    EXPECT_FALSE(stack_.shared());
+    EXPECT_FALSE(stack_.BeginClose());
+    block_import_.store(false);
+    block_import_.notify_all();
+    ASSERT_TRUE(SpinUntil([&] { return stack_.paused(1) && segment_import_calls_.load() == 1; }));
+    const auto segment_pause = polls_[1];
+    for (int i = 0; i < 8; ++i) {
+        ASSERT_TRUE(stack_.Tick());
+    }
+    EXPECT_EQ(polls_[1], segment_pause);
+    EXPECT_FALSE(stack_.resources(1));
+    EXPECT_TRUE(stack_.resources(0));
+    block_segment_import_.store(false);
+    block_segment_import_.notify_all();
+    ASSERT_TRUE(SpinUntil([&] {
+        return !stack_.paused(1) && shared_->imports->Get(endpoint).has_value() &&
+               shared_->segments->Get(segment).has_value();
+    }));
+    const auto snapshot = stack_.Inspect();
+    ASSERT_TRUE(snapshot);
+    EXPECT_TRUE(snapshot->rndv_enabled);
+    EXPECT_EQ(snapshot->segment_entries, 1u);
+    EXPECT_EQ(snapshot->segment_leases, 1u);
+    EXPECT_EQ(snapshot->segment_tasks, 0u);
+    EXPECT_EQ(shared_->segments->Get(segment).value()->urma_ctx, &contexts_[1]);
+    EXPECT_TRUE(shared_->imports->Release(endpoint));
+    EXPECT_TRUE(shared_->segments->Release(segment));
+}
+
+TEST_F(RawStackTest, SegmentDmaPinAndDeferredUnimportPreventRuntimeDetach) {
+    config_.enable_rndv = true;
+    Open();
+    const auto segment = AcquireSegment(2);
+    ASSERT_TRUE(segment.owner);
+    ASSERT_TRUE(SpinUntil([&] { return !stack_.paused(2) && shared_->segments->Get(segment).has_value(); }));
+    const auto pin = shared_->segments->Retain(segment);
+    ASSERT_TRUE(pin);
+    segment_leases_.push_back(*pin);
+    ASSERT_TRUE(shared_->segments->Release(segment));
+    ASSERT_TRUE(stack_.BeginClose());
+    // 业务引用已归还但 DMA pin 尚在；失效只是停止提交，不能撤销底层导入或停止 Runtime。
+    EXPECT_FALSE(shared_->segments->Get(*pin));
+    EXPECT_FALSE(stack_.AdvanceClose(Proof()));
+    ExpectStillRunning();
+    EXPECT_EQ(segment_unimport_calls_.load(), 0u);
+    ASSERT_TRUE(shared_->segments->Release(*pin));
+    EXPECT_FALSE(stack_.AdvanceClose(Proof()));
+    ASSERT_TRUE(SpinUntil([&] { return !stack_.paused(2) && shared_->segments->entries() == 0; }));
+    EXPECT_EQ(segment_unimport_calls_.load(), 1u);
+    EXPECT_EQ(Deleted(Kind::kContext), 0u);
+    Close();
+    const auto snapshot = stack_.Inspect();
+    ASSERT_TRUE(snapshot);
+    EXPECT_EQ(snapshot->segment_entries, 0u);
+    EXPECT_EQ(snapshot->segment_leases, 0u);
+    EXPECT_EQ(snapshot->segment_tasks, 0u);
+}
+
+TEST_F(RawStackTest, InvalidOptInSegmentCacheConfigPreservesExplicitClosePath) {
+    config_.enable_rndv = true;
+    config_.segments.entries = 0;
+    const auto opened = stack_.Open(endpoints_, config_);
+    ASSERT_FALSE(opened);
+    EXPECT_EQ(opened.error().code, RawStackErrorCode::kImport);
+    ASSERT_TRUE(opened.error().segment);
+    EXPECT_EQ(opened.error().segment->code, control::TsegImportCacheErrorCode::kInvalidArgument);
+    EXPECT_FALSE(stack_.shared());
+    EXPECT_EQ(Deleted(Kind::kContext), 0u);
+    Close();
+    EXPECT_EQ(Deleted(Kind::kContext), 4u);
 }
 
 TEST_F(RawStackTest, PhysicalSourceMustBeRemovedEvenAfterItsLogicalRouteRetires) {
