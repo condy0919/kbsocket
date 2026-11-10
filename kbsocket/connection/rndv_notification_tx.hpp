@@ -22,6 +22,7 @@
 namespace kbsocket {
 namespace connection {
 class RndvNotificationTx;
+class RndvRxIngress;
 struct RndvNotificationHandle {
     const RndvNotificationTx* owner = nullptr;
     std::uint32_t slot = 0;
@@ -130,6 +131,10 @@ public:
     std::expected<void, RndvNotificationError> Close() noexcept;
 
 private:
+    friend class RndvRxIngress;
+    std::expected<void, RndvNotificationError> BindIngress(const RndvRxIngress& ingress, urma_context_t* context,
+                                                           std::uint64_t peer) noexcept;
+    std::expected<void, RndvNotificationError> UnbindIngress(const RndvRxIngress& ingress) noexcept;
     struct Entry;
     struct State;
     std::expected<Entry*, RndvNotificationError> Find(RndvNotificationHandle handle) const noexcept;

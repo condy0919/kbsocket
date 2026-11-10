@@ -69,7 +69,7 @@
 
 M6.3.3 增加 `ReserveRndv`：在 RTS 准入时占用共同 SN 和完整业务字节额度，返回单调代次 reservation；没有目标 Lease 的 pending 项阻止后继 Eager/FIN 交付。`CompleteRndv` 只接受相同 session/SN/长度及有效 Lease 的可信完成项，原位转为可重排数据，不重复扣字节。停止或失败后的 `AbandonRndv` 仅删除占位元数据，不终结远端 Grant，也不增加消费前缀。见 [完整契约](rndv-protocol.md)。
 
-M6.3.5 增加 `GrantHandle` 借用分支，只允许实际 Borrowed Grant 的精确只读范围作为 `kValidatedRmaDone` 进入窗口。`ValidateDelivery` 核验真实 Delivered receipt 与完整 frame/Lease/span；[接收协调器](rndv-receiver.md) 的 ReturnGrant 先真实归还目标，再释放窗口 receipt。Grant payload 不能通过物理 RX 或 Slab 的普通归还路径释放。协调器对 GrantManager 和窗口独占绑定，绑定期间禁止关闭依赖；现有 EagerRxStream 的自动混合流装配尚未接入。
+M6.3.5 增加 `GrantHandle` 借用分支，只允许实际 Borrowed Grant 的精确只读范围作为 `kValidatedRmaDone` 进入窗口。`ValidateDelivery` 核验真实 Delivered receipt 与完整 frame/Lease/span；[接收协调器](rndv-receiver.md) 的 ReturnGrant 先真实归还目标，再释放窗口 receipt。Grant payload 不能通过物理 RX 或 Slab 的普通归还路径释放。协调器对 GrantManager 和窗口独占绑定，绑定期间禁止关闭依赖。M6.3.7 已提供 [实际 RNDV 接收分发和混合读取](rndv-rx-ingress.md)：EagerRxStream 可绑定同一 Receiver 处理 Grant 短读与 Lease 归还，所有 stream 都须取得窗口唯一读者绑定。`observed_prefix` 记录连续已收到/占位前缀，Pending 也可以推进；它与交付、消费前缀独立，不恢复授信，只用于防止乱序 RTS 提前耗尽前序资源。
 
 `Poll` 每次最多交付 `min(output.size(),64)` 个连续帧。交付后 Lease 由应用/宿主持有，窗口仍以 `ReorderReceipt` 记录驻留责任。只有真实 Lease 已归还、应用不再访问后，才能 `Release(receipt)`；该调用不会代替 `ReleaseCpu` 或 `RxBufferPool::Release`。迟到/重复 receipt 不得释放新一轮槽位。
 

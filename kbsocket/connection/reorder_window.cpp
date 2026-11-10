@@ -67,6 +67,7 @@ struct ReorderWindow::State {
     std::uint64_t last_now = 0;
     std::uint32_t drain_cursor = 0;
     const RndvReceiver* receiver = nullptr;
+    const EagerRxStream* stream = nullptr;
     bool stopping = false;
 };
 
@@ -81,7 +82,7 @@ std::expected<void, ReorderError> ReorderWindow::BindReceiver(const RndvReceiver
     if (!state_) {
         return Error(ReorderErrorCode::kNotReady);
     }
-    if (state_->receiver || state_->stats.pending_frames) {
+    if (state_->receiver || state_->stream || state_->stats.pending_frames) {
         return Error(ReorderErrorCode::kInUse);
     }
     if (!accepting()) {
@@ -98,6 +99,28 @@ std::expected<void, ReorderError> ReorderWindow::UnbindReceiver(const RndvReceiv
         return Error(ReorderErrorCode::kInvalidArgument);
     }
     state_->receiver = nullptr;
+    return {};
+}
+std::expected<void, ReorderError> ReorderWindow::BindStream(const EagerRxStream& stream,
+                                                            const RndvReceiver* receiver) noexcept {
+    if (!state_) {
+        return Error(ReorderErrorCode::kNotReady);
+    }
+    if (state_->stream || state_->receiver != receiver) {
+        // 纯 Eager 入口也必须占唯一读者，不能绕过混合流或遗漏窗口已绑定的 Receiver。
+        return Error(ReorderErrorCode::kInUse);
+    }
+    if (!accepting()) {
+        return Error(ReorderErrorCode::kStopped);
+    }
+    state_->stream = &stream;
+    return {};
+}
+std::expected<void, ReorderError> ReorderWindow::UnbindStream(const EagerRxStream& stream) noexcept {
+    if (!state_ || state_->stream != &stream) {
+        return Error(ReorderErrorCode::kInvalidArgument);
+    }
+    state_->stream = nullptr;
     return {};
 }
 std::expected<void, ReorderError> ReorderWindow::Open(ReorderSession session, const ReorderConfig& config) noexcept {
@@ -118,7 +141,7 @@ std::expected<void, ReorderError> ReorderWindow::Open(ReorderSession session, co
     }
     state->session = session;
     state->config = config;
-    state->stats.rcv_next = state->stats.released_prefix = config.initial_sequence;
+    state->stats.observed_prefix = state->stats.rcv_next = state->stats.released_prefix = config.initial_sequence;
     state_ = std::move(state);
     return {};
 }
@@ -126,7 +149,7 @@ std::expected<void, ReorderError> ReorderWindow::Close() noexcept {
     if (!state_) {
         return {};
     }
-    if (state_->receiver) {
+    if (state_->receiver || state_->stream) {
         return Error(ReorderErrorCode::kInUse);
     }
     state_->stopping = true;
@@ -215,6 +238,17 @@ void ReorderWindow::UpdateGap(std::uint64_t now_ns) noexcept {
         state_->gap_since.reset();
     } else if (!state_->gap_since) {
         state_->gap_since = now_ns;
+    }
+}
+void ReorderWindow::UpdateObservedPrefix() noexcept {
+    // 一次准入至多补齐一个窗口；Pending 已证实收到 RTS，但不得因此推进交付或归还前缀。
+    auto& prefix = state_->stats.observed_prefix;
+    for (std::uint32_t count = 0; count < state_->config.window && prefix < kSequenceEnd; ++count) {
+        const auto& entry = state_->entries[prefix % state_->config.window];
+        if (entry.status == State::Status::kEmpty || entry.frame.sequence != prefix) {
+            break;
+        }
+        ++prefix;
     }
 }
 std::expected<void, ReorderError> ReorderWindow::CheckAdmission(const ReorderFrame& frame, std::uint64_t bytes,
@@ -309,6 +343,7 @@ std::expected<void, ReorderError> ReorderWindow::Push(const ReorderFrame& frame,
     if (frame.kind == ReorderFrameKind::kFin) {
         state_->fin = frame.sequence;
     }
+    UpdateObservedPrefix();
     UpdateGap(now_ns);
     return {};
 }
@@ -332,6 +367,7 @@ std::expected<ReorderReservation, ReorderError> ReorderWindow::ReserveRndv(Reord
     ++state_->stats.pending_frames;
     state_->stats.resident_bytes += entry.reserved_bytes;
     state_->stats.received_bytes += bytes;
+    UpdateObservedPrefix();
     UpdateGap(now_ns);
     return ReorderReservation{this, index, entry.reservation};
 }

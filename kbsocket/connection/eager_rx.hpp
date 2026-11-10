@@ -46,6 +46,7 @@ struct EagerRxError {
     bool accepted_known = true;
 };
 class EagerReceiveDomain;
+class RndvReceiver;
 struct EagerRxPacket {
     const EagerReceiveDomain* domain = nullptr;
     std::uint32_t slot = 0;
@@ -60,6 +61,7 @@ struct EagerReceiveSource {
 struct EagerRxPacketView {
     raw::RxBufferLease lease;
     WireFrameView decoded;
+    WireReceiveContext observed{};
 };
 enum class EagerRxDisposition : std::uint8_t { kHeld, kRelease };
 using EagerRxHandler = std::expected<EagerRxDisposition, EagerRxError> (*)(void* connection, EagerReceiveDomain&,
@@ -118,7 +120,8 @@ struct EagerReadLeaseResult {
     bool would_block = false;
 };
 
-/// 借用握手已经初始化的重排窗口。Read 复制数据，短读继续持有真实 Lease 与两份 receipt。
+/// 借用握手已经初始化的重排窗口；可绑定同一窗口/路由的 RNDV 接收者统一交付。
+/// Read 复制数据，短读继续持有真实 RX Lease 或 Grant 与其 receipt。
 /// 只有完整消费一帧才归还全部驻留责任；FIN 也按序消费后才可见 EOF。
 class EagerRxStream {
 public:
@@ -127,7 +130,7 @@ public:
     EagerRxStream(const EagerRxStream&) = delete;
     EagerRxStream& operator=(const EagerRxStream&) = delete;
     std::expected<void, EagerRxError> Open(EagerReceiveDomain& domain, ReorderWindow& window,
-                                           WireSessionBinding binding) noexcept;
+                                           WireSessionBinding binding, RndvReceiver* receiver = nullptr) noexcept;
     /// 成功接管 packet；失败时仍归调用方/Dispatch 清理。
     std::expected<void, EagerRxError> Accept(EagerRxPacket packet, std::uint64_t now_ns) noexcept;
     /// 已复制前缀后遇错仍返回该前缀并置 failed()；宿主保留本次读取结果，同时终止后续业务推进。
@@ -139,7 +142,7 @@ public:
     /// 第一次合法尝试即结束视图有效期；底层归还失败时保留 token，仅供清理重试，禁止继续访问旧视图。
     std::expected<void, EagerRxError> ReleaseLease(std::uint64_t generation) noexcept;
     void Fail() noexcept;
-    /// 已停止后按预算释放本流持有的真实 Lease；不触碰仍 Posted 或已借给应用的 RX。
+    /// 已停止后按预算释放本流持有的真实 RX/Grant；不触碰仍 Posted 或已借给应用的视图。
     std::expected<std::size_t, EagerRxError> Drain(std::size_t budget = ReorderWindow::kMaxBatch) noexcept;
     std::expected<void, EagerRxError> Close() noexcept;
     /// 未读的当前帧、连续后继帧/FIN 或 EOF；乱序驻留本身不代表可读。

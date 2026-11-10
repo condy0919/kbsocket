@@ -7,7 +7,9 @@
 #include <limits>
 #include <new>
 #include <optional>
+#include <variant>
 
+#include "kbsocket/connection/rndv_receiver.hpp"
 #include "kbsocket/transport/raw/receive_domain_closer.hpp"
 
 namespace kbsocket {
@@ -25,6 +27,7 @@ struct EagerReceiveDomain::State {
         raw::RxBufferLease lease{};
         RxCreditReceipt receipt{};
         WireFrameView decoded{};
+        WireReceiveContext observed{};
         std::uint64_t id = 0;
         std::uint32_t next = kEnd;
         Phase phase = Phase::kFree;
@@ -170,6 +173,7 @@ std::expected<void, EagerRxError> EagerReceiveDomain::Dispatch(const raw::RxBuff
         return Error(EagerRxErrorCode::kRouteRejected);
     }
     s.dispatching = true;
+    entry.observed = source.peer_context;
     auto handled = handler(route->connection, *this, *decoded, packet, now_ns);
     s.dispatching = false;
     if (!handled || *handled == EagerRxDisposition::kRelease) {
@@ -195,7 +199,7 @@ std::expected<EagerRxPacketView, EagerRxError> EagerReceiveDomain::View(EagerRxP
     if (e.id != packet.id || e.phase != State::Phase::kHeld) {
         return Error(EagerRxErrorCode::kInvalidPacket);
     }
-    return EagerRxPacketView{e.lease, e.decoded};
+    return EagerRxPacketView{e.lease, e.decoded, e.observed};
 }
 
 std::expected<void, EagerRxError> EagerReceiveDomain::Release(EagerRxPacket packet) noexcept {
@@ -366,6 +370,7 @@ struct EagerRxStream::State {
     };
     EagerReceiveDomain* domain = nullptr;
     ReorderWindow* window = nullptr;
+    RndvReceiver* receiver = nullptr;
     WireSessionBinding binding;
     std::unique_ptr<Entry[]> entries;
     std::optional<ReorderDelivery> current;
@@ -374,6 +379,7 @@ struct EagerRxStream::State {
     std::uint64_t lease_generation = 0;
     bool release_started = false;
     bool failed = false, stopped = false;
+    bool cancel_pending = false;
 };
 EagerRxStream::EagerRxStream() noexcept = default;
 EagerRxStream::~EagerRxStream() {
@@ -384,7 +390,7 @@ EagerRxStream::~EagerRxStream() {
 }
 
 std::expected<void, EagerRxError> EagerRxStream::Open(EagerReceiveDomain& domain, ReorderWindow& window,
-                                                      WireSessionBinding binding) noexcept {
+                                                      WireSessionBinding binding, RndvReceiver* receiver) noexcept {
     if (state_) {
         return Error(EagerRxErrorCode::kInUse);
     }
@@ -407,6 +413,24 @@ std::expected<void, EagerRxError> EagerRxStream::Open(EagerReceiveDomain& domain
     state->window = &window;
     state->binding = binding;
     state->capacity = capacity;
+    if (receiver && !receiver->Matches(window, binding)) {
+        return Error(EagerRxErrorCode::kInvalidSource);
+    }
+    if (!window.BindStream(*this, receiver)) {
+        return Error(EagerRxErrorCode::kInUse);
+    }
+    if (receiver) {
+        if (!receiver->BindStream(*this, window, binding)) {
+            if (!window.UnbindStream(*this)) {
+                // 仅保留本流已经取得的窗口绑定，不能取消并未绑定成功的 Receiver。
+                state->stopped = true;
+                state_ = std::move(state);
+                return Error(EagerRxErrorCode::kRetained);
+            }
+            return Error(EagerRxErrorCode::kInUse);
+        }
+        state->receiver = receiver;
+    }
     state_ = std::move(state);
     return {};
 }
@@ -424,7 +448,7 @@ std::expected<void, EagerRxError> EagerRxStream::Accept(EagerRxPacket packet, st
         return std::unexpected(view.error());
     }
     const auto& frame = view->decoded.frame;
-    auto identity = ValidateWireIdentity(view->decoded, s.binding, s.binding.context);
+    auto identity = ValidateWireIdentity(view->decoded, s.binding, view->observed);
     if (!identity) {
         return Error(EagerRxErrorCode::kInvalidSource);
     }
@@ -456,6 +480,14 @@ std::expected<void, EagerRxError> EagerRxStream::Accept(EagerRxPacket packet, st
 
 std::expected<void, EagerRxError> EagerRxStream::ReleaseDelivery(const ReorderDelivery& delivery) noexcept {
     auto& s = *state_;
+    if (std::holds_alternative<GrantHandle>(delivery.frame.lease)) {
+        // ReturnGrant 同时归还注册目标和共同 receipt，不能再次 Release 同一 receipt。
+        if (!s.receiver || !s.receiver->ReturnGrant(delivery)) {
+            Fail();
+            return Error(EagerRxErrorCode::kRetained);
+        }
+        return {};
+    }
     auto& entry = s.entries[delivery.frame.sequence % s.capacity];
     if (!entry.active) {
         Fail();
@@ -619,6 +651,9 @@ void EagerRxStream::Fail() noexcept {
     if (state_) {
         state_->failed = true;
         state_->window->Fail();
+        if (state_->receiver) {
+            state_->cancel_pending = !state_->receiver->Cancel();
+        }
     }
 }
 std::expected<std::size_t, EagerRxError> EagerRxStream::Drain(std::size_t budget) noexcept {
@@ -628,6 +663,12 @@ std::expected<std::size_t, EagerRxError> EagerRxStream::Drain(std::size_t budget
     auto& s = *state_;
     if (!budget || budget > ReorderWindow::kMaxBatch || (!s.stopped && !s.failed)) {
         return Error(EagerRxErrorCode::kInvalidArgument);
+    }
+    if (s.cancel_pending) {
+        s.cancel_pending = !s.receiver->Cancel();
+        if (s.cancel_pending) {
+            return Error(EagerRxErrorCode::kRetained);
+        }
     }
     if (s.lease_generation) {
         // 不抢回应用视图，也不绕过待重试的精确 token；压力仍由固定窗口与物理 RX 容量约束。
@@ -666,10 +707,29 @@ std::expected<void, EagerRxError> EagerRxStream::Close() noexcept {
     if (!state_) {
         return {};
     }
-    state_->stopped = true;
-    state_->window->StopAccepting();
-    if (state_->pending || state_->lease_generation) {
+    auto& s = *state_;
+    s.stopped = true;
+    s.window->StopAccepting();
+    if (s.receiver && (s.receiver->stats().active || s.cancel_pending || s.failed)) {
+        s.cancel_pending = !s.receiver->Cancel();
+        if (s.cancel_pending) {
+            return Error(EagerRxErrorCode::kRetained);
+        }
+    }
+    const auto stats = s.window->stats();
+    if (pending() || s.current || s.lease_generation || stats.pending_frames || stats.buffered_frames ||
+        stats.delivered_frames) {
         return Error(EagerRxErrorCode::kInUse);
+    }
+    // 已发布未终结的 Grant 仍由 Receiver 保留；这里只卸下共同流交付责任，不代替其 Close。
+    if (s.receiver) {
+        if (!s.receiver->UnbindStream(*this)) {
+            return Error(EagerRxErrorCode::kRetained);
+        }
+        s.receiver = nullptr;
+    }
+    if (!s.window->UnbindStream(*this)) {
+        return Error(EagerRxErrorCode::kRetained);
     }
     state_.reset();
     return {};
@@ -685,7 +745,7 @@ bool EagerRxStream::failed() const noexcept {
     return state_ && state_->failed;
 }
 std::size_t EagerRxStream::pending() const noexcept {
-    return state_ ? state_->pending : 0;
+    return state_ ? state_->pending + (state_->receiver ? state_->receiver->stats().in_reorder : 0) : 0;
 }
 
 } // namespace connection

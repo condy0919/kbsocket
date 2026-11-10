@@ -265,6 +265,46 @@ protected:
     std::size_t tracked_count_ = 0;
 };
 
+TEST_F(RndvReceiverTest, MatchesRequiresActualManagerWindowAndCompleteRoute) {
+    Open();
+    EXPECT_TRUE(receiver_.Matches(reorder_, Route()));
+    EXPECT_TRUE(receiver_.Matches(grants_, reorder_, Route()));
+    ReorderWindow other_window;
+    GrantManager other_manager;
+    EXPECT_FALSE(receiver_.Matches(other_window, Route()));
+    EXPECT_FALSE(receiver_.Matches(other_manager, reorder_, Route()));
+    // 不能仅凭共享 token/窗口接纳不同 epoch 或来源的入口。
+    for (unsigned field = 0; field < 7; ++field) {
+        auto route = Route();
+        switch (field) {
+        case 0:
+            ++route.context.version;
+            break;
+        case 1:
+            ++route.context.peer_runtime;
+            break;
+        case 2:
+            ++route.context.receive_domain;
+            break;
+        case 3:
+            ++route.context.session;
+            break;
+        case 4:
+            ++route.token.slot;
+            break;
+        case 5:
+            ++route.token.generation;
+            break;
+        case 6:
+            ++route.credit_epoch;
+            break;
+        }
+        EXPECT_FALSE(receiver_.Matches(reorder_, route));
+    }
+    EXPECT_TRUE(receiver_.Close());
+    EXPECT_FALSE(receiver_.Matches(reorder_, Route()));
+}
+
 TEST_F(RndvReceiverTest, OpenRequiresTrustedPeerAndMatchingManagerRouteAndWindow) {
     Resources();
     for (unsigned field = 0; field < 8; ++field) {

@@ -9,9 +9,13 @@
 #include <new>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include <gtest/gtest.h>
 
+#include "kbsocket/connection/rndv_protocol.hpp"
+#include "kbsocket/connection/rndv_receiver.hpp"
+#include "kbsocket/memory/slab_allocator.hpp"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
 
 namespace {
@@ -64,7 +68,16 @@ protected:
         f.delete_jfc = [](auto*) { return URMA_SUCCESS; };
         f.delete_jfr = [](auto*) { return URMA_SUCCESS; };
         f.delete_jetty = [](auto*) { return URMA_SUCCESS; };
-        f.register_seg = [](auto*, auto*) { return &active_->segment_; };
+        f.register_seg = [](auto* context, auto* config) {
+            auto& segment = active_->segments_[active_->registrations_++];
+            segment.urma_ctx = context;
+            segment.seg.ubva.eid = context->eid;
+            segment.seg.ubva.va = config->va;
+            segment.seg.len = config->len;
+            segment.seg.attr.value = config->flag.value;
+            segment.seg.token_id = static_cast<std::uint32_t>(active_->registrations_);
+            return &segment;
+        };
         f.unregister_seg = [](auto*) { return URMA_SUCCESS; };
         f.post_jfr_wr = [](auto*, auto* first, auto** bad) {
             auto& s = *active_;
@@ -241,7 +254,8 @@ protected:
     urma_jfc_t tx_{}, rx_{};
     urma_jfr_t jfr_{};
     urma_jetty_t passive_{}, jetty_{};
-    urma_target_seg_t segment_{};
+    std::array<urma_target_seg_t, 4> segments_{};
+    std::size_t registrations_ = 0;
     raw::JettyPool pool_;
     raw::RxBufferPool buffers_;
     ReceiveCreditDomain credits_;
@@ -874,6 +888,341 @@ TEST_F(EagerRxTest, FailureAfterValidatedPrefixPreservesCopiedBytesAndExposesFai
     EXPECT_EQ(stream_.pending(), 1u);
     ASSERT_TRUE(stream_.Drain());
     EXPECT_EQ(stream_.pending(), 0u);
+}
+
+TEST_F(EagerRxTest, PacketViewPreservesObservedSourceAndStreamRejectsMismatchedExpectedPeer) {
+    ASSERT_TRUE(Dispatch(Data(0, "a")));
+    const auto view = domain_.View(last_packet_);
+    ASSERT_TRUE(view);
+    EXPECT_EQ(view->observed, source_.peer_context);
+    EXPECT_EQ(Read(1), "a");
+
+    // 路由表与真实来源仍匹配，但调用方错配流绑定；不能把 expected 当 observed 接受 DATA。
+    ASSERT_TRUE(stream_.Close());
+    ASSERT_TRUE(window_.Close());
+    ASSERT_TRUE(window_.Open({22, 33, 44, route_.token.slot, route_.token.generation}, {8, 32, 10000, 0}));
+    auto wrong = binding_;
+    ++wrong.context.peer_runtime;
+    ASSERT_TRUE(stream_.Open(domain_, window_, wrong));
+    const auto result = Dispatch(Data(0, "b"));
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, EagerRxErrorCode::kInvalidSource);
+    EXPECT_EQ(stream_.pending(), 0u);
+    EXPECT_EQ(domain_.held(), 0u);
+}
+
+TEST_F(EagerRxTest, WindowPinsLegacyReaderAndRejectsLateReceiverWithoutPoisoningIt) {
+    EagerRxStream other;
+    EXPECT_FALSE(other.Open(domain_, window_, binding_));
+    EXPECT_FALSE(window_.Close());
+    EXPECT_TRUE(window_.accepting());
+
+    // 反向初始化顺序也必须拒绝：旧 Eager 读者仍绑定时不能加入 RNDV 生产者。
+    memory::MemoryBudget budget(65536);
+    memory::SlabAllocator slab;
+    const std::array contexts{&context_};
+    ASSERT_TRUE(slab.Open(contexts, {.buffer_count = 8, .buffer_size = 128, .max_references = 16}, budget));
+    GrantManager grants;
+    const GrantBinding binding{22, 11, 33, 44, route_.token};
+    ASSERT_TRUE(grants.Open(binding, {77, 88}, slab, &context_, {.window = 8, .max_active = 8, .max_bytes = 128}));
+    RndvReceiver receiver;
+    const auto opened = receiver.Open({binding, binding_, 8, true}, grants, window_);
+    ASSERT_FALSE(opened);
+    EXPECT_EQ(opened.error().code, RndvReceiveErrorCode::kInUse);
+    EXPECT_TRUE(window_.accepting());
+    EXPECT_TRUE(grants.accepting());
+    EXPECT_TRUE(receiver.Close());
+    // 失败 Open 必须撤销先前取得的管理器绑定，局部资源可立即安全关闭。
+    EXPECT_TRUE(grants.Close());
+    EXPECT_TRUE(slab.Close());
+    ASSERT_TRUE(Dispatch(Data(0, "ab")));
+    EXPECT_EQ(Read(8), "ab");
+}
+
+class MixedRxTest : public EagerRxTest {
+protected:
+    void SetUp() override {
+        EagerRxTest::SetUp();
+        ASSERT_TRUE(stream_.Close());
+        ASSERT_TRUE(window_.Close());
+        ASSERT_TRUE(window_.Open({22, 33, 44, route_.token.slot, route_.token.generation}, {8, 128, 10000, 0}));
+        const std::array contexts{&context_};
+        ASSERT_TRUE(slab_.Open(contexts, {.buffer_count = 8, .buffer_size = 128, .max_references = 16}, budget_));
+        grant_binding_ = {22, 11, 33, 44, route_.token};
+        ASSERT_TRUE(
+            grants_.Open(grant_binding_, {77, 88}, slab_, &context_, {.window = 8, .max_active = 8, .max_bytes = 128}));
+        ASSERT_TRUE(receiver_.Open({grant_binding_, binding_, 8, true}, grants_, window_));
+        ASSERT_TRUE(stream_.Open(domain_, window_, binding_, &receiver_));
+    }
+    void TearDown() override {
+        stream_.Fail();
+        for (unsigned i = 0; i < 8 && stream_.pending(); ++i) {
+            EXPECT_TRUE(stream_.Drain());
+        }
+        EXPECT_TRUE(stream_.Close());
+        (void)receiver_.Cancel();
+        // mock 对端在清理时明确承诺无后续 WRITE；不以流关闭替代远端 DMA 终结。
+        for (std::size_t i = 0; i < tracked_count_; ++i) {
+            (void)receiver_.ConfirmTerminal(
+                tracked_[i].first,
+                {.identity = tracked_[i].second.identity, .no_future_writes = true, .acceptance_known = true});
+        }
+        EXPECT_TRUE(receiver_.Close());
+        EXPECT_TRUE(grants_.Close());
+        EXPECT_EQ(slab_.stats().cpu_leases, 0u);
+        EXPECT_EQ(slab_.stats().remote_grants, 0u);
+        EXPECT_TRUE(slab_.Close());
+        EagerRxTest::TearDown();
+    }
+    WireFrameInput RtsFrame(std::uint32_t seq, std::size_t bytes) {
+        const auto frame = BuildRndvRts({grant_binding_, 100 + static_cast<std::uint64_t>(seq), seq, bytes},
+                                        {11, 33, 44, route_.token});
+        EXPECT_TRUE(frame);
+        return frame ? *frame : WireFrameInput{};
+    }
+    WireFrameView Decode(const WireFrameInput& frame) {
+        const auto wire = EncodeWireFrame(frame, wire_bytes_);
+        EXPECT_TRUE(wire);
+        if (!wire) {
+            return {};
+        }
+        const auto decoded = DecodeWireFrame(wire->imm_data, std::span(wire_bytes_).first(wire->payload_bytes));
+        EXPECT_TRUE(decoded);
+        return decoded ? *decoded : WireFrameView{};
+    }
+    GrantReservation Publish(std::uint32_t seq, const std::string& payload) {
+        const auto request = receiver_.OnRts(Decode(RtsFrame(seq, payload.size())), source_.peer_context, ++now_);
+        EXPECT_TRUE(request);
+        if (!request) {
+            return {};
+        }
+        const auto grant = receiver_.PrepareGrant(*request);
+        EXPECT_TRUE(grant);
+        if (!grant) {
+            return {};
+        }
+        EXPECT_TRUE(grants_.CommitPublication(grant->handle));
+        // 模拟远端已发布授权上的实际 WRITE，数据随后只经 DONE 验证后交付。
+        std::copy(payload.begin(), payload.end(), reinterpret_cast<char*>(grant->target.addr));
+        tracked_[tracked_count_++] = {*request, *grant};
+        return *grant;
+    }
+    void Done(const GrantReservation& grant) {
+        auto frame = RtsFrame(static_cast<std::uint32_t>(grant.identity.transfer.seq), grant.identity.transfer.bytes);
+        frame.control = WireControlType::kRndvDone;
+        frame.rndv.arena_id = grant.identity.arena.id;
+        frame.rndv.arena_generation = grant.identity.arena.generation;
+        frame.rndv.grant_slot = grant.identity.slot;
+        frame.rndv.grant_generation = grant.identity.generation;
+        frame.rndv.target_address = grant.identity.target_address;
+        ASSERT_TRUE(receiver_.OnDone(Decode(frame), source_.peer_context, ++now_));
+    }
+    void Fin(std::uint32_t seq) {
+        WireFrameInput frame;
+        frame.type = WireFrameType::kControl;
+        frame.control = WireControlType::kFin;
+        frame.token = route_.token;
+        frame.seq = seq;
+        frame.session = binding_.context.session;
+        ASSERT_TRUE(Dispatch(Event(frame)));
+    }
+    memory::MemoryBudget budget_{65536};
+    memory::SlabAllocator slab_;
+    GrantManager grants_;
+    RndvReceiver receiver_;
+    GrantBinding grant_binding_;
+    std::array<std::byte, 112> wire_bytes_{};
+    std::array<std::pair<RndvReceiveHandle, GrantReservation>, 8> tracked_{};
+    std::size_t tracked_count_ = 0;
+};
+
+TEST_F(MixedRxTest, CopiesEagerGrantAndFinInCommonSequenceWithShortReads) {
+    const auto grant = Publish(1, "cdef");
+    ASSERT_TRUE(Dispatch(Data(2, "gh")));
+    Fin(3);
+    ASSERT_TRUE(Dispatch(Data(0, "ab")));
+    EXPECT_EQ(Read(3), "ab");
+    EXPECT_FALSE(stream_.readable());
+    Done(grant);
+    EXPECT_EQ(stream_.pending(), 3u);
+
+    // 短读不归还 Grant；跨帧读到 FIN 后每份物理/注册责任恰好释放一次。
+    EXPECT_EQ(Read(1), "c");
+    EXPECT_EQ(receiver_.stats().in_reorder, 1u);
+    EXPECT_EQ(slab_.stats().cpu_leases, 1u);
+    EXPECT_EQ(Read(16), "defgh");
+    EXPECT_TRUE(stream_.eof());
+    EXPECT_EQ(stream_.pending(), 0u);
+    EXPECT_EQ(receiver_.stats().active, 0u);
+    EXPECT_EQ(window_.stats().released_prefix, 4u);
+    EXPECT_EQ(domain_.held(), 0u);
+}
+
+TEST_F(MixedRxTest, LeaseReadsSwitchFromGrantToPhysicalRxThenOrderedFin) {
+    Done(Publish(0, "ab"));
+    ASSERT_TRUE(Dispatch(Data(1, "cd")));
+    Fin(2);
+    const auto grant = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(grant);
+    EXPECT_EQ(grant->data[0], std::byte{'a'});
+    EXPECT_EQ(domain_.held(), 2u);
+    ASSERT_TRUE(stream_.ReleaseLease(grant->generation));
+    EXPECT_EQ(receiver_.stats().active, 0u);
+    const auto eager = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(eager);
+    EXPECT_EQ(eager->data[0], std::byte{'c'});
+    EXPECT_NE(eager->generation, grant->generation);
+    ASSERT_TRUE(stream_.ReleaseLease(eager->generation));
+    EXPECT_FALSE(stream_.eof());
+    const auto fin = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(fin);
+    EXPECT_TRUE(fin->eof);
+    EXPECT_EQ(fin->generation, 0u);
+    EXPECT_EQ(domain_.held(), 0u);
+    EXPECT_EQ(stream_.pending(), 0u);
+}
+
+TEST_F(MixedRxTest, CancelRetainsPartiallyCopiedCurrentGrantUntilDrain) {
+    Done(Publish(0, "abcd"));
+    EXPECT_EQ(Read(1), "a");
+    stream_.Fail();
+    // current 已由 Poll 移出 Buffered，仍须计入流责任且不能丢弃原完整 delivery。
+    EXPECT_EQ(window_.stats().buffered_frames, 0u);
+    EXPECT_EQ(window_.stats().delivered_frames, 1u);
+    EXPECT_EQ(stream_.pending(), 1u);
+    EXPECT_FALSE(stream_.Close());
+    const auto drained = stream_.Drain(1);
+    ASSERT_TRUE(drained);
+    EXPECT_EQ(*drained, 1u);
+    EXPECT_EQ(stream_.pending(), 0u);
+    EXPECT_EQ(receiver_.stats().active, 0u);
+    EXPECT_EQ(slab_.stats().cpu_leases, 0u);
+    EXPECT_TRUE(stream_.Close());
+}
+
+TEST_F(MixedRxTest, GrantLeasePreventsCloseAndDrainUntilExactReturn) {
+    Done(Publish(0, "abcd"));
+    ASSERT_TRUE(Dispatch(Data(1, "ef")));
+    auto prefix = stream_.ReadLease(2, ++now_);
+    ASSERT_TRUE(prefix);
+    ASSERT_EQ(prefix->data.size(), 2u);
+    EXPECT_EQ(prefix->data[0], std::byte{'a'});
+    ASSERT_TRUE(stream_.ReleaseLease(prefix->generation));
+    EXPECT_EQ(receiver_.stats().in_reorder, 1u);
+    auto tail = stream_.ReadLease(8, ++now_);
+    ASSERT_TRUE(tail);
+    EXPECT_EQ(tail->data.size(), 2u);
+    EXPECT_EQ(tail->data[0], std::byte{'c'});
+
+    // Close 仅停止后续交付并取消准入，不能抢回应用仍持有的注册目标。
+    EXPECT_FALSE(stream_.Close());
+    const auto drained = stream_.Drain();
+    ASSERT_TRUE(drained);
+    EXPECT_EQ(*drained, 0u);
+    EXPECT_EQ(stream_.pending(), 2u);
+    EXPECT_EQ(slab_.stats().cpu_leases, 1u);
+    EXPECT_FALSE(stream_.ReleaseLease(tail->generation + 1));
+    EXPECT_EQ(tail->data[1], std::byte{'d'});
+    ASSERT_TRUE(stream_.ReleaseLease(tail->generation));
+    EXPECT_EQ(receiver_.stats().active, 0u);
+    const auto rest = stream_.Drain();
+    ASSERT_TRUE(rest);
+    EXPECT_EQ(*rest, 1u);
+    EXPECT_EQ(stream_.pending(), 0u);
+    EXPECT_TRUE(stream_.Close());
+}
+
+TEST_F(MixedRxTest, CancelDrainsUnreadGrantAndPhysicalRxWithoutApplicationDelivery) {
+    Done(Publish(0, "ab"));
+    ASSERT_TRUE(Dispatch(Data(1, "cd")));
+    stream_.Fail();
+    EXPECT_EQ(stream_.pending(), 2u);
+    EXPECT_FALSE(stream_.ReadLease(8, ++now_));
+    const auto first = stream_.Drain(1);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(*first, 1u);
+    EXPECT_EQ(stream_.pending(), 1u);
+    const auto second = stream_.Drain(1);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(*second, 1u);
+    EXPECT_EQ(receiver_.stats().active, 0u);
+    EXPECT_EQ(domain_.held(), 0u);
+}
+
+TEST_F(MixedRxTest, ClosingPendingPublishedGrantLeavesTerminalResponsibilityWithReceiver) {
+    const auto grant = Publish(0, "ab");
+    EXPECT_EQ(receiver_.stats().waiting_done, 1u);
+    EXPECT_TRUE(stream_.Close());
+    EXPECT_EQ(receiver_.stats().active, 1u);
+    EXPECT_EQ(window_.stats().pending_frames, 0u);
+    EXPECT_EQ(slab_.stats().remote_grants, 1u);
+    EXPECT_FALSE(receiver_.Close());
+    // 已解绑流后迟到的合法 DONE 仍由 Receiver 接收并清理，不形成新应用交付。
+    Done(grant);
+    EXPECT_EQ(receiver_.stats().active, 0u);
+    EXPECT_EQ(window_.stats().buffered_frames, 0u);
+    EXPECT_EQ(slab_.stats().remote_grants, 0u);
+}
+
+TEST_F(MixedRxTest, FailedOpenDoesNotTakeAnotherReceiversBindingOrLifetime) {
+    EagerRxStream other;
+    auto wrong = binding_;
+    ++wrong.credit_epoch;
+    const auto opened = other.Open(domain_, window_, wrong, &receiver_);
+    ASSERT_FALSE(opened);
+    EXPECT_EQ(opened.error().code, EagerRxErrorCode::kInvalidSource);
+    EXPECT_TRUE(other.Close());
+    EXPECT_FALSE(receiver_.Close());
+    // 失败候选既未抢走唯一流绑定，也未取消原流；正常 Grant 仍可交付。
+    Done(Publish(0, "ab"));
+    EXPECT_EQ(Read(8), "ab");
+    EXPECT_EQ(receiver_.stats().active, 0u);
+}
+
+TEST_F(MixedRxTest, MixedCopyAndGrantReturnDoNotAllocate) {
+    Done(Publish(0, "ab"));
+    ASSERT_TRUE(Dispatch(Data(1, "cd")));
+    Fin(2);
+    std::array<std::byte, 8> output{};
+    allocations = 0;
+    count_allocations = true;
+    const auto result = stream_.Read(output, ++now_);
+    count_allocations = false;
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->bytes, 4u);
+    EXPECT_TRUE(result->eof);
+    EXPECT_EQ(allocations, 0u);
+    EXPECT_EQ(stream_.pending(), 0u);
+}
+
+TEST_F(MixedRxTest, LegacyOpenCannotBypassTheMixedWindowsUniqueReader) {
+    EagerRxStream legacy;
+    const auto opened = legacy.Open(domain_, window_, binding_);
+    ASSERT_FALSE(opened);
+    EXPECT_EQ(opened.error().code, EagerRxErrorCode::kInUse);
+    EXPECT_TRUE(legacy.Close());
+    EXPECT_FALSE(window_.Close());
+    EXPECT_TRUE(window_.accepting());
+    Done(Publish(0, "ab"));
+    EXPECT_EQ(Read(8), "ab");
+    EXPECT_EQ(receiver_.stats().active, 0u);
+}
+
+TEST_F(MixedRxTest, ReceiverRejectsCloseAndSecondStreamWhileBoundEvenWithoutGrants) {
+    EagerRxStream other;
+    const auto closed = receiver_.Close();
+    ASSERT_FALSE(closed);
+    EXPECT_EQ(closed.error().code, RndvReceiveErrorCode::kInUse);
+    EXPECT_TRUE(window_.accepting());
+    EXPECT_TRUE(grants_.accepting());
+    const auto opened = other.Open(domain_, window_, binding_, &receiver_);
+    ASSERT_FALSE(opened);
+    EXPECT_EQ(opened.error().code, EagerRxErrorCode::kInUse);
+    EXPECT_TRUE(receiver_.Matches(grants_, window_, binding_));
+    EXPECT_TRUE(stream_.Close());
+    EXPECT_FALSE(receiver_.stats().stopped);
+    EXPECT_TRUE(grants_.accepting());
+    EXPECT_TRUE(receiver_.Close());
 }
 
 } // namespace

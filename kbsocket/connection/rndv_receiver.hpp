@@ -14,6 +14,8 @@
 namespace kbsocket {
 namespace connection {
 class RndvReceiver;
+class EagerRxStream;
+class RndvRxIngress;
 struct RndvReceiveHandle {
     const RndvReceiver* owner = nullptr;
     std::uint32_t slot = 0;
@@ -60,7 +62,7 @@ struct RndvReceiveStats {
 /// Open 原子绑定 GrantManager 与共同窗口；绑定期间禁止另一个协调器接管或直接关闭依赖。
 /// observed 必须来自可信 RX 来源登记，不能复制预期 route 冒充真实来源。
 /// grants/reorder/Slab 必须覆盖全部责任；宿主通过共同窗口 Poll/Drain，并将 Grant 项交给 ReturnGrant。
-/// 未接入 EagerRxStream/Connection 的自动分发；外部不得直接 Return/Cancel 本协调器管理的 Grant。
+/// 可由唯一 EagerRxStream 接管共同窗口交付；外部不得直接 Return/Cancel 本协调器管理的 Grant。
 class RndvReceiver {
 public:
     static constexpr std::uint32_t kMaxCapacity = GrantManager::kMaxWindow;
@@ -90,11 +92,21 @@ public:
     /// 仅取消后接受独立可信终结证明，不产生业务交付；身份必须对应保留的同一事务。
     std::expected<void, RndvReceiveError> ConfirmTerminal(RndvReceiveHandle handle,
                                                           const GrantTerminalEvidence& evidence) noexcept;
-    /// 无活动责任时仅释放本地状态，不使健康共同流失败；否则取消并等待真实终结/归还。
+    /// 入口或流绑定期间拒绝关闭；解绑且无活动责任时仅释放本地状态，不使健康共同流失败。
+    /// 其余情况取消并等待真实终结/归还。
     std::expected<void, RndvReceiveError> Close() noexcept;
     RndvReceiveStats stats() const noexcept;
+    bool Matches(const ReorderWindow& reorder, WireSessionBinding route) const noexcept;
+    bool Matches(const GrantManager& grants, const ReorderWindow& reorder, WireSessionBinding route) const noexcept;
 
 private:
+    friend class EagerRxStream;
+    friend class RndvRxIngress;
+    std::expected<void, RndvReceiveError> BindIngress(const RndvRxIngress& ingress) noexcept;
+    std::expected<void, RndvReceiveError> UnbindIngress(const RndvRxIngress& ingress) noexcept;
+    std::expected<void, RndvReceiveError> BindStream(const EagerRxStream& stream, const ReorderWindow& reorder,
+                                                     WireSessionBinding route) noexcept;
+    std::expected<void, RndvReceiveError> UnbindStream(const EagerRxStream& stream) noexcept;
     struct Entry;
     struct State;
     std::expected<Entry*, RndvReceiveError> Find(RndvReceiveHandle handle) const noexcept;

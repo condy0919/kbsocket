@@ -45,4 +45,4 @@
 
 无真机测试覆盖双向不同 session/token、短/扩展编码、错误来源与完整 Grant 身份、取消后的 DONE 禁发、旧事务句柄、Eager/RNDV/FIN 共同窗口、数量/字节额度和零分配。Mock 测试中的显式 DMA 事实不代表 UB 真机端到端验证。
 
-M6.3.4 已绑定 RTS 发送 SN、未来 DONE 额度、本地通知槽、Grant 发布及导入引用。M6.3.5 已增加接收端可信 DONE 终结和共同重排窗口中的 Grant 只读借用/真实归还。后续仍须完成能力协商、Arena 描述交换、混合应用流及 Connection/RawDomain/Runtime 装配。
+M6.3.4 已绑定 RTS 发送 SN、未来 DONE 额度、本地通知槽、Grant 发布及导入引用。M6.3.5 已增加接收端可信 DONE 终结和共同重排窗口中的 Grant 只读借用/真实归还。M6.3.6 已提供能力/Arena 协商；M6.3.7 已提供实际 RX 的 RNDV 暂存/背压与混合 copy/Lease 读取。完整发送事务调度及 Connection/RawDomain/Runtime 自动装配仍待完成。

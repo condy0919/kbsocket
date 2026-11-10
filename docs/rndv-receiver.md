@@ -19,7 +19,7 @@ Open 原子绑定同一连接的 GrantManager 和 ReorderWindow，核对完整�
 3. 宿主将返回的同一 GrantReservation 交给 `RndvNotificationTx::QueueGrant`；发布者在任何可能的 SEND 前提交远端责任。重复 Prepare 只返回原授权，不授予第二个发布权。
 4. 正常 DONE 完成目标后，协调器调用真实 `Borrow`，以 GrantHandle 与只读 span 完成原重排占位，不复制 payload、不再次计入业务字节。
 
-物理 RX 及 Credit 扣账、RTS/DONE 包的 Lease 归还与实际补投仍由接收域处理。OnRts 尚未准入时，调用者继续持有输入责任；不能因为返回背压就丢弃已接收请求，也不能重放已接受的请求。能力、Arena 目录与完整连接装配将在后续阶段协商这些容量限制。
+物理 RX 及 Credit 扣账、RTS/DONE 包的 Lease 归还与实际补投仍由接收域处理。OnRts 尚未准入时，调用者继续持有输入责任；不能因为返回背压就丢弃已接收请求，也不能重放已接受的请求。能力和 Arena 目录已由 [RNDV 协商](rndv-negotiation.md) 提供；实际资源装配仍须落实这些容量限制。
 
 ## 有序借用与归还
 
@@ -45,4 +45,4 @@ Close 没有活动 RNDV 责任时仅结束协调器；存在活动责任时先�
 
 测试使用真实 Slab/Grant/重排账本与 Mock URMA 注册，覆盖来源和身份校验、资源背压、乱序混合交付、取消、迟到通知、借用保留、槽复用及热路径零分配。结果记录在 [roadmap](roadmap.md)，不代表 UB 真机验证。
 
-现有 EagerRxStream 仍只处理其物理 RX 包归还，不能把它直接接到混合窗口上就认为完成了应用流集成。M6.3.6 已提供 [RNDV 能力/Arena 协商](rndv-negotiation.md)；后续仍需接入通知与事务调度、混合流短读及零拷贝归还、Connection/Runtime 分发和关闭流程。
+M6.3.6 已提供 [RNDV 能力/Arena 协商](rndv-negotiation.md)。M6.3.7 的 [接收分发与混合流](rndv-rx-ingress.md) 已将真实 RX 的来源、物理归还、RNDV 背压和 Eager/Grant/FIN 短读及 Lease 归还接通。Receiver 在 stream 或 ingress 绑定期间拒绝 Close，即使当前为空；整个窗口也只允许一个 stream。后续仍需完成发送事务调度、Connection/Runtime 自动分发与完整应用关闭。

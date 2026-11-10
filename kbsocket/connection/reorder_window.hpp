@@ -17,6 +17,7 @@
 namespace kbsocket {
 namespace connection {
 class ReorderWindow;
+class EagerRxStream;
 
 struct ReorderSession {
     std::uint64_t peer_runtime = 0;
@@ -88,6 +89,8 @@ struct ReorderStats {
     std::uint64_t received_bytes = 0;
     std::uint64_t consumed_bytes = 0;
     std::uint64_t rcv_next = 0;
+    // 已接收或 RTS 占位的连续 SN 前缀；不代表 DONE、应用交付或消费。
+    std::uint64_t observed_prefix = 0;
     std::uint64_t released_prefix = 0;
     std::uint64_t max_frame_seq = 0;
     std::uint64_t max_stream_bytes = 0;
@@ -145,6 +148,9 @@ public:
 
 private:
     friend class RndvReceiver;
+    friend class EagerRxStream;
+    std::expected<void, ReorderError> BindStream(const EagerRxStream& stream, const RndvReceiver* receiver) noexcept;
+    std::expected<void, ReorderError> UnbindStream(const EagerRxStream& stream) noexcept;
     std::expected<void, ReorderError> BindReceiver(const RndvReceiver& receiver) noexcept;
     std::expected<void, ReorderError> UnbindReceiver(const RndvReceiver& receiver) noexcept;
     struct State;
@@ -152,6 +158,7 @@ private:
                                                      std::uint64_t now_ns, bool reserving) noexcept;
     std::expected<void, ReorderError> ObserveTime(std::uint64_t now_ns) noexcept;
     void UpdateGap(std::uint64_t now_ns) noexcept;
+    void UpdateObservedPrefix() noexcept;
     bool Deliver(std::uint32_t index, ReorderDelivery& output, bool discarded) noexcept;
     std::unique_ptr<State> state_;
     // Close/Open 不重置；同一对象生命周期内 receipt 身份绝不回绕复用。

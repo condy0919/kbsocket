@@ -111,6 +111,7 @@ struct RndvNotificationTx::State {
     SenderCreditAccount* credits = nullptr;
     TxSequenceWindow* sequence = nullptr;
     control::ImportLease endpoint;
+    const RndvRxIngress* ingress = nullptr;
     std::unique_ptr<Entry[]> entries;
     std::uint64_t next_generation = 0;
     std::uint64_t accepted = 0;
@@ -783,9 +784,37 @@ void RndvNotificationTx::Stop() noexcept {
         state_->stopped = true;
     }
 }
+std::expected<void, RndvNotificationError>
+RndvNotificationTx::BindIngress(const RndvRxIngress& ingress, urma_context_t* context, std::uint64_t peer) noexcept {
+    if (!state_) {
+        return Error(RndvNotificationErrorCode::kNotReady);
+    }
+    if (state_->ingress) {
+        return Error(RndvNotificationErrorCode::kInUse);
+    }
+    if (state_->stopped || state_->failed) {
+        return Error(RndvNotificationErrorCode::kStopped);
+    }
+    if (state_->config.endpoint.local_context != context || state_->config.destination.runtime != peer) {
+        return Error(RndvNotificationErrorCode::kWrongIdentity);
+    }
+    state_->ingress = &ingress;
+    return {};
+}
+std::expected<void, RndvNotificationError> RndvNotificationTx::UnbindIngress(const RndvRxIngress& ingress) noexcept {
+    if (!state_ || state_->ingress != &ingress) {
+        return Error(RndvNotificationErrorCode::kWrongIdentity);
+    }
+    state_->ingress = nullptr;
+    return {};
+}
 std::expected<void, RndvNotificationError> RndvNotificationTx::Close() noexcept {
     if (!state_) {
         return {};
+    }
+    if (state_->ingress) {
+        // ingress 仍可能持有精确通知 handle；不能越过其 RX/远端授权责任关闭或取消整队列。
+        return Error(RndvNotificationErrorCode::kInUse);
     }
     Stop();
     auto& state = *state_;

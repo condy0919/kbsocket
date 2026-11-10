@@ -47,6 +47,8 @@ struct RndvReceiver::State {
     RndvReceiverConfig config;
     GrantManager* grants = nullptr;
     ReorderWindow* reorder = nullptr;
+    const EagerRxStream* stream = nullptr;
+    const RndvRxIngress* ingress = nullptr;
     std::unique_ptr<Entry[]> entries;
     std::uint64_t next_generation = 0;
     bool grants_bound = false;
@@ -113,6 +115,55 @@ std::expected<void, RndvReceiveError> RndvReceiver::Open(const RndvReceiverConfi
     state->reorder_bound = true;
     state_ = std::move(state);
     opened_once_ = true;
+    return {};
+}
+bool RndvReceiver::Matches(const ReorderWindow& reorder, WireSessionBinding route) const noexcept {
+    return state_ && opened_once_ && state_->reorder == &reorder && state_->config.route.context == route.context &&
+           state_->config.route.token == route.token && state_->config.route.credit_epoch == route.credit_epoch;
+}
+bool RndvReceiver::Matches(const GrantManager& grants, const ReorderWindow& reorder,
+                           WireSessionBinding route) const noexcept {
+    return Matches(reorder, route) && state_->grants == &grants;
+}
+std::expected<void, RndvReceiveError>
+RndvReceiver::BindStream(const EagerRxStream& stream, const ReorderWindow& reorder, WireSessionBinding route) noexcept {
+    if (!Matches(reorder, route)) {
+        return Error(RndvReceiveErrorCode::kWrongIdentity);
+    }
+    if (state_->stream) {
+        return Error(RndvReceiveErrorCode::kInUse);
+    }
+    if (state_->stopped) {
+        return Error(RndvReceiveErrorCode::kStopped);
+    }
+    state_->stream = &stream;
+    return {};
+}
+std::expected<void, RndvReceiveError> RndvReceiver::UnbindStream(const EagerRxStream& stream) noexcept {
+    if (!state_ || state_->stream != &stream) {
+        return Error(RndvReceiveErrorCode::kWrongIdentity);
+    }
+    state_->stream = nullptr;
+    return {};
+}
+std::expected<void, RndvReceiveError> RndvReceiver::BindIngress(const RndvRxIngress& ingress) noexcept {
+    if (!state_ || !opened_once_) {
+        return Error(RndvReceiveErrorCode::kNotReady);
+    }
+    if (state_->ingress) {
+        return Error(RndvReceiveErrorCode::kInUse);
+    }
+    if (state_->stopped) {
+        return Error(RndvReceiveErrorCode::kStopped);
+    }
+    state_->ingress = &ingress;
+    return {};
+}
+std::expected<void, RndvReceiveError> RndvReceiver::UnbindIngress(const RndvRxIngress& ingress) noexcept {
+    if (!state_ || state_->ingress != &ingress) {
+        return Error(RndvReceiveErrorCode::kWrongIdentity);
+    }
+    state_->ingress = nullptr;
     return {};
 }
 std::expected<RndvReceiver::Entry*, RndvReceiveError> RndvReceiver::Find(RndvReceiveHandle handle) const noexcept {
@@ -465,6 +516,10 @@ std::expected<void, RndvReceiveError> RndvReceiver::ConfirmTerminal(RndvReceiveH
 std::expected<void, RndvReceiveError> RndvReceiver::Close() noexcept {
     if (!state_) {
         return {};
+    }
+    if (state_->stream || state_->ingress) {
+        // 即使暂无 Grant，流仍持有本对象指针；拒绝关闭且不取消健康共同窗口。
+        return Error(RndvReceiveErrorCode::kInUse);
     }
     if (stats().active) {
         if (!Cancel() || stats().active) {

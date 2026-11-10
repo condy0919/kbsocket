@@ -123,6 +123,110 @@ protected:
     std::size_t reservation_count_ = 0;
 };
 
+TEST_F(ReorderWindowTest, ObservedPrefixIncludesOutOfOrderEagerRtsAndFinWithoutDeliveringPending) {
+    ASSERT_TRUE(window_.Open(Session(), Config()));
+    ASSERT_TRUE(window_.Push(Fin(3), 0));
+    const auto later = Reserve(2);
+    ASSERT_TRUE(later);
+    ASSERT_TRUE(window_.Push(Frame(1), 0));
+    EXPECT_EQ(window_.stats().observed_prefix, 0u);
+    const auto head = Reserve(0);
+    ASSERT_TRUE(head);
+    // 补上最低 RTS 即证明四个连续 SN 已观察，但前两个 RTS 均未完成 WRITE。
+    EXPECT_EQ(window_.stats().observed_prefix, 4u);
+    EXPECT_EQ(window_.stats().rcv_next, 0u);
+    EXPECT_EQ(window_.stats().released_prefix, 0u);
+    EXPECT_EQ(window_.stats().consumed_bytes, 0u);
+    EXPECT_EQ(window_.stats().pending_frames, 2u);
+    std::array<ReorderDelivery, 4> output{};
+    ASSERT_EQ(Poll(output), 0u);
+    EXPECT_FALSE(window_.readable());
+    ASSERT_TRUE(window_.CompleteRndv(*head, RndvFrame(0), 0));
+    ASSERT_EQ(Poll(output), 2u);
+    EXPECT_EQ(window_.stats().observed_prefix, 4u);
+    EXPECT_EQ(window_.stats().rcv_next, 2u);
+    EXPECT_EQ(window_.stats().released_prefix, 0u);
+    ASSERT_TRUE(window_.Release(output[0].receipt));
+    ASSERT_TRUE(window_.Release(output[1].receipt));
+    EXPECT_EQ(window_.stats().released_prefix, 2u);
+    ASSERT_TRUE(window_.CompleteRndv(*later, RndvFrame(2), 0));
+    ASSERT_EQ(Poll(output), 2u);
+    ASSERT_TRUE(window_.Release(output[0].receipt));
+    ASSERT_TRUE(window_.Release(output[1].receipt));
+    EXPECT_TRUE(window_.eof());
+    EXPECT_EQ(window_.stats().observed_prefix, 4u);
+}
+
+TEST_F(ReorderWindowTest, ObservedPrefixUsesExactSequenceWhenPhysicalSlotsWrap) {
+    ASSERT_TRUE(window_.Open(Session(), Config()));
+    ASSERT_TRUE(window_.Push(Frame(0), 0));
+    std::array<ReorderDelivery, 1> output{};
+    ASSERT_EQ(Poll(output), 1u);
+    ASSERT_TRUE(window_.Release(output[0].receipt));
+    // SN4 复用 SN0 的槽，不能用非空槽冒充缺失的 SN1；释放前缀只前进到1。
+    ASSERT_TRUE(window_.Push(Frame(4), 0));
+    ASSERT_TRUE(window_.Push(Frame(3), 0));
+    ASSERT_TRUE(window_.Push(Frame(2), 0));
+    EXPECT_EQ(window_.stats().observed_prefix, 1u);
+    const auto head = Reserve(1);
+    ASSERT_TRUE(head);
+    EXPECT_EQ(window_.stats().observed_prefix, 5u);
+    EXPECT_EQ(window_.stats().rcv_next, 1u);
+    EXPECT_EQ(window_.stats().released_prefix, 1u);
+    EXPECT_EQ(window_.stats().consumed_bytes, 4u);
+    ASSERT_EQ(Poll(output), 0u);
+    EXPECT_FALSE(window_.Push(Frame(1), 0));
+    EXPECT_EQ(window_.stats().observed_prefix, 5u);
+}
+
+TEST_F(ReorderWindowTest, CancellingObservedReservationsDoesNotInventApplicationConsumption) {
+    ASSERT_TRUE(window_.Open(Session(), Config()));
+    const auto reservation = Reserve(0);
+    ASSERT_TRUE(reservation);
+    ASSERT_TRUE(window_.Push(Fin(1), 0));
+    EXPECT_EQ(window_.stats().observed_prefix, 2u);
+    window_.StopAccepting();
+    ASSERT_TRUE(window_.AbandonRndv(*reservation));
+    std::array<ReorderDelivery, 4> output{};
+    const auto drained = window_.Drain(output);
+    ASSERT_TRUE(drained);
+    ASSERT_EQ(*drained, 1u);
+    ASSERT_TRUE(output[0].discarded);
+    ASSERT_TRUE(window_.Release(output[0].receipt));
+    // observed 记录历史接收事实；停止后的丢弃不能把它误当成 DONE、交付或信用归还。
+    EXPECT_EQ(window_.stats().observed_prefix, 2u);
+    EXPECT_EQ(window_.stats().rcv_next, 0u);
+    EXPECT_EQ(window_.stats().released_prefix, 0u);
+    EXPECT_EQ(window_.stats().consumed_bytes, 0u);
+    EXPECT_FALSE(window_.eof());
+    EXPECT_FALSE(window_.Push(Frame(2), 0));
+    EXPECT_EQ(window_.stats().observed_prefix, 2u);
+}
+
+TEST_F(ReorderWindowTest, ObservedPrefixEndsAtWideFinBoundaryWithoutSequenceWrap) {
+    constexpr auto last = std::numeric_limits<std::uint32_t>::max();
+    auto config = Config();
+    config.initial_sequence = last - 2;
+    ASSERT_TRUE(window_.Open(Session(), config));
+    EXPECT_EQ(window_.stats().observed_prefix, static_cast<std::uint64_t>(last) - 2);
+    ASSERT_TRUE(window_.Push(Fin(last), 0));
+    const auto reservation = Reserve(last - 1);
+    ASSERT_TRUE(reservation);
+    // 最后一个合法 DATA 补齐观察前缀；uint32 最大值只能由 FIN 占用，前缀保存为 uint64。
+    ASSERT_TRUE(window_.Push(Frame(last - 2), 0));
+    EXPECT_EQ(window_.stats().observed_prefix, std::uint64_t{1} << 32);
+    EXPECT_EQ(window_.stats().rcv_next, static_cast<std::uint64_t>(last) - 2);
+    ASSERT_TRUE(window_.CompleteRndv(*reservation, RndvFrame(last - 1), 0));
+    std::array<ReorderDelivery, 4> output{};
+    ASSERT_EQ(Poll(output), 3u);
+    for (std::size_t i = 0; i < 3; ++i) {
+        ASSERT_TRUE(window_.Release(output[i].receipt));
+    }
+    EXPECT_EQ(window_.stats().observed_prefix, std::uint64_t{1} << 32);
+    EXPECT_EQ(window_.stats().released_prefix, std::uint64_t{1} << 32);
+    EXPECT_TRUE(window_.eof());
+}
+
 TEST_F(ReorderWindowTest, ReadableOnlyForContinuousHeadOrConsumedEofWithoutMutation) {
     EXPECT_FALSE(window_.readable());
     ASSERT_TRUE(window_.Open(Session(), Config()));

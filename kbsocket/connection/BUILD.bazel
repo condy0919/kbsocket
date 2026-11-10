@@ -2,6 +2,33 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "rndv_rx_ingress",
+    srcs = ["rndv_rx_ingress.cpp"],
+    hdrs = ["rndv_rx_ingress.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":eager_rx",
+        ":grant_manager",
+        ":reorder_window",
+        ":rndv_notification_tx",
+        ":rndv_receiver",
+        ":wire_frame",
+    ],
+)
+
+cc_test(
+    name = "rndv_rx_ingress_test",
+    srcs = ["rndv_rx_ingress_test.cpp"],
+    deps = [
+        ":rndv_protocol",
+        ":rndv_rx_ingress",
+        "//kbsocket/runtime:control_executor",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "rndv_receiver",
     srcs = ["rndv_receiver.cpp"],
     hdrs = ["rndv_receiver.hpp"],
@@ -171,6 +198,7 @@ cc_library(
         ":connection_table",
         ":credit_account",
         ":reorder_window",
+        ":rndv_receiver",
         ":wire_frame",
         "//kbsocket/transport/raw:receive_domain_closer",
         "//kbsocket/transport/raw:rx_buffer_pool",
@@ -221,6 +249,9 @@ cc_test(
     srcs = ["eager_rx_test.cpp"],
     deps = [
         ":eager_rx",
+        ":rndv_protocol",
+        ":rndv_receiver",
+        "//kbsocket/memory:slab_allocator",
         "//kbsocket/transport/raw:urma_test_support",
         "@googletest//:gtest_main",
     ],

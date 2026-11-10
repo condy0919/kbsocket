@@ -38,4 +38,4 @@ Offer 包含单 WR WRITE 大小、整条事务大小、最大 Grant 数量、共
 
 无硬件测试覆盖规范编码、双方及单方协商、READY 回显、身份/范围拒绝、真实 Mock Slab 导出、缓存失效、fd 所有权及零分配路径，具体结果见 [roadmap](roadmap.md)。UB 真机未执行。
 
-下一阶段接入 Connection/Runtime 的通知与 WRITE 事务调度，以及共同 Eager/RNDV copy-read、Lease 归还和关闭流程；在这些路径完成前，应用流继续默认使用 Eager。
+M6.3.7 已提供 [实际接收分发及共同 Eager/RNDV 读取](rndv-rx-ingress.md)。下一阶段接通有界发送事务调度，再装配 Connection/Runtime 的双方协商资源、通知/WRITE 进度及关闭流程；在这些路径完成前，应用流继续使用 Eager。
