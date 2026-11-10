@@ -178,7 +178,7 @@ flowchart TB
 | :--- | :--- | :--- |
 | `RuntimeInstanceId` | `uint64_t`（节点标识 + 启动时间戳/随机数） | 唯一标识一个 `KbRuntime` 进程实例；握手、流控总账与 SHM 配对的根身份 |
 | `ContextIncarnation` / `PoolEpoch` | context / 池每次创建或重新打开时递增的实例代次 | 区分同一对象地址、context 索引或池槽位的先后生命周期；导入缓存、MR、Lane 和账本均绑定所属实例 |
-| `FdBindingId` | `int32_t fd` + `uint32_t binding_gen` | 区分同一整数 `fd` 的先后绑定，防止迟到的 `epoll` 就绪或异步回调命中复用后的新连接 |
+| `FdBindingId` | `uint64_t table_id` + `int32_t fd` + `uint32_t generation` | 表身份不复用，区分同一整数 `fd` 的先后绑定，防止迟到的 `epoll` 就绪或异步回调命中复用后的新连接 |
 | `SessionId` (`ConnId`) | `uint32_t conn_slot` + `uint32_t conn_gen` | 在所属 `RuntimeShard` 内唯一定位一条逻辑连接；每次新建连接递增 `conn_gen`，断链重连必为新 `SessionId` |
 | `ReceiveDomainId` | `uint16_t ctx_idx` + `uint16_t domain_id` + `uint32_t domain_gen` | 标识共享 `JFR` 与被动接收端点 `rx_target_jetty`；远端据此绑定 `CreditAccount` |
 | `JettyLaneId` | `const JettyPool*` + `PoolEpoch` + `uint32_t lane_idx` + `uint64_t lane_gen` | 标识池内单条主动发送 SQ；**单条故障 Lane 重建仅递增该槽位的 `lane_gen`**，不使池内其他健康 Lane 的票据失效 |
@@ -193,9 +193,11 @@ flowchart TB
 
 应用线程通过整数 `fd` 调用 `read`/`write`/`close` 时，不能直接锁全局表或裸读指针后再加引用计数（存在 TOCTOU 竞态）：
 
-1. `FdTable` 为预分配的平铺数组（支持到 `RLIMIT_NOFILE`，默认按块惰性映射），每个槽位原子发布不可变的 `FdBinding` 指针。
-2. 任意应用线程查询 `fd` 时，使用线程本地 **Hazard Pointer** 保护加载出的指针并重检槽位一致性；在成功校验 `binding_gen` 并将请求推入目标 Shard 的 `Mailbox`（或取得受控操作句柄）后，立即退出 Hazard 保护，**绝不跨阻塞等待长期持有 Hazard 指针**。
-3. `close(fd)` 解绑槽位后，旧连接对象进入所属 `RuntimeShard` 的本地退休队列（`RetireQueue`），由 `ShardReactor` 在满足双轨回收条件后批量释放，彻底消除全局 `deferred_mutex`。
+1. `FdTable` 为按 fd 索引的两级目录，每个槽位原子发布不可变的 `FdBinding` 指针。M7.1 首版按配置上限一次预分配全部 256 槽目录页、绑定池及读者槽，以硬预算约束存储；宿主按自身 FD 上限配置，最大支持 `1<<20` 个 fd，按块惰性映射尚未实现。
+2. 任意应用线程查询 `fd` 时，使用线程本地 **Hazard Pointer** 保护加载出的指针并重检槽位一致性；在成功校验完整 `FdBindingId` 并将请求推入目标 Shard 的 `Mailbox`（或取得受控操作句柄）后，立即退出 Hazard 保护，**绝不跨阻塞等待长期持有 Hazard 指针**。
+3. `close(fd)` 的 owner 解绑槽位后，旧绑定进入本地有界退休队列；原节点在 Hazard、长期引用及 owner 关闭确认均结束后才能复用。回收先扫 Hazard 再检查引用，不能漏掉查询向长期引用交接的并发窗口。实际 Connection/Runtime 仍按双轨条件关闭，最终 SocketAdapter/ShardReactor 的自动接入待后续。
+
+M7.1 的 [FdTable](../fd-table.md) 只保存 owner 与完整 stream 数值身份；`FdLease` 保护绑定元数据，不自动保活实际 ConnectionOwner 或授权跨线程调用 C stream。适配层必须另行保留 Mailbox、回调和目标依赖。解绑后可立即发布同一 fd 的新代，已取得的旧引用只能在旧连接完成或失败，不能改投新连接；32 位代次耗尽时拒绝复用。
 
 ### 4.3 CPU 生命周期与硬件 DMA 生命周期严格分离
 

@@ -3,7 +3,7 @@
 > **对齐规范**：[kbsocket-design-v1.md](design/kbsocket-design-v1.md) · [hardware-observations.md](hardware-observations.md) · [hardware-validation-matrix.md](hardware-validation-matrix.md) · [OBSERVABILITY-DESIGN-GUIDE.md](OBSERVABILITY-DESIGN-GUIDE.md)
 > **最后更新**：2026-11-10
 
-本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语；M3 已实现借用 raw 资源的单 owner 进度器、四 context 调度、事件与有界控制执行器，验证状态分别见对应小节。M4 已交付 M4.1 固定 Slab/Lease 和 M4.2 协议、顺序、授信原语；M5.1 已交付已连接协议 fd 上的非阻塞握手、完整身份路由和 Single-Flight 导入。M5.2 已接通有界 Eager Connection copy-stream 与 NativeTCP 数据后端；M5.3.1–10 已接通借用 raw 资源的 Runtime owner、context 暂停组、连接 fd 调度、实际 CQE 来源登记校验、HELLO 主动 Lane 交换、在线 UPDATE/ACK，以及拥有连接对象的有界入口和跨线程业务 mailbox；已提供真实物理关闭后冻结 RX receipt 的整域核销，以及独立控制 fd 上的 Peer 共账授信撤回与 Runtime 调度。M5.3.9–10 已有单域 RawDomain 和最多四 context 的 RawStack，接通会话、共享 Slab/import、连接及 Runtime 的装配和分阶段关闭；认证、远端静默、来源退休仍由宿主提供。M5.4.1–8 已交付 Eager/NativeTCP copy-stream C ABI、有界连接/监听事件与一次性就绪订阅，提供独立 NativeTCP C Runtime/非阻塞建链及 raw C++ 应用 Runtime/两阶段协议准备；认证、Peer 共账和独立静默证明仍由宿主管理。已提供应用 Buffer Lease 分配/视图/归还与 CPU-only 池，并接通 raw Eager 源 Lease 零拷贝发送和源可复用查询；已接通有序 RX 只读视图借用/归还。M6.1 已提供接收端 Grant 身份、准入及独立责任账本；M6.2 已接通单事务分块 WRITE、逐 WR 源责任及成功/清理证据，M6.3.1 已提供远端段 Single-Flight 缓存及共享 context 暂停域的控制调度源；M6.3.2 已提供可复用 WRITE 事务槽、导入引用绑定与退休防重放记录；M6.3.3 已提供 RTS/GRANT/DONE 编解码、成功通知构造门禁和 Eager/RNDV 共同接收占位；M6.3.4 已交付有界 SEND/IMM 通知及未来控制额度，M6.3.5 已接通可信 DONE、真实 Grant 借用与共同窗口归还；M6.3.6 已提供可选 HELLO/READY 能力/Arena 协商、真实 Slab 导出及完整 Grant 的段导入请求适配；M6.3.7 已接通真实接收域 RNDV 暂存/背压及 Eager/Grant/FIN 混合读取；M7、L1/L2、O1/O2 及明确列出的 M6 剩余边界仍为待交付计划，未实现类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。 M6.3.8 已提供有界发送事务协调，覆盖排队源保留、GRANT 校验、段导入、WRITE 和独立 DONE 终结；M6.3.9–11 已接通 Connection、RawStreamRuntime 和应用 RNDV，补齐有界大流与故障组合回归；当前单 Arena、固定 Lane，真机及规模验收仍未执行。
+本文档将 [kbsocket-design-v1.md](design/kbsocket-design-v1.md) 的架构拆解为可执行的里程碑、代码落点与验收门禁。M0 为文档契约及已有 raw 基础；M1 已交付 raw 关闭协调器，M2 已实现主被动 Jetty 分离、Lane 替换、完成身份校验和 WRITE 提交原语；M3 已实现借用 raw 资源的单 owner 进度器、四 context 调度、事件与有界控制执行器，验证状态分别见对应小节。M4 已交付 M4.1 固定 Slab/Lease 和 M4.2 协议、顺序、授信原语；M5.1 已交付已连接协议 fd 上的非阻塞握手、完整身份路由和 Single-Flight 导入。M5.2 已接通有界 Eager Connection copy-stream 与 NativeTCP 数据后端；M5.3.1–10 已接通借用 raw 资源的 Runtime owner、context 暂停组、连接 fd 调度、实际 CQE 来源登记校验、HELLO 主动 Lane 交换、在线 UPDATE/ACK，以及拥有连接对象的有界入口和跨线程业务 mailbox；已提供真实物理关闭后冻结 RX receipt 的整域核销，以及独立控制 fd 上的 Peer 共账授信撤回与 Runtime 调度。M5.3.9–10 已有单域 RawDomain 和最多四 context 的 RawStack，接通会话、共享 Slab/import、连接及 Runtime 的装配和分阶段关闭；认证、远端静默、来源退休仍由宿主提供。M5.4.1–8 已交付 Eager/NativeTCP copy-stream C ABI、有界连接/监听事件与一次性就绪订阅，提供独立 NativeTCP C Runtime/非阻塞建链及 raw C++ 应用 Runtime/两阶段协议准备；认证、Peer 共账和独立静默证明仍由宿主管理。已提供应用 Buffer Lease 分配/视图/归还与 CPU-only 池，并接通 raw Eager 源 Lease 零拷贝发送和源可复用查询；已接通有序 RX 只读视图借用/归还。M6.1 已提供接收端 Grant 身份、准入及独立责任账本；M6.2 已接通单事务分块 WRITE、逐 WR 源责任及成功/清理证据，M6.3.1 已提供远端段 Single-Flight 缓存及共享 context 暂停域的控制调度源；M6.3.2 已提供可复用 WRITE 事务槽、导入引用绑定与退休防重放记录；M6.3.3 已提供 RTS/GRANT/DONE 编解码、成功通知构造门禁和 Eager/RNDV 共同接收占位；M6.3.4 已交付有界 SEND/IMM 通知及未来控制额度，M6.3.5 已接通可信 DONE、真实 Grant 借用与共同窗口归还；M6.3.6 已提供可选 HELLO/READY 能力/Arena 协商、真实 Slab 导出及完整 Grant 的段导入请求适配；M6.3.7 已接通真实接收域 RNDV 暂存/背压及 Eager/Grant/FIN 混合读取；M7.1 已交付有界 FD 身份表、Hazard 到 CPU 引用交接及退休确认；M7 后续、L1/L2、O1/O2 及明确列出的 M6 剩余边界仍为待交付计划，未实现类、接口和测试路径是拟议落点。无 UB 真机时先完成 Mock 与 NativeTCP/SHM 双进程验证，真机回归明确保持未执行。 M6.3.8 已提供有界发送事务协调，覆盖排队源保留、GRANT 校验、段导入、WRITE 和独立 DONE 终结；M6.3.9–11 已接通 Connection、RawStreamRuntime 和应用 RNDV，补齐有界大流与故障组合回归；当前单 Arena、固定 Lane，真机及规模验收仍未执行。
 
 ---
 
@@ -30,7 +30,7 @@
 - `kbsocket/runtime/` 后续集成：NUMA 亲和性、应用入口整合与连接定时器扩展；当前已有有界 `ProgressSource` 接口、CPU Lease 归还源、`ConnectionOwner`、业务 mailbox、单域 `RawDomain` 及四 context `RawStack` 所有者
 - `kbsocket/control/` 后续集成：拓扑/身份策略与 `HealthRegistry`；M5.1 已有握手协调器及 `EndpointImportCache`，M5.3 已接通控制 fd 调度和在线 Lane 更新
 - `kbsocket/connection/` 后续集成：完整应用入口、远端关闭协议及 WRITE RNDV 连接装配；WRITE Engine/Pool、通知发送与 Grant 接收协调原语已交付，M5.2 已交付有界 Connection copy-stream，M5.3 已接通 Runtime 收发调度与实际来源路由，详见 [Eager 接线](eager-connection.md)
-- `kbsocket/api/` 与 `kbsocket/socket/`：M5.4.1–8 已有 `buffer_lease.h` / `BufferBinding`、`stream.h` / `StreamBinding`、连接及监听事件、NativeTCP 独立 `stream_runtime.h` 及 raw C++ `RawStreamRuntime`；raw 独立 C Runtime ABI、跨线程接收 Lease 归还、C++23 `execution` 封装、`FdTable`、`SocketAdapter`、`EpollMux` 待交付
+- `kbsocket/api/` 与 `kbsocket/socket/`：M5.4.1–8 已有 `buffer_lease.h` / `BufferBinding`、`stream.h` / `StreamBinding`、连接及监听事件、NativeTCP 独立 `stream_runtime.h` 及 raw C++ `RawStreamRuntime`；M7.1 已有 `FdTable` 的有界元数据映射、代次和 CPU 退休；raw 独立 C Runtime ABI、跨线程接收 Lease 归还、C++23 `execution` 封装、实际 Socket owner dispatch、`SocketAdapter`、`EpollMux` 待交付
 - `kbsocket/transport/tcp/` 后续集成与 `kbsocket/transport/shm/`：NativeTCP 的 Runtime/ABI 接线、`ShmBackend`
 - `kbsocket/observability/` 与 `adapters/brpc/`：缓存行对齐 `ShardMetrics`、USDT 探针、bRPC 零拷贝适配器
 
@@ -337,7 +337,7 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 - **M6.3.11 故障与诊断**：补 RawStreamRuntime 的 WRITE status 8/9、GRANT/DONE 通知未交付、未知接受、发送取消后逐条 WRITE CQE 与接收取消后迟到 DONE 回归。真实 CQE 分别终结源 DMA 和通知责任，远端未获有效 DONE 时 Grant 保留；不可终结用例在子进程保留完整依赖至退出，不伪造静默或重放。修复 Connection 吞掉 RNDV CQE 原始状态的问题，C stream `failure.underlying` 保留 status 8/9；无效和重复完成不能改变连接首错。详见 [应用 Runtime 验证](raw-stream-runtime.md#m6311应用-rndv-故障与有界大流回归)。
 - **M6.3.11 有界大流**：公共 C copy/Lease 单次接受上限 1 MiB，测试 64 KiB / 1 MiB 单事务和 16 MiB 连续流短写；每笔最多 64 个 16 KiB WRITE、每次 post 最多两个。固定 40 MiB 共享源/目标 backing，报告 Step/应用调用边界的责任采样峰值及最终回归基线。扣留 bulk WRITE CQE 时，同 Lane 兄弟连接的小包、CREDIT 和 FIN 仍推进；慢读/持有目标 Lease 耗尽两份 Grant 配额时，第三笔不越额写入，归还后继续。该回归不等于单事务 16 MiB、多 SGE 或真机性能验收。
 - **M6.3.11 验证**：2026-11-10 完整相关回归通过 90 个测试目标、1907 个用例，新增 12 个，无失败或跳过。8 个应用故障用例、3 个有界大流用例和 1 个 Connection 完成防伪用例覆盖上述行为；原应用 Runtime 的 35 个用例继续通过。严格 C++23、自包含共享测试头、格式、文档链接与 diff 检查通过。实际采样表见 [应用 Runtime 验证](raw-stream-runtime.md#m6311应用-rndv-故障与有界大流回归)，UB 真机与规模验收未执行。
-- **下一步 M7.1**：先实现 Socket 兼容层的有界 FD 身份表、引用保留及关闭/复用防 ABA，再接入 EpollMux；基于现有 C stream 语义，用 NativeTCP/Mock 验证，保持错误显式上报。当前单 Arena/固定 Lane、跨线程 Lease、多 Arena 选择、UB WN1–WN4 与 40k 规模验收仍独立推进，不把 Mock 结果当作硬件或性能结论。
+- **后续边界**：Socket 兼容层按下文 M7 分阶段推进。当前单 Arena/固定 Lane、跨线程 Lease、多 Arena 选择、UB WN1–WN4 与 40k 规模验收仍独立推进，不把 Mock 结果当作硬件或性能结论。
 
 - **目标**：基于已确认的 WRITE 可见性，交付 WRITE + SEND/IMM 两阶段通知。RNDV 阈值初始候选为 16 KiB，按负载对照测量调整；超过 4096 B 仍可有界分片 eager，不强制每次跨页写都走 RNDV。
 - **设计章节**：[§7.4 WRITE RNDV 状态机与终结](design/kbsocket-design-v1.md#74-write-rndv-完整状态机与安全终结)
@@ -360,6 +360,11 @@ M6 保留为 WRITE RNDV 阶段，M7 为规模与适配阶段；M5 后可并行�
 ---
 
 ### M7：Socket/epoll 兼容层、`HealthRegistry`、bRPC 适配与 40k 规模验收
+
+- **已交付 M7.1**：[`FdTable`](fd-table.md) 在 Open 时按硬预算预分配两级 256 槽目录页、绑定池和读者表；发布、查询、解绑及收集不分配、不加锁。完整身份包含不复用的表 ID、fd 和代次，代次耗尽拒绝复用；有界 Hazard 发布/重检后交接为可移动 CPU Lease，迟到操作保留旧目标，不按裸 fd 改投新连接。
+- **M7.1 退休与边界**：单 owner 解绑后允许同一整数 fd 发布新代；旧节点同时等待真实关闭确认、Hazard 消失及 CPU 引用归零，再由有界轮转队列回收。FdLease 仅保留绑定元数据，实际 owner、stream、命令及 DMA/Grant 责任仍由宿主管理；未完成关闭就析构会停止准入并保留 State，迟归还不访问已销毁门面。当前尚无内核 FD 分配或自动 Socket I/O 接入。
+- **M7.1 验证**：2026-11-10 完整相关回归通过 93 个测试目标、1937 个用例，新增 30 个，无失败或跳过。26 个基础用例覆盖预算/分配失败、页和代次边界、容量、引用交接、退休及零分配；3 个并发用例覆盖四读线程与 owner 换代、跨线程迟归还和读者满额；1 个真实 IPv4 NativeTCP C Runtime 用例验证旧/新请求分别抵达原 stream、真实 Close/Release 后退休和 stream 槽复用拒绝旧身份。并发组三个用例在 ThreadSanitizer 下重复 10 次通过，共执行 40,000 代换绑/回收；严格 C++23、自包含头文件、格式、文档链接与 diff 检查通过。该计数不是 40k 并发连接或建链吞吐验收，UB 真机未执行。
+- **下一步 M7.2**：接通 Socket 操作到单 owner 的有界调度，在完整 FD/stream 身份下推进非阻塞收发和关闭，明确排队命令、实际流与内核 FD 的所有权及释放顺序；先用 NativeTCP/Mock 覆盖关闭竞争、迟到命令及 fd 复用，再推进 EpollMux。不能仅凭 FD 元数据 Lease 假定实际 Runtime 已被保活。
 
 - **目标**：提供兼容 POSIX `socket`/`epoll` 语义的虚拟 FD 适配层、跨连接加速平面熔断器与 bRPC 零拷贝接入，完成单容器 40k 连接与 40k/s 建链目标验收。
 - **设计章节**：[§10.2 健康注册表](design/kbsocket-design-v1.md#102-故障分类健康注册表healthregistry与有限探测)、[§10.3 Socket 与 API](design/kbsocket-design-v1.md#103-接口分层c-abiposix-兼容与-c23-p2300)

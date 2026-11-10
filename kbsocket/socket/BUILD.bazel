@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+cc_library(
+    name = "fd_table",
+    srcs = ["fd_table.cpp"],
+    hdrs = ["fd_table.hpp"],
+    visibility = ["//visibility:public"],
+    deps = ["//kbsocket/api:stream"],
+)
+
+cc_test(
+    name = "fd_table_test",
+    srcs = ["fd_table_test.cpp"],
+    deps = [
+        ":fd_table",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "fd_table_concurrency_test",
+    srcs = ["fd_table_concurrency_test.cpp"],
+    deps = [
+        ":fd_table",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "fd_table_stream_test",
+    srcs = ["fd_table_stream_test.cpp"],
+    deps = [
+        ":fd_table",
+        "//kbsocket/api:stream_runtime",
+        "@googletest//:gtest_main",
+    ],
+)
