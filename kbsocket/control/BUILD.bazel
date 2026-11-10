@@ -2,6 +2,47 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
+    name = "rndv_capabilities",
+    srcs = ["rndv_capabilities.cpp"],
+    hdrs = ["rndv_capabilities.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "rndv_capabilities_test",
+    srcs = ["rndv_capabilities_test.cpp"],
+    deps = [
+        ":rndv_capabilities",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "rndv_arena",
+    srcs = ["rndv_arena.cpp"],
+    hdrs = ["rndv_arena.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":rndv_capabilities",
+        "//kbsocket/connection:grant_manager",
+        "//kbsocket/memory:slab_allocator",
+        "//kbsocket/transport/raw:urma_api",
+    ],
+)
+
+cc_test(
+    name = "rndv_arena_test",
+    srcs = ["rndv_arena_test.cpp"],
+    deps = [
+        ":rndv_arena",
+        ":rndv_capabilities",
+        "//kbsocket/memory:slab_allocator",
+        "//kbsocket/transport/raw:urma_test_support",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "tseg_import_cache",
     srcs = ["tseg_import_cache.cpp"],
     hdrs = ["tseg_import_cache.hpp"],
@@ -39,7 +80,10 @@ cc_library(
     srcs = ["handshake_channel.cpp"],
     hdrs = ["handshake_channel.hpp"],
     visibility = ["//visibility:public"],
-    deps = ["//kbsocket/connection:wire_frame"],
+    deps = [
+        ":rndv_capabilities",
+        "//kbsocket/connection:wire_frame",
+    ],
 )
 
 cc_library(
@@ -105,8 +149,11 @@ cc_library(
     deps = [
         ":endpoint_import_cache",
         ":handshake_channel",
+        ":rndv_capabilities",
+        ":tseg_import_cache",
         "//kbsocket/connection:connection_table",
         "//kbsocket/connection:credit_account",
+        "//kbsocket/connection:grant_manager",
         "//kbsocket/connection:reorder_window",
     ],
 )
@@ -116,6 +163,7 @@ cc_test(
     srcs = ["handshake_channel_test.cpp"],
     deps = [
         ":handshake_channel",
+        ":rndv_capabilities",
         "@googletest//:gtest_main",
     ],
 )
@@ -137,8 +185,11 @@ cc_test(
         ":connection_handshake",
         ":endpoint_import_cache",
         ":handshake_channel",
+        ":rndv_capabilities",
+        ":tseg_import_cache",
         "//kbsocket/connection:connection_table",
         "//kbsocket/connection:credit_account",
+        "//kbsocket/connection:grant_manager",
         "//kbsocket/connection:wire_frame",
         "//kbsocket/runtime:control_executor",
         "//kbsocket/transport/raw:urma_test_support",

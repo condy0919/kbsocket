@@ -86,6 +86,8 @@ protected:
         active_ = this;
         for (std::size_t i = 0; i < contexts_.size(); ++i) {
             contexts_[i] = &context_storage_[i];
+            contexts_[i]->eid.raw[15] = static_cast<std::uint8_t>(i + 1);
+            contexts_[i]->uasid = static_cast<std::uint32_t>(100 + i);
         }
     }
     void TearDown() override {
@@ -103,8 +105,12 @@ protected:
             return nullptr;
         }
         segments_[index].urma_ctx = context;
+        segments_[index].seg.ubva.eid = context->eid;
+        segments_[index].seg.ubva.uasid = context->uasid;
         segments_[index].seg.ubva.va = config->va;
         segments_[index].seg.len = config->len;
+        segments_[index].seg.attr.bs.access = config->flag.bs.access;
+        segments_[index].seg.token_id = static_cast<std::uint32_t>(index + 1);
         return &segments_[index];
     }
     urma_status_t Unregister(urma_target_seg_t* segment) {
@@ -772,6 +778,131 @@ TEST_F(SlabAllocatorTest, HostLeaseFastPathDoesNotAllocate) {
     EXPECT_EQ(allocation_count, 0u);
     EXPECT_EQ(register_calls_, 0u);
     EXPECT_EQ(slab_.stats().available, 1u);
+}
+
+TEST_F(SlabAllocatorTest, ExportSegmentUsesActualContextRegistrationWithoutCreatingResponsibilities) {
+    ASSERT_TRUE(slab_.Open(Contexts(), Config(3), budget_));
+    const auto before = slab_.stats();
+    // 同一 backing 的多个注册使用各自 EID/UASID/token id，导出不是新的 Lease 或 Grant。
+    for (std::size_t i = 0; i < 4; ++i) {
+        const auto snapshot = slab_.ExportSegment(contexts_[i]);
+        ASSERT_TRUE(snapshot);
+        EXPECT_EQ(snapshot->descriptor.ubva.va, registrations_[i].config.va);
+        EXPECT_EQ(snapshot->descriptor.len, page_);
+        EXPECT_EQ(snapshot->descriptor.ubva.uasid, contexts_[i]->uasid);
+        EXPECT_EQ(snapshot->descriptor.ubva.eid.raw[15], contexts_[i]->eid.raw[15]);
+        EXPECT_EQ(snapshot->descriptor.token_id, segments_[i].seg.token_id);
+        EXPECT_EQ(snapshot->descriptor.attr.bs.access, Config().access);
+        EXPECT_EQ(snapshot->token.token, 0u);
+        EXPECT_EQ(snapshot->buffer_size, 64u);
+        EXPECT_EQ(snapshot->buffer_count, 3u);
+    }
+    EXPECT_EQ(slab_.stats().available, before.available);
+    EXPECT_EQ(slab_.stats().cpu_leases, before.cpu_leases);
+    EXPECT_EQ(slab_.stats().local_dma, before.local_dma);
+    EXPECT_EQ(slab_.stats().remote_grants, before.remote_grants);
+    ASSERT_TRUE(slab_.Close());
+    EXPECT_EQ(unregister_calls_, 4u);
+}
+
+TEST_F(SlabAllocatorTest, ExportRejectsInactiveHostStoppedAndUnregisteredContexts) {
+    const auto expect_error = [](const auto& result, MemoryErrorCode code) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, code);
+    };
+    expect_error(slab_.ExportSegment(contexts_[0]), MemoryErrorCode::kNotReady);
+    ASSERT_TRUE(slab_.OpenHost(Config(), budget_));
+    expect_error(slab_.ExportSegment(contexts_[0]), MemoryErrorCode::kInvalidArgument);
+    ASSERT_TRUE(slab_.Close());
+    ASSERT_TRUE(slab_.Open(Contexts(1), Config(), budget_));
+    expect_error(slab_.ExportSegment(nullptr), MemoryErrorCode::kInvalidArgument);
+    expect_error(slab_.ExportSegment(contexts_[1]), MemoryErrorCode::kInvalidArgument);
+    slab_.StopAccepting();
+    expect_error(slab_.ExportSegment(contexts_[0]), MemoryErrorCode::kStopped);
+    ASSERT_TRUE(slab_.Close());
+    expect_error(slab_.ExportSegment(contexts_[0]), MemoryErrorCode::kNotReady);
+}
+
+TEST_F(SlabAllocatorTest, ExportRejectsProviderMismatchAndUnrepresentableRegistrationProperties) {
+    ASSERT_TRUE(slab_.Open(Contexts(1), Config(), budget_));
+    const auto valid = segments_[0];
+    // 每次只改变一个 provider 字段，确认不能公布另一段或需要额外 ABI 信息的注册。
+    for (unsigned field = 0; field < 16; ++field) {
+        SCOPED_TRACE(field);
+        segments_[0] = valid;
+        auto& segment = segments_[0];
+        switch (field) {
+        case 0:
+            segment.urma_ctx = contexts_[1];
+            break;
+        case 1:
+            ++segment.seg.ubva.va;
+            break;
+        case 2:
+            ++segment.seg.len;
+            break;
+        case 3:
+            ++segment.seg.ubva.uasid;
+            break;
+        case 4:
+            ++segment.seg.ubva.eid.raw[15];
+            break;
+        case 5:
+            segment.seg.attr.bs.access = URMA_ACCESS_WRITE;
+            break;
+        case 6:
+            segment.seg.attr.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+            break;
+        case 7:
+            segment.seg.attr.bs.cacheable = 1;
+            break;
+        case 8:
+            segment.seg.attr.bs.dsva = 1;
+            break;
+        case 9:
+            segment.seg.attr.bs.non_pin = 1;
+            break;
+        case 10:
+            segment.seg.attr.bs.user_iova = 1;
+            break;
+        case 11:
+            segment.seg.attr.bs.user_token_id = 1;
+            break;
+        case 12:
+            segment.seg.attr.bs.has_user_info = 1;
+            break;
+        case 13:
+            segment.seg.attr.bs.reserved = 1;
+            break;
+        case 14:
+            segment.seg.token_id = URMA_SEG_TOKEN_ID_INVALID;
+            break;
+        case 15:
+            segment.seg.attr.bs.token_policy = URMA_TOKEN_SIGNED;
+            break;
+        }
+        const auto snapshot = slab_.ExportSegment(contexts_[0]);
+        ASSERT_FALSE(snapshot);
+        EXPECT_EQ(snapshot.error().code, MemoryErrorCode::kRegisterFailed);
+        EXPECT_EQ(snapshot.error().provider_error, EPROTO);
+    }
+    segments_[0] = valid;
+    EXPECT_TRUE(slab_.ExportSegment(contexts_[0]));
+}
+
+TEST_F(SlabAllocatorTest, ExportSegmentDoesNotAllocateOrChangeReferenceCapacity) {
+    ASSERT_TRUE(slab_.Open(Contexts(), Config(), budget_));
+    const auto before = slab_.stats().available_references;
+    bool succeeded = true;
+    allocation_count = 0;
+    count_allocations = true;
+    for (unsigned i = 0; i < 64; ++i) {
+        succeeded &= slab_.ExportSegment(contexts_[i % 4]).has_value();
+    }
+    count_allocations = false;
+    EXPECT_TRUE(succeeded);
+    EXPECT_EQ(allocation_count, 0u);
+    EXPECT_EQ(slab_.stats().available_references, before);
 }
 } // namespace
 } // namespace memory

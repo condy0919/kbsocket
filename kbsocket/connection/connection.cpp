@@ -58,6 +58,10 @@ std::expected<void, ConnectionError> Connection::Open(int fd, ConnectionTable& t
     if (opened_once_) {
         return Error(ConnectionErrorCode::kInUse);
     }
+    // 当前应用流仍只有 Eager 接收装配；不能公告尚不能处理的 RTS/DONE 和目标 Arena。
+    if (config.local.capabilities & control::kHandshakeCapabilityWriteRndv) {
+        return Error(ConnectionErrorCode::kInvalidArgument);
+    }
     auto opened = handshake_.Open(fd, table, config, now_ns);
     if (!opened) {
         return std::unexpected(HandshakeError(opened.error()));

@@ -48,6 +48,30 @@ HandshakeMessage Ready() {
     message.ready.max_stream_bytes = 256 * 1024;
     return message;
 }
+HandshakeMessage RndvHello() {
+    auto result = Hello();
+    result.hello.capabilities |= kHandshakeCapabilityWriteRndv;
+    auto& offer = result.hello.rndv;
+    offer.limits = {.version = kRndvVersion,
+                    .flags = kRndvSuccessfulWriteDone,
+                    .max_write_bytes = 4096,
+                    .max_transfer_bytes = 16384,
+                    .max_grants = 8,
+                    .window = 128,
+                    .max_bytes = 131072};
+    offer.arena_count = 1;
+    offer.arenas[0] = {.id = 11,
+                       .generation = 12,
+                       .address = 0x100000,
+                       .length = 131072,
+                       .max_grant_bytes = 16384,
+                       .eid = result.hello.eid,
+                       .uasid = 13,
+                       .token_id = 14,
+                       .access = kRndvAccessWrite,
+                       .token_policy = kRndvTokenNone};
+    return result;
+}
 HandshakeMessage LaneUpdate() {
     HandshakeMessage message;
     message.kind = HandshakeMessageKind::kLaneUpdate;
@@ -243,8 +267,9 @@ TEST(HandshakeCodec, MaximumOpaqueDescriptorFitsAndSequenceUpperBoundIsFinite) {
     std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
     const auto size = EncodeHandshakeMessage(message, bytes);
     ASSERT_TRUE(size);
-    EXPECT_EQ(*size, bytes.size());
-    const auto decoded = DecodeHandshakeMessage(bytes);
+    // 无 RNDV 时仍保留旧 v3 最大帧长度，数组额外空间只供显式启用的后缀使用。
+    EXPECT_EQ(*size, bytes.size() - kRndvMaxOfferBytes);
+    const auto decoded = DecodeHandshakeMessage(std::span(bytes).first(*size));
     ASSERT_TRUE(decoded);
     EXPECT_EQ(decoded->hello.descriptor.back(), std::byte{0xbe});
     EXPECT_EQ(decoded->hello.tx_lanes, message.hello.tx_lanes);
@@ -922,6 +947,145 @@ TEST_F(HandshakeChannelTest, FullSocketSendBufferReturnsWithinBudget) {
     ASSERT_TRUE(progress);
     EXPECT_EQ(progress->sent, 152u);
     EXPECT_TRUE(channel.output_flushed());
+}
+
+TEST(HandshakeCodec, RndvHelloAndReadyAppendCanonicalOptionalSuffixes) {
+    auto message = RndvHello();
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
+    const auto encoded = EncodeHandshakeMessage(message, bytes);
+    ASSERT_TRUE(encoded);
+    EXPECT_EQ(*encoded, 152u + kRndvOfferPrefixBytes + kRndvArenaBytes);
+    const auto decoded = DecodeHandshakeMessage(std::span(bytes).first(*encoded));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->hello.rndv, message.hello.rndv);
+    EXPECT_EQ(decoded->hello.descriptor, message.hello.descriptor);
+    EXPECT_EQ(decoded->hello.tx_lanes, message.hello.tx_lanes);
+    message = Ready();
+    message.ready.rndv = RndvHello().hello.rndv.limits;
+    const auto ready_bytes = EncodeHandshakeMessage(message, bytes);
+    ASSERT_TRUE(ready_bytes);
+    EXPECT_EQ(*ready_bytes, 156u + kRndvLimitsBytes);
+    const auto ready = DecodeHandshakeMessage(std::span(bytes).first(*ready_bytes));
+    ASSERT_TRUE(ready);
+    EXPECT_EQ(ready->ready.rndv, message.ready.rndv);
+}
+
+TEST(HandshakeCodec, RndvRequiresRawCapabilityAndMatchingEndpointEid) {
+    const auto good = RndvHello();
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes;
+    bytes.fill(std::byte{0xcc});
+    const auto original = bytes;
+    // 未声明、声明缺少内容以及目录跨端点均失败，不能悄悄丢弃配置或创建另一导入来源。
+    auto bad = good;
+    bad.hello.capabilities = kHandshakeCapabilityRaw;
+    EXPECT_FALSE(EncodeHandshakeMessage(bad, bytes));
+    bad = good;
+    bad.hello.rndv = {};
+    EXPECT_FALSE(EncodeHandshakeMessage(bad, bytes));
+    bad = good;
+    bad.hello.rndv.arenas[0].eid[0] = std::byte{1};
+    EXPECT_FALSE(EncodeHandshakeMessage(bad, bytes));
+    bad = {};
+    bad.hello.identity = Identity();
+    bad.hello.capabilities = kHandshakeCapabilityTcp | kHandshakeCapabilityWriteRndv;
+    bad.hello.rndv = good.hello.rndv;
+    EXPECT_FALSE(EncodeHandshakeMessage(bad, bytes));
+    EXPECT_EQ(bytes, original);
+}
+
+TEST(HandshakeCodec, RndvReadyRejectsTcpAndPartiallyDisabledLimits) {
+    auto message = Ready();
+    message.ready.rndv = RndvHello().hello.rndv.limits;
+    message.ready.transport = HandshakeTransport::kTcp;
+    message.ready.credit_epoch = 0;
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
+    EXPECT_FALSE(EncodeHandshakeMessage(message, bytes));
+    message = Ready();
+    message.ready.rndv.max_bytes = 1;
+    EXPECT_FALSE(EncodeHandshakeMessage(message, bytes));
+    // 额外全零后缀不是未启用态的第二种编码；旧 READY 必须保持精确长度。
+    auto encoded = EncodeHandshakeMessage(Ready(), bytes);
+    ASSERT_TRUE(encoded);
+    bytes[11] = static_cast<std::byte>(144 + kRndvLimitsBytes);
+    EXPECT_FALSE(DecodeHandshakeMessage(std::span(bytes).first(*encoded + kRndvLimitsBytes)));
+}
+
+TEST(HandshakeCodec, RndvDecoderRejectsStrippedCapabilityAndMalformedSuffix) {
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
+    const auto encoded = EncodeHandshakeMessage(RndvHello(), bytes);
+    ASSERT_TRUE(encoded);
+    const auto good = bytes;
+    bytes[15] = static_cast<std::byte>(kHandshakeCapabilityRaw);
+    EXPECT_FALSE(DecodeHandshakeMessage(std::span(bytes).first(*encoded)));
+    // 子协议版本与保留位独立校验；恶意 count 在遍历任何目录前被拒绝。
+    bytes = good;
+    bytes[153] = std::byte{2};
+    ExpectError(DecodeHandshakeMessage(std::span(bytes).first(*encoded)), HandshakeErrorCode::kVersionMismatch);
+    bytes = good;
+    bytes[152 + 44] = std::byte{1};
+    EXPECT_FALSE(DecodeHandshakeMessage(std::span(bytes).first(*encoded)));
+    bytes = good;
+    bytes[152 + 40] = std::byte{0xff};
+    EXPECT_FALSE(DecodeHandshakeMessage(std::span(bytes).first(*encoded)));
+    bytes = good;
+    bytes[152 + 48 + 40] = std::byte{1};
+    EXPECT_FALSE(DecodeHandshakeMessage(std::span(bytes).first(*encoded)));
+}
+
+TEST(HandshakeCodec, RndvMaximumFrameFitsBoundAndSmallOutputRemainsUntouched) {
+    auto message = RndvHello();
+    message.hello.descriptor_bytes = kHandshakeMaxDescriptorBytes;
+    message.hello.tx_lanes.count = kHandshakeMaxTxLanes;
+    for (std::size_t i = 1; i < kHandshakeMaxTxLanes; ++i) {
+        message.hello.tx_lanes.lanes[i] = message.hello.tx_lanes.lanes[0];
+        message.hello.tx_lanes.lanes[i].jetty_id += static_cast<std::uint32_t>(i);
+    }
+    auto& offer = message.hello.rndv;
+    offer.arena_count = kRndvMaxArenas;
+    for (std::size_t i = 1; i < kRndvMaxArenas; ++i) {
+        offer.arenas[i] = offer.arenas[0];
+        offer.arenas[i].id += i;
+        offer.arenas[i].address += i * offer.arenas[0].length;
+    }
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes;
+    bytes.fill(std::byte{0xdd});
+    const auto original = bytes;
+    ExpectError(EncodeHandshakeMessage(message, std::span(bytes).first(bytes.size() - 1)),
+                HandshakeErrorCode::kBufferTooSmall);
+    EXPECT_EQ(bytes, original);
+    const auto encoded = EncodeHandshakeMessage(message, bytes);
+    ASSERT_TRUE(encoded);
+    EXPECT_EQ(*encoded, bytes.size());
+    const auto decoded = DecodeHandshakeMessage(bytes);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->hello.rndv, offer);
+}
+
+TEST_F(HandshakeChannelTest, FragmentedRndvSuffixDoesNotConsumeFollowingBusinessByte) {
+    HandshakeChannel channel;
+    Open(channel, 0);
+    std::array<std::byte, kHandshakeMaxFrameBytes> bytes{};
+    const auto encoded = EncodeHandshakeMessage(RndvHello(), bytes);
+    ASSERT_TRUE(encoded);
+    bytes[*encoded] = std::byte{0xa5};
+    ASSERT_EQ(send(pair_[1], bytes.data(), *encoded + 1, MSG_NOSIGNAL), static_cast<ssize_t>(*encoded + 1));
+    // 将扩展分割到单字节进度，证明长度上界更新没有引入过读或无限循环。
+    for (std::size_t i = 0; i < *encoded && !channel.message_ready(); ++i) {
+        const auto progress = channel.Progress(i, {1, 1});
+        ASSERT_TRUE(progress);
+        EXPECT_LE(progress->received, 1u);
+        EXPECT_LE(progress->syscalls, 1u);
+    }
+    ASSERT_TRUE(channel.message_ready());
+    const auto decoded = channel.TakeMessage();
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->hello.rndv, RndvHello().hello.rndv);
+    auto established = channel.ReleaseEstablished(true);
+    ASSERT_TRUE(established);
+    OwnedFd owner{*established};
+    std::byte remaining{};
+    ASSERT_EQ(recv(owner.fd, &remaining, 1, MSG_DONTWAIT), 1);
+    EXPECT_EQ(remaining, std::byte{0xa5});
 }
 
 TEST(HandshakeTcp, RealLoopbackStreamExchangesHelloAndReady) {

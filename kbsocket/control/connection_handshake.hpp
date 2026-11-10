@@ -8,9 +8,12 @@
 
 #include "kbsocket/connection/connection_table.hpp"
 #include "kbsocket/connection/credit_account.hpp"
+#include "kbsocket/connection/grant_manager.hpp"
 #include "kbsocket/connection/reorder_window.hpp"
 #include "kbsocket/control/endpoint_import_cache.hpp"
 #include "kbsocket/control/handshake_channel.hpp"
+#include "kbsocket/control/rndv_capabilities.hpp"
+#include "kbsocket/control/tseg_import_cache.hpp"
 
 namespace kbsocket {
 namespace control {
@@ -66,6 +69,8 @@ struct RawHandshakePreparation {
     connection::ReorderConfig reorder;
     /// 路由借用的完整连接对象；准备完成后即可接收首包，不能等本端 Active 才初始化。
     void* route_owner = nullptr;
+    /// 宿主已独立认证对端成功 DONE 契约，并授权按规范字段导入其 Arena；网络 capability 不能替代该许可。
+    bool rndv_peer_authorized = false;
 };
 
 /// 单 owner 建链协调器。Open 接管已连接协议 fd 并预留 token；不执行 connect 或创建 raw 队列。
@@ -96,6 +101,13 @@ public:
     std::expected<void, ConnectionHandshakeError> Close() noexcept;
     /// Active 后把协议字节恰好读完的 fd 交给后续控制/NativeTCP 后端；之后不再由本对象读写。
     std::expected<int, ConnectionHandshakeError> TakeEstablishedFd() noexcept;
+
+    /// 双方 READY 完成后才返回共同 RNDV 上限；限额不是动态空闲量，也不代表目标 Grant 已授予。
+    const RndvLimits* rndv() const noexcept;
+    /// 只从当前已确认的 peer 目录与完整 Grant 构造请求，不调用 provider、不取得缓存引用或授权 WRITE。
+    /// 调用方仍须核验对应 RTS、经共享暂停域驱动导入，并由 WRITE pool 持有逐 WR 所需引用。
+    std::expected<TsegImportRequest, ConnectionHandshakeError>
+    PrepareRndvImport(const connection::GrantIdentity& grant) const noexcept;
 
     ConnectionHandshakeState state() const noexcept {
         return state_;
@@ -146,6 +158,7 @@ private:
     connection::ConnectionRouteLease route_;
     HandshakeHello local_, peer_;
     HandshakeReady local_ready_, remote_ready_;
+    RndvLimits rndv_;
     connection::ReorderWindow receive_;
     RawHandshakePreparation raw_;
     ImportLease import_;

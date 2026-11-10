@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <new>
 
@@ -167,6 +168,45 @@ void SlabAllocator::StopAccepting() noexcept {
 }
 bool SlabAllocator::accepting() const noexcept {
     return state_ && state_->ready && !state_->stopping;
+}
+std::expected<SlabSegmentSnapshot, MemoryError> SlabAllocator::ExportSegment(urma_context_t* context) const noexcept {
+    if (!state_ || !state_->ready) {
+        return Error(MemoryErrorCode::kNotReady);
+    }
+    if (state_->stopping) {
+        return Error(MemoryErrorCode::kStopped);
+    }
+    if (!context) {
+        return Error(MemoryErrorCode::kInvalidArgument);
+    }
+    for (std::size_t i = 0; i < state_->context_count; ++i) {
+        if (state_->contexts[i] != context) {
+            continue;
+        }
+        const auto* segment = state_->segments[i];
+        if (!segment || segment->urma_ctx != context) {
+            return Error(MemoryErrorCode::kRegisterFailed, EPROTO, i);
+        }
+        const auto& descriptor = segment->seg;
+        // provider 的额外区间/权限和未经请求的属性不属于本 Slab，不能悄悄公布。
+        // 注册配置固定 NONE/零 token；不能从另一 policy 猜测访问 token。
+        if (descriptor.ubva.va != reinterpret_cast<std::uintptr_t>(state_->memory) ||
+            descriptor.len != state_->stats.backing_bytes || !descriptor.ubva.va || !descriptor.len ||
+            descriptor.len > std::numeric_limits<std::uint64_t>::max() - descriptor.ubva.va ||
+            descriptor.ubva.uasid != context->uasid || descriptor.ubva.uasid >= (1U << 24) ||
+            std::memcmp(descriptor.ubva.eid.raw, context->eid.raw, URMA_EID_SIZE) ||
+            std::all_of(std::begin(descriptor.ubva.eid.raw), std::end(descriptor.ubva.eid.raw),
+                        [](auto byte) { return byte == 0; }) ||
+            descriptor.token_id == URMA_SEG_TOKEN_ID_INVALID || descriptor.attr.bs.access != state_->config.access ||
+            descriptor.attr.bs.token_policy != URMA_TOKEN_NONE || descriptor.attr.bs.cacheable ||
+            descriptor.attr.bs.dsva || descriptor.attr.bs.non_pin || descriptor.attr.bs.user_iova ||
+            descriptor.attr.bs.user_token_id || descriptor.attr.bs.has_user_info || descriptor.attr.bs.reserved) {
+            return Error(MemoryErrorCode::kRegisterFailed, EPROTO, i);
+        }
+        return SlabSegmentSnapshot{descriptor, {}, state_->config.buffer_size, state_->config.buffer_count};
+    }
+    // CPU-only backing 或未参与注册的 context 都没有可导出的段。
+    return Error(MemoryErrorCode::kInvalidArgument);
 }
 std::expected<void, MemoryError> SlabAllocator::Close() noexcept {
     if (!state_) {

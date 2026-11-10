@@ -45,4 +45,4 @@ Close 没有活动 RNDV 责任时仅结束协调器；存在活动责任时先�
 
 测试使用真实 Slab/Grant/重排账本与 Mock URMA 注册，覆盖来源和身份校验、资源背压、乱序混合交付、取消、迟到通知、借用保留、槽复用及热路径零分配。结果记录在 [roadmap](roadmap.md)，不代表 UB 真机验证。
 
-现有 EagerRxStream 仍只处理其物理 RX 包归还，不能把它直接接到混合窗口上就认为完成了应用流集成。后续需要接入 RNDV 能力/Arena 协商、通知与事务调度、混合流短读及零拷贝归还、Connection/Runtime 分发和关闭流程。
+现有 EagerRxStream 仍只处理其物理 RX 包归还，不能把它直接接到混合窗口上就认为完成了应用流集成。M6.3.6 已提供 [RNDV 能力/Arena 协商](rndv-negotiation.md)；后续仍需接入通知与事务调度、混合流短读及零拷贝归还、Connection/Runtime 分发和关闭流程。

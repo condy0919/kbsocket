@@ -10,6 +10,7 @@
 #include <span>
 
 #include "kbsocket/connection/wire_frame.hpp"
+#include "kbsocket/control/rndv_capabilities.hpp"
 
 namespace kbsocket {
 namespace control {
@@ -18,10 +19,11 @@ inline constexpr std::size_t kHandshakeMaxDescriptorBytes = 4096;
 inline constexpr std::size_t kHandshakeMaxTxLanes = 64;
 inline constexpr std::size_t kHandshakeHeaderBytes = 12;
 inline constexpr std::size_t kHandshakeMaxFrameBytes =
-    kHandshakeHeaderBytes + 104 + 32 * kHandshakeMaxTxLanes + kHandshakeMaxDescriptorBytes;
+    kHandshakeHeaderBytes + 104 + 32 * kHandshakeMaxTxLanes + kHandshakeMaxDescriptorBytes + kRndvMaxOfferBytes;
 inline constexpr std::uint16_t kHandshakeVersion = 3;
 inline constexpr std::uint16_t kHandshakeCapabilityRaw = 1;
 inline constexpr std::uint16_t kHandshakeCapabilityTcp = 2;
+inline constexpr std::uint16_t kHandshakeCapabilityWriteRndv = 4;
 
 enum class HandshakeMessageKind : std::uint8_t {
     kHello = 1,
@@ -73,6 +75,8 @@ struct HandshakeHello {
     HandshakeTxLanes tx_lanes;
     /// 只搬运 provider 导出的有界 opaque 描述符；宿主必须另行验证 ABI、来源与端点字段。
     std::array<std::byte, kHandshakeMaxDescriptorBytes> descriptor{};
+    /// 仅 WRITE RNDV capability 声明时编码；未启用时必须全零。
+    RndvOffer rndv{};
 };
 struct HandshakeReady {
     HandshakeIdentity sender;
@@ -83,6 +87,8 @@ struct HandshakeReady {
     std::uint64_t max_control_credit_seq = 0;
     std::uint64_t max_frame_seq = 0;
     std::uint64_t max_stream_bytes = 0;
+    /// RAW 双方声明时回显确定性协商结果；全零时保留原 v3 READY 字节。
+    RndvLimits rndv{};
 };
 struct HandshakeReject {
     std::uint64_t sender_session = 0;

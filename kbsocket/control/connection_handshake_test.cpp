@@ -8,13 +8,82 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <optional>
 #include <thread>
 
 #include <gtest/gtest.h>
 
+#include "kbsocket/connection/grant_manager.hpp"
+#include "kbsocket/control/rndv_capabilities.hpp"
+#include "kbsocket/control/tseg_import_cache.hpp"
 #include "kbsocket/transport/raw/testing/scoped_urma_override.hpp"
+
+namespace {
+// Open 之外才启用计数，避免把 GTest 或控制路径的预分配计入发送热路径。
+thread_local bool count_allocations = false;
+thread_local std::size_t allocations = 0;
+thread_local std::size_t deallocations = 0;
+void RecordAllocation() {
+    if (count_allocations) {
+        ++allocations;
+    }
+}
+void RecordDeallocation(void* pointer) {
+    if (count_allocations && pointer) {
+        ++deallocations;
+    }
+}
+} // namespace
+void* operator new(std::size_t bytes) {
+    RecordAllocation();
+    if (auto* pointer = std::malloc(bytes ? bytes : 1)) {
+        return pointer;
+    }
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t bytes) {
+    return ::operator new(bytes);
+}
+void* operator new(std::size_t bytes, std::align_val_t alignment) {
+    RecordAllocation();
+    void* pointer = nullptr;
+    if (::posix_memalign(&pointer, static_cast<std::size_t>(alignment), bytes ? bytes : 1) != 0) {
+        throw std::bad_alloc();
+    }
+    return pointer;
+}
+void* operator new[](std::size_t bytes, std::align_val_t alignment) {
+    return ::operator new(bytes, alignment);
+}
+void operator delete(void* pointer) noexcept {
+    RecordDeallocation(pointer);
+    std::free(pointer);
+}
+void operator delete[](void* pointer) noexcept {
+    ::operator delete(pointer);
+}
+void operator delete(void* pointer, std::size_t) noexcept {
+    ::operator delete(pointer);
+}
+void operator delete[](void* pointer, std::size_t) noexcept {
+    ::operator delete(pointer);
+}
+void operator delete(void* pointer, std::align_val_t) noexcept {
+    ::operator delete(pointer);
+}
+void operator delete[](void* pointer, std::align_val_t) noexcept {
+    ::operator delete(pointer);
+}
+void operator delete(void* pointer, std::size_t, std::align_val_t) noexcept {
+    ::operator delete(pointer);
+}
+void operator delete[](void* pointer, std::size_t, std::align_val_t) noexcept {
+    ::operator delete(pointer);
+}
 
 namespace kbsocket {
 namespace control {
@@ -58,6 +127,47 @@ HandshakeHello Hello(std::uint64_t runtime, bool raw = true) {
     return hello;
 }
 
+HandshakeHello RndvHello(std::uint64_t runtime) {
+    auto hello = Hello(runtime);
+    hello.capabilities |= kHandshakeCapabilityWriteRndv;
+    hello.rndv.limits = {.version = kRndvVersion,
+                         .flags = kRndvSuccessfulWriteDone,
+                         .max_write_bytes = 65536,
+                         .max_transfer_bytes = 32768,
+                         .max_grants = 8,
+                         .window = 32,
+                         .max_bytes = 262144};
+    hello.rndv.arena_count = 1;
+    hello.rndv.arenas[0] = {.id = runtime + 10,
+                            .generation = runtime + 20,
+                            .address = runtime * 0x100000,
+                            .length = 0x100000,
+                            .max_grant_bytes = 65536,
+                            .eid = hello.eid,
+                            .uasid = static_cast<std::uint32_t>(runtime + 30),
+                            .token_id = static_cast<std::uint32_t>(runtime + 40),
+                            .access = kRndvAccessRead | kRndvAccessWrite,
+                            .token_policy = kRndvTokenNone};
+    return hello;
+}
+
+connection::GrantIdentity RndvGrant(const ConnectionHandshake& handshake, std::uint32_t arena_index = 0) {
+    const auto& peer = *handshake.peer();
+    const auto& arena = peer.rndv.arenas[arena_index];
+    return {.transfer = {.binding = {.sender_runtime = handshake.local().identity.runtime,
+                                     .receiver_runtime = peer.identity.runtime,
+                                     .receive_domain = peer.identity.receive_domain,
+                                     .session = peer.identity.session,
+                                     .token = peer.identity.token},
+                         .transfer_id = 99,
+                         .seq = 0,
+                         .bytes = 16384},
+            .arena = {arena.id, arena.generation},
+            .slot = 0,
+            .generation = 17,
+            .target_address = arena.address + 64};
+}
+
 class ConnectionHandshakeTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -72,6 +182,7 @@ protected:
         ASSERT_TRUE(executor_.Open({.workers = 1, .capacity = 4}));
     }
     void TearDown() override {
+        count_allocations = false;
         EXPECT_TRUE(a_.Close());
         EXPECT_TRUE(b_.Close());
         if (a_credit_) {
@@ -109,12 +220,15 @@ protected:
         return URMA_SUCCESS;
     }
     void OpenPair(bool raw = true) {
+        OpenPairHello(Hello(1, raw), Hello(2, raw));
+    }
+    void OpenPairHello(const HandshakeHello& left, const HandshakeHello& right) {
         int sockets[2];
         ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sockets), 0);
         ConnectionHandshakeConfig config{
-            .local = Hello(1, raw), .expected_peer_authorization = 7, .compatible_peer = true, .deadline_ns = 1000000};
+            .local = left, .expected_peer_authorization = 7, .compatible_peer = true, .deadline_ns = 1000000};
         ASSERT_TRUE(a_.Open(sockets[0], a_table_, config, 0));
-        config.local = Hello(2, raw);
+        config.local = right;
         ASSERT_TRUE(b_.Open(sockets[1], b_table_, config, 0));
         for (int i = 0; i < 100 && (!a_.peer() || !b_.peer()); ++i) {
             ASSERT_TRUE(a_.Progress(++now_));
@@ -150,12 +264,14 @@ protected:
                 .descriptor_compatible = true,
                 .credits = &a_credits_,
                 .credit_peer = *a_credit_,
+                .reorder = {},
                 .route_owner = &a_};
     }
-    void PreparePair() {
+    void PreparePair(bool rndv_authorized = false) {
         Credits();
-        ASSERT_TRUE(a_.PrepareRaw(APreparation()));
         auto preparation = APreparation();
+        preparation.rndv_peer_authorized = rndv_authorized;
+        ASSERT_TRUE(a_.PrepareRaw(preparation));
         preparation.local_context = &b_context_;
         preparation.credits = &b_credits_;
         preparation.credit_peer = *b_credit_;
@@ -186,23 +302,26 @@ protected:
         } while (std::chrono::steady_clock::now() < deadline);
         FAIL() << "control worker failed to complete";
     }
-    void Activate(State target) {
-        for (int i = 0; i < 100 && (a_.state() != target || b_.state() != target); ++i) {
-            ASSERT_TRUE(a_.Progress(++now_));
-            ASSERT_TRUE(b_.Progress(++now_));
+    void Activate(State target, HandshakeIoBudget budget = {}) {
+        for (int i = 0; i < 10000 && (a_.state() != target || b_.state() != target); ++i) {
+            ASSERT_TRUE(a_.Progress(++now_, budget));
+            ASSERT_TRUE(b_.Progress(++now_, budget));
         }
         ASSERT_EQ(a_.state(), target);
         ASSERT_EQ(b_.state(), target);
     }
-    void OpenRemote(HandshakeChannel& remote) {
+    void OpenRemote(HandshakeChannel& remote, bool rndv = false) {
         int sockets[2];
         ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sockets), 0);
-        ASSERT_TRUE(a_.Open(
-            sockets[0], a_table_,
-            {.local = Hello(1), .expected_peer_authorization = 7, .compatible_peer = true, .deadline_ns = 1000000}, 0));
+        ASSERT_TRUE(a_.Open(sockets[0], a_table_,
+                            {.local = rndv ? RndvHello(1) : Hello(1),
+                             .expected_peer_authorization = 7,
+                             .compatible_peer = true,
+                             .deadline_ns = 1000000},
+                            0));
         ASSERT_TRUE(remote.Open(sockets[1], true, 0, 1000000));
         HandshakeMessage hello;
-        hello.hello = Hello(2);
+        hello.hello = rndv ? RndvHello(2) : Hello(2);
         ASSERT_TRUE(remote.Queue(hello));
         ASSERT_TRUE(remote.Progress(++now_));
         ASSERT_TRUE(a_.Progress(++now_));
@@ -222,6 +341,13 @@ protected:
                        .max_control_credit_seq = 2,
                        .max_frame_seq = 64,
                        .max_stream_bytes = 4096};
+        return ready;
+    }
+
+    HandshakeMessage RndvPeerReady() const {
+        auto ready = PeerReady();
+        ready.ready.rndv = RndvHello(1).rndv.limits;
+        ready.ready.max_stream_bytes = ready.ready.rndv.max_bytes;
         return ready;
     }
 
@@ -257,6 +383,7 @@ TEST_F(ConnectionHandshakeTest, RawImportAndRoutePrecedeReadyAndFirstFrame) {
     connection::WireFrameInput frame{.type = connection::WireFrameType::kControl,
                                      .control = connection::WireControlType::kFin,
                                      .token = a_.local().identity.token,
+                                     .data = {},
                                      .session = a_.local().identity.session};
     std::array<std::byte, 64> payload{};
     auto encoded = connection::EncodeWireFrame(frame, payload);
@@ -292,6 +419,7 @@ TEST_F(ConnectionHandshakeTest, OppositeDirectionEpochAndPhysicalCreditRemainDis
     connection::WireFrameInput update{.type = connection::WireFrameType::kControl,
                                       .control = connection::WireControlType::kCreditUpdate,
                                       .token = a_.local().identity.token,
+                                      .data = {},
                                       .max_credit_seq = 16,
                                       .max_control_credit_seq = 4,
                                       .session = a_.local().identity.session,
@@ -637,6 +765,400 @@ TEST_F(ConnectionHandshakeTest, NoCommonTransportFailsWithoutImportOrFallback) {
     EXPECT_EQ(a_table_.published(), 0u);
     EXPECT_EQ(import_calls_, 0);
     ExpectError(a_.PrepareTcp(), Code::kNotReady);
+}
+
+TEST_F(ConnectionHandshakeTest, RndvNegotiatesCommonLimitsOnlyAfterBothReadyFramesComplete) {
+    auto left = RndvHello(1);
+    auto right = RndvHello(2);
+    right.rndv.limits.max_write_bytes = 32768;
+    right.rndv.limits.max_transfer_bytes = 16384;
+    right.rndv.limits.max_grants = 4;
+    right.rndv.limits.window = 16;
+    right.rndv.limits.max_bytes = 131072;
+    OpenPairHello(left, right);
+    EXPECT_EQ(a_.rndv(), nullptr);
+    EXPECT_EQ(b_.rndv(), nullptr);
+    ExpectError(a_.PrepareRndvImport(RndvGrant(a_)), Code::kNotReady);
+    PreparePair(true);
+    DriveCache();
+    ASSERT_TRUE(a_.Progress(++now_));
+    ASSERT_EQ(a_.state(), State::kWaitingReady);
+    EXPECT_EQ(a_.rndv(), nullptr);
+    // 多轮短写覆盖 READY 尚在本地输出中时不能提前启用 RNDV 的门禁。
+    Activate(State::kRawActive, {.bytes = 7, .syscalls = 1});
+    ASSERT_NE(a_.rndv(), nullptr);
+    ASSERT_NE(b_.rndv(), nullptr);
+    EXPECT_EQ(*a_.rndv(), right.rndv.limits);
+    EXPECT_EQ(*b_.rndv(), right.rndv.limits);
+    ASSERT_NE(a_.local_ready(), nullptr);
+    ASSERT_NE(a_.peer_ready(), nullptr);
+    EXPECT_EQ(a_.local_ready()->rndv, right.rndv.limits);
+    EXPECT_EQ(a_.peer_ready()->rndv, right.rndv.limits);
+    EXPECT_TRUE(a_.PrepareRndvImport(RndvGrant(a_)));
+    EXPECT_TRUE(b_.PrepareRndvImport(RndvGrant(b_)));
+}
+
+TEST_F(ConnectionHandshakeTest, OneSidedRndvOfferKeepsRawEagerWithoutImportPermission) {
+    OpenPairHello(RndvHello(1), Hello(2));
+    // 不共同声明能力时无需 RNDV 授权，普通 RAW 建链仍可完成。
+    PreparePair();
+    DriveCache();
+    Activate(State::kRawActive);
+    EXPECT_EQ(a_.rndv(), nullptr);
+    EXPECT_EQ(b_.rndv(), nullptr);
+    EXPECT_EQ(a_.peer_ready()->rndv, RndvLimits{});
+    ExpectError(a_.PrepareRndvImport({}), Code::kNotReady);
+}
+
+TEST_F(ConnectionHandshakeTest, SelectedTcpNeverEnablesRndvFromOneRawOffer) {
+    OpenPairHello(RndvHello(1), Hello(2, false));
+    ASSERT_TRUE(a_.PrepareTcp());
+    ASSERT_TRUE(b_.PrepareTcp());
+    Activate(State::kTcpActive);
+    EXPECT_EQ(a_.rndv(), nullptr);
+    EXPECT_EQ(b_.rndv(), nullptr);
+    EXPECT_EQ(cache_.leases(), 0u);
+    EXPECT_EQ(import_calls_, 0);
+    ExpectError(a_.PrepareRndvImport({}), Code::kNotReady);
+}
+
+TEST_F(ConnectionHandshakeTest, RndvPeerAuthorizationPrecedesAnyImportOrWindowPublication) {
+    OpenPairHello(RndvHello(1), RndvHello(2));
+    Credits();
+    auto prep = APreparation();
+    ExpectError(a_.PrepareRaw(prep), Code::kUnauthorized);
+    EXPECT_EQ(a_.state(), State::kPreparing);
+    EXPECT_EQ(cache_.leases(), 0u);
+    EXPECT_EQ(import_calls_, 0);
+    EXPECT_FALSE(a_.receive_window().session());
+    EXPECT_EQ(a_table_.published(), 0u);
+    // 宿主补齐独立认证/导入许可后可以在原握手重试，不需撤销或重发 HELLO。
+    prep.rndv_peer_authorized = true;
+    ASSERT_TRUE(a_.PrepareRaw(prep));
+    EXPECT_EQ(cache_.leases(), 1u);
+}
+
+TEST_F(ConnectionHandshakeTest, RndvPreparationRejectsInsufficientCommonWindowOrByteBudget) {
+    OpenPairHello(RndvHello(1), RndvHello(2));
+    Credits();
+    auto prep = APreparation();
+    prep.rndv_peer_authorized = true;
+    prep.reorder.window = 31;
+    ExpectError(a_.PrepareRaw(prep), Code::kInvalidArgument);
+    prep.reorder.window = 64;
+    prep.reorder.max_resident_bytes = 262143;
+    ExpectError(a_.PrepareRaw(prep), Code::kInvalidArgument);
+    EXPECT_EQ(cache_.leases(), 0u);
+    EXPECT_FALSE(a_.receive_window().session());
+    prep.reorder.max_resident_bytes = 262144;
+    ASSERT_TRUE(a_.PrepareRaw(prep));
+}
+
+TEST_F(ConnectionHandshakeTest, EarlyRndvReadyDoesNotReplaceLocalPreparationOrOutputFlush) {
+    HandshakeChannel remote;
+    OpenRemote(remote, true);
+    ASSERT_TRUE(remote.Queue(RndvPeerReady()));
+    ASSERT_TRUE(remote.Progress(++now_));
+    ASSERT_TRUE(a_.Progress(++now_));
+    ASSERT_NE(a_.peer_ready(), nullptr);
+    EXPECT_EQ(a_.rndv(), nullptr);
+    ExpectError(a_.PrepareRndvImport(RndvGrant(a_)), Code::kNotReady);
+    Credits();
+    auto prep = APreparation();
+    prep.rndv_peer_authorized = true;
+    ASSERT_TRUE(a_.PrepareRaw(prep));
+    DriveCache();
+    for (int i = 0; i < 1000 && a_.state() != State::kRawActive; ++i) {
+        ASSERT_TRUE(a_.Progress(++now_, {.bytes = 1, .syscalls = 1}));
+        if (a_.output_pending()) {
+            EXPECT_EQ(a_.rndv(), nullptr);
+        }
+    }
+    ASSERT_EQ(a_.state(), State::kRawActive);
+    ASSERT_NE(a_.rndv(), nullptr);
+    EXPECT_TRUE(a_.PrepareRndvImport(RndvGrant(a_)));
+}
+
+class MalformedRndvReadyTest : public ConnectionHandshakeTest, public ::testing::WithParamInterface<int> {};
+
+TEST_P(MalformedRndvReadyTest, ReadyMustEchoTheExactCommonLimitsAndCoverItsWindow) {
+    HandshakeChannel remote;
+    OpenRemote(remote, true);
+    auto ready = RndvPeerReady();
+    // 所有变体都保持可编码；证明拒绝来自双向协商关联，不能借合法 READY 偷改能力。
+    switch (GetParam()) {
+    case 0:
+        ready.ready.rndv = {};
+        break;
+    case 1:
+        ready.ready.rndv.max_write_bytes /= 2;
+        break;
+    case 2:
+        ready.ready.rndv.max_transfer_bytes /= 2;
+        break;
+    case 3:
+        --ready.ready.rndv.max_grants;
+        break;
+    case 4:
+        --ready.ready.rndv.window;
+        break;
+    case 5:
+        --ready.ready.rndv.max_bytes;
+        break;
+    case 6:
+        ready.ready.max_frame_seq = ready.ready.rndv.window - 1;
+        break;
+    case 7:
+        ready.ready.max_stream_bytes = ready.ready.rndv.max_bytes - 1;
+        break;
+    default:
+        FAIL() << "unknown malformed RNDV READY case";
+    }
+    ASSERT_TRUE(remote.Queue(ready));
+    ASSERT_TRUE(remote.Progress(++now_));
+    ExpectError(a_.Progress(++now_), Code::kProtocol);
+    EXPECT_EQ(a_.state(), State::kFailed);
+    EXPECT_EQ(a_.rndv(), nullptr);
+    EXPECT_EQ(a_.peer_ready(), nullptr);
+    EXPECT_EQ(a_table_.published(), 0u);
+    EXPECT_EQ(import_calls_, 0);
+}
+INSTANTIATE_TEST_SUITE_P(NegotiatedRndv, MalformedRndvReadyTest, ::testing::Range(0, 8));
+
+TEST_F(ConnectionHandshakeTest, ReadyCannotEnableRndvWithoutCommonHelloOffer) {
+    HandshakeChannel remote;
+    OpenRemote(remote);
+    ASSERT_TRUE(remote.Queue(RndvPeerReady()));
+    ASSERT_TRUE(remote.Progress(++now_));
+    ExpectError(a_.Progress(++now_), Code::kProtocol);
+    EXPECT_EQ(a_.rndv(), nullptr);
+    EXPECT_EQ(import_calls_, 0);
+}
+
+TEST_F(ConnectionHandshakeTest, RndvImportRequestUsesPeerIdentityDirectoryAndBoundLocalContext) {
+    auto peer = RndvHello(2);
+    peer.rndv.arenas[0].token_policy = kRndvTokenPlainText;
+    peer.rndv.arenas[0].token = 0xa1b2c3d4;
+    OpenPairHello(RndvHello(1), peer);
+    PreparePair(true);
+    DriveCache();
+    Activate(State::kRawActive);
+    const auto request = a_.PrepareRndvImport(RndvGrant(a_));
+    ASSERT_TRUE(request);
+    const auto& arena = peer.rndv.arenas[0];
+    const auto& key = request->key;
+    EXPECT_EQ(key.local_context, &a_context_);
+    EXPECT_EQ(key.local_context_incarnation, 1u);
+    EXPECT_EQ(key.peer_runtime, peer.identity.runtime);
+    EXPECT_EQ(key.receive_domain, peer.identity.receive_domain);
+    EXPECT_EQ(key.authorization_identity, peer.identity.authorization);
+    EXPECT_EQ(key.slab_id, arena.id);
+    EXPECT_EQ(key.slab_generation, arena.generation);
+    EXPECT_EQ(std::memcmp(key.eid.data(), arena.eid.data(), arena.eid.size()), 0);
+    // 规范字段逐个重建，不能把网络字节解释为包含 ABI padding 的 urma_seg_t。
+    EXPECT_EQ(request->descriptor.ubva.va, arena.address);
+    EXPECT_EQ(request->descriptor.ubva.uasid, arena.uasid);
+    EXPECT_EQ(std::memcmp(request->descriptor.ubva.eid.raw, arena.eid.data(), arena.eid.size()), 0);
+    EXPECT_EQ(request->descriptor.len, arena.length);
+    EXPECT_EQ(request->descriptor.token_id, arena.token_id);
+    EXPECT_EQ(request->descriptor.attr.bs.access, static_cast<std::uint32_t>(URMA_ACCESS_READ | URMA_ACCESS_WRITE));
+    EXPECT_EQ(request->descriptor.attr.bs.token_policy, static_cast<std::uint32_t>(URMA_TOKEN_PLAIN_TEXT));
+    EXPECT_EQ(request->descriptor.attr.bs.dsva, 0u);
+    EXPECT_EQ(request->descriptor.attr.bs.non_pin, 0u);
+    EXPECT_EQ(request->descriptor.attr.bs.user_iova, 0u);
+    EXPECT_EQ(request->descriptor.attr.bs.has_user_info, 0u);
+    EXPECT_EQ(request->descriptor.attr.bs.reserved, 0u);
+    EXPECT_EQ(request->token.token, arena.token);
+    // 使用真正缓存的准入规则检验映射结果；不提交慢导入操作，单靠目录不能取得可写 target。
+    TsegImportCache segments;
+    ASSERT_TRUE(segments.Open({.entries = 1, .leases = 2, .in_flight = 1}));
+    const auto segment_lease = segments.Acquire(*request);
+    ASSERT_TRUE(segment_lease);
+    const auto pending = segments.Get(*segment_lease);
+    ASSERT_FALSE(pending);
+    EXPECT_EQ(pending.error().code, TsegImportCacheErrorCode::kPending);
+    ASSERT_TRUE(segments.Release(*segment_lease));
+    EXPECT_TRUE(segments.Close());
+    const auto reverse = b_.PrepareRndvImport(RndvGrant(b_));
+    ASSERT_TRUE(reverse);
+    EXPECT_EQ(reverse->key.local_context, &b_context_);
+    EXPECT_EQ(reverse->key.peer_runtime, 1u);
+    EXPECT_EQ(reverse->key.receive_domain, 101u);
+    EXPECT_EQ(reverse->descriptor.attr.bs.token_policy, static_cast<std::uint32_t>(URMA_TOKEN_NONE));
+    EXPECT_EQ(reverse->token.token, 0u);
+    EXPECT_EQ(import_calls_, 2);
+}
+
+class InvalidRndvGrantTest : public ConnectionHandshakeTest, public ::testing::WithParamInterface<int> {};
+
+TEST_P(InvalidRndvGrantTest, RejectsWrongDirectionStaleIdentityAndUnauthorizedRange) {
+    OpenPairHello(RndvHello(1), RndvHello(2));
+    PreparePair(true);
+    DriveCache();
+    Activate(State::kRawActive);
+    auto grant = RndvGrant(a_);
+    const auto original = grant;
+    const auto& arena = a_.peer()->rndv.arenas[0];
+    // 不合法 Grant 不能产生第二套导入 key，也不能污染同一协商下仍然有效的原授权。
+    switch (GetParam()) {
+    case 0:
+        ++grant.transfer.binding.sender_runtime;
+        break;
+    case 1:
+        ++grant.transfer.binding.receiver_runtime;
+        break;
+    case 2:
+        grant.transfer.binding.receive_domain = a_.local().identity.receive_domain;
+        break;
+    case 3:
+        grant.transfer.binding.session = a_.local().identity.session;
+        break;
+    case 4:
+        ++grant.transfer.binding.token.slot;
+        break;
+    case 5:
+        ++grant.transfer.binding.token.generation;
+        break;
+    case 6:
+        ++grant.arena.id;
+        break;
+    case 7:
+        ++grant.arena.generation;
+        break;
+    case 8:
+        grant.slot = a_.rndv()->window;
+        break;
+    case 9:
+        grant.transfer.seq = 1;
+        break;
+    case 10:
+        grant.generation = 0;
+        break;
+    case 11:
+        grant.transfer.transfer_id = 0;
+        break;
+    case 12:
+        grant.transfer.bytes = 0;
+        break;
+    case 13:
+        grant.transfer.bytes = a_.rndv()->max_transfer_bytes + 1;
+        break;
+    case 14:
+        grant.target_address = arena.address - 1;
+        break;
+    case 15:
+        grant.target_address = arena.address + arena.length - grant.transfer.bytes + 1;
+        break;
+    case 16:
+        grant.target_address = std::numeric_limits<std::uint64_t>::max() - 1;
+        break;
+    case 17:
+        grant.transfer.seq = std::numeric_limits<std::uint32_t>::max();
+        break;
+    default:
+        FAIL() << "unknown invalid RNDV Grant case";
+    }
+    ExpectError(a_.PrepareRndvImport(grant), Code::kProtocol);
+    EXPECT_TRUE(a_.PrepareRndvImport(original));
+    EXPECT_EQ(a_.state(), State::kRawActive);
+    EXPECT_EQ(cache_.leases(), 2u);
+    EXPECT_EQ(import_calls_, 2);
+}
+INSTANTIATE_TEST_SUITE_P(GrantBindingAndRange, InvalidRndvGrantTest, ::testing::Range(0, 18));
+
+TEST_F(ConnectionHandshakeTest, RndvImportSelectsSecondArenaAndAcceptsExactEndBoundary) {
+    auto peer = RndvHello(2);
+    peer.rndv.arena_count = 2;
+    peer.rndv.arenas[1] = peer.rndv.arenas[0];
+    peer.rndv.arenas[1].id += 10;
+    peer.rndv.arenas[1].generation += 20;
+    peer.rndv.arenas[1].address += peer.rndv.arenas[1].length;
+    peer.rndv.arenas[1].token_id += 30;
+    OpenPairHello(RndvHello(1), peer);
+    PreparePair(true);
+    DriveCache();
+    Activate(State::kRawActive);
+    auto grant = RndvGrant(a_, 1);
+    const auto& second = peer.rndv.arenas[1];
+    grant.target_address = second.address + second.length - grant.transfer.bytes;
+    const auto request = a_.PrepareRndvImport(grant);
+    ASSERT_TRUE(request);
+    EXPECT_EQ(request->key.slab_id, second.id);
+    EXPECT_EQ(request->key.slab_generation, second.generation);
+    EXPECT_EQ(request->descriptor.ubva.va, second.address);
+    EXPECT_EQ(request->descriptor.token_id, second.token_id);
+}
+
+TEST_F(ConnectionHandshakeTest, InvalidatedEndpointPreventsNewRndvImportRequestsAfterActivation) {
+    OpenPairHello(RndvHello(1), RndvHello(2));
+    PreparePair(true);
+    DriveCache();
+    Activate(State::kRawActive);
+    const auto grant = RndvGrant(a_);
+    ASSERT_TRUE(a_.PrepareRndvImport(grant));
+    ASSERT_TRUE(cache_.Invalidate(a_.import_lease()));
+    ExpectError(a_.PrepareRndvImport(grant), Code::kImport);
+}
+
+TEST_F(ConnectionHandshakeTest, FrozenCreditDomainPreventsNewRndvImportRequests) {
+    OpenPairHello(RndvHello(1), RndvHello(2));
+    PreparePair(true);
+    DriveCache();
+    Activate(State::kRawActive);
+    const auto grant = RndvGrant(a_);
+    // Active 的协商结果不是永久准入许可；Peer 共账冻结后不能创建新的 WRITE 准备请求。
+    a_credits_.Freeze();
+    ExpectError(a_.PrepareRndvImport(grant), Code::kCredit);
+    EXPECT_EQ(import_calls_, 2);
+}
+
+TEST_F(ConnectionHandshakeTest, FailedCommonReceiveWindowPreventsNewRndvImportRequests) {
+    OpenPairHello(RndvHello(1), RndvHello(2));
+    PreparePair(true);
+    DriveCache();
+    Activate(State::kRawActive);
+    const auto grant = RndvGrant(a_);
+    a_.receive_window().Fail();
+    ExpectError(a_.PrepareRndvImport(grant), Code::kReorder);
+    EXPECT_EQ(cache_.leases(), 2u);
+}
+
+TEST_F(ConnectionHandshakeTest, CancellationAndCloseInvalidateRndvImportAccess) {
+    OpenPairHello(RndvHello(1), RndvHello(2));
+    PreparePair(true);
+    DriveCache();
+    Activate(State::kRawActive);
+    const auto grant = RndvGrant(a_);
+    a_.Cancel();
+    EXPECT_EQ(a_.rndv(), nullptr);
+    ExpectError(a_.PrepareRndvImport(grant), Code::kNotReady);
+    ASSERT_TRUE(a_.Close());
+    ExpectError(a_.PrepareRndvImport(grant), Code::kNotReady);
+}
+
+TEST_F(ConnectionHandshakeTest, ActiveRndvGrantValidationAndImportRequestMappingDoNotAllocate) {
+    OpenPairHello(RndvHello(1), RndvHello(2));
+    PreparePair(true);
+    DriveCache();
+    Activate(State::kRawActive);
+    auto grant = RndvGrant(a_);
+    auto wrong = grant;
+    ++wrong.arena.generation;
+    bool valid = true;
+    allocations = deallocations = 0;
+    // 已建链路径只读固定目录与现有缓存，不应隐式导入、构造动态容器或创建责任票据。
+    count_allocations = true;
+    for (int i = 0; i < 64; ++i) {
+        const auto result = a_.PrepareRndvImport(grant);
+        const auto rejected = a_.PrepareRndvImport(wrong);
+        valid &= result.has_value() && !rejected.has_value() && a_.rndv() != nullptr;
+    }
+    count_allocations = false;
+    EXPECT_TRUE(valid);
+    EXPECT_EQ(allocations, 0u);
+    EXPECT_EQ(deallocations, 0u);
+    EXPECT_EQ(cache_.leases(), 2u);
+    EXPECT_EQ(import_calls_, 2);
 }
 
 } // namespace

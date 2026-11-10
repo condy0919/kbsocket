@@ -55,6 +55,15 @@ struct SlabStats {
     std::size_t available_references = 0;
 };
 
+/// 真实注册段的值快照，不增加引用、不授权远端 WRITE，也不能直接按结构体布局发送。
+/// 宿主保持 Slab/context 存活，并通过逐事务 Grant 账本约束访问及关闭。
+struct SlabSegmentSnapshot {
+    urma_seg_t descriptor{};
+    urma_token_t token{};
+    std::size_t buffer_size = 0;
+    std::uint32_t buffer_count = 0;
+};
+
 /// 一个固定容量、页对齐 Slab，显式 CPU 池或最多四 context 注册；所有 Lease/责任操作由同一 owner 串行推进。
 /// 数据路径不分配、不注册、不持锁。Open/Close 是可能阻塞的控制路径，不与任何访问并发。
 /// CPU、DMA、Grant 是独立责任；全部结束才回收，复制 token 不增引用。
@@ -99,6 +108,9 @@ public:
     std::expected<void, MemoryError> EndGrant(BufferReference reference) noexcept;
     /// 每槽预留隔离记录，覆盖全部可能借出 Lease；隔离不丢责任，不产生虚假完成。
     std::expected<void, MemoryError> Quarantine(BufferLease lease) noexcept;
+    /// 仅导出活动注册 Slab 的精确 backing；核对 provider 段与 context、权限及固定注册属性。
+    /// 当前注册固定 NONE/零 token；快照不延长生命周期，也不允许绕过 Grant 发布单边访问。
+    std::expected<SlabSegmentSnapshot, MemoryError> ExportSegment(urma_context_t* context) const noexcept;
     SlabStats stats() const noexcept;
     bool accepting() const noexcept;
 

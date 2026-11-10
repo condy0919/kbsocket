@@ -1,17 +1,39 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 #include "kbsocket/control/connection_handshake.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
+#include <limits>
 #include <span>
 
 namespace kbsocket {
 namespace control {
 namespace {
+// wire 使用固定语义值；本地 SDK 改变枚举编码时必须显式更新映射，不能静默赋给 provider 位域。
+static_assert(kRndvAccessRead == URMA_ACCESS_READ && kRndvAccessWrite == URMA_ACCESS_WRITE &&
+              kRndvAccessAtomic == URMA_ACCESS_ATOMIC && kRndvTokenNone == URMA_TOKEN_NONE &&
+              kRndvTokenPlainText == URMA_TOKEN_PLAIN_TEXT);
 auto Error(ConnectionHandshakeErrorCode code, int detail = 0, int underlying_error = 0) noexcept {
     return std::unexpected(ConnectionHandshakeError{code, detail, underlying_error});
 }
 ConnectionHandshakeError ChannelError(HandshakeError error) noexcept {
     return {ConnectionHandshakeErrorCode::kChannel, static_cast<int>(error.code), error.system_error};
+}
+RndvLimits NegotiateRndv(const HandshakeHello& local, const HandshakeHello& peer) noexcept {
+    if (!(local.capabilities & peer.capabilities & kHandshakeCapabilityWriteRndv)) {
+        return {};
+    }
+    const auto& left = local.rndv.limits;
+    const auto& right = peer.rndv.limits;
+    // 首版共用较小的双向上限；实际每连接/每 Arena 分配仍须受共享内存硬预算约束。
+    return {.version = left.version,
+            .flags = left.flags,
+            .max_write_bytes = std::min(left.max_write_bytes, right.max_write_bytes),
+            .max_transfer_bytes = std::min(left.max_transfer_bytes, right.max_transfer_bytes),
+            .max_grants = std::min(left.max_grants, right.max_grants),
+            .window = std::min(left.window, right.window),
+            .max_bytes = std::min(left.max_bytes, right.max_bytes)};
 }
 } // namespace
 
@@ -21,6 +43,76 @@ ConnectionHandshake::~ConnectionHandshake() {
 }
 bool ConnectionHandshake::active() const noexcept {
     return state_ == ConnectionHandshakeState::kRawActive || state_ == ConnectionHandshakeState::kTcpActive;
+}
+const RndvLimits* ConnectionHandshake::rndv() const noexcept {
+    return state_ == ConnectionHandshakeState::kRawActive && rndv_.version ? &rndv_ : nullptr;
+}
+std::expected<TsegImportRequest, ConnectionHandshakeError>
+ConnectionHandshake::PrepareRndvImport(const connection::GrantIdentity& grant) const noexcept {
+    if (!rndv()) {
+        return Error(ConnectionHandshakeErrorCode::kNotReady);
+    }
+    if (!raw_.rndv_peer_authorized) {
+        return Error(ConnectionHandshakeErrorCode::kUnauthorized);
+    }
+    if (!receive_.accepting()) {
+        return Error(ConnectionHandshakeErrorCode::kReorder);
+    }
+    const auto endpoint = raw_.imports->Get(import_);
+    if (!endpoint) {
+        return Error(ConnectionHandshakeErrorCode::kImport, static_cast<int>(endpoint.error().code),
+                     endpoint.error().provider_error);
+    }
+    const auto credit = raw_.credits->PeerStats(raw_.credit_peer);
+    if (!credit || credit->frozen || credit->retired || raw_.credits->stats().frozen) {
+        return Error(ConnectionHandshakeErrorCode::kCredit);
+    }
+    // 当前方向的接收者拥有事务 session/token；不能误用反向 GRANT 通知的路由身份。
+    const connection::GrantBinding expected{.sender_runtime = local_.identity.runtime,
+                                            .receiver_runtime = peer_.identity.runtime,
+                                            .receive_domain = peer_.identity.receive_domain,
+                                            .session = peer_.identity.session,
+                                            .token = peer_.identity.token};
+    if (grant.transfer.binding != expected || !grant.transfer.transfer_id || !grant.transfer.bytes ||
+        grant.transfer.bytes > rndv_.max_transfer_bytes || !grant.generation ||
+        grant.transfer.seq == std::numeric_limits<std::uint32_t>::max() || grant.slot >= rndv_.window ||
+        grant.slot != grant.transfer.seq % rndv_.window) {
+        return Error(ConnectionHandshakeErrorCode::kProtocol);
+    }
+    const RndvArenaDescriptor* arena = nullptr;
+    for (std::uint32_t i = 0; i < peer_.rndv.arena_count; ++i) {
+        const auto& candidate = peer_.rndv.arenas[i];
+        if (candidate.id == grant.arena.id && candidate.generation == grant.arena.generation) {
+            arena = &candidate;
+            break;
+        }
+    }
+    if (!arena || grant.transfer.bytes > arena->max_grant_bytes || grant.target_address < arena->address ||
+        grant.transfer.bytes > arena->length ||
+        grant.target_address - arena->address > arena->length - grant.transfer.bytes) {
+        return Error(ConnectionHandshakeErrorCode::kProtocol);
+    }
+    TsegImportRequest request;
+    request.key = {.local_context = raw_.local_context,
+                   .local_context_incarnation = raw_.local_context_incarnation,
+                   .peer_runtime = peer_.identity.runtime,
+                   .receive_domain = peer_.identity.receive_domain,
+                   .slab_id = arena->id,
+                   .slab_generation = arena->generation,
+                   .authorization_identity = peer_.identity.authorization};
+    for (std::size_t i = 0; i < arena->eid.size(); ++i) {
+        const auto byte = std::to_integer<std::uint8_t>(arena->eid[i]);
+        request.key.eid[i] = byte;
+        request.descriptor.ubva.eid.raw[i] = byte;
+    }
+    request.descriptor.ubva.uasid = arena->uasid;
+    request.descriptor.ubva.va = arena->address;
+    request.descriptor.len = arena->length;
+    request.descriptor.attr.bs.access = arena->access;
+    request.descriptor.attr.bs.token_policy = arena->token_policy;
+    request.descriptor.token_id = arena->token_id;
+    request.token.token = arena->token;
+    return request;
 }
 std::expected<void, ConnectionHandshakeError> ConnectionHandshake::Open(int fd, connection::ConnectionTable& table,
                                                                         const ConnectionHandshakeConfig& config,
@@ -94,6 +186,7 @@ std::expected<void, ConnectionHandshakeError> ConnectionHandshake::Handle(const 
             return Error(ConnectionHandshakeErrorCode::kNoCommonTransport);
         }
         peer_ = message.hello;
+        rndv_ = transport_ == HandshakeTransport::kRaw ? NegotiateRndv(local_, peer_) : RndvLimits{};
         peer_hello_ = true;
         state_ = ConnectionHandshakeState::kPreparing;
         return {};
@@ -107,10 +200,13 @@ std::expected<void, ConnectionHandshakeError> ConnectionHandshake::Handle(const 
     }
     if (message.kind != HandshakeMessageKind::kReady || !peer_hello_ || peer_ready_ ||
         message.ready.sender != peer_.identity || message.ready.receiver != local_.identity ||
-        message.ready.transport != transport_) {
+        message.ready.transport != transport_ || message.ready.rndv != rndv_) {
         return Error(ConnectionHandshakeErrorCode::kProtocol);
     }
     const auto& ready = message.ready;
+    if (rndv_.version && (ready.max_frame_seq < rndv_.window || ready.max_stream_bytes < rndv_.max_bytes)) {
+        return Error(ConnectionHandshakeErrorCode::kProtocol);
+    }
     if (transport_ == HandshakeTransport::kRaw &&
         (ready.credit_epoch != peer_.credit_epoch || !ready.max_credit_seq || !ready.max_control_credit_seq ||
          !ready.max_frame_seq || !ready.max_stream_bytes)) {
@@ -149,6 +245,15 @@ ConnectionHandshake::PrepareRaw(const RawHandshakePreparation& preparation) noex
         !preparation.descriptor_compatible || !preparation.credits || !preparation.route_owner ||
         preparation.reorder.initial_sequence != 0) {
         return Error(ConnectionHandshakeErrorCode::kInvalidArgument);
+    }
+    // 在任何 import 引用或重排分配前检查；不能单方静默关闭双方已经声明的 RNDV。
+    if (rndv_.version) {
+        if (!preparation.rndv_peer_authorized) {
+            return Error(ConnectionHandshakeErrorCode::kUnauthorized);
+        }
+        if (preparation.reorder.window < rndv_.window || preparation.reorder.max_resident_bytes < rndv_.max_bytes) {
+            return Error(ConnectionHandshakeErrorCode::kInvalidArgument);
+        }
     }
     auto credit = preparation.credits->PeerStats(preparation.credit_peer);
     if (!credit || credit->identity.peer_runtime != peer_.identity.runtime ||
@@ -207,7 +312,8 @@ std::expected<void, ConnectionHandshakeError> ConnectionHandshake::PublishRaw() 
                     .max_credit_seq = credit->max_data,
                     .max_control_credit_seq = credit->max_control,
                     .max_frame_seq = window.max_frame_seq,
-                    .max_stream_bytes = window.max_stream_bytes};
+                    .max_stream_bytes = window.max_stream_bytes,
+                    .rndv = rndv_};
     connection::WireSessionBinding binding{.context = {.version = local_.wire_version,
                                                        .peer_runtime = peer_.identity.runtime,
                                                        .receive_domain = local_.identity.receive_domain,

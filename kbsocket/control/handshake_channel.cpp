@@ -16,7 +16,12 @@ constexpr std::uint32_t kMagic = 0x4b425348; // KBSH
 constexpr std::size_t kHelloPrefix = 104, kTxLaneBytes = 32, kReadyBytes = 144, kRejectBytes = 20;
 constexpr std::size_t kLaneUpdatePrefix = 120, kLaneAckBytes = 104;
 constexpr std::size_t kCreditStopBytes = 128;
-constexpr std::uint16_t kCapabilities = kHandshakeCapabilityRaw | kHandshakeCapabilityTcp;
+constexpr std::uint16_t kCapabilities =
+    kHandshakeCapabilityRaw | kHandshakeCapabilityTcp | kHandshakeCapabilityWriteRndv;
+HandshakeError CapabilityError(RndvCapabilityError error) noexcept {
+    return {error.code == RndvCapabilityErrorCode::kVersionMismatch ? HandshakeErrorCode::kVersionMismatch
+                                                                    : HandshakeErrorCode::kInvalidFrame};
+}
 
 class Writer {
 public:
@@ -111,7 +116,24 @@ std::expected<std::size_t, HandshakeError> BodySize(const HandshakeMessage& mess
                    hello.tx_lanes.pool_epoch != 0) {
             return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
         }
-        return kHelloPrefix + kTxLaneBytes * hello.tx_lanes.count + hello.descriptor_bytes;
+        std::size_t extension = 0;
+        if (hello.capabilities & kHandshakeCapabilityWriteRndv) {
+            if (!(hello.capabilities & kHandshakeCapabilityRaw)) {
+                return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+            }
+            if (const auto valid = ValidateRndvOffer(hello.rndv); !valid) {
+                return std::unexpected(CapabilityError(valid.error()));
+            }
+            for (std::uint32_t i = 0; i < hello.rndv.arena_count; ++i) {
+                if (hello.rndv.arenas[i].eid != hello.eid) {
+                    return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+                }
+            }
+            extension = kRndvOfferPrefixBytes + kRndvArenaBytes * hello.rndv.arena_count;
+        } else if (hello.rndv != RndvOffer{}) {
+            return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+        }
+        return kHelloPrefix + kTxLaneBytes * hello.tx_lanes.count + hello.descriptor_bytes + extension;
     }
     case HandshakeMessageKind::kReady: {
         const auto& ready = message.ready;
@@ -120,6 +142,15 @@ std::expected<std::size_t, HandshakeError> BodySize(const HandshakeMessage& mess
             (ready.transport == HandshakeTransport::kRaw && ready.credit_epoch == 0) ||
             ready.max_frame_seq > (std::uint64_t{1} << 32)) {
             return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+        }
+        if (ready.rndv != RndvLimits{}) {
+            if (ready.transport != HandshakeTransport::kRaw) {
+                return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+            }
+            if (const auto valid = ValidateRndvLimits(ready.rndv); !valid) {
+                return std::unexpected(CapabilityError(valid.error()));
+            }
+            return kReadyBytes + kRndvLimitsBytes;
         }
         return kReadyBytes;
     }
@@ -175,8 +206,9 @@ std::expected<std::size_t, HandshakeError> ParseHeader(std::span<const std::byte
     const auto length = in.Get(4);
     const bool valid_size =
         (kind == HandshakeMessageKind::kHello && length >= kHelloPrefix &&
-         length <= kHelloPrefix + kTxLaneBytes * kHandshakeMaxTxLanes + kHandshakeMaxDescriptorBytes) ||
-        (kind == HandshakeMessageKind::kReady && length == kReadyBytes) ||
+         length <=
+             kHelloPrefix + kTxLaneBytes * kHandshakeMaxTxLanes + kHandshakeMaxDescriptorBytes + kRndvMaxOfferBytes) ||
+        (kind == HandshakeMessageKind::kReady && (length == kReadyBytes || length == kReadyBytes + kRndvLimitsBytes)) ||
         (kind == HandshakeMessageKind::kReject && length == kRejectBytes) ||
         (kind == HandshakeMessageKind::kLaneUpdate && length >= kLaneUpdatePrefix &&
          length <= kLaneUpdatePrefix + kTxLaneBytes * kHandshakeMaxTxLanes) ||
@@ -227,6 +259,22 @@ std::expected<std::size_t, HandshakeError> EncodeHandshakeMessage(const Handshak
     if (output.size() < size) {
         return std::unexpected(HandshakeError{HandshakeErrorCode::kBufferTooSmall});
     }
+    // 在修改最终输出前编码可选后缀，保持所有失败均不改 output 的契约。
+    std::array<std::byte, kRndvMaxOfferBytes> extension{};
+    std::size_t extension_size = 0;
+    if (message.kind == HandshakeMessageKind::kHello && (message.hello.capabilities & kHandshakeCapabilityWriteRndv)) {
+        const auto encoded = EncodeRndvOffer(message.hello.rndv, extension);
+        if (!encoded) {
+            return std::unexpected(CapabilityError(encoded.error()));
+        }
+        extension_size = *encoded;
+    } else if (message.kind == HandshakeMessageKind::kReady && message.ready.rndv.version) {
+        const auto encoded = EncodeRndvLimits(message.ready.rndv, extension);
+        if (!encoded) {
+            return std::unexpected(CapabilityError(encoded.error()));
+        }
+        extension_size = *encoded;
+    }
     Writer out(output.first(size));
     out.Put(kMagic, 4);
     out.Put(kHandshakeVersion, 2);
@@ -255,6 +303,7 @@ std::expected<std::size_t, HandshakeError> EncodeHandshakeMessage(const Handshak
             out.Put(lane.generation, 8);
         }
         out.Copy(std::span(hello.descriptor).first(hello.descriptor_bytes));
+        out.Copy(std::span(extension).first(extension_size));
         break;
     }
     case HandshakeMessageKind::kReady: {
@@ -268,6 +317,7 @@ std::expected<std::size_t, HandshakeError> EncodeHandshakeMessage(const Handshak
         out.Put(ready.max_control_credit_seq, 8);
         out.Put(ready.max_frame_seq, 8);
         out.Put(ready.max_stream_bytes, 8);
+        out.Copy(std::span(extension).first(extension_size));
         break;
     }
     case HandshakeMessageKind::kReject:
@@ -340,9 +390,21 @@ std::expected<HandshakeMessage, HandshakeError> DecodeHandshakeMessage(std::span
         const auto reserved = in.Get(4);
         // 先验证完整长度与数量，再读取可变列表；不能信任远端声明的 count。
         if (hello.descriptor_bytes > kHandshakeMaxDescriptorBytes || hello.tx_lanes.count > kHandshakeMaxTxLanes ||
-            reserved != 0 ||
-            frame.size() !=
-                kHandshakeHeaderBytes + kHelloPrefix + kTxLaneBytes * hello.tx_lanes.count + hello.descriptor_bytes) {
+            reserved != 0) {
+            return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+        }
+        const auto base_size =
+            kHandshakeHeaderBytes + kHelloPrefix + kTxLaneBytes * hello.tx_lanes.count + hello.descriptor_bytes;
+        if (frame.size() < base_size) {
+            return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
+        }
+        if (hello.capabilities & kHandshakeCapabilityWriteRndv) {
+            const auto decoded = DecodeRndvOffer(frame.subspan(base_size));
+            if (!decoded) {
+                return std::unexpected(CapabilityError(decoded.error()));
+            }
+            hello.rndv = *decoded;
+        } else if (frame.size() != base_size) {
             return std::unexpected(HandshakeError{HandshakeErrorCode::kInvalidFrame});
         }
         for (std::uint32_t i = 0; i < hello.tx_lanes.count; ++i) {
@@ -368,6 +430,13 @@ std::expected<HandshakeMessage, HandshakeError> DecodeHandshakeMessage(std::span
         ready.max_control_credit_seq = in.Get(8);
         ready.max_frame_seq = in.Get(8);
         ready.max_stream_bytes = in.Get(8);
+        if (frame.size() > kHandshakeHeaderBytes + kReadyBytes) {
+            const auto decoded = DecodeRndvLimits(frame.subspan(kHandshakeHeaderBytes + kReadyBytes));
+            if (!decoded) {
+                return std::unexpected(CapabilityError(decoded.error()));
+            }
+            ready.rndv = *decoded;
+        }
         break;
     }
     case HandshakeMessageKind::kReject:

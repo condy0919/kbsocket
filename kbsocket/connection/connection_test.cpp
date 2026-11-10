@@ -2,6 +2,7 @@
 #include "kbsocket/connection/connection.hpp"
 
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include <array>
 #include <chrono>
@@ -20,6 +21,35 @@
 namespace kbsocket {
 namespace connection {
 namespace {
+TEST(ConnectionRndvAdmissionTest, EagerOnlyAssemblyRejectsRndvBeforeTakingFdAndAllowsRetry) {
+    Connection connection;
+    ConnectionTable table;
+    ASSERT_TRUE(table.Open({1, 101}, 4));
+    int sockets[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sockets), 0);
+    control::ConnectionHandshakeConfig config;
+    config.compatible_peer = true;
+    config.expected_peer_authorization = 7;
+    config.deadline_ns = 1000;
+    config.local.identity = {
+        .runtime = 1, .receive_domain = 101, .endpoint_generation = 1, .authorization = 7, .session = 201, .token = {}};
+    config.local.capabilities = control::kHandshakeCapabilityRaw | control::kHandshakeCapabilityWriteRndv;
+    // 即使宿主试图手工开启 capability，未接线的应用流也不能向对端发出虚假 RNDV 支持声明。
+    const auto rejected = connection.Open(sockets[0], table, config, 0);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code, ConnectionErrorCode::kInvalidArgument);
+    const std::byte marker{0x45};
+    EXPECT_EQ(send(sockets[0], &marker, 1, MSG_NOSIGNAL), 1);
+    std::byte received{};
+    EXPECT_EQ(recv(sockets[1], &received, 1, 0), 1);
+    EXPECT_EQ(received, marker);
+    // 拒绝不消耗 Open 生命周期或 token，纠正配置后原 fd 可以交给普通协议握手。
+    config.local.capabilities = control::kHandshakeCapabilityTcp;
+    EXPECT_TRUE(connection.Open(sockets[0], table, config, 0));
+    EXPECT_TRUE(connection.Close());
+    EXPECT_EQ(close(sockets[1]), 0);
+    EXPECT_TRUE(table.Close());
+}
 class ConnectionTest : public ::testing::Test {
 protected:
     // 这里隔离验证 Connection 的准入时序；真实来源登记及 CQE 查表在 Runtime 双端测试覆盖。

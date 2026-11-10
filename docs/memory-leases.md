@@ -110,3 +110,5 @@ bazel test //kbsocket/memory:all --test_output=errors
 ```
 
 这些测试检查软件身份、计数、通知和清理边界，不提供新的真机 DMA、远端撤权或性能保证。硬件依据继续见[观测记录](hardware-observations.md)与[验证矩阵](hardware-validation-matrix.md)。
+
+M6.3.6 新增只读 `ExportSegment(context)`：仅活动注册 Slab 可导出与真实 backing/context/注册属性一致的值快照。快照不增加 CPU/DMA/Grant 引用，不能按本地 ABI 直接发送，也不授权远端访问；用于 [RNDV Arena 目录](rndv-negotiation.md) 的规范字段构造。
