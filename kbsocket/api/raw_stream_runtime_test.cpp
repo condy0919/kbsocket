@@ -135,26 +135,21 @@ TEST_F(RawStreamRuntimeTest, MultipleLogicalConnectionsSharePeerBudgetsAndSurviv
     EXPECT_FALSE(runtime_.PrepareRaw(endpoints_[0].streams[0], Preparation(0)));
 }
 
-TEST_F(RawStreamRuntimeTest, ImportPauseGuardsContextAndSharedPreparationWithoutPartialEffects) {
+TEST_F(RawStreamRuntimeTest, ImportKeepsHostResourcesAndOtherContextPreparationAvailable) {
     AdoptPair();
     endpoints_[0].block_import.store(true);
     ASSERT_TRUE(runtime_.PrepareRaw(endpoints_[0].streams[0], Preparation(0)));
-    ASSERT_TRUE(Until([&] { return runtime_.paused(0); }));
-    const auto paused = runtime_.HostResources(0);
-    ASSERT_FALSE(paused);
-    EXPECT_EQ(paused.error().code, KBS_STREAM_BUSY);
+    ASSERT_TRUE(Until([&] { return endpoints_[0].imports.load() == 1; }));
+    // worker 正在等待导入；资源查询与另一 context 的握手不受其影响。
+    EXPECT_FALSE(runtime_.paused(0));
+    EXPECT_TRUE(runtime_.HostResources(0));
     EXPECT_TRUE(runtime_.HostResources(1));
-    EXPECT_FALSE(runtime_.Peer(endpoints_[0].streams[0]));
-    const auto shared_gate = runtime_.PrepareRaw(endpoints_[1].streams[0], Preparation(1));
-    ASSERT_FALSE(shared_gate);
-    EXPECT_EQ(shared_gate.error().code, KBS_STREAM_BUSY);
-    EXPECT_EQ(endpoints_[1].imports.load(), 0u);
-    EXPECT_EQ(Status(1)->state, KBS_STREAM_PREPARING);
-    EXPECT_FALSE(runtime_.BeginClose());
+    EXPECT_TRUE(runtime_.Peer(endpoints_[0].streams[0]));
+    ASSERT_TRUE(runtime_.PrepareRaw(endpoints_[1].streams[0], Preparation(1)));
+    ASSERT_TRUE(Until([&] { return endpoints_[1].imports.load() == 1; }));
+    EXPECT_EQ(Status(0)->state, KBS_STREAM_PREPARING);
     endpoints_[0].block_import.store(false);
     endpoints_[0].block_import.notify_all();
-    ASSERT_TRUE(Until([&] { return !runtime_.paused(0); }));
-    ASSERT_TRUE(runtime_.PrepareRaw(endpoints_[1].streams[0], Preparation(1)));
     ActivePair();
     Transfer();
 }
@@ -559,7 +554,7 @@ TEST_F(RawStreamRuntimeTest, ApplicationLeaseBlocksPhysicalCloseUntilReturnedAft
     EXPECT_EQ(kbs_buffer_readable(buffers, handle, &readable, nullptr), KBS_STREAM_NOT_READY);
 }
 
-TEST_F(RawStreamRuntimeTest, SharedBufferOperationsWaitForOtherContextControlPauseWithoutLosingLease) {
+TEST_F(RawStreamRuntimeTest, SharedBufferOperationsContinueDuringOtherContextImport) {
     ASSERT_TRUE(runtime_.OpenBuffers({905, 2}));
     auto* buffers = runtime_.buffers();
     kbs_buffer_handle handle{};
@@ -570,36 +565,28 @@ TEST_F(RawStreamRuntimeTest, SharedBufferOperationsWaitForOtherContextControlPau
     AdoptPair();
     endpoints_[1].block_import.store(true);
     ASSERT_TRUE(runtime_.PrepareRaw(endpoints_[1].streams[0], Preparation(1)));
-    ASSERT_TRUE(Until([&] { return runtime_.paused(1); }));
+    ASSERT_TRUE(Until([&] { return endpoints_[1].imports.load() == 1; }));
     EXPECT_TRUE(runtime_.HostResources(0));
     EXPECT_FALSE(runtime_.paused(0));
+    EXPECT_FALSE(runtime_.paused(1));
 
-    // 池在两个 context 注册；即便 context 0 可用，任何 context 暂停也禁止共享 Lease 操作。
-    kbs_buffer_handle rejected{99, 99, 99, 99};
-    EXPECT_EQ(kbs_buffer_acquire(buffers, 1, &rejected, nullptr), KBS_STREAM_BUSY);
-    EXPECT_EQ(rejected.generation, 0u);
-    EXPECT_EQ(kbs_buffer_writable(buffers, handle, &writable, nullptr), KBS_STREAM_BUSY);
-    EXPECT_EQ(writable.data, nullptr);
+    // 导入只操作独立快照；跨 context 注册的共享 Slab 仍可借用、查询和归还。
+    kbs_buffer_handle second{};
+    ASSERT_EQ(kbs_buffer_acquire(buffers, 1, &second, nullptr), 0);
+    EXPECT_EQ(kbs_buffer_writable(buffers, handle, &writable, nullptr), 0);
     kbs_buffer_const_view readable{};
-    EXPECT_EQ(kbs_buffer_readable(buffers, handle, &readable, nullptr), KBS_STREAM_BUSY);
-    EXPECT_EQ(readable.data, nullptr);
-    kbs_buffer_status status{99, 1, 1};
-    EXPECT_EQ(kbs_buffer_inspect(buffers, handle, &status, nullptr), KBS_STREAM_BUSY);
-    EXPECT_EQ(status.bytes, 0u);
-    EXPECT_EQ(status.source_reusable, 0u);
-    EXPECT_EQ(status.reserved, 0u);
-    EXPECT_EQ(kbs_buffer_release(buffers, handle, nullptr), KBS_STREAM_BUSY);
-    EXPECT_FALSE(runtime_.BeginClose());
+    ASSERT_EQ(kbs_buffer_readable(buffers, handle, &readable, nullptr), 0);
+    EXPECT_EQ(static_cast<const std::byte*>(readable.data)[0], std::byte{0x31});
+    kbs_buffer_status status{};
+    ASSERT_EQ(kbs_buffer_inspect(buffers, handle, &status, nullptr), 0);
+    EXPECT_EQ(status.bytes, 17u);
+    EXPECT_EQ(status.source_reusable, 1u);
+    ASSERT_EQ(kbs_buffer_release(buffers, second, nullptr), 0);
+    ASSERT_EQ(kbs_buffer_release(buffers, handle, nullptr), 0);
+    EXPECT_EQ(kbs_buffer_readable(buffers, handle, &readable, nullptr), KBS_STREAM_INVALID_HANDLE);
 
     endpoints_[1].block_import.store(false);
     endpoints_[1].block_import.notify_all();
-    ASSERT_TRUE(Until([&] { return !runtime_.paused(1); }));
-    ASSERT_EQ(kbs_buffer_readable(buffers, handle, &readable, nullptr), 0);
-    EXPECT_EQ(static_cast<const std::byte*>(readable.data)[0], std::byte{0x31});
-    // 暂停拒绝没有消耗第二个发布槽，也没有停止准入或清除已有 Lease。
-    ASSERT_EQ(kbs_buffer_acquire(buffers, 1, &rejected, nullptr), 0);
-    ASSERT_EQ(kbs_buffer_release(buffers, rejected, nullptr), 0);
-    ASSERT_EQ(kbs_buffer_release(buffers, handle, nullptr), 0);
     ASSERT_TRUE(runtime_.PrepareRaw(endpoints_[0].streams[0], Preparation(0)));
     ActivePair();
     Transfer();
@@ -934,23 +921,22 @@ TEST_F(RawStreamRuntimeRndvTest, LeaseWritePinsOriginalSourceUntilWriteRetiremen
     EXPECT_GT(runtime_.Inspect()->slab.available, before->slab.available);
 }
 
-TEST_F(RawStreamRuntimeRndvTest, SegmentImportPauseAlsoGuardsHostResolutionAndApplicationIo) {
+TEST_F(RawStreamRuntimeRndvTest, SegmentImportKeepsHostResolutionAvailableAndOnlyBlocksItsTransfer) {
     Activate();
     const auto payload = Payload(16384, 67);
     endpoints_[0].block_segment_import = true;
     WritePayload(0, 0, payload);
-    ASSERT_TRUE(Until([&] { return runtime_.paused(0) && endpoints_[0].segment_imports.load() == 1; }));
-    // 段导入属于同一 context 的独占控制窗口；门面和宿主 mailbox 句柄解析不能绕过暂停。
+    ASSERT_TRUE(Until([&] { return endpoints_[0].segment_imports.load() == 1; }));
+    // 仅依赖远端段的 RNDV 尚不能继续；公开查询不应误报整个 context 忙。
+    EXPECT_FALSE(runtime_.paused(0));
     const auto resolved = runtime_.Resolve(endpoints_[0].streams[0]);
-    ASSERT_FALSE(resolved);
-    EXPECT_EQ(resolved.error().code, KBS_STREAM_BUSY);
+    ASSERT_TRUE(resolved);
     kbs_stream_io io{};
     EXPECT_EQ(
         kbs_stream_write(runtime_.table(0), endpoints_[0].streams[0], payload.data(), payload.size(), &io, nullptr),
-        KBS_STREAM_BUSY);
+        KBS_STREAM_WOULD_BLOCK);
     const auto snapshot = runtime_.Inspect();
-    ASSERT_FALSE(snapshot);
-    EXPECT_EQ(snapshot.error().code, KBS_STREAM_BUSY);
+    ASSERT_TRUE(snapshot);
     EXPECT_EQ(endpoints_[0].posted_writes, 0u);
     endpoints_[0].block_segment_import = false;
     endpoints_[0].block_segment_import.notify_all();
