@@ -82,6 +82,7 @@ public:
     std::expected<void, TxSendError> Close() noexcept;
 
     /// 支持 SEND/SEND_WITH_IMM/WRITE 混合提交，同一批使用一个 SQ，可指定 lane 或由池选择。
+    /// 同连接批次按 connection_id 选择稳定首选 SQ，容量不足/故障才漂移；混连接批次轮转。
     /// 混批不建立 WRITE 与 SEND 通知的可见性依赖；需要通知时须先等全部关联 WRITE 成功退休。
     /// post 前预留整批；额度不足则全部撤销，不提交部分预留的请求。
     /// ids 至少与 requests 等长；有效输入下清零对应范围，仅保留未退休记录的 id。

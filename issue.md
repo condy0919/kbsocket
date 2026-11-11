@@ -131,6 +131,15 @@
    - 本地 `ReplaceDrainedLane` 重建 TX Jetty 时对端完全无感，可**彻底删除 `LaneControl` 及 3104B 的 `kLaneUpdate/Ack` 协议**，并在握手 `READY` 后立即关闭或复用每连接的 TCP 握手 fd（节省 40k 个内核 fd）。
 3. **未知/迟到 CQE 原位释放补投**：收到迟到或未知帧时直接归还 `RxBufferLease` 并正常进入 `Refill` 补投（物理 RQE 守恒并未破坏），不再调用 `Freeze()` 冻结共享接收域。
 
+
+#### 5. 核实与修复记录（2026-11-11）
+
+- **结论：部分修复。** 默认按批轮转、逐 Lane 来源注册、LaneControl 常驻握手 fd 和未知来源冻结均已证实。乱序频率、40k fd 的实际性能代价尚未实测。
+- **本次修复：** `TxSender` 对未显式指定 Lane 的同连接批次，按 `connection_id` 选择稳定首选 SQ；仅首选无法容纳整批或发生故障时有界查找其他健康 SQ。整批预留仍由 ledger 完成，全满可信零接受并由上层背压；混连接批次保留轮转。新增选择不分配、不加锁、不重放。
+- **验证：** `tx_sender_test`、`jetty_pool_test`、`connection_runtime_test` 通过；新增回归覆盖连续批次在途仍复用首选、首选剩余不足整批时漂移、故障隔离、显式故障 Lane 拒绝。HELLO 集成测试通过填满首选 SQ 触发漂移，继续验证两条物理来源已在 READY 前注册。
+- **保留项：** 这是稳定首选策略，不是完整 DCS_QUOTA；没有在途全部排空后才切换/回迁的保证。RNDV WRITE/通知使用显式 `prep.lane`，不在本次自动选择范围。来源注册与 LaneControl 未删除，仍需单独调整协议、来源安全验证及共享信用归属。
+- **不能直接套用的建议：** `ConsumeUnknown()` 将 CQE 记入 `unattributed`，现有账本不能判断应从哪个 Peer 的 data/control 授信扣减。只归还物理 RQE 后继续授信可能重复授出信用，故保留失败隔离；已能识别来源但旧 token 的帧，原实现已经扣账、释放并返回 `kRouteRejected`，并非所有迟到帧都会冻结。UCX 的 `ep_uuid` 查表本身也不等于不可伪造的认证。
+
 ---
 
 ### ISSUE-4 [P1]：`ReorderWindow` 网络乱序重组与应用接收缓存耦合、静态内存膨胀及乱序 RTS 队头阻塞

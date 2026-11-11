@@ -523,6 +523,28 @@ std::expected<JettyTicket, JettyPoolFailure> JettyPool::Reserve() noexcept {
     return std::unexpected(Failure(JettyPoolErrorCode::kExhausted));
 }
 
+std::expected<JettyLane, JettyPoolFailure> JettyPool::SelectLane(std::uint64_t affinity,
+                                                                 std::size_t count) const noexcept {
+    if (!ready_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kNotReady));
+    }
+    if (admission_stopped_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kStopped));
+    }
+    if (!count || count > tx_depth_) {
+        return std::unexpected(Failure(JettyPoolErrorCode::kExhausted));
+    }
+    const auto preferred = affinity % slots_.size();
+    for (std::size_t offset = 0; offset < slots_.size(); ++offset) {
+        const auto index = static_cast<std::uint32_t>((preferred + offset) % slots_.size());
+        const auto& slot = slots_[index];
+        if (slot.state == JettyLaneState::kReady && count <= tx_depth_ - slot.used) {
+            return JettyLane{this, index, epoch_, slot.generation};
+        }
+    }
+    return std::unexpected(Failure(JettyPoolErrorCode::kExhausted));
+}
+
 std::expected<JettyTicket, JettyPoolFailure> JettyPool::ReserveOn(JettyLane lane) noexcept {
     auto result = Find(lane);
     if (!result) {

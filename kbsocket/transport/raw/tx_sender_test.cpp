@@ -389,6 +389,86 @@ TEST_F(TxSenderTest, AccountingFailureNeverCancelsAcceptedRequests) {
     ASSERT_TRUE(pool_.FlushSend(record->ticket.lane, cr));
 }
 
+TEST_F(TxSenderTest, ConsecutiveBatchesKeepAffinityAndDriftOnlyForCapacityOrFault) {
+    ASSERT_TRUE(sender_.Close());
+    ASSERT_TRUE(ledger_.Close());
+    EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJetty(&passive_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_TRUE(pool_.Close());
+    // 两条 SQ 各能容纳三条 WR；故意留一个不足以接收整批的首选槽。
+    urma_jetty_t second{};
+    urma_device_cap_t cap{};
+    cap.trans_mode = URMA_TM_RM;
+    cap.rm_tp_cap.bs.ctp = 1;
+    cap.max_jetty = 3;
+    cap.max_jfs_depth = cap.max_jfr_depth = cap.max_jfc_depth = 256;
+    cap.max_jfs_sge = cap.max_jfs_rsge = cap.max_jfr_sge = 1;
+    JettyPoolConfig config;
+    config.jetty_count = 2;
+    config.tx_depth = config.rx_depth = 3;
+    EXPECT_CALL(*this, CreateJfc(_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
+    EXPECT_CALL(*this, CreateJfr(_, _)).WillOnce(Return(&jfr_));
+    EXPECT_CALL(*this, CreateJetty(_, _))
+        .WillOnce(Return(&passive_))
+        .WillOnce(Return(&jetty_))
+        .WillOnce(Return(&second));
+    ASSERT_TRUE(pool_.Open(&ctx_, cap, config));
+    ASSERT_TRUE(ledger_.Open(pool_, 6));
+    ASSERT_TRUE(sender_.Open(ledger_));
+    const auto request = Request(2);
+    std::array<AttemptId, 2> first{};
+    EXPECT_CALL(*this, Post(&jetty_, _, _)).Times(2).WillRepeatedly(Return(URMA_SUCCESS));
+    for (auto& id : first) {
+        ASSERT_EQ(sender_.Send({&request, 1}, {&id, 1}), 1u);
+    }
+    // 前两批仍在途，第三批因首选 SQ 剩余一槽而完整漂移到另一 SQ。
+    std::array batch{request, request};
+    std::array<AttemptId, 2> drift{};
+    EXPECT_CALL(*this, Post(&second, _, _)).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_EQ(sender_.Send(batch, drift), 2u);
+    for (const auto id : first) {
+        ASSERT_EQ(ledger_.Lookup(id)->ticket.lane.index, 0u);
+        ASSERT_TRUE(ledger_.Complete(id));
+    }
+    for (const auto id : drift) {
+        ASSERT_EQ(ledger_.Lookup(id)->ticket.lane.index, 1u);
+        ASSERT_TRUE(ledger_.Complete(id));
+    }
+    // 首选槽恢复后重新使用它；隔离后只能选择健康槽，显式指定故障槽仍拒绝。
+    const auto preferred = pool_.lane(0);
+    ASSERT_TRUE(preferred);
+    const auto restored = pool_.SelectLane(2, 2);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->index, preferred->index);
+    ASSERT_TRUE(pool_.MarkFaulted(*preferred));
+    AttemptId id = 0;
+    EXPECT_FALSE(sender_.Send({&request, 1}, {&id, 1}, *preferred));
+    EXPECT_CALL(*this, Post(&second, _, _)).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_EQ(sender_.Send({&request, 1}, {&id, 1}), 1u);
+    ASSERT_TRUE(ledger_.Complete(id));
+    EXPECT_CALL(*this, DeleteJetty(&second)).WillOnce(Return(URMA_SUCCESS));
+    // second 是局部对象，必须在作用域结束前关闭池；TearDown 的原对象删除预期在这里满足。
+    ASSERT_TRUE(sender_.Close());
+    ASSERT_TRUE(ledger_.Close());
+    EXPECT_CALL(*this, DeleteJetty(&jetty_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJetty(&passive_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJfr(&jfr_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJfc(&rx_)).WillOnce(Return(URMA_SUCCESS));
+    EXPECT_CALL(*this, DeleteJfc(&tx_)).WillOnce(Return(URMA_SUCCESS));
+    ASSERT_TRUE(pool_.Close());
+    // 恢复 fixture 的单 Lane 资源，供公共 TearDown 验证最终清理。
+    config.jetty_count = 1;
+    EXPECT_CALL(*this, CreateJfc(_, _)).WillOnce(Return(&tx_)).WillOnce(Return(&rx_));
+    EXPECT_CALL(*this, CreateJfr(_, _)).WillOnce(Return(&jfr_));
+    EXPECT_CALL(*this, CreateJetty(_, _)).WillOnce(Return(&passive_)).WillOnce(Return(&jetty_));
+    ASSERT_TRUE(pool_.Open(&ctx_, cap, config));
+    ASSERT_TRUE(ledger_.Open(pool_, 3));
+    ASSERT_TRUE(sender_.Open(ledger_));
+}
+
 TEST_F(TxSenderTest, MaximumBatchUsesEntireFixedArrayAndRejectsOneMore) {
     ASSERT_TRUE(sender_.Close());
     ASSERT_TRUE(ledger_.Close());

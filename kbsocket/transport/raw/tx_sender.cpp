@@ -108,6 +108,19 @@ std::expected<std::size_t, TxSendError> TxSender::Send(std::span<const TxSendReq
         return Error(TxSendErrorCode::kExhausted);
     }
 
+    // 同一连接的连续批次优先走同一 SQ，避免逐批轮转制造额外乱序。
+    // 多连接混批仍保留通用轮转；显式 lane 仍由调用方控制，不能擅自漂移。
+    const auto affinity = requests.front().metadata.connection_id;
+    if (!lane && affinity && pool_->capacity() > 1 && std::ranges::all_of(requests, [affinity](const auto& request) {
+            return request.metadata.connection_id == affinity;
+        })) {
+        const auto selected = pool_->SelectLane(affinity, requests.size());
+        if (!selected) {
+            return std::unexpected(TxSendError{.code = TxSendErrorCode::kPoolFailure, .pool_error = selected.error()});
+        }
+        lane = *selected;
+    }
+
     // 所有失败清理都保留未能撤销的 id；不能静默遗失其资源归属。
     auto rollback = [&](TxSendError error) -> std::expected<std::size_t, TxSendError> {
         if (auto cleanup = Cancel(ids)) {

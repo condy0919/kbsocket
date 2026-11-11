@@ -184,6 +184,10 @@ public:
     /// 轮转（Round-Robin）选择未故障且有空闲额度的 SQ，为一个 WR 预留额度票据。
     std::expected<JettyTicket, JettyPoolFailure> Reserve() noexcept;
 
+    /// 按稳定亲和键选择能容纳整批的健康 SQ；首选槽不足时有界查找其他槽。
+    /// 只选择、不预留，调用方须在同一 owner 上立即预留，不能跨进度调用缓存结果。
+    std::expected<JettyLane, JettyPoolFailure> SelectLane(std::uint64_t affinity, std::size_t count) const noexcept;
+
     /// 在指定的物理 SQ 通道上为一个 WR 预留额度；同一批批处理 WR 若需绑定同一 SQ 可用此接口。
     std::expected<JettyTicket, JettyPoolFailure> ReserveOn(JettyLane lane) noexcept;
 

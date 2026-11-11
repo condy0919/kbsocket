@@ -1127,8 +1127,18 @@ TEST_F(ConnectionRuntimeTest, HelloAutomaticallyAdmitsBothActiveLanesBeforeReady
     }));
     auto& sender = endpoints_[0];
     auto& receiver = endpoints_[1];
-    // 两次独立投递触发真实 TxSender 的 Lane 轮转，CQE 携带实际 Jetty 来源，不能靠手工路由兜底。
+    // 第二轮填满亲和 SQ，迫使真实 TxSender 漂移；CQE 仍须携带实际来源并匹配 HELLO 快照。
+    std::array<raw::JettyTicket, 16> occupied{};
     for (unsigned round = 0; round < 2; ++round) {
+        if (round == 1) {
+            const auto lane = sender.pool.SelectLane(sender.connection.connection_id(), 1);
+            ASSERT_TRUE(lane);
+            for (auto& ticket : occupied) {
+                const auto reserved = sender.pool.ReserveOn(*lane);
+                ASSERT_TRUE(reserved);
+                ticket = *reserved;
+            }
+        }
         const std::array<std::byte, 16> input{std::byte(round + 1)};
         ASSERT_TRUE(sender.connection.Write(input));
         ASSERT_TRUE(sender.scheduler.Wake(sender.scheduled));
@@ -1138,6 +1148,11 @@ TEST_F(ConnectionRuntimeTest, HelloAutomaticallyAdmitsBothActiveLanesBeforeReady
         ASSERT_TRUE(read);
         ASSERT_EQ(read->bytes, input.size());
         EXPECT_EQ(output, input);
+        if (round == 1) {
+            for (const auto& ticket : occupied) {
+                ASSERT_TRUE(sender.pool.Cancel(ticket));
+            }
+        }
         ASSERT_TRUE(receiver.scheduler.Wake(receiver.scheduled));
         ASSERT_TRUE(Until([&] { return sender.slab.stats().local_dma == 0; }));
     }
