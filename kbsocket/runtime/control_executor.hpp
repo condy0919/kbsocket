@@ -29,6 +29,8 @@ struct ControlTask {
     std::uint64_t token = 0;
     /// 已接受任务始终执行；取消仅决定 owner 如何处理返回的资源，不能撤销硬件操作。
     bool cancelled = false;
+    /// 默认暂停整个源；仅独立参数快照、与 owner 活动资源无共享写入的任务可关闭屏障。
+    bool pause_progress = true;
 };
 
 struct ControlTaskId {

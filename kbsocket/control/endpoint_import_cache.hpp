@@ -132,13 +132,14 @@ public:
     std::size_t EvictUnused() noexcept;
 
     /// 返回下一项可调度操作，不代表已经提交；同一 context 在本缓存内至多一个在途任务。
-    /// context 非空时只选择该实例的操作，供每 context 共享暂停屏障的调度源使用。
+    /// context 非空时只选择该实例的操作，供每 context 控制任务调度源使用。
     std::expected<std::optional<ImportOperation>, ImportCacheError>
     NextOperation(urma_context_t* context = nullptr, std::uint64_t incarnation = 0) noexcept;
     /// 只准备 owner 数据，不调用 provider；保留容量与参数直到 Commit 后收割，或 Discard。
     std::expected<ImportPreparedOperation, ImportCacheError>
     PrepareOperation(const ImportOperation& operation) noexcept;
-    /// 调用方须在提交 task 前暂停该 context 的全部使用者，屏障保持到 HandleCompletion。
+    /// task 使用独立 Work 快照，可与 owner 数据面并行；同 context 的控制操作仍须串行。
+    /// context、缓存及已有目标引用必须活到 HandleCompletion；不得提前复用任务参数。
     /// worker 可已开始，Commit 仅访问 owner 元数据。已提交任务必须 Commit，绝不能 Discard。
     std::expected<void, ImportCacheError> CommitOperation(const ImportPreparedOperation& prepared,
                                                           runtime::ControlTaskId id) noexcept;

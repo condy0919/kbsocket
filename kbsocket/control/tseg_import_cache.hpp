@@ -108,7 +108,7 @@ struct TsegImportCacheConfig {
 /// 已保存的裸指针不能绕过失效门禁；每次新提交前须检查 Get，已接受 WR 仍由原 pin 保留至终结。
 /// Ready 且零引用的条目作为暖缓存保留；Invalidate/EvictUnused 后才异步 unimport。
 /// 缓存不 Poll 借用的 ControlExecutor；宿主把属于本缓存的完成交给 HandleCompletion。
-/// context 暂停域须同时覆盖 endpoint/segment 导入与全部数据访问；本缓存的互斥不能替代跨缓存屏障。
+/// endpoint/segment 导入及共享队列变更须串行提交；本缓存的互斥不能替代跨缓存控制调度。
 /// 驱逐后不保留旧 Slab 高水位；宿主须先拒绝过期 session/Slab 描述，不能把缓存 miss 当作新授权。
 /// context、函数表、executor 与缓存须活到所有任务和引用终结；Close 不猜测这些证据。
 /// provider 返回错误 context 的非空句柄时永久保留：无法在原 context 暂停域安全 unimport，Close 不会成功。
@@ -134,13 +134,14 @@ public:
     std::size_t EvictUnused() noexcept;
 
     /// 返回下一项可调度操作，不代表已经提交；同一 context 在本缓存内至多一个在途任务。
-    /// context 非空时只选择该实例的操作，供每 context 共享暂停屏障的调度源使用。
+    /// context 非空时只选择该实例的操作，供每 context 控制任务调度源使用。
     std::expected<std::optional<TsegImportOperation>, TsegImportCacheError>
     NextOperation(urma_context_t* context = nullptr, std::uint64_t incarnation = 0) noexcept;
     /// 只准备 owner 数据，不调用 provider；保留容量与参数直到 Commit 后收割，或 Discard。
     std::expected<TsegImportPreparedOperation, TsegImportCacheError>
     PrepareOperation(const TsegImportOperation& operation) noexcept;
-    /// 调用方须在提交 task 前暂停该 context 的全部使用者，屏障保持到 HandleCompletion。
+    /// task 使用独立 Work 快照，可与 owner 数据面并行；同 context 的控制操作仍须串行。
+    /// context、缓存及已有目标引用必须活到 HandleCompletion；不得提前复用任务参数。
     /// worker 可已开始，Commit 仅访问 owner 元数据。已提交任务必须 Commit，绝不能 Discard。
     std::expected<void, TsegImportCacheError> CommitOperation(const TsegImportPreparedOperation& prepared,
                                                               runtime::ControlTaskId id) noexcept;

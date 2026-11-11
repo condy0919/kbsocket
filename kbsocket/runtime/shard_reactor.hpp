@@ -32,7 +32,7 @@ struct ReactorStats {
 
 /// 单 owner 反应堆；源、执行器及其参数必须覆盖全部异步任务和反应堆的存活期。
 /// 注册后独占执行器提交/收割与源进度。外部只能通过 Notify 唤醒，不得并发操作源或 raw 句柄。
-/// 回调不可重入反应堆；控制任务暂停整个源并临时移除其 fd，完成后由 owner 恢复。
+/// 回调不可重入反应堆；独占控制任务暂停源并移除其 fd，独立快照任务继续数据面进度。
 class ShardReactor {
 public:
     static constexpr std::size_t kMaxSources = 8;

@@ -34,7 +34,7 @@ struct ProgressBatch {
 };
 
 /// 单 owner、预分配的进度源。实现者须遵守每次调用的预算，回调不得阻塞、重入或销毁源。
-/// 同一源的控制任务执行期间，反应堆停止全部数据和事件访问；调用方也必须停止外部借用。
+/// 独占控制任务执行期间停止全部数据和事件访问及外部借用；独立快照任务可继续 owner 进度。
 class ProgressSource {
 public:
     virtual ~ProgressSource() = default;

@@ -14,8 +14,8 @@
 namespace kbsocket {
 namespace runtime {
 
-/// 每个 context 实例的段导入控制源；须与 endpoint 导入及全部 post/poll/refill 使用者组成同一暂停域。
-/// 单独注册在另一反应堆槽并不能暂停 raw 使用者，因此宿主必须使用共享暂停域的组合源。
+/// 每个 context 实例的段导入控制源；独立 Work 快照允许导入与数据面并行。
+/// 仍与该 context 的使用者组成组合源，保留队列变更任务的独占暂停域。
 /// 不拥有缓存、context 或 executor，不消费 fd；缓存与本对象存活至已接受任务被完整收割。
 class TsegImportProgress final : public ProgressSource {
 public:

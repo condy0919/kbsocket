@@ -884,27 +884,30 @@ TEST_F(RawStackTest, ShutdownKeepsRuntimeAliveToUnimportWarmEntries) {
     Close();
 }
 
-TEST_F(RawStackTest, InflightImportPauseRejectsGlobalInspectionAndShutdownMutation) {
+TEST_F(RawStackTest, InflightImportAllowsInspectionAndShutdownWaitsForCompletion) {
     Open();
     block_import_.store(true);
     const auto lease = AcquireImport(1);
     ASSERT_TRUE(lease.owner);
-    ASSERT_TRUE(SpinUntil([&] { return stack_.paused(1); }));
-    EXPECT_FALSE(stack_.Inspect());
-    EXPECT_FALSE(stack_.shared());
-    EXPECT_FALSE(stack_.resources(1));
+    ASSERT_TRUE(SpinUntil([&] { return import_calls_.load() == 1; }));
+    // 慢导入只拥有工作快照；健康连接仍可获取资源和共享缓存。
+    EXPECT_FALSE(stack_.paused(1));
+    EXPECT_TRUE(stack_.Inspect());
+    EXPECT_TRUE(stack_.shared());
+    EXPECT_TRUE(stack_.resources(1));
     EXPECT_TRUE(stack_.resources(0));
-    EXPECT_FALSE(stack_.BeginClose());
-    EXPECT_EQ(stack_.stage(), RawStackStage::kReady);
-    // 全局关闭检查不能先停止未暂停的域，须保持事务前的准入状态。
-    EXPECT_TRUE(resources_[0]->connections->stats().accepting);
+    ASSERT_TRUE(stack_.BeginClose());
+    EXPECT_EQ(stack_.stage(), RawStackStage::kStopping);
+    EXPECT_FALSE(stack_.AdvanceClose(Proof()));
+    EXPECT_EQ(Deleted(Kind::kContext), 0u);
+    // 开始停止不会释放未收割导入依赖；完成仍经正常 owner 收割。
     block_import_.store(false);
     block_import_.notify_all();
-    ASSERT_TRUE(SpinUntil([&] { return !stack_.paused(1) && shared_->imports->Get(lease).has_value(); }));
+    ASSERT_TRUE(SpinUntil([&] { return shared_->imports->in_flight() == 0; }));
     ASSERT_TRUE(shared_->imports->Release(lease));
 }
 
-TEST_F(RawStackTest, SegmentAndEndpointImportsShareOneContextPause) {
+TEST_F(RawStackTest, SegmentAndEndpointImportsKeepContextDataPlaneRunning) {
     config_.enable_rndv = true;
     Open();
     ASSERT_NE(shared_->segments, nullptr);
@@ -914,32 +917,32 @@ TEST_F(RawStackTest, SegmentAndEndpointImportsShareOneContextPause) {
     const auto segment = AcquireSegment(1);
     ASSERT_TRUE(endpoint.owner);
     ASSERT_TRUE(segment.owner);
-    ASSERT_TRUE(SpinUntil([&] { return stack_.paused(1) && import_calls_.load() == 1; }));
-    // 同 context 的两个慢导入不可并发；暂停还须覆盖 raw poll，其他 context 继续工作。
+    ASSERT_TRUE(SpinUntil([&] { return import_calls_.load() == 1; }));
+    // 同 context 控制任务仍串行提交，但所有 context 的 raw poll 都继续推进。
     const auto before = polls_;
     for (int i = 0; i < 8; ++i) {
         ASSERT_TRUE(stack_.Tick());
     }
     EXPECT_EQ(segment_import_calls_.load(), 0u);
-    EXPECT_EQ(polls_[1], before[1]);
+    EXPECT_GT(polls_[1], before[1]);
+    EXPECT_FALSE(stack_.paused(1));
     EXPECT_GT(polls_[0], before[0]);
-    EXPECT_FALSE(stack_.Inspect());
-    EXPECT_FALSE(stack_.shared());
-    EXPECT_FALSE(stack_.BeginClose());
+    EXPECT_TRUE(stack_.Inspect());
+    EXPECT_TRUE(stack_.shared());
     block_import_.store(false);
     block_import_.notify_all();
-    ASSERT_TRUE(SpinUntil([&] { return stack_.paused(1) && segment_import_calls_.load() == 1; }));
+    ASSERT_TRUE(SpinUntil([&] { return segment_import_calls_.load() == 1; }));
     const auto segment_pause = polls_[1];
     for (int i = 0; i < 8; ++i) {
         ASSERT_TRUE(stack_.Tick());
     }
-    EXPECT_EQ(polls_[1], segment_pause);
-    EXPECT_FALSE(stack_.resources(1));
+    EXPECT_GT(polls_[1], segment_pause);
+    EXPECT_TRUE(stack_.resources(1));
     EXPECT_TRUE(stack_.resources(0));
     block_segment_import_.store(false);
     block_segment_import_.notify_all();
     ASSERT_TRUE(SpinUntil([&] {
-        return !stack_.paused(1) && shared_->imports->Get(endpoint).has_value() &&
+        return shared_->imports->Get(endpoint).has_value() &&
                shared_->segments->Get(segment).has_value();
     }));
     const auto snapshot = stack_.Inspect();

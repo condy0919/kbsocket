@@ -341,6 +341,7 @@ protected:
             return !executor_.outstanding();
         }));
         EXPECT_TRUE(reactor_.Close());
+        EXPECT_TRUE(nested_.Close());
         EXPECT_TRUE(group_.Close());
         EXPECT_TRUE(executor_.Close());
         for (auto& member : members_) {
@@ -349,7 +350,7 @@ protected:
     }
     std::array<Member, 4> members_;
     std::array<BlockingWork, 2> work_;
-    ContextProgressGroup group_;
+    ContextProgressGroup group_, nested_;
     ControlExecutor executor_;
     ShardReactor reactor_;
 };
@@ -381,6 +382,43 @@ TEST_F(ContextGroupReactorTest, BlockingImportPausesEveryContextMemberButNotOthe
     EXPECT_EQ(members_[0].completed, 0u);
     EXPECT_EQ(members_[1].completed, 0u);
     EXPECT_GT(members_[0].progress_calls, paused_calls);
+}
+
+TEST_F(ContextGroupReactorTest, SnapshotControlKeepsNestedGroupRunningAndRetainsLifetime) {
+    // 生产栈将两类导入再包装一层组合源；非独占属性必须穿过嵌套组。
+    auto& nested = nested_;
+    std::array<ProgressSource*, 1> nested_members{&group_};
+    ASSERT_TRUE(nested.Open(nested_members));
+    std::array<ProgressSource*, 2> sources{&nested, &members_[3]};
+    members_[2].pending = ControlTask{.function = BlockingWork::Run,
+                                      .argument = &work_[0],
+                                      .token = 10,
+                                      .pause_progress = false};
+    ASSERT_TRUE(reactor_.Open(sources, executor_, {.events = true, .budget = 2}));
+    ASSERT_TRUE(reactor_.Tick());
+    ASSERT_TRUE(Until([&] { return work_[0].entered.load(std::memory_order_acquire); }));
+    EXPECT_FALSE(reactor_.paused(0));
+    const auto before = members_[0].progress_calls;
+    // 后台任务保持阻塞时，数据面、通知、rearm 与 fd 就绪都继续工作。
+    EXPECT_TRUE(nested.Rearm());
+    EXPECT_TRUE(nested.WaitFdEnabled(members_[0].fds[0]));
+    ASSERT_TRUE(reactor_.Tick());
+    for (std::size_t i = 0; i < 3; ++i) {
+        EXPECT_GT(members_[i].progress_calls, before);
+        EXPECT_EQ(members_[i].notifications, 2u);
+    }
+    EXPECT_EQ(members_[2].submitted, 1u);
+    EXPECT_FALSE(reactor_.Close());
+    EXPECT_FALSE(nested.Close());
+    EXPECT_FALSE(group_.Close());
+    work_[0].Release();
+    ASSERT_TRUE(Until([&] {
+        const auto tick = reactor_.Tick();
+        EXPECT_TRUE(tick);
+        return members_[2].completed == 1;
+    }));
+    EXPECT_TRUE(reactor_.Close());
+    EXPECT_TRUE(nested.Close());
 }
 
 TEST_F(ContextGroupReactorTest, ExecutorBackpressureKeepsPreparedControlAndContextRunnable) {

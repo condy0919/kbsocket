@@ -820,18 +820,17 @@ TEST_F(MailboxConnectionRuntimeTest, CopiedCommandsDriveRawDataRefillAndOrderedF
     }
 }
 
-TEST_F(MailboxConnectionRuntimeTest, ConcurrentSubmissionWaitsForItsContextImportBarrier) {
+TEST_F(MailboxConnectionRuntimeTest, ConcurrentSubmissionProgressesDuringContextImport) {
     endpoints_[0].block_import.store(true);
     for (std::size_t side = 0; side < owners_.size(); ++side) {
         ASSERT_TRUE(owners_[side].PrepareRaw(owned_[side], OwnedPreparation(side), endpoints_[side].sources));
     }
-    ASSERT_TRUE(Until([&] { return shard_.paused(0) && endpoints_[0].importing.load() == 1; }));
+    ASSERT_TRUE(Until([&] { return endpoints_[0].importing.load() == 1; }));
     ASSERT_TRUE(Until([&] { return !shard_.paused(1) && endpoints_[1].importing.load() == 1; }));
     const auto polls_before = endpoints_[0].polls;
-    const auto visits_before = endpoints_[0].scheduler.stats()->visits;
     std::array<std::optional<runtime::ConnectionCommandTicket>, 2> tickets;
     std::array<std::thread, 2> producers;
-    // producer 可在 context 控制调用阻塞时入队，只有 owner 的命令执行必须被同一屏障挡住。
+    // 慢导入仅阻塞对应握手；producer 提交后同 context 的 owner 仍须执行命令。
     for (std::size_t side = 0; side < producers.size(); ++side) {
         producers[side] = std::thread([&, side] {
             const auto submitted = mailboxes_[side].TrySubmit(
@@ -852,15 +851,7 @@ TEST_F(MailboxConnectionRuntimeTest, ConcurrentSubmissionWaitsForItsContextImpor
     ASSERT_TRUE(other->result);
     ASSERT_TRUE(other->result->status);
     EXPECT_EQ(other->command.token, 22u);
-    EXPECT_TRUE(notices_[0].empty());
-    const auto pending = mailboxes_[0].TakeCompletion(*tickets[0]);
-    ASSERT_FALSE(pending);
-    EXPECT_EQ(pending.error().code, runtime::CommandQueueErrorCode::kPending);
-    EXPECT_EQ(endpoints_[0].polls, polls_before);
-    EXPECT_EQ(endpoints_[0].scheduler.stats()->visits, visits_before);
-
-    endpoints_[0].block_import.store(false);
-    endpoints_[0].block_import.notify_all();
+    // ImportJetty 仍未返回，此时读取状态命令已经可以完成，raw CQ 也继续轮询。
     const auto resumed = AwaitCompletion(0, *tickets[0]);
     ASSERT_TRUE(resumed);
     ASSERT_TRUE(resumed->result);
@@ -870,6 +861,8 @@ TEST_F(MailboxConnectionRuntimeTest, ConcurrentSubmissionWaitsForItsContextImpor
     EXPECT_EQ(notices_[0][0].ticket, *tickets[0]);
     EXPECT_FALSE(shard_.paused(0));
     EXPECT_GT(endpoints_[0].polls, polls_before);
+    endpoints_[0].block_import.store(false);
+    endpoints_[0].block_import.notify_all();
     ASSERT_TRUE(Until([&] {
         const auto left = owners_[0].Inspect(owned_[0]);
         const auto right = owners_[1].Inspect(owned_[1]);
@@ -1617,21 +1610,21 @@ TEST_F(ConnectionRuntimeTest, StoppedRawReceiveFreezesCreditsAndFailsConnectionW
     EXPECT_FALSE(endpoint.callback_bad_id);
 }
 
-TEST_F(ConnectionRuntimeTest, ImportControlPausesRawAndConnectionsOnlyForItsContext) {
+TEST_F(ConnectionRuntimeTest, ImportControlKeepsRawAndConnectionsRunning) {
     endpoints_[0].block_import.store(true);
     Prepare();
-    ASSERT_TRUE(Until([&] { return shard_.paused(0) && endpoints_[0].importing.load() == 1; }));
+    ASSERT_TRUE(Until([&] { return endpoints_[0].importing.load() == 1; }));
     const auto raw_before = endpoints_[0].polls;
-    const auto connection_before = endpoints_[0].scheduler.stats()->visits;
     const auto other_before = endpoints_[1].polls;
     ASSERT_TRUE(Until([&] { return !shard_.paused(1) && endpoints_[1].importing.load() == 1; }));
     for (int i = 0; i < 10; ++i) {
         ASSERT_TRUE(Step());
     }
-    EXPECT_EQ(endpoints_[0].polls, raw_before);
-    EXPECT_EQ(endpoints_[0].scheduler.stats()->visits, connection_before);
+    EXPECT_GT(endpoints_[0].polls, raw_before);
+    EXPECT_FALSE(shard_.paused(0));
+    EXPECT_NE(endpoints_[0].connection.state(), ConnectionState::kRawActive);
     EXPECT_GT(endpoints_[1].polls, other_before);
-    // 阻塞的 Import 返回并由 owner 收割后，原 context 恢复握手和数据推进。
+    // raw 一直推进；只有等待该 Import 的握手须等 owner 收割后才能激活。
     endpoints_[0].block_import.store(false);
     endpoints_[0].block_import.notify_all();
     ASSERT_TRUE(Until([&] {

@@ -82,7 +82,7 @@ std::expected<ProgressBatch, ProgressError> ContextProgressGroup::Progress(Progr
     if (failure_) {
         return std::unexpected(*failure_);
     }
-    if (submitted_) {
+    if (submitted_ && selected_->pause_progress) {
         return Error(ProgressErrorCode::kInUse);
     }
     const auto index = static_cast<std::size_t>(kind);
@@ -119,7 +119,7 @@ std::expected<ProgressBatch, ProgressError> ContextProgressGroup::CollectNotific
     if (failure_) {
         return std::unexpected(*failure_);
     }
-    if (submitted_) {
+    if (submitted_ && selected_->pause_progress) {
         return Error(ProgressErrorCode::kInUse);
     }
     if (!budget || budget > std::numeric_limits<std::size_t>::max() / member_count_) {
@@ -154,7 +154,7 @@ std::expected<void, ProgressError> ContextProgressGroup::Rearm() noexcept {
     if (failure_) {
         return std::unexpected(*failure_);
     }
-    if (submitted_) {
+    if (submitted_ && selected_->pause_progress) {
         return Error(ProgressErrorCode::kInUse);
     }
     std::optional<ProgressError> error;
@@ -174,7 +174,7 @@ std::span<const int> ContextProgressGroup::wait_fds() const noexcept {
     return std::span(fds_).first(fd_count_);
 }
 bool ContextProgressGroup::WaitFdEnabled(int fd) const noexcept {
-    if (submitted_ || failure_) {
+    if ((submitted_ && selected_->pause_progress) || failure_) {
         return false;
     }
     for (std::size_t i = 0; i < fd_count_; ++i) {

@@ -101,7 +101,10 @@ std::optional<ControlTask> ImportProgress::PendingControl() noexcept {
         prepared_ = *prepared;
     }
     // queue-full 时反应堆不会调用 ControlSubmitted；参数保持稳定，下一次只重试同一任务。
-    return prepared_->task;
+    // worker 仅访问缓存中的独立 Work 快照；完成收割前目标不会发布给数据面。
+    auto task = prepared_->task;
+    task.pause_progress = false;
+    return task;
 }
 
 void ImportProgress::ControlSubmitted(ControlTaskId id) noexcept {

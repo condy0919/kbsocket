@@ -238,20 +238,23 @@ std::expected<ProgressBatch, ProgressError> ShardReactor::Advance() noexcept {
                 failure = watch.error();
             }
         }
-        if (stopping_) {
+        if (stopping_ || slot.task) {
             continue;
         }
         const auto task = slot.source->PendingControl();
         if (!task) {
             continue;
         }
-        // 在发布任务前停止该源全部访问和 readiness，工作线程可在 TrySubmit 返回前执行。
-        slot.paused = true;
-        if (auto watch = WatchSource(i, false); !watch) {
-            if (!failure) {
-                failure = watch.error();
+        // 只有共享队列变更需要在发布前停止访问；快照导入任务保留数据面和 fd 就绪。
+        // 工作线程可在 TrySubmit 返回前执行，不能事后才建立独占屏障。
+        if (task->pause_progress) {
+            slot.paused = true;
+            if (auto watch = WatchSource(i, false); !watch) {
+                if (!failure) {
+                    failure = watch.error();
+                }
+                continue;
             }
-            continue;
         }
         const auto submitted = executor_->TrySubmit(*task);
         if (!submitted) {

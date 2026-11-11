@@ -47,6 +47,15 @@
 1. **移除 `ImportJetty` / `ImportSeg` / `Unimport` / `ModifyJfr` 的全 Context 暂停屏障**：`liburma` 的 `urma_import_jetty`、`urma_import_seg`、`urma_modify_jfr` 属于控制面命令，与单 Owner 线程在用户态无锁队列（`lock_free = 1`）上的 `PostJettySendWr` / `PostJfrWr` / `PollJfc` 正交，无需暂停整个 Context 数据面（仅在 `ReplaceDrainedLane` 替换物理队列时对目标 Lane 做局部状态隔离）。
 2. **支持 `ControlExecutor` 批量并行提交与常驻 `epoll` 注册**：允许 `EndpointImportCache` 与 `TsegImportCache` 向 `ControlExecutor` 批量提交多个并发导入任务，执行期间仅对应的 `ConnectionHandshake` 或 `RndvTxCoordinator` 槽位处于 `kPending` 等待态，且不反复调用 `epoll_ctl(DEL/ADD)`。
 
+
+#### 5. 核实与修复记录（2026-11-11）
+
+- **结论：部分修复。** 全 Context 暂停机制属实；“毫秒级停摆”、P99/P99.9 和 40k 规模影响尚未通过硬件/压测证实。
+- **本次修复：** `ControlTask::pause_progress` 默认保留独占屏障，仅 endpoint/tseg 导入及解导入任务关闭屏障。worker 使用独立 `Work` 快照，导入结果只在 owner 收割后发布；解导入仍检查引用。Reactor 与组合源继续数据轮询、通知、Rearm 和 fd 注册，同时保持单源单在途任务及完成身份检查；关闭仍等待在途任务。
+- **验证：** `context_progress_group_test`、`import_progress_test`、`tseg_import_progress_test`、`raw_stack_test`、`shard_reactor_test`、`runtime_shard_test` 及两类 `import_cache_test` 通过（146 个独立用例）；连接集成测试已将旧暂停预期改为阻塞导入期间仍能轮询与执行 mailbox。`raw_stack_test` 另验证 `AdvanceClose` 不提前释放后台任务依赖。
+- **保留项：** `ModifyJfr`、`BeginDrain`、`ReplaceDrainedLane` 仍有屏障，同 Context 控制操作仍串行。`RawContextProgress::RunControl` 直接访问 `rx->posted()/stopped()`、pool 状态，直接关闭屏障存在竞态；需先拆分 worker 快照和 owner 状态发布，再实现局部隔离及批量并行。UB 真机并发验证未执行。
+- **UCX 对比纠正：** 本地 `ucx/src/uct/ib/efa/srd/srd_ep.c` 引用处实际同步调用 `uct_ib_iface_ah_get`，不能据此证明“异步建 AH”或任何控制操作均不阻塞 Worker；`ucp_worker_progress` 的实现也不能支持“永不暂停”的绝对结论。这里修复的依据是本库的具体线程共享关系。
+
 ---
 
 ### ISSUE-2 [P0]：Reactor 热路径 `RequestSweep()` 全量连接扫描与高频系统调用开销

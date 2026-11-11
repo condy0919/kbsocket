@@ -363,7 +363,7 @@ private:
     urma_context_t* context_;
 };
 
-TEST_F(TsegImportProgressTest, SegmentAndEndpointImportsSharePauseUntilCompletionIsCollected) {
+TEST_F(TsegImportProgressTest, SegmentAndEndpointImportsKeepQueuesRunningUntilCompletionIsCollected) {
     const auto segment = Acquire();
     ASSERT_TRUE(segment);
     urma_rjetty_t descriptor{};
@@ -392,7 +392,7 @@ TEST_F(TsegImportProgressTest, SegmentAndEndpointImportsSharePauseUntilCompletio
     ASSERT_TRUE(reactor_.Open(groups, executor_));
     reactor_open_ = true;
 
-    // 阻塞首个段导入，验证另一个缓存和所有队列使用者共同停止访问。
+    // 阻塞首个段导入；串行控制提交不应阻塞同 context 的队列使用者。
     provider_.block.store(true);
     ASSERT_TRUE(Until([&] { return provider_.imports.load() == 1; }));
     ASSERT_TRUE(source_.in_flight());
@@ -400,13 +400,14 @@ TEST_F(TsegImportProgressTest, SegmentAndEndpointImportsSharePauseUntilCompletio
     for (int i = 0; i < 20; ++i) {
         ASSERT_TRUE(reactor_.Tick());
     }
-    EXPECT_EQ(queues.calls, before);
+    EXPECT_GT(queues.calls, before);
+    EXPECT_FALSE(reactor_.paused(0));
     EXPECT_EQ(provider_.jetty_imports.load(), 0u);
     EXPECT_FALSE(endpoint_source_.in_flight());
     EXPECT_EQ(reactor_.stats().controls_submitted, 1u);
     EXPECT_FALSE(group_.Close());
     EXPECT_FALSE(source_.Close());
-    // 完成由 reactor 收割后才能恢复队列并调度 endpoint 导入。
+    // 完成由 reactor 收割后才发布段目标并调度 endpoint 导入。
     provider_.block.store(false);
     provider_.block.notify_all();
     ASSERT_TRUE(Until([&] { return cache_.Get(*segment).has_value() && endpoint_cache_.Get(*endpoint).has_value(); }));
