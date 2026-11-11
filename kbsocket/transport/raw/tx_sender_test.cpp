@@ -430,11 +430,15 @@ TEST_F(TxSenderTest, ConsecutiveBatchesKeepAffinityAndDriftOnlyForCapacityOrFaul
     EXPECT_CALL(*this, Post(&second, _, _)).WillOnce(Return(URMA_SUCCESS));
     ASSERT_EQ(sender_.Send(batch, drift), 2u);
     for (const auto id : first) {
-        ASSERT_EQ(ledger_.Lookup(id)->ticket.lane.index, 0u);
+        const auto record = ledger_.Lookup(id);
+        ASSERT_TRUE(record);
+        EXPECT_EQ(record->ticket.lane.index, 0u);
         ASSERT_TRUE(ledger_.Complete(id));
     }
     for (const auto id : drift) {
-        ASSERT_EQ(ledger_.Lookup(id)->ticket.lane.index, 1u);
+        const auto record = ledger_.Lookup(id);
+        ASSERT_TRUE(record);
+        EXPECT_EQ(record->ticket.lane.index, 1u);
         ASSERT_TRUE(ledger_.Complete(id));
     }
     // 首选槽恢复后重新使用它；隔离后只能选择健康槽，显式指定故障槽仍拒绝。
