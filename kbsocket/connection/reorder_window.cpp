@@ -49,8 +49,16 @@ bool SameLease(const ReorderLease& left, const ReorderLease& right) noexcept {
 
 struct ReorderWindow::State {
     enum class Status : std::uint8_t { kEmpty, kPending, kBuffered, kDelivered, kConsumed };
+    // Session 在准入时已校验且窗口存活期间不变，无需每个槽重复保存。
+    struct StoredFrame {
+        std::uint32_t sequence = 0;
+        ReorderFrameKind kind = ReorderFrameKind::kEager;
+        ReorderLease lease{};
+        std::span<const std::byte> payload{};
+    };
+    static_assert(sizeof(StoredFrame) + sizeof(ReorderSession) <= sizeof(ReorderFrame));
     struct Entry {
-        ReorderFrame frame;
+        StoredFrame frame;
         std::uint64_t receipt = 0;
         std::uint64_t reservation = 0;
         std::size_t reserved_bytes = 0;
@@ -307,7 +315,10 @@ std::expected<void, ReorderError> ReorderWindow::CheckAdmission(const ReorderFra
         return std::unexpected(*state_->failure);
     }
     // 有界身份检查覆盖已交给应用的 Lease，避免同一物理所有权挂进两个 SN 后被双重归还。
-    for (std::uint32_t i = 0; i < state_->config.window; ++i) {
+    const auto held_count =
+        state_->stats.pending_frames + state_->stats.buffered_frames + state_->stats.delivered_frames;
+    // 顺序流及时消费后的空窗口无需扫描；有持有项时仍保留防双重归还检查。
+    for (std::uint32_t i = 0; held_count && i < state_->config.window; ++i) {
         const auto& held = state_->entries[i];
         if (held.status != State::Status::kPending && held.status != State::Status::kBuffered &&
             held.status != State::Status::kDelivered) {
@@ -335,7 +346,7 @@ std::expected<void, ReorderError> ReorderWindow::Push(const ReorderFrame& frame,
         return checked;
     }
     auto& entry = state_->entries[frame.sequence % state_->config.window];
-    entry.frame = frame;
+    entry.frame = {frame.sequence, frame.kind, frame.lease, frame.payload};
     entry.status = State::Status::kBuffered;
     ++state_->stats.buffered_frames;
     state_->stats.resident_bytes += frame.payload.size();
@@ -360,7 +371,7 @@ std::expected<ReorderReservation, ReorderError> ReorderWindow::ReserveRndv(Reord
     }
     const auto index = sequence % state_->config.window;
     auto& entry = state_->entries[index];
-    entry.frame = frame;
+    entry.frame = {frame.sequence, frame.kind, frame.lease, frame.payload};
     entry.reservation = ++next_reservation_;
     entry.reserved_bytes = static_cast<std::size_t>(bytes);
     entry.status = State::Status::kPending;
@@ -408,7 +419,7 @@ std::expected<void, ReorderError> ReorderWindow::CompleteRndv(ReorderReservation
             return Error(ReorderErrorCode::kLeaseAlreadyHeld);
         }
     }
-    entry.frame = frame;
+    entry.frame = {frame.sequence, frame.kind, frame.lease, frame.payload};
     entry.reservation = 0;
     entry.reserved_bytes = 0;
     entry.status = State::Status::kBuffered;
@@ -450,7 +461,9 @@ bool ReorderWindow::Deliver(std::uint32_t index, ReorderDelivery& output, bool d
     entry.discarded = discarded;
     --state_->stats.buffered_frames;
     ++state_->stats.delivered_frames;
-    output = {entry.frame, ReorderReceipt{this, index, entry.receipt}, discarded};
+    output = {{state_->session, entry.frame.sequence, entry.frame.kind, entry.frame.lease, entry.frame.payload},
+              ReorderReceipt{this, index, entry.receipt},
+              discarded};
     return true;
 }
 std::expected<std::size_t, ReorderError> ReorderWindow::Poll(std::span<ReorderDelivery> output,
@@ -499,7 +512,7 @@ std::expected<void, ReorderError> ReorderWindow::ValidateDelivery(const ReorderD
     const bool same_lease =
         (frame.lease.index() == 0 && entry.frame.lease.index() == 0) || SameLease(frame.lease, entry.frame.lease);
     if (entry.status != State::Status::kDelivered || entry.receipt != receipt.generation ||
-        entry.discarded != delivery.discarded || entry.frame.session != frame.session ||
+        entry.discarded != delivery.discarded || state_->session != frame.session ||
         entry.frame.sequence != frame.sequence || entry.frame.kind != frame.kind || !same_lease ||
         entry.frame.payload.data() != frame.payload.data() || entry.frame.payload.size() != frame.payload.size()) {
         return Error(ReorderErrorCode::kInvalidReceipt);

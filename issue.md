@@ -172,6 +172,15 @@
 2. **使用侵入式描述符链或按需分配乱序槽**：在 `RxBufferPool` 描述符内嵌链表指针，消除每连接预分配 `Entry[W]` 的百兆级内存开销，并用槽位 `kHeld` 状态位在 $O(1)$ 内替代 $O(W)$ 的 `SameLease` 遍历。
 3. **允许乱序到达的 `RNDV_RTS` 立即准入并回复 `GRANT`**：只要 `rts.sequence < max_frame_seq` 且 RNDV 内存预算允许，立即在重排窗口占坑并发回 `GRANT`，让远端 RDMA `WRITE` 与前序在途 Eager 包并行传输，仅在向应用交付时按 `rcv_next` 保序。
 
+
+#### 5. 核实与修复记录（2026-11-11）
+
+- **结论：部分修复。** 应用持有槽与网络窗口耦合、Open 按 W 预分配、非空窗口 SameLease 扫描、乱序 RTS 顺序门禁均属实。原文内存数字需区分十进制 MB 与 MiB，具体 Entry 大小也应实测，不能把估算视为测量。
+- **本次修复：** 槽内改用不重复保存 `ReorderSession` 的紧凑帧描述；会话身份只在窗口保存，准入时校验，交付时恢复，校验交付时仍严格检查。每槽至少节省一个 `ReorderSession`（当前 64 位环境 32 B），W=64、40k 连接约减少 78.1 MiB，W=128 约减少 156.3 MiB；并非消除全部空窗开销。空窗口不再执行 SameLease 的 W 次扫描，及时读完的顺序流进入 O(1) 检查路径。
+- **验证：** `reorder_window_test`、`rndv_rx_ingress_test` 通过。新增分配计量测试比较 W=1/65 的 Open 分配差值，约束槽尺寸不超过 112 B，并验证交付会话恢复和伪造会话拒绝；既有用例继续覆盖乱序、慢读、重复 Lease、RNDV、Drain 与数据路径零分配。
+- **不能直接套用的建议：** `OutOfOrderRtsCannotOccupyOnlyReceiverSlotBeforeMissingPredecessor` 和 `OutOfOrderRtsCannotTakeOnlyTargetAwayFromStreamPredecessor` 已复现有限事务/目标池的死锁风险：若后序 RTS 先拿走唯一槽，前序无资源，后序又不能按序消费。须为前序保留资源或引入可回收准入，不能仅删除顺序检查。硬件可靠传输也不保证软件必然提交每个 SN 或进程始终存活，不能据此取消故障检测。
+- **保留项：** 网络重排/应用队列拆分、空闲连接按需描述符、非空窗口 O(1) Lease 索引及安全乱序 RTS 并发尚未实现。默认 gap timeout 本来可配置；本次未取消/改变默认值，真实网络下超时阈值与误杀概率仍需测量。
+
 ---
 
 ### ISSUE-5 [P2]：RNDV 每 Peer 单在途事务锁死、Eager/RNDV 互斥与 Slab 内存粒度浪费

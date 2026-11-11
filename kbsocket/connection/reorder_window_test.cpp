@@ -18,11 +18,13 @@ namespace {
 // 只包围已初始化后的纯状态机调用，排除 GTest 和 Open 的控制路径分配。
 thread_local bool count_allocations = false;
 thread_local std::size_t allocation_count = 0;
+thread_local std::size_t allocation_bytes = 0;
 thread_local std::size_t free_count = 0;
 } // namespace
 void* operator new(std::size_t size) {
     if (count_allocations) {
         ++allocation_count;
+        allocation_bytes += size;
     }
     if (auto* memory = std::malloc(size ? size : 1)) {
         return memory;
@@ -122,6 +124,32 @@ protected:
     std::array<ReorderReservation, 512> reservations_{};
     std::size_t reservation_count_ = 0;
 };
+
+TEST_F(ReorderWindowTest, WindowStorageDoesNotDuplicateSessionInEverySlot) {
+    // 只比较 Open 的两种容量，排除 State 和测试框架自身开销。
+    allocation_bytes = 0;
+    count_allocations = true;
+    const auto small = window_.Open(Session(), Config(1));
+    count_allocations = false;
+    const auto small_bytes = allocation_bytes;
+    ASSERT_TRUE(small);
+    ASSERT_TRUE(window_.Close());
+    allocation_bytes = 0;
+    count_allocations = true;
+    const auto large = window_.Open(Session(), Config(65));
+    count_allocations = false;
+    const auto large_bytes = allocation_bytes;
+    ASSERT_TRUE(large);
+    // 原 Entry 至少为 ReorderFrame + 三个 uint64 + 状态；压缩后每槽最多112字节。
+    EXPECT_LE(large_bytes - small_bytes, 64u * 112u);
+    ASSERT_TRUE(window_.Push(Frame(0), 0));
+    ReorderDelivery delivery;
+    ASSERT_EQ(Poll({&delivery, 1}), 1u);
+    EXPECT_EQ(delivery.frame.session, Session());
+    EXPECT_TRUE(window_.ValidateDelivery(delivery));
+    ++delivery.frame.session.generation;
+    EXPECT_FALSE(window_.ValidateDelivery(delivery));
+}
 
 TEST_F(ReorderWindowTest, ObservedPrefixIncludesOutOfOrderEagerRtsAndFinWithoutDeliveringPending) {
     ASSERT_TRUE(window_.Open(Session(), Config()));
