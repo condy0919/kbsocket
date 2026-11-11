@@ -628,7 +628,7 @@ stateDiagram-v2
 3. **POSIX Socket & Epoll 兼容层（`kbsocket/socket/`）**：支持 `socket`/`connect`/`accept`/`read`/`write`/`readv`/`writev`/`close`/`shutdown`/`getsockopt(SO_ERROR)` 及 `epoll`（`EPOLLIN`/`EPOLLOUT`/`EPOLLET`/`EPOLLONESHOT`）。内部合成事件与原生内核 `epoll` 共享公平配额，防止加速连接事件饿死原生 TCP `accept`。
 4. **C++23 项目中的 P2300 风格异步层**：通过适配实现 sender/receiver，不把 P2300 的标准库实现当作 C++23 已有能力。基于 Operation State 封装 `AsyncConnect`/`AsyncRead`/`AsyncWrite`，正常、错误、超时与取消竞争下恰好完成一次；错误通知和 `source_reusable` 分开，DMA 未终结前不归还借用内存。
 
-**当前实现 M7.2**：[SocketDispatcher](../socket-dispatcher.md) 通过有界命令队列将完整 FD/stream 身份交给单 owner，支持复制读写、半关闭、状态与逻辑关闭，完成领取前保留元数据引用。Attach 控制路径独立预留内核 fd，传输 socket 仍归 Runtime；真实 Close/Release 与 CPU 回收分别推进。公开 fd 目前只保留身份，Submit/TakeCompletion 是异步请求接口，不能冒充 POSIX I/O 返回值或 epoll readiness；backend/Runtime 必须活到 dispatcher 显式 Close 成功。
+**当前实现 M7.2–M7.3.1**：[SocketDispatcher](../socket-dispatcher.md) 通过有界命令队列将完整 FD/stream 身份交给单 owner，支持复制读写、半关闭、状态、逻辑关闭及可选 Watch，完成领取前保留元数据引用。事件桥独占消费 C stream 表事件，以预分配节点合并提示并交付完整 FD 身份；Detach 撤销待取事件，迟到旧流事件按完整身份过滤。保留底层整体一次性订阅语义，cancel/rearm 不撤回已排队提示；事件没有订阅代次，命令 token 只用于命令完成。Attach 控制路径独立预留内核 fd，传输 socket 仍归 Runtime；真实 Close/Release 与 CPU 回收分别推进。公开 fd 目前只保留身份，Submit/TakeCompletion 是异步请求接口，不能冒充 POSIX I/O 返回值或 epoll readiness；backend/Runtime 必须活到 dispatcher 显式 Close 成功。完整 EpollMux 的 LT/ET/ONESHOT 与原生 fd 公平调度仍待 M7.3.2。
 
 普通读写支持部分完成、`EAGAIN`、双向独立关闭与 `SO_ERROR`。可读 readiness 来自连续可读字节或可报告的 FIN/错误；可写 readiness 由连接状态及本地能否接纳新的写入决定。远端 credit 暂缺限制物理提交，但不应遮蔽仍有 staging 容量可接收的普通复制写。非 owner 线程调用普通 `write` 时，必须在返回前复制已接受字节，或等 owner 完成该复制后返回；不能只把用户指针入 Mailbox 就宣告成功。
 

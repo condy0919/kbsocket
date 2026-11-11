@@ -46,6 +46,9 @@ void Signal(int fd) noexcept {
     // EAGAIN 意味着已经可读；发布后不能再报告提交失败，避免调用方重复提交。
 }
 bool ValidCommand(const FdCommand& command, std::span<const std::byte> input, std::size_t max_io_bytes) noexcept {
+    if (command.kind != FdCommandKind::kWatch && (command.readable || command.writable)) {
+        return false;
+    }
     switch (command.kind) {
     case FdCommandKind::kWrite:
         return command.bytes <= max_io_bytes && input.size() == command.bytes;
@@ -54,6 +57,7 @@ bool ValidCommand(const FdCommand& command, std::span<const std::byte> input, st
     case FdCommandKind::kShutdownWrite:
     case FdCommandKind::kInspect:
     case FdCommandKind::kClose:
+    case FdCommandKind::kWatch:
         return command.bytes == 0 && input.empty();
     }
     return false;
@@ -73,6 +77,7 @@ bool ValidReply(const FdCommand& command, const FdCommandResult& result) noexcep
     case FdCommandKind::kInspect:
     case FdCommandKind::kShutdownWrite:
     case FdCommandKind::kClose:
+    case FdCommandKind::kWatch:
         return result->io.bytes == 0 && !result->io.eof;
     }
     return false;

@@ -100,3 +100,30 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "socket_dispatcher_events_test",
+    srcs = ["socket_dispatcher_events_test.cpp"],
+    deps = [
+        ":fd_command_queue",
+        ":fd_table",
+        ":socket_dispatcher",
+        "//kbsocket/api:stream",
+        "//kbsocket/runtime:progress_source",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "socket_dispatcher_events_tcp_test",
+    srcs = ["socket_dispatcher_events_tcp_test.cpp"],
+    deps = [
+        ":fd_command_queue",
+        ":fd_table",
+        ":socket_dispatcher",
+        "//kbsocket/api:stream",
+        "//kbsocket/api:stream_runtime",
+        "//kbsocket/runtime:progress_source",
+        "@googletest//:gtest_main",
+    ],
+)

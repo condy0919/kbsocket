@@ -14,11 +14,15 @@
 namespace kbsocket {
 namespace socket {
 
-enum class FdCommandKind : std::uint8_t { kWrite, kRead, kShutdownWrite, kInspect, kClose };
+enum class FdCommandKind : std::uint8_t { kWrite, kRead, kShutdownWrite, kInspect, kClose, kWatch };
 struct FdCommand {
     FdCommandKind kind = FdCommandKind::kInspect;
+    // 仅关联此命令的完成结果，不作为 Watch 订阅或事件代际标识。
     std::uint64_t token = 0;
     std::uint32_t bytes = 0;
+    // 仅 kWatch 使用；两者均为 false 表示取消关注，不撤回已排队事件。
+    bool readable = false;
+    bool writable = false;
 };
 struct FdCommandTicket {
     std::uint64_t queue_id = 0;

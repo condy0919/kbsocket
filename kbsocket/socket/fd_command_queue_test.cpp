@@ -410,6 +410,100 @@ TEST_F(FdCommandQueueTest, InvalidRepliesDoNotPublishOrDiscardExecutingRequest) 
     EXPECT_EQ(completed->result.error().code, KBS_STREAM_WOULD_BLOCK);
 }
 
+TEST_F(FdCommandQueueTest, WatchInterestsAndCancellationPreserveCommandSnapshotAndCompletionToken) {
+    ASSERT_NO_FATAL_FAILURE(Open());
+    // 分别覆盖只读、只写、双向和取消关注；token 只跟随命令完成，不表示订阅代际。
+    const std::array commands{FdCommand{.kind = FdCommandKind::kWatch, .token = 81, .readable = true},
+                              FdCommand{.kind = FdCommandKind::kWatch, .token = 82, .writable = true},
+                              FdCommand{.kind = FdCommandKind::kWatch, .token = 83, .readable = true, .writable = true},
+                              FdCommand{.kind = FdCommandKind::kWatch, .token = 84}};
+    std::array<FdCommandTicket, 4> tickets;
+    for (std::size_t i = 0; i < commands.size(); ++i) {
+        auto command = commands[i];
+        const auto ticket = Submit(command);
+        ASSERT_TRUE(ticket);
+        tickets[i] = *ticket;
+        // 提交后修改调用方对象，owner 仍必须读取提交时的字段副本。
+        command = FdCommand{.kind = FdCommandKind::kClose};
+    }
+    std::array<FdCommandRequest, 4> requests;
+    ASSERT_EQ(queue_.PollCommands(requests), commands.size());
+    for (std::size_t i = 0; i < commands.size(); ++i) {
+        const auto& request = requests[i];
+        EXPECT_EQ(request.ticket, tickets[i]);
+        EXPECT_EQ(request.binding.id, binding_);
+        EXPECT_EQ(request.command.kind, FdCommandKind::kWatch);
+        EXPECT_EQ(request.command.token, commands[i].token);
+        EXPECT_EQ(request.command.readable, commands[i].readable);
+        EXPECT_EQ(request.command.writable, commands[i].writable);
+        EXPECT_EQ(request.command.bytes, 0u);
+        EXPECT_TRUE(request.payload.empty());
+        ASSERT_TRUE(queue_.Complete(request.ticket, FdCommandReply{}));
+        const auto completed = queue_.TakeCompletion(request.ticket);
+        ASSERT_TRUE(completed);
+        ASSERT_TRUE(completed->result);
+        EXPECT_EQ(completed->command.kind, FdCommandKind::kWatch);
+        EXPECT_EQ(completed->command.token, commands[i].token);
+        EXPECT_EQ(completed->command.readable, commands[i].readable);
+        EXPECT_EQ(completed->command.writable, commands[i].writable);
+        EXPECT_EQ(completed->result->io.bytes, 0u);
+        EXPECT_EQ(completed->result->io.eof, 0u);
+    }
+    EXPECT_EQ(queue_.outstanding(), 0u);
+    EXPECT_EQ(table_.stats().references, 0u);
+}
+
+TEST_F(FdCommandQueueTest, InvalidWatchPayloadAndForeignInterestFlagsPreserveLeaseAndCapacity) {
+    ASSERT_NO_FATAL_FAILURE(Open());
+    auto lease = table_.Lookup(reader_, binding_);
+    ASSERT_TRUE(lease);
+    const std::array input{std::byte{1}};
+    // Watch 不传输数据；即使 bytes 与输入长度匹配，也不能占用命令槽。
+    ExpectError(queue_.TrySubmit(*lease, {.kind = FdCommandKind::kWatch, .bytes = 1}),
+                FdQueueErrorCode::kInvalidArgument);
+    ExpectError(queue_.TrySubmit(*lease, {.kind = FdCommandKind::kWatch}, input), FdQueueErrorCode::kInvalidArgument);
+    ExpectError(queue_.TrySubmit(*lease, {.kind = FdCommandKind::kWatch, .bytes = 1}, input),
+                FdQueueErrorCode::kInvalidArgument);
+    // 其他命令不能携带关注标记，避免被静默忽略后产生错误订阅预期。
+    for (const auto kind : {FdCommandKind::kWrite, FdCommandKind::kRead, FdCommandKind::kShutdownWrite,
+                            FdCommandKind::kInspect, FdCommandKind::kClose}) {
+        for (const auto flags : {1u, 2u, 3u}) {
+            ExpectError(
+                queue_.TrySubmit(*lease, {.kind = kind, .readable = (flags & 1u) != 0, .writable = (flags & 2u) != 0}),
+                FdQueueErrorCode::kInvalidArgument);
+            EXPECT_TRUE(*lease);
+        }
+    }
+    EXPECT_TRUE(*lease);
+    EXPECT_EQ(queue_.outstanding(), 0u);
+    EXPECT_FALSE(Ready(queue_.command_fd()));
+    // 非法提交不消耗 Lease；修正字段后原 Lease 可以正常提交取消关注。
+    const auto ticket = queue_.TrySubmit(*lease, {.kind = FdCommandKind::kWatch});
+    ASSERT_TRUE(ticket);
+    tickets_.push_back(*ticket);
+    EXPECT_FALSE(*lease);
+}
+
+TEST_F(FdCommandQueueTest, WatchCompletionRejectsIoBytesAndEofBeforeValidControlReply) {
+    ASSERT_NO_FATAL_FAILURE(Open());
+    const auto ticket = Submit({.kind = FdCommandKind::kWatch, .readable = true, .writable = true});
+    ASSERT_TRUE(ticket);
+    std::array<FdCommandRequest, 1> requests;
+    ASSERT_EQ(queue_.PollCommands(requests), 1u);
+    // Watch 是控制操作；非法 I/O 结果既不能发布完成，也不能丢弃 owner 正在处理的命令。
+    ExpectError(queue_.Complete(*ticket, FdCommandReply{.io = {1, 0, 0}}), FdQueueErrorCode::kInvalidArgument);
+    ExpectError(queue_.Complete(*ticket, FdCommandReply{.io = {0, 1, 0}}), FdQueueErrorCode::kInvalidArgument);
+    ExpectError(queue_.TakeCompletion(*ticket), FdQueueErrorCode::kPending);
+    EXPECT_EQ(queue_.outstanding(), 1u);
+    ASSERT_TRUE(queue_.Complete(*ticket, FdCommandReply{}));
+    const auto completed = queue_.TakeCompletion(*ticket);
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(completed->result);
+    EXPECT_EQ(completed->result->io.bytes, 0u);
+    EXPECT_EQ(completed->result->io.eof, 0u);
+    EXPECT_EQ(queue_.outstanding(), 0u);
+}
+
 TEST_F(FdCommandQueueTest, ForgedAndCrossQueueTicketsCannotReadOrCompleteRequests) {
     ASSERT_NO_FATAL_FAILURE(Open());
     const auto ticket = Submit({});

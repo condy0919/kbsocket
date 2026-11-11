@@ -38,6 +38,9 @@ kbs_stream_error StreamError(int code, int detail = 0) noexcept {
 bool SameStream(kbs_stream_handle a, kbs_stream_handle b) noexcept {
     return a.table_id == b.table_id && a.generation == b.generation && a.slot == b.slot && a.reserved == b.reserved;
 }
+std::uint64_t SaturatingAdd(std::uint64_t a, std::uint64_t b) noexcept {
+    return b > std::numeric_limits<std::uint64_t>::max() - a ? std::numeric_limits<std::uint64_t>::max() : a + b;
+}
 void Signal(int fd) noexcept {
     const std::uint64_t one = 1;
     ssize_t result;
@@ -54,6 +57,12 @@ auto ProgressFailure(FdQueueError error) noexcept {
 }
 } // namespace
 
+std::expected<void, kbs_stream_error> SocketStreamBackend::Watch(kbs_stream_handle, bool, bool) noexcept {
+    return std::unexpected(StreamError(KBS_STREAM_NOT_SUPPORTED));
+}
+std::expected<std::size_t, kbs_stream_error> SocketStreamBackend::PollEvents(std::span<kbs_stream_event>) noexcept {
+    return std::unexpected(StreamError(KBS_STREAM_NOT_SUPPORTED));
+}
 CStreamBackend::CStreamBackend(kbs_stream_table* table, const void* context) noexcept
     : table_(table), context_(context) {}
 std::expected<kbs_stream_io, kbs_stream_error> CStreamBackend::Write(kbs_stream_handle stream,
@@ -103,6 +112,25 @@ std::expected<void, kbs_stream_error> CStreamBackend::Release(kbs_stream_handle 
     }
     return {};
 }
+bool CStreamBackend::supports_events() const noexcept {
+    return table_ != nullptr;
+}
+std::expected<void, kbs_stream_error> CStreamBackend::Watch(kbs_stream_handle stream, bool readable,
+                                                            bool writable) noexcept {
+    kbs_stream_error error{};
+    if (kbs_stream_watch(table_, stream, readable, writable, &error)) {
+        return std::unexpected(error);
+    }
+    return {};
+}
+std::expected<std::size_t, kbs_stream_error> CStreamBackend::PollEvents(std::span<kbs_stream_event> output) noexcept {
+    std::size_t count = 0;
+    kbs_stream_error error{};
+    if (kbs_stream_poll_events(table_, output.data(), output.size(), &count, &error)) {
+        return std::unexpected(error);
+    }
+    return count;
+}
 const void* CStreamBackend::exclusive_context() const noexcept {
     return context_;
 }
@@ -111,9 +139,13 @@ struct SocketDispatcher::State {
     static constexpr auto kNone = std::numeric_limits<std::uint32_t>::max();
     struct Record {
         std::uint32_t next = kNone;
+        // 与真实流退休 FIFO 分离；每个绑定至多一个待取提示，关闭时可 O(1) 撤销。
+        std::uint32_t event_prev = kNone, event_next = kNone;
         bool occupied = false;
+        bool event_pending = false;
         SocketBindingStatus status;
         FdRetireToken retired;
+        kbs_stream_event event{};
     };
     SocketDispatcherConfig config;
     SocketStreamBackend* backend = nullptr;
@@ -124,6 +156,10 @@ struct SocketDispatcher::State {
     std::array<int, 1> fds{-1};
     std::size_t record_bytes = 0, pending = 0, scan_remaining = 0, retired = 0, collect_remaining = 0;
     std::uint32_t head = kNone, tail = kNone;
+    std::uint32_t event_head = kNone, event_tail = kNone;
+    std::size_t pending_events = 0;
+    std::uint64_t mapped_events = 0, unmapped_events = 0;
+    kbs_stream_error event_error{};
 
     ~State() {
         // 仅 Open 回滚或已经确认外部静止的 Close 会销毁 State；不完整析构由门面整体保留。
@@ -150,6 +186,62 @@ struct SocketDispatcher::State {
                    ? &record
                    : nullptr;
     }
+    void RemoveEvent(Record& record) noexcept {
+        if (!record.event_pending) {
+            return;
+        }
+        if (record.event_prev == kNone) {
+            event_head = record.event_next;
+        } else {
+            records[record.event_prev].event_next = record.event_next;
+        }
+        if (record.event_next == kNone) {
+            event_tail = record.event_prev;
+        } else {
+            records[record.event_next].event_prev = record.event_prev;
+        }
+        record.event_prev = record.event_next = kNone;
+        record.event_pending = false;
+        record.event = {};
+        --pending_events;
+    }
+    void CollectEvent(const kbs_stream_event& event) noexcept {
+        if (event.stream.slot >= config.stream_capacity) {
+            unmapped_events = SaturatingAdd(unmapped_events, 1);
+            return;
+        }
+        auto& record = records[event.stream.slot];
+        if (!record.occupied || record.status.stage != SocketRetireStage::kActive ||
+            !SameStream(record.status.binding.target.stream, event.stream)) {
+            unmapped_events = SaturatingAdd(unmapped_events, 1);
+            return;
+        }
+        mapped_events = SaturatingAdd(mapped_events, 1);
+        if (record.event_pending) {
+            auto flags = record.event.flags | event.flags;
+            const auto old_retired = record.event.tx_retired;
+            const auto retired_sum = SaturatingAdd(old_retired, event.tx_retired);
+            if (event.tx_retired > std::numeric_limits<std::uint64_t>::max() - old_retired) {
+                flags |= KBS_STREAM_EVENT_COUNTER_SATURATED;
+            }
+            // 方向标志保留历史提示，其他字段来自最新快照；不能由 rx_pending 推导可读或 EOF。
+            record.event = event;
+            record.event.flags = flags;
+            record.event.tx_retired = retired_sum;
+            return;
+        }
+        record.event = event;
+        record.event_pending = true;
+        record.event_prev = event_tail;
+        record.event_next = kNone;
+        if (event_tail == kNone) {
+            event_head = event.stream.slot;
+        } else {
+            records[event_tail].event_next = event.stream.slot;
+        }
+        event_tail = event.stream.slot;
+        ++pending_events;
+    }
     std::expected<void, SocketDispatchError> Detach(Record& record) noexcept {
         if (record.status.stage != SocketRetireStage::kActive) {
             return Error(SocketDispatchErrorCode::kStopped);
@@ -158,6 +250,7 @@ struct SocketDispatcher::State {
         if (!unbound) {
             return FdFailure(unbound.error());
         }
+        RemoveEvent(record);
         record.retired = *unbound;
         record.status.stage = SocketRetireStage::kClose;
         Queue(record.status.binding.target.stream.slot);
@@ -189,6 +282,9 @@ std::expected<void, SocketDispatchError> SocketDispatcher::Open(SocketStreamBack
     if (!config.owner_id || !config.stream_capacity || config.stream_capacity > FdTable::kMaxBindings ||
         !config.record_budget_bytes) {
         return Error(SocketDispatchErrorCode::kInvalidArgument);
+    }
+    if (config.events && !backend.supports_events()) {
+        return StreamFailure(StreamError(KBS_STREAM_NOT_SUPPORTED));
     }
     const auto bytes = sizeof(State) + config.stream_capacity * sizeof(State::Record);
     if (bytes > config.record_budget_bytes) {
@@ -371,6 +467,16 @@ FdCommandResult SocketDispatcher::Execute(const FdCommandRequest& request, std::
         }
         break;
     }
+    case FdCommandKind::kWatch: {
+        if (!state.config.events) {
+            return std::unexpected(StreamError(KBS_STREAM_NOT_SUPPORTED));
+        }
+        const auto result = state.backend->Watch(stream, request.command.readable, request.command.writable);
+        if (!result) {
+            return std::unexpected(result.error());
+        }
+        break;
+    }
     }
     return reply;
 }
@@ -496,7 +602,8 @@ std::expected<void, SocketDispatchError> SocketDispatcher::Close(bool clients_st
         return Error(SocketDispatchErrorCode::kNotQuiescent);
     }
     const auto stats = state_->bindings.stats();
-    if (stats.active || stats.retired || stats.readers != 0 || state_->commands.outstanding()) {
+    if (stats.active || stats.retired || stats.readers != 0 || state_->commands.outstanding() ||
+        state_->pending_events) {
         return Error(SocketDispatchErrorCode::kRetained);
     }
     const auto bindings = state_->bindings.Close(true);
@@ -518,6 +625,10 @@ SocketDispatcherStats SocketDispatcher::stats() const noexcept {
     result.bindings = state_->bindings.stats();
     result.commands = state_->commands.outstanding();
     result.record_bytes = state_->record_bytes;
+    result.pending_events = state_->pending_events;
+    result.mapped_events = state_->mapped_events;
+    result.unmapped_events = state_->unmapped_events;
+    result.event_error = state_->event_error;
     for (std::uint32_t i = 0; i < state_->config.stream_capacity; ++i) {
         const auto& record = state_->records[i];
         if (!record.occupied) {
@@ -530,8 +641,53 @@ SocketDispatcherStats SocketDispatcher::stats() const noexcept {
     return result;
 }
 std::expected<runtime::ProgressBatch, runtime::ProgressError>
-SocketDispatcher::CollectNotifications(std::size_t) noexcept {
-    return runtime::ProgressBatch{};
+SocketDispatcher::CollectNotifications(std::size_t budget) noexcept {
+    if (!state_) {
+        return std::unexpected(runtime::ProgressError{runtime::ProgressErrorCode::kNotReady});
+    }
+    auto& state = *state_;
+    if (!state.config.events) {
+        return runtime::ProgressBatch{};
+    }
+    if (!budget) {
+        return std::unexpected(runtime::ProgressError{runtime::ProgressErrorCode::kInvalidArgument});
+    }
+    const auto limit = std::min(budget, std::size_t{KBS_STREAM_EVENT_BATCH_MAX});
+    std::array<kbs_stream_event, KBS_STREAM_EVENT_BATCH_MAX> events{};
+    const auto count = state.backend->PollEvents(std::span(events).first(limit));
+    if (!count || *count > limit) {
+        state.event_error = count ? StreamError(KBS_STREAM_PROTOCOL) : count.error();
+        return std::unexpected(runtime::ProgressError{runtime::ProgressErrorCode::kProvider, state.event_error.code});
+    }
+    state.event_error = {};
+    for (std::size_t i = 0; i < *count; ++i) {
+        state.CollectEvent(events[i]);
+    }
+    // 即使 backend 已排空，仍须让宿主领取本地提示，不能带着待交付事件进入阻塞。
+    return runtime::ProgressBatch{*count, state.pending_events != 0 || *count == limit};
+}
+std::expected<std::size_t, SocketDispatchError> SocketDispatcher::PollEvents(std::span<FdEvent> output) noexcept {
+    if (!state_) {
+        return Error(SocketDispatchErrorCode::kNotReady);
+    }
+    auto& state = *state_;
+    if (!state.config.events) {
+        return StreamFailure(StreamError(KBS_STREAM_NOT_SUPPORTED));
+    }
+    if (output.empty()) {
+        return Error(SocketDispatchErrorCode::kInvalidArgument);
+    }
+    const auto limit = std::min(output.size(), std::size_t{KBS_STREAM_EVENT_BATCH_MAX});
+    std::size_t count = 0;
+    while (count < limit && state.event_head != State::kNone) {
+        auto& record = state.records[state.event_head];
+        output[count++] = {record.status.binding, record.event};
+        state.RemoveEvent(record);
+    }
+    return count;
+}
+bool SocketDispatcher::events_pending() const noexcept {
+    return state_ && state_->pending_events != 0;
 }
 std::expected<void, runtime::ProgressError> SocketDispatcher::Rearm() noexcept {
     return {};

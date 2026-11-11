@@ -17,7 +17,7 @@ namespace kbsocket {
 namespace socket {
 
 /// 只由 dispatcher 的唯一 owner 调用；对象及其 Runtime 必须活到 dispatcher Close 成功。
-/// 绑定期间禁止宿主绕过 dispatcher 对相同 stream 执行 I/O、Close 或 Release。
+/// 绑定期间禁止宿主绕过 dispatcher 对相同 stream 执行 I/O、Watch、Close 或 Release。
 class SocketStreamBackend {
 public:
     virtual ~SocketStreamBackend() = default;
@@ -29,6 +29,13 @@ public:
     virtual std::expected<kbs_stream_status, kbs_stream_error> Inspect(kbs_stream_handle stream) noexcept = 0;
     virtual std::expected<void, kbs_stream_error> CloseStream(kbs_stream_handle stream) noexcept = 0;
     virtual std::expected<void, kbs_stream_error> Release(kbs_stream_handle stream) noexcept = 0;
+    // 默认不支持事件，保持只提供 I/O 的 backend 可用；开启事件要求独占消费其整张 stream 表事件。
+    virtual bool supports_events() const noexcept {
+        return false;
+    }
+    virtual std::expected<void, kbs_stream_error> Watch(kbs_stream_handle stream, bool readable,
+                                                        bool writable) noexcept;
+    virtual std::expected<std::size_t, kbs_stream_error> PollEvents(std::span<kbs_stream_event> output) noexcept;
     virtual const void* exclusive_context() const noexcept = 0;
 };
 
@@ -44,6 +51,10 @@ public:
     std::expected<kbs_stream_status, kbs_stream_error> Inspect(kbs_stream_handle stream) noexcept override;
     std::expected<void, kbs_stream_error> CloseStream(kbs_stream_handle stream) noexcept override;
     std::expected<void, kbs_stream_error> Release(kbs_stream_handle stream) noexcept override;
+    bool supports_events() const noexcept override;
+    std::expected<void, kbs_stream_error> Watch(kbs_stream_handle stream, bool readable,
+                                                bool writable) noexcept override;
+    std::expected<std::size_t, kbs_stream_error> PollEvents(std::span<kbs_stream_event> output) noexcept override;
     const void* exclusive_context() const noexcept override;
 
 private:
@@ -58,6 +69,8 @@ struct SocketDispatcherConfig {
     // 按 stream.slot 直接索引，宿主配置为底层 stream 表容量；记录单独受硬预算约束。
     std::uint32_t stream_capacity = 1024;
     std::size_t record_budget_bytes = 1024u * 1024u;
+    // 开启后独占 backend 的整表事件消费；未 Attach 的 stream 提示会计为 unmapped，不转交其他消费者。
+    bool events = false;
 };
 enum class SocketDispatchErrorCode : std::uint8_t {
     kInvalidArgument,
@@ -87,6 +100,12 @@ struct SocketBindingStatus {
     kbs_stream_error last_error{};
     int fd_close_error = 0;
 };
+/// 原始提示与完整绑定身份；无订阅代次。取消/重 arm 不撤回同一流已经排队的提示。
+/// 取出后可能立即发生关闭/复用；应用必须用 binding.id 重新 Lookup，不能只读裸 fd。
+struct FdEvent {
+    FdBinding binding;
+    kbs_stream_event event{};
+};
 struct SocketDispatcherStats {
     FdTableStats bindings;
     std::size_t commands = 0;
@@ -94,6 +113,10 @@ struct SocketDispatcherStats {
     std::size_t releasing = 0;
     std::size_t confirmed = 0;
     std::size_t record_bytes = 0;
+    std::size_t pending_events = 0;
+    std::uint64_t mapped_events = 0, unmapped_events = 0;
+    // 最近一次 backend 事件收集错误；成功收集后清零，不推断 DMA/连接已终结。
+    kbs_stream_error event_error{};
 };
 
 /// 有界跨线程请求桥；不是 POSIX syscall 替换层。Submit 成功只表示入队，实际 I/O 结果由 Take 领取。
@@ -101,7 +124,7 @@ struct SocketDispatcherStats {
 /// 传输 socket 继续归 Runtime 所有。Attach 成功转交 stream 管理权，失败则仍归宿主。
 /// Close 命令先解绑/关闭公开 fd，完成代表逻辑关闭；真实流通过 owner 控制入口 RetireStreams 的 Close/Release 收敛。
 /// Retained 和真实诊断由 InspectBinding 可见，仍须宿主提供 raw 来源退休等独立证明。
-/// Open/Attach/Detach/InspectBinding/RetireStreams/Progress/stats/Close 单 owner；Lookup/Submit/Take 可并发。
+/// 除 RegisterReader/Lookup/Submit/Take 可并发外，其他操作均为单 owner。
 /// raw 必须注册到同 context 暂停组，宿主不能单独绕过暂停推进。Open/Close/析构排除所有外部调用。
 class SocketDispatcher final : public runtime::ProgressSource {
 public:
@@ -125,6 +148,11 @@ public:
                                                                   std::span<const std::byte> input = {}) noexcept;
     std::expected<FdCommandCompletion, FdQueueError> TakeCompletion(FdCommandTicket ticket,
                                                                     std::span<std::byte> output = {}) noexcept;
+    /// 唯一 owner 领取合并后的提示，每次最多 64 条；不推进 Runtime，不调用 Watch。
+    /// flags 为待取期间历史并集，快照为最新值，TX_RETIRED 饱和累加；不是持续 readiness 电平。
+    /// 宿主每轮必须领取并分发；本地尚有提示时 CollectNotifications 持续报告 runnable。
+    std::expected<std::size_t, SocketDispatchError> PollEvents(std::span<FdEvent> output) noexcept;
+    bool events_pending() const noexcept;
     void StopAccepting() noexcept;
     // 停准入后仍须 Detach 全部绑定、推进退休并领取全部结果；最后退出/销毁全部 Reader/Lease。
     // Close 失败保留完整 State 和借用依赖要求，绝不主动关闭后端 Runtime。
