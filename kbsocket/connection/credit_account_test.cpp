@@ -764,7 +764,7 @@ TEST_F(ReceiveCreditDomainTest, StopAdmissionPreservesAuthorizedReceivesAndTrust
     CheckConservation();
 }
 
-TEST_F(ReceiveCreditDomainTest, PublicationSerializesPeerAndConfirmsBothPhysicalFrontiersWithoutAllocation) {
+TEST_F(ReceiveCreditDomainTest, ConcurrentPublicationsConfirmIndependentPhysicalFrontiersWithoutAllocation) {
     PostAll();
     const auto peer = Admit(1);
     ASSERT_TRUE(peer);
@@ -778,7 +778,7 @@ TEST_F(ReceiveCreditDomainTest, PublicationSerializesPeerAndConfirmsBothPhysical
     credit_allocations = 0;
     count_credit_allocations = true;
     const auto publication = domain_.ReservePublication(*peer, {2, 4});
-    const auto busy = domain_.ReservePublication(*peer, {2, 4});
+    const auto concurrent = domain_.ReservePublication(*peer, {1, 3});
     const auto pending = domain_.PublicationPending(*peer);
     const auto exposed = domain_.RecordPublishedControl(*peer, 4);
     const auto before = domain_.ConfirmedCredits(*peer);
@@ -786,8 +786,7 @@ TEST_F(ReceiveCreditDomainTest, PublicationSerializesPeerAndConfirmsBothPhysical
                                       : std::expected<void, CreditError>{std::unexpected(CreditError{})};
     count_credit_allocations = false;
     ASSERT_TRUE(publication);
-    ASSERT_FALSE(busy);
-    EXPECT_EQ(busy.error().code, CreditErrorCode::kInUse);
+    ASSERT_TRUE(concurrent);
     ASSERT_TRUE(pending);
     EXPECT_TRUE(*pending);
     ASSERT_TRUE(exposed);
@@ -798,10 +797,45 @@ TEST_F(ReceiveCreditDomainTest, PublicationSerializesPeerAndConfirmsBothPhysical
     ASSERT_TRUE(resolved);
     EXPECT_EQ(domain_.ConfirmedCredits(*peer)->max_data, 2u);
     EXPECT_EQ(domain_.ConfirmedCredits(*peer)->max_control, 4u);
+    // 后发的较旧上界晚完成，既不能倒退 confirmed，也不能提前清掉其他 WR 责任。
+    EXPECT_EQ(domain_.stats().publications, 1u);
+    EXPECT_TRUE(*domain_.PublicationPending(*peer));
+    ASSERT_TRUE(domain_.ResolvePublication(*concurrent, CreditPublicationResult::kSuccess));
+    EXPECT_EQ(domain_.ConfirmedCredits(*peer)->max_data, 2u);
+    EXPECT_EQ(domain_.ConfirmedCredits(*peer)->max_control, 4u);
     EXPECT_EQ(domain_.stats().publications, 0u);
     EXPECT_FALSE(*domain_.PublicationPending(*peer));
     EXPECT_FALSE(domain_.ResolvePublication(*publication, CreditPublicationResult::kSuccess));
     EXPECT_EQ(credit_allocations, 0u);
+}
+
+TEST_F(ReceiveCreditDomainTest, ConcurrentPublicationPoolIsBoundedAndRejectsStaleTickets) {
+    PostAll();
+    const auto peer = Admit(1);
+    ASSERT_TRUE(peer);
+    std::array<CreditPublication, 16> tickets{};
+    // 整个域共用固定池；同一 Peer 可用全部槽，耗尽后不能覆盖任何未知接受责任。
+    for (auto& ticket : tickets) {
+        const auto reserved = domain_.ReservePublication(*peer, {});
+        ASSERT_TRUE(reserved);
+        ticket = *reserved;
+    }
+    const auto exhausted = domain_.ReservePublication(*peer, {});
+    ASSERT_FALSE(exhausted);
+    EXPECT_EQ(exhausted.error().code, CreditErrorCode::kExhausted);
+    EXPECT_EQ(domain_.stats().publications, tickets.size());
+    ASSERT_TRUE(domain_.ResolvePublication(tickets[3], CreditPublicationResult::kNotAccepted));
+    const auto replacement = domain_.ReservePublication(*peer, {});
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(replacement->slot, tickets[3].slot);
+    EXPECT_NE(replacement->id, tickets[3].id);
+    EXPECT_FALSE(domain_.ResolvePublication(tickets[3], CreditPublicationResult::kSuccess));
+    tickets[3] = *replacement;
+    // 反向回收模拟不同 Lane 的 CQE 乱序；成功只终结自己的票据。
+    for (auto it = tickets.rbegin(); it != tickets.rend(); ++it) {
+        ASSERT_TRUE(domain_.ResolvePublication(*it, CreditPublicationResult::kSuccess));
+    }
+    EXPECT_FALSE(*domain_.PublicationPending(*peer));
 }
 
 TEST_F(ReceiveCreditDomainTest, FailedPublicationReleasesDedupWithoutRevokingGrantOrAcceptedFrontier) {

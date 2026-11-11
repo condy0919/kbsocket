@@ -385,17 +385,18 @@ TEST_F(EagerTxPublicationTest, ConnectionWindowChangeSurvivesSharedPhysicalCoale
     window.max_frame_seq = 17;
     window.max_stream_bytes = 2048;
     ASSERT_TRUE(sibling_.QueueCredit(window));
-    EXPECT_FALSE(sibling_.Progress());
-    // 后来合并的纯共账更新不能清掉此连接独立窗口的必发标记。
+    // 同 Peer 的首个 WR 尚未收到 CQE，第二条连接仍须独立发布自己的接收窗口。
+    ASSERT_EQ(sibling_.Progress(), 1u);
+    EXPECT_EQ(receive_.stats().publications, 2u);
     ASSERT_TRUE(sibling_.QueueCredit(credit_, false));
     Complete(0);
-    ASSERT_EQ(sibling_.Progress(), 1u);
     const auto decoded = DecodeWireFrame(packets_[1].imm, std::span(packets_[1].payload).first(packets_[1].bytes));
     ASSERT_TRUE(decoded);
     EXPECT_EQ(decoded->frame.token.slot, 4u);
     EXPECT_EQ(decoded->frame.max_frame_seq, 17u);
     EXPECT_EQ(decoded->frame.max_stream_bytes, 2048u);
     Complete(1, &sibling_);
+    ASSERT_EQ(sibling_.Progress(), 0u);
     EXPECT_EQ(packet_count_, 2u);
 }
 

@@ -133,11 +133,12 @@ struct CreditPeerHandle {
 struct CreditPublicationLimits {
     std::uint64_t max_data = 0, max_control = 0;
 };
-/// 同 Peer 的一份 CREDIT 在途去重票据；不代表物理授信或 DMA 已经终结。
+/// 一份 CREDIT 在途票据；每次发布独立记录，不代表物理授信或 DMA 已经终结。
 enum class CreditPublicationResult : std::uint8_t { kNotAccepted, kSuccess, kFailed };
 struct CreditPublication {
     CreditPeerHandle peer;
     std::uint64_t id = 0;
+    std::uint32_t slot = 0;
 };
 struct RxCreditReceipt {
     const ReceiveCreditDomain* domain = nullptr;
@@ -214,7 +215,8 @@ public:
     /// 真实 accepted CREDIT 失败后，直到后来成功通告覆盖其两类上界才清除此证据。
     /// 已有 confirmed 相等不能掩盖后发生的窗口通告失败；READY/零接受不产生失败证据。
     std::expected<bool, CreditError> PublicationFailed(CreditPeerHandle peer) const noexcept;
-    /// 每 Peer 至多一个在途 CREDIT，包括连接自身窗口更新；临时忙不丢调用方待发送内容。
+    /// 多连接可并发发布各自窗口；票据使用域级预分配池，容量为 config.capacity。
+    /// 池耗尽时临时背压，不丢调用方待发送内容，也不释放在途责任。
     std::expected<CreditPublication, CreditError> ReservePublication(CreditPeerHandle peer,
                                                                      CreditPublicationLimits limits) noexcept;
     /// 仅真实 CQE 可以选择 Success/Failed；NotAccepted 用于可信零接受，不撤销物理 Grant。

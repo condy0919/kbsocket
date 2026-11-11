@@ -580,6 +580,16 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexc
         (control && s.credits->available(kind) == 1 && s.credit.max_control_credit_seq <= *published)) {
         return Error(EagerTxErrorCode::kWouldBlock);
     }
+    if (control && !s.credit_window_changed && s.config.advertised_credits) {
+        const auto pending = s.config.advertised_credits->PublicationPending(s.config.advertised_peer);
+        if (!pending) {
+            return Error(EagerTxErrorCode::kCredit);
+        }
+        // 纯物理额度仍合并去重；连接独立窗口必须能越过同 Peer 的其他在途通告。
+        if (*pending) {
+            return Error(EagerTxErrorCode::kWouldBlock);
+        }
+    }
     if (control) {
         count = 1;
         s.batch[0] = s.config.capacity;
@@ -645,8 +655,8 @@ std::expected<std::size_t, EagerTxError> EagerTxStream::Post(bool control) noexc
                 Fail();
                 return Error(EagerTxErrorCode::kAccounting);
             }
-            return Error(publication.error().code == CreditErrorCode::kInUse ? EagerTxErrorCode::kWouldBlock
-                                                                             : EagerTxErrorCode::kCredit);
+            return Error(publication.error().code == CreditErrorCode::kExhausted ? EagerTxErrorCode::kWouldBlock
+                                                                                 : EagerTxErrorCode::kCredit);
         }
         s.records[s.batch[0]].publication = *publication;
     }

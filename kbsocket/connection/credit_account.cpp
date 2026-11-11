@@ -244,10 +244,15 @@ struct ReceiveCreditDomain::State {
         CreditPeerStats stats;
         std::uint64_t id = 0;
         std::uint64_t published_control = 0;
-        CreditPublicationLimits confirmed, publishing, failed;
+        CreditPublicationLimits confirmed, failed;
         bool publication_failed = false;
-        std::uint64_t publication = 0;
+        std::uint32_t publications = 0;
         const control::PeerCreditControl* withdrawal_owner = nullptr;
+    };
+    struct Publication {
+        CreditPublicationLimits limits;
+        std::uint64_t id = 0;
+        std::uint32_t peer = kEnd, next = kEnd;
     };
     struct Receipt {
         std::uint64_t id = 0;
@@ -260,8 +265,9 @@ struct ReceiveCreditDomain::State {
     std::array<std::uint64_t, 2> initial_unposted{};
     std::unique_ptr<Peer[]> peers;
     std::unique_ptr<Receipt[]> receipts;
+    std::unique_ptr<Publication[]> publications;
     const EagerReceiveDomain* receive_owner = nullptr;
-    std::uint32_t peer_slots = 0, free_receipt = 0;
+    std::uint32_t peer_slots = 0, free_receipt = 0, free_publication = 0;
 };
 
 ReceiveCreditDomain::ReceiveCreditDomain() noexcept = default;
@@ -287,7 +293,8 @@ std::expected<void, CreditError> ReceiveCreditDomain::Open(const CreditDomainCon
     }
     state->peers.reset(new (std::nothrow) State::Peer[config.peer_capacity]);
     state->receipts.reset(new (std::nothrow) State::Receipt[config.capacity]);
-    if (!state->peers || !state->receipts) {
+    state->publications.reset(new (std::nothrow) State::Publication[config.capacity]);
+    if (!state->peers || !state->receipts || !state->publications) {
         return Error(CreditErrorCode::kNoMemory);
     }
     state->config = config;
@@ -296,6 +303,7 @@ std::expected<void, CreditError> ReceiveCreditDomain::Open(const CreditDomainCon
     state->stats.control.unposted = state->initial_unposted[1];
     for (std::uint32_t i = 0; i < config.capacity; ++i) {
         state->receipts[i].next = i + 1 == config.capacity ? kEnd : i + 1;
+        state->publications[i].next = i + 1 == config.capacity ? kEnd : i + 1;
     }
     state_ = std::move(state);
     last_domain_ = config.receive_domain;
@@ -538,7 +546,7 @@ std::expected<bool, CreditError> ReceiveCreditDomain::PublicationPending(CreditP
     if (!index) {
         return std::unexpected(index.error());
     }
-    return state_->peers[*index].publication != 0;
+    return state_->peers[*index].publications != 0;
 }
 std::expected<bool, CreditError> ReceiveCreditDomain::PublicationFailed(CreditPeerHandle handle) const noexcept {
     const auto index = Find(handle);
@@ -560,17 +568,20 @@ ReceiveCreditDomain::ReservePublication(CreditPeerHandle handle, CreditPublicati
     if (limits.max_data > peer.stats.max_data || limits.max_control > peer.stats.max_control) {
         return Error(CreditErrorCode::kInvalidArgument);
     }
-    if (peer.publication) {
-        return Error(CreditErrorCode::kInUse);
+    if (state_->free_publication == kEnd) {
+        return Error(CreditErrorCode::kExhausted);
     }
     if (next_publication_ == std::numeric_limits<std::uint64_t>::max()) {
         return Error(CreditErrorCode::kSequenceExhausted);
     }
-    peer.publication = ++next_publication_;
-    // 接受前保存不可变快照；连接后续合并新的窗口/额度不改变这次 CQE 所确认的内容。
-    peer.publishing = limits;
+    const auto slot = state_->free_publication;
+    auto& record = state_->publications[slot];
+    state_->free_publication = record.next;
+    // 每个 WR 独立保存不可变快照；并发通告的乱序 CQE 不能确认彼此的上界。
+    record = {.limits = limits, .id = ++next_publication_, .peer = *index};
+    ++peer.publications;
     ++state_->stats.publications;
-    return CreditPublication{handle, peer.publication};
+    return CreditPublication{handle, record.id, slot};
 }
 std::expected<void, CreditError> ReceiveCreditDomain::ResolvePublication(CreditPublication publication,
                                                                          CreditPublicationResult result) noexcept {
@@ -579,7 +590,11 @@ std::expected<void, CreditError> ReceiveCreditDomain::ResolvePublication(CreditP
         return std::unexpected(index.error());
     }
     auto& peer = state_->peers[*index];
-    if (!publication.id || publication.id != peer.publication) {
+    if (!publication.id || publication.slot >= state_->config.capacity) {
+        return Error(CreditErrorCode::kInvalidReservation);
+    }
+    auto& record = state_->publications[publication.slot];
+    if (record.id != publication.id || record.peer != *index) {
         return Error(CreditErrorCode::kInvalidReservation);
     }
     if (result != CreditPublicationResult::kNotAccepted && result != CreditPublicationResult::kSuccess &&
@@ -588,21 +603,22 @@ std::expected<void, CreditError> ReceiveCreditDomain::ResolvePublication(CreditP
     }
     if (result == CreditPublicationResult::kFailed) {
         peer.publication_failed = true;
-        peer.failed.max_data = std::max(peer.failed.max_data, peer.publishing.max_data);
-        peer.failed.max_control = std::max(peer.failed.max_control, peer.publishing.max_control);
+        peer.failed.max_data = std::max(peer.failed.max_data, record.limits.max_data);
+        peer.failed.max_control = std::max(peer.failed.max_control, record.limits.max_control);
     }
     if (result == CreditPublicationResult::kSuccess) {
-        peer.confirmed.max_data = std::max(peer.confirmed.max_data, peer.publishing.max_data);
-        peer.confirmed.max_control = std::max(peer.confirmed.max_control, peer.publishing.max_control);
+        peer.confirmed.max_data = std::max(peer.confirmed.max_data, record.limits.max_data);
+        peer.confirmed.max_control = std::max(peer.confirmed.max_control, record.limits.max_control);
         // 只由失败之后的真实成功票据解除重公告责任，已有 confirmed 相等不能覆盖窗口-only 失败。
-        if (peer.publishing.max_data >= peer.failed.max_data &&
-            peer.publishing.max_control >= peer.failed.max_control) {
+        if (record.limits.max_data >= peer.failed.max_data &&
+            record.limits.max_control >= peer.failed.max_control) {
             peer.publication_failed = false;
             peer.failed = {};
         }
     }
-    peer.publication = 0;
-    peer.publishing = {};
+    record = {.next = state_->free_publication};
+    state_->free_publication = publication.slot;
+    --peer.publications;
     --state_->stats.publications;
     return {};
 }
@@ -826,7 +842,7 @@ std::expected<void, CreditError> ReceiveCreditDomain::RetireWithdrawn(const cont
             return Error(CreditErrorCode::kWrongIdentity);
         }
     }
-    if (consumed != spent || peer.pending_rx || record.publication) {
+    if (consumed != spent || peer.pending_rx || record.publications) {
         return Error(CreditErrorCode::kInUse);
     }
     FinishRetire(*index);
@@ -853,7 +869,7 @@ std::expected<void, CreditError> ReceiveCreditDomain::RetirePeer(CreditPeerHandl
     if (state_->stats.unattributed) {
         return Error(CreditErrorCode::kRetained);
     }
-    if (peer.pending_rx || record.publication) {
+    if (peer.pending_rx || record.publications) {
         return Error(CreditErrorCode::kInUse);
     }
     FinishRetire(*index);
