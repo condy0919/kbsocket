@@ -104,6 +104,16 @@ struct ConnectionCommandQueue::State {
     struct alignas(64) Accounting {
         std::atomic<std::uint64_t> outstanding{0};
     } accounting;
+    struct alignas(64) Notification {
+        // bit 0 合并已发布请求；bit 1 证明首次 write 已完成，owner 才能清空事件。
+        std::atomic<unsigned> state{0};
+    } notification;
+    void Notify() noexcept {
+        if (notification.state.fetch_or(1, std::memory_order_acq_rel) == 0) {
+            Signal(fd);
+            notification.state.fetch_or(2, std::memory_order_release);
+        }
+    }
     std::unique_ptr<Slot[]> slots;
     std::unique_ptr<std::byte[], PayloadDeleter> payload;
     std::size_t capacity = 0, max_io_bytes = 0;
@@ -206,7 +216,7 @@ ConnectionCommandQueue::TrySubmit(const ConnectionCommand& command, std::span<co
             std::memcpy(slot.payload, input.data(), input.size());
         }
         slot.tag.store(Tag(position, kPublished), std::memory_order_release);
-        Signal(state.fd);
+        state.Notify();
         return ConnectionCommandTicket{.queue = this, .sequence = position + 1};
     }
 }
@@ -220,10 +230,18 @@ ConnectionCommandQueue::PollCommands(std::span<ConnectionCommandRequest> request
         return Error(CommandQueueErrorCode::kInvalidArgument);
     }
     auto& state = *state_;
-    std::uint64_t notification;
-    const auto result = ::read(state.fd, &notification, sizeof(notification));
-    if (result < 0 && errno != EAGAIN && errno != EINTR) {
-        return Error(CommandQueueErrorCode::kSystem, errno);
+    if (state.notification.state.load(std::memory_order_acquire) & 2) {
+        std::uint64_t notification;
+        ssize_t result;
+        do {
+            result = ::read(state.fd, &notification, sizeof(notification));
+        } while (result < 0 && errno == EINTR);
+        if (result < 0 && errno != EAGAIN) {
+            return Error(CommandQueueErrorCode::kSystem, errno);
+        }
+        // 先清 fd 再重新开放通知资格；exchange 同步此前合并通知的所有发布者，
+        // 随后的队首检查必能看到它们。并发的后续发布者则负责下一次唤醒。
+        state.notification.state.exchange(0, std::memory_order_acq_rel);
     }
     std::size_t count = 0;
     while (count < requests.size()) {
@@ -241,7 +259,7 @@ ConnectionCommandQueue::PollCommands(std::span<ConnectionCommandRequest> request
     // 未发布的预留空洞不能阻塞 owner；由其 producer 发布时唤醒。
     // 预算耗尽留下的连续前缀重新保留 readiness，扫描后不再次清空通知。
     if (runnable()) {
-        Signal(state.fd);
+        state.Notify();
     }
     return count;
 }

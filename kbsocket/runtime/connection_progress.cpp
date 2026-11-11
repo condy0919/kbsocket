@@ -164,12 +164,8 @@ struct ConnectionProgress::State {
         if ((connection.state() != ConnectionState::kIdle && connection.state() != ConnectionState::kFailed &&
              connection.state() != ConnectionState::kClosing && connection.state() != ConnectionState::kClosed) ||
             connection.needs_cleanup_progress()) {
-            // Reactor 的批次时间可能早于本轮 RX 回调/应用 Read；每次访问刷新同一单调时钟，
-            // 防止把旧时间传入已见到较新 RX 的重排窗口。传入值仍作为测试/调度时间下界。
-            const auto current = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                std::chrono::steady_clock::now().time_since_epoch())
-                                                                .count());
-            const auto advanced = connection.Progress(std::max(now, current));
+            // Connection::ObserveTime 保留已观察到的 RX/Read 时间，批次时钟不会使其倒退。
+            const auto advanced = connection.Progress(now);
             if (advanced) {
                 processed = *advanced;
             }
@@ -383,6 +379,17 @@ std::expected<void, ProgressError> ConnectionProgress::WatchTcp(ScheduledConnect
     slot->watched_events = 0;
     return state_->Watch(*slot);
 }
+std::expected<void, ProgressError> ConnectionProgress::OnRxConnection(connection::Connection& connection) noexcept {
+    if (!state_) {
+        return Error(ProgressErrorCode::kNotReady);
+    }
+    auto* slot = state_->Lookup(connection.connection_id());
+    if (!slot || slot->connection != &connection || connection.raw_context() != state_->config.context) {
+        return Error(ProgressErrorCode::kInvalidArgument);
+    }
+    state_->Enqueue(*slot);
+    return {};
+}
 std::expected<void, ProgressError> ConnectionProgress::OnTxCompletion(const raw::TxCompletionEvent& event) noexcept {
     if (!state_) {
         return Error(ProgressErrorCode::kNotReady);
@@ -496,6 +503,13 @@ std::expected<ProgressBatch, ProgressError> ConnectionProgress::Progress(Progres
         }
         result.runnable = state.sweeping || state.head != kNone;
     } else if (kind == ProgressKind::kMailbox) {
+        // 同批次连接共享一次时钟采样；空就绪队列无需读取时钟。
+        if (state.head != kNone) {
+            const auto current = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                                .count());
+            now = std::max(now, current);
+        }
         for (std::size_t i = 0; i < budget && state.head != kNone; ++i) {
             auto& slot = state.slots[state.head];
             state.Dequeue(slot);

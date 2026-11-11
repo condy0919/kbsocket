@@ -1472,6 +1472,55 @@ TEST_F(ConnectionRuntimeTest, CancelRetainsHelloSourcesUntilQueuedReceiveHasSett
     EXPECT_EQ(receiver.sources.size(), 2u);
 }
 
+TEST_F(ConnectionRuntimeTest, OrdinaryRxWakesOnlyItsConnectionBeforeNextSweep) {
+    Activate();
+    auto& sender = endpoints_[0];
+    auto& receiver = endpoints_[1];
+    std::array<Connection, 3> idle;
+    std::array<runtime::ScheduledConnection, 3> handles{};
+    struct Cleanup {
+        runtime::ConnectionProgress& scheduler;
+        std::array<Connection, 3>& connections;
+        std::array<runtime::ScheduledConnection, 3>& handles;
+        ~Cleanup() {
+            for (std::size_t i = 0; i < handles.size(); ++i) {
+                if (handles[i].owner) {
+                    (void)connections[i].Close();
+                    (void)scheduler.Detach(handles[i]);
+                }
+            }
+        }
+    } cleanup{receiver.scheduler, idle, handles};
+    // 额外挂载空闲连接；预先完成正常周期巡检，避免把已有就绪任务误算为 RX 扫描。
+    for (std::size_t i = 0; i < idle.size(); ++i) {
+        const auto attached = receiver.scheduler.Attach(idle[i]);
+        ASSERT_TRUE(attached);
+        handles[i] = *attached;
+    }
+    ASSERT_TRUE(receiver.scheduler.RequestSweep());
+    const auto now = Now();
+    ASSERT_TRUE(receiver.scheduler.Progress(runtime::ProgressKind::kTimer, 8, now));
+    ASSERT_TRUE(receiver.scheduler.Progress(runtime::ProgressKind::kMailbox, 8, now));
+    const auto visits = receiver.scheduler.stats()->visits;
+
+    // 同一 owner 手动推进一次真实 SEND/CQE/Dispatch；业务包不改变 Peer 的反向信用上限。
+    const std::array<std::byte, 1> payload{std::byte{0x42}};
+    ASSERT_EQ(sender.connection.Write(payload), payload.size());
+    ASSERT_TRUE(sender.connection.Progress(Now()));
+    Deliver();
+    std::array<raw::RxBufferEvent, 8> events;
+    const auto count = receiver.buffers.Poll(events);
+    ASSERT_TRUE(count);
+    ASSERT_EQ(*count, 1u);
+    ASSERT_TRUE(receiver.io.OnRx(events[0], Now()));
+    ASSERT_TRUE(receiver.scheduler.Progress(runtime::ProgressKind::kTimer, 8, now));
+    ASSERT_TRUE(receiver.scheduler.Progress(runtime::ProgressKind::kMailbox, 8, now));
+    EXPECT_EQ(receiver.scheduler.stats()->visits - visits, 1u);
+    EXPECT_EQ(receiver.connection.rx_pending(), 1u);
+    EXPECT_EQ(receiver.callback_rx_pending, 1u);
+    EXPECT_FALSE(receiver.connection.failure());
+}
+
 TEST_F(ConnectionRuntimeTest, RuntimeOwnsHandshakeImportDataCreditAndOrderedFin) {
     Activate();
     EXPECT_EQ(shard_.stats()->controls_completed, 2u);

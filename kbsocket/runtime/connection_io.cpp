@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 #include "kbsocket/runtime/connection_io.hpp"
 
+#include <array>
 #include <cerrno>
 #include <ctime>
 
@@ -59,14 +60,24 @@ std::expected<void, ConnectionIoError> ConnectionIoBinding::OnRx(const raw::RxBu
     ++stats_.rx_events;
     const auto source = sources_->Resolve(event);
     // Resolve 只确认身份，不消费 Lease。任何拒绝仍须走真实 RQE 的未知来源结账并冻结接收域。
+    auto* sender_credits = source ? source->sender_credits : nullptr;
+    const auto limits = sender_credits ? sender_credits->stats().limits : std::array<std::uint64_t, 2>{};
+    void* dispatched = nullptr;
     const auto received = receive_->Dispatch(event, source ? *source : connection::EagerReceiveSource{},
-                                             &connection::Connection::DispatchRx, now_ns);
-    const auto swept = progress_->RequestSweep();
+                                             &connection::Connection::DispatchRx, now_ns, &dispatched);
+    // 只有共享信用上限变化或整域冻结才可能影响其他流。普通 DATA/FIN/RNDV 仅唤醒
+    // 路由实际命中的连接；旧 token 即使没有目标，也不能吞掉兄弟流的共享信用更新。
+    std::expected<void, ProgressError> scheduled;
+    if (receive_->frozen() || (sender_credits && limits != sender_credits->stats().limits)) {
+        scheduled = progress_->RequestSweep();
+    } else if (dispatched) {
+        scheduled = progress_->OnRxConnection(*static_cast<connection::Connection*>(dispatched));
+    }
     if (!source) {
         return Record({.code = ConnectionIoErrorCode::kSource,
                        .source = source.error(),
                        .receive = received ? std::nullopt : std::optional(received.error()),
-                       .progress = swept ? std::nullopt : std::optional(swept.error())});
+                       .progress = scheduled ? std::nullopt : std::optional(scheduled.error())});
     }
     if (!received) {
         if (received.error().code == connection::EagerRxErrorCode::kRouteRejected) {
@@ -76,12 +87,12 @@ std::expected<void, ConnectionIoError> ConnectionIoBinding::OnRx(const raw::RxBu
             return Record({.code = ConnectionIoErrorCode::kReceive,
                            .source = {},
                            .receive = received.error(),
-                           .progress = swept ? std::nullopt : std::optional(swept.error())});
+                           .progress = scheduled ? std::nullopt : std::optional(scheduled.error())});
         }
     }
-    if (!swept) {
+    if (!scheduled) {
         return Record(
-            {.code = ConnectionIoErrorCode::kProgress, .source = {}, .receive = {}, .progress = swept.error()});
+            {.code = ConnectionIoErrorCode::kProgress, .source = {}, .receive = {}, .progress = scheduled.error()});
     }
     return {};
 }

@@ -494,6 +494,32 @@ TEST_F(ConnectionCommandQueueTest, PollBudgetPreservesReadinessAndReservationOrd
     EXPECT_EQ(*queue_.PollCommands(requests), 0u);
 }
 
+TEST_F(ConnectionCommandQueueTest, BurstSubmissionsCoalesceEventFdNotification) {
+    ASSERT_TRUE(queue_.Open(4));
+    // 多个生产者顺序发布的突发只需要一次唤醒，eventfd 计数不能等于命令条数。
+    for (std::uint64_t token = 1; token <= 3; ++token) {
+        ASSERT_TRUE(queue_.TrySubmit(Command(ConnectionCommandKind::kCancel, token)));
+    }
+    std::uint64_t notifications = 0;
+    ASSERT_EQ(::read(queue_.command_fd(), &notifications, sizeof(notifications)),
+              static_cast<ssize_t>(sizeof(notifications)));
+    EXPECT_EQ(notifications, 1u);
+    // 即使通知已被外部取走，真实命令仍由环上的发布状态决定；限额出队恢复剩余 readiness。
+    std::array<ConnectionCommandRequest, 1> requests;
+    for (std::uint64_t token = 1; token <= 3; ++token) {
+        ASSERT_EQ(*queue_.PollCommands(requests), 1u);
+        EXPECT_EQ(requests[0].command.token, token);
+        ASSERT_TRUE(queue_.Complete(requests[0].ticket, ConnectionCommandReply{}));
+        ASSERT_TRUE(queue_.TakeCompletion(requests[0].ticket));
+        EXPECT_EQ(Readable(queue_.command_fd()), token != 3);
+    }
+    // 空轮询不制造假通知；下一批仍需可靠唤醒。
+    EXPECT_EQ(*queue_.PollCommands(requests), 0u);
+    EXPECT_FALSE(Readable(queue_.command_fd()));
+    ASSERT_TRUE(queue_.TrySubmit(Command()));
+    EXPECT_TRUE(Readable(queue_.command_fd()));
+}
+
 TEST_F(ConnectionCommandQueueTest, PublicationAfterEmptyPollWakesOwner) {
     ASSERT_TRUE(queue_.Open(2));
     std::atomic<bool> start{false};

@@ -88,6 +88,14 @@
    - 在 `ConnectionCommandQueue` 中维护 `std::atomic<bool> sleeping` 状态，仅当 Reactor 准备进入 `epoll_wait` 休眠时才触发 `eventfd` 的 `::write` / `::read`；
    - 在 `ShardReactor::Advance()` 入口采样一次 `now_ns` 并向下透传，移除 `Visit()` 内逐连接的 `steady_clock::now()` 调用。
 
+
+#### 5. 核实与修复记录（2026-11-11）
+
+- **结论：部分修复。** 已证实普通 RX 无条件 `RequestSweep()`、逐连接时钟采样、命令提交/空轮询的 eventfd 调用。原文“每次 kRefill 都扫描”不准确：实际补投成功才重置巡检时间，空补投不会。
+- **本次修复：** 普通 RX 按已验证的路由 O(1) 入队目标连接；共享信用上限变化或整域冻结仍保留巡检，避免漏掉兄弟连接及迟到 CREDIT。命令队列合并突发通知、跳过空轮询 `read`，区分通知写入中/已写入以防丢唤醒；预算耗尽仍保留 readiness。`Visit` 的时钟改为每个非空调度批次采样一次，连接内部仍钳制已观察时间，避免倒退。
+- **验证：** `connection_command_queue_test`、`connection_progress_test`、`rx_source_registry_test`、`eager_rx_test` 通过；`connection_runtime_test` 无过滤全目标通过。新增回归验证三条命令仅生成一次 eventfd 通知、多条空闲连接场景下普通 RX 只访问目标，以及批次时间晚于/早于 RX 与应用 Read 时保持单调。
+- **保留项：** 成功补投、共享 CREDIT 和 1 ms 周期巡检仍可能扫描全表；精确待授信队列/时间轮、嵌套 epoll、`SubmissionTime()` 和 RNDV 的额外采样未改。通知当前按批合并，尚非仅休眠时写 eventfd，不能宣称热路径已无系统调用。
+
 ---
 
 ### ISSUE-3 [P1]：主动 TX Lane 逐批 Round-Robin 喷洒加剧乱序，且 `RxSourceRegistry` / `LaneControl` 与对端物理 Lane 过度耦合

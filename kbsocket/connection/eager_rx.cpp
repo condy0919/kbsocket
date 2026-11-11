@@ -96,7 +96,10 @@ std::expected<void, EagerRxError> EagerReceiveDomain::Open(raw::RxBufferPool& bu
 
 std::expected<void, EagerRxError> EagerReceiveDomain::Dispatch(const raw::RxBufferEvent& event,
                                                                const EagerReceiveSource& source, EagerRxHandler handler,
-                                                               std::uint64_t now_ns) noexcept {
+                                                               std::uint64_t now_ns, void** dispatched) noexcept {
+    if (dispatched) {
+        *dispatched = nullptr;
+    }
     if (!state_) {
         return Error(EagerRxErrorCode::kNotReady);
     }
@@ -192,6 +195,9 @@ std::expected<void, EagerRxError> EagerReceiveDomain::Dispatch(const raw::RxBuff
             return released;
         }
         return Error(EagerRxErrorCode::kRouteRejected);
+    }
+    if (dispatched) {
+        *dispatched = route->connection;
     }
     s.dispatching = true;
     entry.observed = source.peer_context;

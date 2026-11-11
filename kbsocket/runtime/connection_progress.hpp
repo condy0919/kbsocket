@@ -68,8 +68,10 @@ public:
     std::expected<void, ProgressError> Detach(ScheduledConnection connection) noexcept;
     std::expected<void, ProgressError> Wake(ScheduledConnection connection) noexcept;
     std::expected<void, ProgressError> WatchTcp(ScheduledConnection connection, bool read, bool write) noexcept;
+    /// RX owner 已通过真实路由定位连接；只入就绪队列，不写 eventfd 或扫描其他连接。
+    std::expected<void, ProgressError> OnRxConnection(connection::Connection& connection) noexcept;
     std::expected<void, ProgressError> OnTxCompletion(const raw::TxCompletionEvent& event) noexcept;
-    // RX/Credit 和补投影响共享 Peer 共账，启动一轮有预算的巡检，合并重复请求。
+    // 共享 Credit 变化、补投或整域故障启动有预算的巡检；普通 RX 使用 OnRxConnection。
     std::expected<void, ProgressError> RequestSweep() noexcept;
     std::expected<void, ProgressError> AddReceiveDomain(connection::EagerReceiveDomain& domain) noexcept;
     /// 控制路径移除同一对象的补投注册，不关闭域或结清 Lease；调用方先停用 raw 回调和相关借用。
@@ -79,7 +81,7 @@ public:
     const ConnectionProgressStats* stats() const noexcept;
     std::uint32_t capacity() const noexcept;
 
-    // now_ns 为本轮调度时间下界；实际 Connection 访问刷新单调时钟，晚到 RX 不造成时间倒退。
+    // now_ns 为本轮调度时间下界；每批就绪连接共享一次时钟采样，连接内部保证时间不倒退。
     std::expected<ProgressBatch, ProgressError> Progress(ProgressKind, std::size_t, std::uint64_t) noexcept override;
     std::expected<ProgressBatch, ProgressError> CollectNotifications(std::size_t) noexcept override;
     std::expected<void, ProgressError> Rearm() noexcept override;

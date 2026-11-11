@@ -87,8 +87,11 @@ public:
     EagerReceiveDomain& operator=(const EagerReceiveDomain&) = delete;
     std::expected<void, EagerRxError> Open(raw::RxBufferPool& buffers, ReceiveCreditDomain& credits,
                                            ConnectionTable& routes) noexcept;
+    /// dispatched 可选返回实际调用 handler 的路由对象；借用仅在本轮 owner 调用中有效。
+    /// 即使 handler 失败仍返回该对象，供调度器精确通知连接失败；未通过路由验证时置空。
     std::expected<void, EagerRxError> Dispatch(const raw::RxBufferEvent& event, const EagerReceiveSource& source,
-                                               EagerRxHandler handler, std::uint64_t now_ns) noexcept;
+                                               EagerRxHandler handler, std::uint64_t now_ns,
+                                               void** dispatched = nullptr) noexcept;
     std::expected<EagerRxPacketView, EagerRxError> View(EagerRxPacket packet) const noexcept;
     /// 真实 RX Lease -> physical receipt -> refill 队列，禁止直接把应用消费当作已补投。
     std::expected<void, EagerRxError> Release(EagerRxPacket packet) noexcept;
