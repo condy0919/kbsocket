@@ -893,6 +893,39 @@ TEST_F(ReceiveCreditDomainTest, FailedWindowPublicationNeedsLaterCoveringSuccess
     EXPECT_EQ(domain_.PublicationFailed(*peer), false);
 }
 
+TEST_F(ReceiveCreditDomainTest, ConcurrentSuccessCannotClearFailureWithoutNewPublication) {
+    PostAll();
+    const auto peer = Admit(1);
+    ASSERT_TRUE(peer);
+    ASSERT_TRUE(domain_.Grant(*peer, CreditClass::kData, 2));
+    ASSERT_TRUE(domain_.Grant(*peer, CreditClass::kControl, 4));
+    // 三份窗口公告共享物理上界，CQE 可以乱序；失败前签发的任何票据都不是重新公告。
+    const auto earlier = domain_.ReservePublication(*peer, {2, 4});
+    const auto failed = domain_.ReservePublication(*peer, {2, 4});
+    const auto later_in_flight = domain_.ReservePublication(*peer, {2, 4});
+    ASSERT_TRUE(earlier);
+    ASSERT_TRUE(failed);
+    ASSERT_TRUE(later_in_flight);
+    ASSERT_TRUE(domain_.ResolvePublication(*failed, CreditPublicationResult::kFailed));
+    ASSERT_TRUE(domain_.ResolvePublication(*earlier, CreditPublicationResult::kSuccess));
+    EXPECT_EQ(domain_.PublicationFailed(*peer), true);
+    ASSERT_TRUE(domain_.ResolvePublication(*later_in_flight, CreditPublicationResult::kSuccess));
+    EXPECT_EQ(domain_.PublicationFailed(*peer), true);
+    EXPECT_EQ(domain_.stats().publications, 0u);
+    EXPECT_EQ(domain_.ConfirmedCredits(*peer)->max_control, 4u);
+
+    // 已确认上界和未接受的新票据都不能抹掉责任；必须在观察到失败后真实重发并成功。
+    const auto rejected = domain_.ReservePublication(*peer, {2, 4});
+    ASSERT_TRUE(rejected);
+    ASSERT_TRUE(domain_.ResolvePublication(*rejected, CreditPublicationResult::kNotAccepted));
+    EXPECT_EQ(domain_.PublicationFailed(*peer), true);
+    const auto replacement = domain_.ReservePublication(*peer, {2, 4});
+    ASSERT_TRUE(replacement);
+    ASSERT_TRUE(domain_.ResolvePublication(*replacement, CreditPublicationResult::kSuccess));
+    EXPECT_EQ(domain_.PublicationFailed(*peer), false);
+    EXPECT_EQ(domain_.stats().publications, 0u);
+}
+
 TEST_F(ReceiveCreditDomainTest, PublicationIdentityAndPendingResponsibilitySurviveFreezeUntilTerminal) {
     PostAll();
     const auto first = Admit(1);

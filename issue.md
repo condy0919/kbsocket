@@ -238,3 +238,5 @@
 - **本次修复：** `ReceiveCreditDomain` 使用域级预分配 publication 池，每个 WR 独立记录 Peer、槽位、代次和上限快照；多连接窗口更新可同时在途，乱序 CQE 分别确认，累计上限不倒退。池耗尽返回背压，零接受归还票据，未知接受保留责任；Peer 退役/域关闭等待全部在途票据。`EagerTxStream` 继续合并纯共账更新，但连接私有窗口更新不再被兄弟连接的 publication 阻塞。
 - **验证：** `USE_BAZEL_VERSION=9.3.0 bazel test //kbsocket/connection:credit_account_test //kbsocket/connection:eager_tx_test --test_output=errors` 通过。覆盖独立快照与乱序完成、池耗尽/复用/旧票据、并发连接窗口、零接受/失败/未知接受及数据路径零分配。
 - **原建议纠正：** `wire_frame.cpp` 中现有 `kDataWithCredit` 只附带 8 字节 `max_credit_seq`，不包含控制信用、连接帧/字节窗口和 `credit_epoch`。因此无法直接捎带完整 `CREDIT_UPDATE`，也不能据此推断能消除近 100% 独立控制帧。本次未修改线协议或启用有限的数据信用捎带，该部分保留待设计。
+
+- **并发完成补充修复：** 交叉审查发现“先签发 A/B，B 失败，A 迟到成功”会错误清除失败后的重公告责任。现记录失败时已签发票据水位，仅失败后新签发且覆盖失败上限的成功通告可清除责任；旧成功仍可累计 confirmed，但不替代重新公告。新增多票据反序完成及零接受回归，`credit_account_test` / `eager_tx_test` 再次全部通过。

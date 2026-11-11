@@ -244,6 +244,7 @@ struct ReceiveCreditDomain::State {
         CreditPeerStats stats;
         std::uint64_t id = 0;
         std::uint64_t published_control = 0;
+        std::uint64_t failed_publication_watermark = 0;
         CreditPublicationLimits confirmed, failed;
         bool publication_failed = false;
         std::uint32_t publications = 0;
@@ -603,6 +604,8 @@ std::expected<void, CreditError> ReceiveCreditDomain::ResolvePublication(CreditP
     }
     if (result == CreditPublicationResult::kFailed) {
         peer.publication_failed = true;
+        // 并发在途票据的迟到成功不能充当失败后的重新公告；保存此刻全部已签发票据的边界。
+        peer.failed_publication_watermark = next_publication_;
         peer.failed.max_data = std::max(peer.failed.max_data, record.limits.max_data);
         peer.failed.max_control = std::max(peer.failed.max_control, record.limits.max_control);
     }
@@ -610,9 +613,10 @@ std::expected<void, CreditError> ReceiveCreditDomain::ResolvePublication(CreditP
         peer.confirmed.max_data = std::max(peer.confirmed.max_data, record.limits.max_data);
         peer.confirmed.max_control = std::max(peer.confirmed.max_control, record.limits.max_control);
         // 只由失败之后的真实成功票据解除重公告责任，已有 confirmed 相等不能覆盖窗口-only 失败。
-        if (record.limits.max_data >= peer.failed.max_data &&
+        if (record.id > peer.failed_publication_watermark && record.limits.max_data >= peer.failed.max_data &&
             record.limits.max_control >= peer.failed.max_control) {
             peer.publication_failed = false;
+            peer.failed_publication_watermark = 0;
             peer.failed = {};
         }
     }
