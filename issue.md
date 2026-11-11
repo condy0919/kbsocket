@@ -211,6 +211,15 @@
 1. **入队即分配 SN，解除 Eager/RNDV 互斥与 `promised_control` 单事务限制**：在 `Write` / `WriteLease` 入队时即从 `TxSequenceWindow` 分配确定序号；允许 `ReserveControl()` 在控制信用充裕时并发预留多笔 RNDV 的 `DONE` 额度。
 2. **控制帧启用硬件 Inline 发送并拆分 Size-Classed Slabs**：对 $\le \text{inline\_bytes}$ 的纯控制帧（`CREDIT_UPDATE`、`RTS`、`GRANT`、`DONE`、`FIN`、`RST`）在 `TxSender` 中使用 `URMA_SEND_INLINE` 发送，免除 Slab 分配与 DMA 引用记账；将 4 KiB Eager Slab 与大块 RNDV Slab 拆池管理，并支持 Pipelined RNDV。
 
+
+#### 5. 核实记录与保留原因（2026-11-11）
+
+- **结论：有真实容量限制，也有描述过度，本项保留待改造。** Peer 级 `promised_control != 0` 门禁和大 Slab 装小控制帧均属实，但不能直接删门禁或仅开启 inline 标志就认为已完成修复。
+- **互斥范围纠正：** 限制的是 Eager 队列/未提交序号，不是等全部 RNDV 完成才允许 Eager。现有 `connection_rndv_test::EagerRndvAndFinShareOneOrderedStream` 扣住 WRITE CQE 后仍验证 RTS accepted 后 Eager/FIN 可先于 DONE 发送；`eager_tx_test::RndvAdmissionWaitsForQueuedEagerButNotAcceptedDma` 验证已接受但 DMA 未完成的 Eager 不阻止 RNDV。这两个测试目标已通过。
+- **门禁不能直接删除的原因：** `Connection::RefreshCredit` 仅在 `control_granted <= control_target/2` 时补额，`SenderCreditAccount::available` 则提前扣除未来 DONE 的承诺。例如预算 8、低水线 4 时，预留 6 个 DONE 后仅余 2；发送一个反向 GRANT 和一个 DONE 后，剩余 5 个承诺占住信用，只剩 1 个实际可用额度，而对端仍有 6 个 granted、不触发补额。双向对称情况下可停顿。应先明确反向 GRANT/DONE/CREDIT 的保留预算及低水线协商，再允许多承诺，而非删除安全条件。
+- **分片能力纠正：** `WriteRndvPool` 已按 `chunk_bytes` 分割 WRITE，API 也允许部分写；缺少的是跨多个目标 Slice 的单事务流水线，不能笼统称“完全不支持分片”。inline 能免本地 DMA 引用，但不能免目标导入引用、信用消耗及完成责任；分级池也需覆盖 GRANT/WRITE 的生命周期。
+- **本次未修改：** 单 Peer 准入门禁、控制帧 inline、分级 Slab 和跨 Slice 流水线。保留本项为未解决，避免引入双向死锁、重复序号或提前归还 DMA 内存。
+
 ---
 
 ### ISSUE-6 [P2]：`kDataWithCredit` 捎带授信未启用，且 `ReservePublication` 限制每 Peer 单在途 `CREDIT_UPDATE`
