@@ -1,5 +1,7 @@
 # kbsocket 架构与实现改进清单（对标 UCX / 基于 RM_CTP 硬件可靠乱序模型）
 
+> **2026-11-11 核实状态**：保留原分析供对照，以各问题下方“核实与修复记录”为准。ISSUE-1/2/3/4/6 已完成部分修复，ISSUE-5 保留待改造；未验证的性能推断及不安全的直接修改建议已逐项说明。
+
 > **分析前提**：`kbsocket` 当前采用的 UB `RM_CTP` 模式在队列拓扑上类似于 RDMA 的无连接多路径模式（UM），但**硬件自身保证可靠传输（硬件处理重传），软件无需维护重传缓存与重传定时器，仅需处理乱序到达（Out-of-Order）、共享接收队列（Shared JFR）流控、主动发送通道（TX Lanes）复用以及 SEND + WRITE RNDV 协同**。
 >
 > 在 `ucx` 中，与 `RM_CTP` 硬件语义高度同构的参考实现包括：
@@ -250,3 +252,13 @@
 - **原建议纠正：** `wire_frame.cpp` 中现有 `kDataWithCredit` 只附带 8 字节 `max_credit_seq`，不包含控制信用、连接帧/字节窗口和 `credit_epoch`。因此无法直接捎带完整 `CREDIT_UPDATE`，也不能据此推断能消除近 100% 独立控制帧。本次未修改线协议或启用有限的数据信用捎带，该部分保留待设计。
 
 - **并发完成补充修复：** 交叉审查发现“先签发 A/B，B 失败，A 迟到成功”会错误清除失败后的重公告责任。现记录失败时已签发票据水位，仅失败后新签发且覆盖失败上限的成功通告可清除责任；旧成功仍可累计 confirmed，但不替代重新公告。新增多票据反序完成及零接受回归，`credit_account_test` / `eager_tx_test` 再次全部通过。
+
+
+---
+
+## 本轮最终验证（2026-11-11）
+
+- `USE_BAZEL_VERSION=9.3.0 bazel test //kbsocket/... --test_output=errors --lockfile_mode=off`：77/77 测试目标通过。
+- `USE_BAZEL_VERSION=9.3.0 bazel test //tools/... --test_output=errors --lockfile_mode=off`：24/24 测试目标通过，同时构建相应工具。
+- 共 101 个测试目标通过（包括 Bazel 有效缓存结果）；`git diff --check` 通过。验证使用 Mock/本机线程与 socket，未执行 UB 真机、40k 连接或 P99/P99.9 性能压测。
+- 各项修复与后续回归分步提交；修改前已有的无关未跟踪文件保留，未推送远端。
